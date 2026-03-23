@@ -1,7 +1,8 @@
-import { loadConfig, loadCredentials, getServerUrl, detectOpenclawConfig } from '../config.js';
-import { WSClient } from '../ws/client.js';
+import { loadConfig, loadCredentials, getServerUrl, detectClawConfig } from '../config.js';
+import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
-import { OpenclawEngine } from '../ai/openclaw.js';
+import { OpenclawAdapter } from '../claw/openclaw.js';
+import { ClawRouter } from '../router.js';
 
 /**
  * aichat start — 读取本地 credentials 自动连接
@@ -16,21 +17,27 @@ export async function start(): Promise<void> {
 	}
 
 	const serverUrl = getServerUrl(config);
-	const openclawConfig = detectOpenclawConfig(config);
+	const clawConfig = detectClawConfig(config);
 
 	console.log(`[start] UID: ${credentials.uid}`);
 	console.log(`[start] Server: ${serverUrl}`);
-	console.log(`[start] OpenClaw: ${openclawConfig.url}`);
+	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
 	console.log(`[start] Machine: ${credentials.machineCode}`);
 
-	// 初始化 AI 引擎（SSE 流式 Chat Completions API）
-	const sessionId = `aichat-${credentials.uid}`;
-	const engine = new OpenclawEngine(openclawConfig.url, openclawConfig.token, sessionId);
+	// 创建路由器并注册适配器
+	const router = new ClawRouter();
+	router.register(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token));
 
-	// 创建 WS 客户端
+	// 连接所有适配器
+	await router.connectAll();
+
+	// 获取默认适配器
+	const adapter = router.getDefault()!;
+
+	// 创建 HuLa WS 客户端
 	let handler: MessageHandler;
 
-	const ws = new WSClient({
+	const ws = new HulaWSClient({
 		url: serverUrl,
 		token: credentials.connectionToken,
 		clientId: credentials.machineCode,
@@ -43,18 +50,17 @@ export async function start(): Promise<void> {
 		},
 	});
 
-	handler = new MessageHandler(ws, engine, credentials.uid);
+	handler = new MessageHandler(ws, adapter, credentials.uid);
 
 	ws.connect();
 
 	// 优雅退出
-	process.on('SIGINT', () => {
+	const shutdown = () => {
 		console.log('\n[start] Shutting down...');
+		router.disconnectAll().catch(() => {});
 		ws.close();
 		process.exit(0);
-	});
-	process.on('SIGTERM', () => {
-		ws.close();
-		process.exit(0);
-	});
+	};
+	process.on('SIGINT', shutdown);
+	process.on('SIGTERM', shutdown);
 }

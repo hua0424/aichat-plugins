@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
-import { WSReqType, WSResponse, buildRequest } from './protocol.js';
+import { WSReqType, type WSResponse, buildRequest } from '../stream/protocol.js';
 
-export interface WSClientOptions {
+export interface HulaWSClientOptions {
 	url: string;
 	token: string;
 	clientId: string; // machineCode
@@ -11,31 +11,31 @@ export interface WSClientOptions {
 }
 
 /**
- * WebSocket 客户端
+ * HuLa-Server WebSocket 客户端
  * 自动重连（指数退避）+ 心跳保活
  */
-export class WSClient {
+export class HulaWSClient {
 	private ws: WebSocket | null = null;
-	private options: WSClientOptions;
+	private options: HulaWSClientOptions;
 	private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private reconnectDelay = 1000;
 	private maxReconnectDelay = 30000;
 	private closed = false;
 
-	constructor(options: WSClientOptions) {
+	constructor(options: HulaWSClientOptions) {
 		this.options = options;
 	}
 
 	connect(): void {
 		this.closed = false;
 		const url = `${this.options.url}?token=${this.options.token}&clientId=${this.options.clientId}`;
-		console.log(`[ws] Connecting to ${this.options.url}...`);
+		console.log(`[hula-ws] Connecting to ${this.options.url}...`);
 
 		this.ws = new WebSocket(url);
 
 		this.ws.on('open', () => {
-			console.log('[ws] Connected');
+			console.log('[hula-ws] Connected');
 			this.reconnectDelay = 1000;
 			this.startHeartbeat();
 			this.options.onConnected?.();
@@ -46,12 +46,12 @@ export class WSClient {
 				const msg = JSON.parse(data.toString()) as WSResponse;
 				this.options.onMessage(msg);
 			} catch (err) {
-				console.error('[ws] Failed to parse message:', err);
+				console.error('[hula-ws] Failed to parse message:', err);
 			}
 		});
 
 		this.ws.on('close', (code, reason) => {
-			console.log(`[ws] Disconnected: code=${code}, reason=${reason.toString()}`);
+			console.log(`[hula-ws] Disconnected: code=${code}, reason=${reason.toString()}`);
 			this.stopHeartbeat();
 			this.options.onDisconnected?.();
 			if (!this.closed) {
@@ -60,7 +60,7 @@ export class WSClient {
 		});
 
 		this.ws.on('error', (err) => {
-			console.error('[ws] Error:', err.message);
+			console.error('[hula-ws] Error:', err.message);
 		});
 	}
 
@@ -68,7 +68,7 @@ export class WSClient {
 		if (this.ws?.readyState === WebSocket.OPEN) {
 			this.ws.send(buildRequest(type, data));
 		} else {
-			console.warn('[ws] Not connected, dropping message');
+			console.warn('[hula-ws] Not connected, dropping message');
 		}
 	}
 
@@ -99,7 +99,7 @@ export class WSClient {
 	}
 
 	private scheduleReconnect(): void {
-		console.log(`[ws] Reconnecting in ${this.reconnectDelay}ms...`);
+		console.log(`[hula-ws] Reconnecting in ${this.reconnectDelay}ms...`);
 		this.reconnectTimer = setTimeout(() => {
 			this.connect();
 		}, this.reconnectDelay);

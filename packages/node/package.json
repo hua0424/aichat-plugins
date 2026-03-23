@@ -1,0 +1,27 @@
+{
+  "name": "@aichat/node",
+  "version": "0.1.0",
+  "description": "aichat-node：HuLa-Server WS 桥接层",
+  "type": "module",
+  "bin": {
+    "aichat": "dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts -- start",
+    "start": "node dist/cli.js start",
+    "build": "tsc",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

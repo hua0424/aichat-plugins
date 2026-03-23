@@ -1,7 +1,7 @@
-import type { WSResponse, ReceivedMessage } from '../ws/protocol.js';
-import type { WSClient } from '../ws/client.js';
-import { WSReqType } from '../ws/protocol.js';
-import type { AIEngine } from '../ai/engine.js';
+import type { WSResponse, ReceivedMessage } from '../stream/protocol.js';
+import type { HulaWSClient } from '../server/hula-ws.js';
+import { WSReqType } from '../stream/protocol.js';
+import type { ClawAdapter, StreamCallbacks } from '../claw/interface.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 
 /**
@@ -14,11 +14,11 @@ interface LastMessageContext {
 
 /**
  * 消息处理器
- * 接收用户消息 → ACK → 去重 → 防抖合并 → 转发 AI 引擎 → 流式回复
+ * 接收用户消息 → ACK → 去重 → 防抖合并 → 转发 Claw 适配器 → 流式回复
  */
 export class MessageHandler {
-	private ws: WSClient;
-	private engine: AIEngine;
+	private ws: HulaWSClient;
+	private adapter: ClawAdapter;
 	private selfUid: number;
 	private debouncer: MessageDebouncer;
 	private streaming = false;
@@ -27,9 +27,9 @@ export class MessageHandler {
 	/** 已处理的 msgId 集合（防重复推送） */
 	private processedMsgIds = new Set<string>();
 
-	constructor(ws: WSClient, engine: AIEngine, selfUid: number) {
+	constructor(ws: HulaWSClient, adapter: ClawAdapter, selfUid: number) {
 		this.ws = ws;
-		this.engine = engine;
+		this.adapter = adapter;
 		this.selfUid = selfUid;
 		this.debouncer = new MessageDebouncer((merged) => {
 			this.sendToAI(merged).catch((err) => {
@@ -115,13 +115,16 @@ export class MessageHandler {
 		let seq = 0;
 		this.streaming = true;
 
+		// sessionKey 格式：aiclaw-{selfUid}-room-{roomId}
+		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+
 		this.ws.send(WSReqType.STREAM_START, {
 			fromUid: this.selfUid,
 			toUid,
 			roomId,
 		});
 
-		await this.engine.chat(message, {
+		const callbacks: StreamCallbacks = {
 			onChunk: (chunk) => {
 				this.ws.send(WSReqType.STREAM_DELTA, {
 					chunk,
@@ -137,7 +140,7 @@ export class MessageHandler {
 				this.flushPendingMessages();
 			},
 			onError: (error) => {
-				console.error('[handler] AI engine error:', error.message);
+				console.error('[handler] Claw adapter error:', error.message);
 				this.ws.send(WSReqType.STREAM_END, {
 					fullContent: '抱歉，我的大脑目前宕机了，请主人关心一下我的身体情况',
 					status: 'error',
@@ -145,7 +148,9 @@ export class MessageHandler {
 				this.streaming = false;
 				this.flushPendingMessages();
 			},
-		});
+		};
+
+		await this.adapter.chat(message, sessionKey, callbacks);
 	}
 
 	private flushPendingMessages(): void {

@@ -5,15 +5,14 @@
     "moduleResolution": "bundler",
     "esModuleInterop": true,
     "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
     "declaration": true,
     "sourceMap": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "references": [
-    { "path": "packages/node" },
-    { "path": "packages/claw" }
-  ],
-  "files": []
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }

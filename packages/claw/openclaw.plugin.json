@@ -1,0 +1,25 @@
+{
+  "id": "aichat-claw",
+  "name": "AiChat Claw",
+  "description": "HuLa IM Channel + Agent Tools for openclaw",
+  "version": "0.1.0",
+  "entry": "src/index.ts",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "hula": {
+        "type": "object",
+        "properties": {
+          "serverUrl": {
+            "type": "string",
+            "description": "HuLa-Server HTTP API base URL"
+          },
+          "aiclawToken": {
+            "type": "string",
+            "description": "aiclaw connection token for HuLa API"
+          }
+        }
+      }
+    }
+  }
+}

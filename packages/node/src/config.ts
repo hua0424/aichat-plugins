@@ -21,9 +21,15 @@ export interface AichatConfig {
 		url?: string;       // WS 地址，默认由插件内置
 	};
 	openclaw?: {
-		url?: string;       // Chat Completions API
+		url?: string;       // Chat Completions API（旧版，向下兼容）
 		token?: string;     // gateway token
 		agentId?: string;
+	};
+	claws?: {
+		openclaw?: {
+			gatewayUrl?: string; // ws:// gateway 地址（新版）
+			token?: string;
+		};
 	};
 }
 
@@ -83,7 +89,54 @@ export function getServerUrl(config: AichatConfig): string {
 }
 
 /**
- * 自动检测 openclaw 配置
+ * Claw 配置结果
+ */
+export interface ClawConfig {
+	gatewayUrl: string;
+	token: string;
+}
+
+/**
+ * 检测 claw 配置（WS RPC gateway）
+ * 优先级：config.claws.openclaw > 旧 config.openclaw（迁移提示）> auto-detect
+ */
+export function detectClawConfig(config: AichatConfig): ClawConfig {
+	// 1. 新版配置 claws.openclaw
+	if (config.claws?.openclaw?.gatewayUrl) {
+		return {
+			gatewayUrl: config.claws.openclaw.gatewayUrl,
+			token: config.claws.openclaw.token || '',
+		};
+	}
+
+	// 2. 旧版配置迁移提示
+	if (config.openclaw?.url) {
+		console.warn('[config] 检测到旧版 openclaw.url 配置（HTTP SSE），已切换为 WS RPC。');
+		console.warn('[config] 建议将 config.jsonc 中的 openclaw.url 迁移到 claws.openclaw.gatewayUrl');
+	}
+
+	// 3. auto-detect：检查本地 openclaw 配置
+	const openclawConfigPath = resolve(homedir(), '.openclaw', 'openclaw.json');
+	if (existsSync(openclawConfigPath)) {
+		try {
+			const raw = readFileSync(openclawConfigPath, 'utf-8');
+			const parsed = JSON.parse(raw);
+			const gatewayToken = parsed.gateway?.auth?.token || config.openclaw?.token || '';
+			console.log('[config] Auto-detected local openclaw installation');
+			return { gatewayUrl: 'ws://localhost:18789', token: gatewayToken };
+		} catch {
+			// fall through
+		}
+	}
+
+	return {
+		gatewayUrl: 'ws://localhost:18789',
+		token: config.openclaw?.token || '',
+	};
+}
+
+/**
+ * 自动检测 openclaw 配置（旧版兼容，activate 命令使用）
  */
 export function detectOpenclawConfig(config: AichatConfig): { url: string; token: string; agentId: string } {
 	// 优先使用用户配置
@@ -101,9 +154,7 @@ export function detectOpenclawConfig(config: AichatConfig): { url: string; token
 		try {
 			const raw = readFileSync(openclawConfigPath, 'utf-8');
 			const parsed = JSON.parse(raw);
-			// openclaw gateway 默认端口 18789
 			const gatewayUrl = 'http://localhost:18789/v1/chat/completions';
-			// gateway token 从 openclaw 配置或 .env 中读取
 			const gatewayToken = parsed.gateway?.auth?.token || process.env.OPENCLAW_TOKEN || '';
 			console.log('[config] Auto-detected local openclaw installation');
 			return { url: gatewayUrl, token: gatewayToken, agentId: '' };
