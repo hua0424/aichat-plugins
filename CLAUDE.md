@@ -9,7 +9,7 @@ Rules:
 
 ## Git Submodules
 
-- `docs/` is a git submodule pointing to `https://github.com/hua0424/aichat-hula-docs.git`
-- When committing changes that include docs/, use `git submodule update --init --recursive` after clone
-- To update docs to latest: `git submodule update --remote docs` then commit the updated submodule ref
-- Do not directly commit files inside docs/ from this repo — go into docs/ and commit from there
+- `teamdocs/` is a git submodule pointing to `https://github.com/hua0424/aichat-hula-docs.git`
+- When committing changes that include teamdocs/, use `git submodule update --init --recursive` after clone
+- To update teamdocs to latest: `git submodule update --remote teamdocs` then commit the updated submodule ref
+- Do not directly commit files inside teamdocs/ from this repo — go into teamdocs/ and commit from there
