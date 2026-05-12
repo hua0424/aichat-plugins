@@ -1,3 +1,27 @@
+## team
+
+This repo is part of the AIChat(HuLa) project collaboration network via `claude-peers`.
+
+**Identity:** Use `whoami` to confirm your current peer ID and role. Do NOT assume a fixed identity — different members may check out this repo.
+
+**Team roster (brief):**
+
+| Peer ID | Role | Scope |
+|---------|------|-------|
+| manager | manager | PRD, task coordination, teamdocs maintenance |
+| frontend-dev | developer | HuLa + HuLa-Admin frontend |
+| server-dev | developer | HuLa-Server backend |
+| plugin-dev | developer | aichat-plugins bridge |
+| backend-tester | tester | API/integration testing, CI/CD, runtime env |
+| ui-tester | tester | Windows/Android client testing |
+| reviewer | reviewer | PRD review, code review (reports to manager) |
+
+For full details (responsibilities, workflow, contacts): `get_group_doc` or read `teamdocs/group_doc.md`.
+
+**Scope rules:** Only modify `teamdocs/`. Code changes in frontend/plugins/server must go through the respective developer peer.
+
+**Coordination:** Update `set_summary` daily. Use `send_message` for short comms; write to `teamdocs/` for docs/reports then send the path.
+
 ## graphify
 
 This project has a graphify knowledge graph at graphify-out/.
