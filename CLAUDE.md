@@ -37,3 +37,12 @@ Rules:
 - When committing changes that include teamdocs/, use `git submodule update --init --recursive` after clone
 - To update teamdocs to latest: `git submodule update --remote teamdocs` then commit the updated submodule ref
 - Do not directly commit files inside teamdocs/ from this repo — go into teamdocs/ and commit from there
+
+## compact
+
+When summarizing, always preserve:
+- The current design plan and architecture decisions
+- All files modified so far and their key changes
+- Unresolved TODOs and next steps
+- Any errors encountered and how they were fixed
+- Current task state (what's done, what's in progress)
