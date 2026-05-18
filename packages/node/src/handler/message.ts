@@ -113,14 +113,14 @@ export class MessageHandler {
 			return;
 		}
 
-		const { roomId, fromUid: toUid } = this.lastCtx;
+		const { roomId, fromUid: toUid, msgId } = this.lastCtx;
 		let seq = 0;
 		this.streaming = true;
 
 		// sessionKey 格式：aiclaw-{selfUid}-room-{roomId}
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
-		console.log(`[stream] start msgId=${this.lastCtx.msgId} fromUid=${this.selfUid} toUid=${toUid} roomId=${roomId} sessionKey=${sessionKey}`);
+		console.log(`[stream] start msgId=${msgId} fromUid=${this.selfUid} toUid=${toUid} roomId=${roomId} sessionKey=${sessionKey}`);
 
 		this.ws.send(WSReqType.STREAM_START, {
 			fromUid: this.selfUid,
@@ -134,19 +134,19 @@ export class MessageHandler {
 					chunk,
 					seq: ++seq,
 				});
-				console.log(`[stream] delta msgId=${this.lastCtx.msgId} seq=${seq} chunkLen=${chunk.length}`);
+				console.log(`[stream] delta msgId=${msgId} seq=${seq} chunkLen=${chunk.length}`);
 			},
 			onDone: (fullContent) => {
 				this.ws.send(WSReqType.STREAM_END, {
 					fullContent,
 					status: 'complete',
 				});
-				console.log(`[stream] end msgId=${this.lastCtx.msgId} status=complete contentLen=${fullContent.length}`);
+				console.log(`[stream] end msgId=${msgId} status=complete contentLen=${fullContent.length}`);
 				this.streaming = false;
 				this.flushPendingMessages();
 			},
 			onError: (error) => {
-				console.error(`[stream] error msgId=${this.lastCtx.msgId} status=error reason=${error.message}`);
+				console.error(`[stream] error msgId=${msgId} status=error reason=${error.message}`);
 				this.ws.send(WSReqType.STREAM_END, {
 					fullContent: '抱歉，我的大脑目前宕机了，请主人关心一下我的身体情况',
 					status: 'error',
