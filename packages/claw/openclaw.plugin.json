@@ -21,5 +21,8 @@
         }
       }
     }
+  },
+  "activation": {
+    "onStartup": true
   }
 }

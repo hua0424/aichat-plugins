@@ -46,7 +46,7 @@ export interface AichatCredentials {
 /**
  * 默认服务器地址
  */
-const DEFAULT_SERVER_URL = 'ws://localhost:18760/ws/ws';
+const DEFAULT_SERVER_URL = 'ws://localhost:18760/api/ws/ws';
 
 /**
  * 加载配置
@@ -82,6 +82,21 @@ export function loadCredentials(): AichatCredentials | null {
 }
 
 /**
+ * 从本地 openclaw 安装目录读取 gateway auth token
+ */
+function readOpenclawGatewayToken(): string | null {
+	const openclawConfigPath = resolve(homedir(), '.openclaw', 'openclaw.json');
+	if (!existsSync(openclawConfigPath)) return null;
+	try {
+		const raw = readFileSync(openclawConfigPath, 'utf-8');
+		const parsed = JSON.parse(raw);
+		return parsed.gateway?.auth?.token || null;
+	} catch {
+		return null;
+	}
+}
+
+/**
  * 获取完整运行配置
  */
 export function getServerUrl(config: AichatConfig): string {
@@ -103,9 +118,13 @@ export interface ClawConfig {
 export function detectClawConfig(config: AichatConfig): ClawConfig {
 	// 1. 新版配置 claws.openclaw
 	if (config.claws?.openclaw?.gatewayUrl) {
+		let token = config.claws.openclaw.token || '';
+		if (!token) {
+			token = readOpenclawGatewayToken() || config.openclaw?.token || '';
+		}
 		return {
 			gatewayUrl: config.claws.openclaw.gatewayUrl,
-			token: config.claws.openclaw.token || '',
+			token,
 		};
 	}
 
@@ -116,17 +135,10 @@ export function detectClawConfig(config: AichatConfig): ClawConfig {
 	}
 
 	// 3. auto-detect：检查本地 openclaw 配置
-	const openclawConfigPath = resolve(homedir(), '.openclaw', 'openclaw.json');
-	if (existsSync(openclawConfigPath)) {
-		try {
-			const raw = readFileSync(openclawConfigPath, 'utf-8');
-			const parsed = JSON.parse(raw);
-			const gatewayToken = parsed.gateway?.auth?.token || config.openclaw?.token || '';
-			console.log('[config] Auto-detected local openclaw installation');
-			return { gatewayUrl: 'ws://localhost:18789', token: gatewayToken };
-		} catch {
-			// fall through
-		}
+	const gatewayToken = readOpenclawGatewayToken();
+	if (gatewayToken) {
+		console.log('[config] Auto-detected local openclaw installation');
+		return { gatewayUrl: 'ws://localhost:18789', token: gatewayToken };
 	}
 
 	return {
