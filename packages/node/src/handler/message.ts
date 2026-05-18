@@ -10,6 +10,7 @@ import { MessageDebouncer } from '../utils/debounce.js';
 interface LastMessageContext {
 	roomId: number;
 	fromUid: number; // 发送者 uid（即 stream 回复的目标 toUid）
+	msgId: string;   // 触发 stream 的原始消息 id（用于日志关联）
 }
 
 /**
@@ -88,6 +89,7 @@ export class MessageHandler {
 		this.lastCtx = {
 			roomId: Number(data.message.roomId),
 			fromUid: Number(data.fromUser.uid),
+			msgId,
 		};
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${data.message.roomId}: ${content.substring(0, 50)}...`);
@@ -118,6 +120,8 @@ export class MessageHandler {
 		// sessionKey 格式：aiclaw-{selfUid}-room-{roomId}
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
+		console.log(`[stream] start msgId=${this.lastCtx.msgId} fromUid=${this.selfUid} toUid=${toUid} roomId=${roomId} sessionKey=${sessionKey}`);
+
 		this.ws.send(WSReqType.STREAM_START, {
 			fromUid: this.selfUid,
 			toUid,
@@ -130,17 +134,19 @@ export class MessageHandler {
 					chunk,
 					seq: ++seq,
 				});
+				console.log(`[stream] delta msgId=${this.lastCtx.msgId} seq=${seq} chunkLen=${chunk.length}`);
 			},
 			onDone: (fullContent) => {
 				this.ws.send(WSReqType.STREAM_END, {
 					fullContent,
 					status: 'complete',
 				});
+				console.log(`[stream] end msgId=${this.lastCtx.msgId} status=complete contentLen=${fullContent.length}`);
 				this.streaming = false;
 				this.flushPendingMessages();
 			},
 			onError: (error) => {
-				console.error('[handler] Claw adapter error:', error.message);
+				console.error(`[stream] error msgId=${this.lastCtx.msgId} status=error reason=${error.message}`);
 				this.ws.send(WSReqType.STREAM_END, {
 					fullContent: '抱歉，我的大脑目前宕机了，请主人关心一下我的身体情况',
 					status: 'error',
