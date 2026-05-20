@@ -338,12 +338,21 @@ export class MessageHandler {
 		}
 
 		if (status === 'error' && error) {
-			const autoReplyErrors = ['short_reply_skip', 'rate_limit_exceeded', 'daily_limit_exceeded'];
-			if (autoReplyErrors.includes(error)) {
-				console.log(`[thinking] server rejected: ${error}, sending autoReply roomId=${roomId}`);
-				this.sendAutoReply(Number(roomId), error);
-			} else {
-				console.log(`[thinking] server error: ${error} (no autoReply)`);
+			switch (error) {
+				case 'rate_limit_exceeded':
+					console.log(`[thinking] server rejected: rate_limit_exceeded, sending autoReply roomId=${roomId}`);
+					this.sendAutoReply(Number(roomId), '发言频率限制，已自动跳过本次响应');
+					break;
+				case 'daily_limit_exceeded':
+					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
+					this.sendAutoReply(Number(roomId), '今日发言上限已达，已自动跳过本次响应');
+					break;
+				case 'short_reply_skip':
+					// 短回复跳过不触发 autoReply，避免短回复+autoReply 互相触发新循环
+					console.log('[anti-loop] short reply skip triggered, no autoReply');
+					break;
+				default:
+					console.log(`[thinking] server error: ${error} (no autoReply)`);
 			}
 		}
 
