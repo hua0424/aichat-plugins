@@ -3,7 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import type { ClawAdapter, StreamCallbacks } from './interface.js';
+import type { ClawAdapter, ThinkingCallbacks } from './interface.js';
 
 /**
  * Device identity for gateway authentication
@@ -87,7 +87,7 @@ interface PendingRequest {
 }
 
 interface PendingChat {
-	callbacks: StreamCallbacks;
+	callbacks: ThinkingCallbacks;
 	fullContent: string;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
@@ -155,7 +155,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.ws = null;
 	}
 
-	async chat(message: string, sessionKey: string, callbacks: StreamCallbacks): Promise<void> {
+	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks): Promise<void> {
 		if (!this.connected || !this.ws) {
 			callbacks.onError(new Error('openclaw gateway not connected'));
 			return;
@@ -365,20 +365,21 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
-		// assistant 流 → 提取 delta chunk
+		// assistant 流 → thinking delta (REQ-004)
 		if (evt.stream === 'assistant') {
 			const delta = evt.data.delta as string | undefined;
 			if (delta) {
 				chat.fullContent += delta;
-				chat.callbacks.onChunk(delta);
+				chat.callbacks.onThinkingDelta(delta);
 			}
 		}
-		// lifecycle 流 → 检查完成状态
+		// lifecycle 流 → thinking end (REQ-004)
 		if (evt.stream === 'lifecycle' && !chat.done) {
 			const phase = evt.data.phase as string | undefined;
 			if (phase === 'end') {
 				chat.done = true;
-				chat.callbacks.onDone(chat.fullContent);
+				const durationMs = Date.now() - chat.startTime;
+				chat.callbacks.onThinkingEnd(durationMs);
 				this.cleanupChatByRunId(evt.runId);
 			} else if (phase === 'error') {
 				chat.done = true;

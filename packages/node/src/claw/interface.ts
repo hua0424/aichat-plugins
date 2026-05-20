@@ -13,12 +13,12 @@ export interface ClawAdapter {
 	disconnect(): Promise<void>;
 
 	/**
-	 * 发送消息并获取流式响应
+	 * REQ-004: 启动 Agent Loop，通过 ThinkingCallbacks 接收 thinking 流
 	 * @param message 用户消息
 	 * @param sessionKey 会话标识（格式：aiclaw-{uid}-room-{roomId}）
-	 * @param callbacks 流式回调
+	 * @param callbacks thinking 流式回调
 	 */
-	chat(message: string, sessionKey: string, callbacks: StreamCallbacks): Promise<void>;
+	chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks): Promise<void>;
 
 	/** 当前是否已连接 */
 	get isConnected(): boolean;
