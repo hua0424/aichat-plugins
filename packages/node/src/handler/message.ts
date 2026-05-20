@@ -3,6 +3,9 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
 import { MessageDebouncer } from '../utils/debounce.js';
+import { AntiLoopGuard } from './anti-loop.js';
+import { GroupConfigCache } from './group-config-cache.js';
+import type { HulaApiClient } from '../api/hula-api.js';
 
 /**
  * REQ-004: Thinking 会话状态
@@ -54,10 +57,20 @@ export class MessageHandler {
 	/** thinking session 超时时间（5 分钟） */
 	private readonly THINKING_SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 
-	constructor(ws: HulaWSClient, adapter: ClawAdapter, selfUid: number) {
+	// REQ-004 M3: 防循环守卫 + 群配置缓存
+	private antiLoopGuard: AntiLoopGuard;
+	private groupConfigCache: GroupConfigCache;
+
+	// REQ-004 M3: 内嵌 HulaApiClient（仅用于 autoReply / CLI）
+	private apiClient: HulaApiClient | null = null;
+
+	constructor(ws: HulaWSClient, adapter: ClawAdapter, selfUid: number, apiClient?: HulaApiClient) {
 		this.ws = ws;
 		this.adapter = adapter;
 		this.selfUid = selfUid;
+		this.antiLoopGuard = new AntiLoopGuard();
+		this.groupConfigCache = new GroupConfigCache();
+		this.apiClient = apiClient || null;
 		this.debouncer = new MessageDebouncer((merged) => {
 			this.triggerAgentLoop(merged).catch((err) => {
 				console.error('[handler] triggerAgentLoop unhandled error:', err.message);
@@ -115,38 +128,65 @@ export class MessageHandler {
 		const content = data.message.body?.content;
 		if (!content?.trim()) return;
 
-		// 4. 【P-M2-6】跳过 AI 消息（M2：暂不支持 AI 互触发，M3 加入 respondToAi 配置后开放）
+		const roomId = Number(data.message.roomId);
+		const fromUid = Number(data.fromUser.uid);
 		const isFromAi = data.fromUser.userType === 4; // 4 = AICLAW
-		if (isFromAi) {
-			console.log(`[handler] Skipping AI message (respondToAi not yet implemented) msgId=${msgId}`);
-			return;
-		}
 
-		// 5. 【M3 预留】跳过 autoReply 消息
+		// 4. 【M3】跳过 autoReply 消息
 		const extra = data.message.body?.urlContentMap as Record<string, unknown> | undefined;
 		if (extra?.autoReply === true) {
 			console.log(`[handler] Skipping autoReply message msgId=${msgId}`);
 			return;
 		}
 
+		// 5. 【M3】AI 互触发开关检查
+		if (isFromAi) {
+			const config = this.groupConfigCache.get(this.selfUid, roomId);
+			if (!config?.respondToAi) {
+				console.log(`[handler] Skipping AI message (respondToAi=false) msgId=${msgId}`);
+				return;
+			}
+		}
+
 		// 缓存消息上下文
-		this.lastCtx = {
-			roomId: Number(data.message.roomId),
-			fromUid: Number(data.fromUser.uid),
-			msgId,
-		};
+		this.lastCtx = { roomId, fromUid, msgId };
 
-		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${data.message.roomId}: ${content.substring(0, 50)}...`);
+		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
 
-		const sessionKey = `aiclaw-${this.selfUid}-room-${Number(data.message.roomId)}`;
+		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
 		// 6. 检查 thinking session 是否已存在
 		if (this.thinkingSessions.has(sessionKey)) {
 			this.pendingMessages.push(content);
 			console.log(`[handler] Message queued (thinking active), pending: ${this.pendingMessages.length}`);
-		} else {
-			this.debouncer.push(content);
+			return;
 		}
+
+		// 7. 【M3】防循环检查
+		const guardResult = this.antiLoopGuard.check({
+			roomId,
+			fromUid,
+			selfUid: this.selfUid,
+			content,
+			isFromAi,
+		});
+
+		if (guardResult.action === 'block') {
+			console.log(`[anti-loop] block roomId=${roomId} reason=${guardResult.reason}`);
+			this.sendAutoReply(roomId, guardResult.reason ?? 'rate limited');
+			return;
+		}
+
+		if (guardResult.action === 'delay') {
+			console.log(`[anti-loop] delay roomId=${roomId} delayMs=${guardResult.delayMs} aiRoundCount=${this.antiLoopGuard.getAiRoundCount(roomId)}`);
+			setTimeout(() => {
+				this.debouncer.push(content);
+			}, guardResult.delayMs);
+			return;
+		}
+
+		// 正常触发
+		this.debouncer.push(content);
 	}
 
 	private async triggerAgentLoop(message: string): Promise<void> {
@@ -267,11 +307,27 @@ export class MessageHandler {
 		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
 	}
 
-	/** M3 预留：群配置变更通知处理 */
+	/** M3: 群配置变更通知处理 */
 	private handleGroupConfigChange(data: GroupConfigChangeDTO): void {
 		if (data.aiclawUid !== this.selfUid) return;
-		console.log(`[config] Group config updated for room ${data.roomId}`, data.config);
-		// M3: 刷新本地缓存
+		this.groupConfigCache.set(this.selfUid, data.roomId, data.config);
+		console.log(`[config] update roomId=${data.roomId} rateLimit=${data.config.rateLimitPerMinute} respondToAi=${data.config.respondToAi}`);
+	}
+
+	/** M3: 发送 autoReply（限流/退避触发时调用） */
+	private sendAutoReply(roomId: number, reason: string): void {
+		if (!this.apiClient) {
+			console.warn('[anti-loop] autoReply skipped: no internal API client available');
+			return;
+		}
+		this.apiClient
+			.sendMessage(roomId, `发言受限：${reason}`, { autoReply: true })
+			.then((result) => {
+				console.log(`[anti-loop] autoReply sent: msgId=${result.msgId} roomId=${roomId}`);
+			})
+			.catch((err) => {
+				console.error('[anti-loop] autoReply failed:', err instanceof Error ? err.message : String(err));
+			});
 	}
 
 	private flushPendingMessages(): void {

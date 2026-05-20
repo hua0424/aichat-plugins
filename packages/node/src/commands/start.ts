@@ -3,6 +3,7 @@ import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawAdapter } from '../claw/openclaw.js';
 import { ClawRouter } from '../router.js';
+import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
 /**
  * aichat start — 读取本地 credentials 自动连接
@@ -34,6 +35,11 @@ export async function start(): Promise<void> {
 	// 获取默认适配器
 	const adapter = router.getDefault()!;
 
+	// REQ-004 M3: 内嵌轻量 HulaApiClient（autoReply / CLI 使用）
+	const restBaseUrl = restBaseUrlFromWsUrl(serverUrl);
+	const internalApiClient = new HulaApiClient(restBaseUrl, credentials.connectionToken);
+	console.log(`[start] REST API: ${restBaseUrl}`);
+
 	// 创建 HuLa WS 客户端
 	let handler: MessageHandler;
 
@@ -50,7 +56,7 @@ export async function start(): Promise<void> {
 		},
 	});
 
-	handler = new MessageHandler(ws, adapter, credentials.uid);
+	handler = new MessageHandler(ws, adapter, credentials.uid, internalApiClient);
 
 	ws.connect();
 
