@@ -90,6 +90,7 @@ interface PendingChat {
 	callbacks: StreamCallbacks;
 	fullContent: string;
 	done: boolean;
+	startTime: number; // REQ-004: 用于计算 thinking durationMs
 }
 
 /**
@@ -198,6 +199,7 @@ export class OpenclawAdapter implements ClawAdapter {
 			callbacks,
 			fullContent: '',
 			done: false,
+			startTime: Date.now(),
 		});
 
 		this.ws.send(JSON.stringify(frame));

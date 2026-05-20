@@ -29,3 +29,16 @@ export interface StreamCallbacks {
 	onDone: (fullContent: string) => void;
 	onError: (error: Error) => void;
 }
+
+/**
+ * REQ-004: Thinking 流式回调（Agent Loop 模型）
+ * 用于 THINKING_START/DELTA/END 协议（20/21/22）
+ */
+export interface ThinkingCallbacks {
+	/** 收到 thinking delta */
+	onThinkingDelta: (chunk: string) => void;
+	/** thinking 结束，durationMs 为处理耗时 */
+	onThinkingEnd: (durationMs: number) => void;
+	/** 处理出错 */
+	onError: (error: Error) => void;
+}
