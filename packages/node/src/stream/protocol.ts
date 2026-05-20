@@ -31,7 +31,7 @@ export type WSRespType =
 	| 'thinkingStart'
 	| 'thinkingDelta'
 	| 'thinkingEnd'
-	| 'groupConfigUpdate';
+	| 'groupConfigChange';
 
 /**
  * WS 请求消息格式
@@ -122,8 +122,8 @@ export interface ThinkingEndDTO {
 	error?: string;
 }
 
-/** server → client/plugin: 群配置更新通知 */
-export interface GroupConfigUpdateDTO {
+/** server → client/plugin: 群配置变更通知 */
+export interface GroupConfigChangeDTO {
 	aiclawUid: number;
 	roomId: number;
 	config: {
