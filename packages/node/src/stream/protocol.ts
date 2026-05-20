@@ -122,6 +122,8 @@ export interface ThinkingEndDTO {
 	durationMs: number;
 	status: 'complete' | 'error';
 	error?: string;
+	/** server 生成的 thinking 记录 ID（有 thinkingId 时为群广播，无时为直接拒绝） */
+	thinkingId?: string;
 }
 
 /** server → client/plugin: 群配置变更通知 */

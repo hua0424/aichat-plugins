@@ -1,4 +1,4 @@
-import type { WSResponse, ReceivedMessage, ThinkingStartDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
+import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
@@ -88,6 +88,9 @@ export class MessageHandler {
 				break;
 			case 'groupConfigChange':
 				this.handleGroupConfigChange(msg.data as GroupConfigChangeDTO);
+				break;
+			case 'thinkingEnd':
+				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
 				break;
 			case 'tokenExpired':
 				console.error('[handler] Token expired, shutting down...');
@@ -312,6 +315,42 @@ export class MessageHandler {
 		if (data.aiclawUid !== this.selfUid) return;
 		this.groupConfigCache.set(this.selfUid, data.roomId, data.config);
 		console.log(`[config] update roomId=${data.roomId} rateLimit=${data.config.rateLimitPerMinute} respondToAi=${data.config.respondToAi}`);
+	}
+
+	/** M3: 接收 server 的 thinkingEnd 广播，处理 error 状态触发 autoReply */
+	private handleThinkingEndBroadcast(data: ThinkingEndDTO): void {
+		const { thinkingId, roomId, status, error } = data;
+
+		// 无 thinkingId 的是 THINKING_START 直接拒绝，server-dev 说不需要处理
+		if (!thinkingId) return;
+
+		// 查找 active session（可能已被 onThinkingEnd/onError 清理）
+		let session: ThinkingSession | undefined;
+		for (const s of this.thinkingSessions.values()) {
+			if (s.thinkingId === thinkingId) {
+				session = s;
+				break;
+			}
+		}
+
+		if (session?.timeoutId) {
+			clearTimeout(session.timeoutId);
+		}
+
+		if (status === 'error' && error) {
+			const autoReplyErrors = ['short_reply_skip', 'rate_limit_exceeded', 'daily_limit_exceeded'];
+			if (autoReplyErrors.includes(error)) {
+				console.log(`[thinking] server rejected: ${error}, sending autoReply roomId=${roomId}`);
+				this.sendAutoReply(Number(roomId), error);
+			} else {
+				console.log(`[thinking] server error: ${error} (no autoReply)`);
+			}
+		}
+
+		if (session) {
+			this.thinkingSessions.delete(session.sessionKey);
+			this.flushPendingMessages();
+		}
 	}
 
 	/** M3: 发送 autoReply（限流/退避触发时调用） */
