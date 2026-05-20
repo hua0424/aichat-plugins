@@ -77,8 +77,8 @@ export interface ReceivedMessage {
 
 /** plugin → server: THINKING_START (20) */
 export interface ThinkingStartPayload {
-	fromUid: number;
-	roomId: number;
+	fromUid: string | number;
+	roomId: string | number;
 	triggerMsgId: string;
 }
 
@@ -87,38 +87,40 @@ export interface ThinkingDeltaPayload {
 	thinkingId?: string;
 	chunk: string;
 	seq: number;
-	roomId?: number;
+	roomId?: string | number;
 }
 
 /** plugin → server: THINKING_END (22) */
 export interface ThinkingEndPayload {
 	thinkingId?: string;
 	durationMs: number;
+	status: 'complete' | 'error';
 	error?: string;
-	roomId?: number;
+	roomId?: string | number;
 }
 
 /** server → client: thinkingStart 广播 */
 export interface ThinkingStartDTO {
-	fromUid: number;
-	roomId: number;
+	fromUid: string | number;
+	roomId: string | number;
 	triggerMsgId: string;
 	thinkingId: string;
 }
 
 /** server → client: thinkingDelta 广播 */
 export interface ThinkingDeltaDTO {
-	fromUid: number;
-	roomId: number;
+	fromUid: string | number;
+	roomId: string | number;
 	chunk: string;
 	seq: number;
 }
 
 /** server → client: thinkingEnd 广播 */
 export interface ThinkingEndDTO {
-	fromUid: number;
-	roomId: number;
+	fromUid: string | number;
+	roomId: string | number;
 	durationMs: number;
+	status: 'complete' | 'error';
 	error?: string;
 }
 
