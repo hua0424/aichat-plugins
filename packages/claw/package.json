@@ -1,5 +1,5 @@
 {
-  "name": "@aichat/claw",
+  "name": "aichat-claw",
   "version": "0.1.0",
   "description": "aichat-claw：openclaw Channel Plugin（HuLa Channel + Agent Tools）",
   "type": "module",
