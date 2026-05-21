@@ -56,7 +56,13 @@ export default function register(api: OpenClawPluginApi) {
 
 	// DEBUG: 输出 runtime.config 完整结构，帮助诊断 config 传递问题
 	api.logger.info('runtime.config keys: ' + Object.keys(api.runtime.config || {}).join(', '));
-	api.logger.info('runtime.config: ' + JSON.stringify(api.runtime.config, null, 2));
+	// DEBUG: 输出 runtime.config 完整结构，敏感字段脱敏
+	const configForLog = JSON.stringify(
+		api.runtime.config || {},
+		(key, value) => (/token|password|secret|key/i.test(key) && typeof value === 'string') ? '***' : value,
+		2
+	);
+	api.logger.info('runtime.config: ' + configForLog);
 
 	// 多路径解析 hula 配置
 	const hulaConfig = resolveHulaConfig(api.runtime.config || {});
