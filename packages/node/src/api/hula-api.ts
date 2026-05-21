@@ -36,7 +36,8 @@ export class HulaApiClient {
 			body.extra = extra;
 		}
 		const resp = await this.post('/api/im/chat/msg', body);
-		return resp.data as { msgId: number };
+		const data = resp.data as { message?: { id?: number } } | undefined;
+		return { msgId: data?.message?.id ?? 0 };
 	}
 
 	/**
