@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi } from './types.js';
+import type { OpenClawPluginApi, ChannelPlugin } from './types.js';
 import { hulaChannel } from './channel/index.js';
 import { HulaApiClientPool } from './hula-api-pool.js';
 import { registerTools } from './tools/index.js';
@@ -12,15 +12,32 @@ import { registerTools } from './tools/index.js';
 export default function register(api: OpenClawPluginApi) {
 	api.logger.info('aichat-claw loading');
 
-	// 注册 HuLa Channel
-	api.registerChannel({ plugin: hulaChannel });
-
 	// 创建 API 客户端池
 	const config = api.runtime.config as { hula?: { serverUrl?: string; aiclawToken?: string } };
 	const serverUrl = config.hula?.serverUrl || 'http://localhost:18760';
 	const aiclawToken = config.hula?.aiclawToken || '';
 
 	const pool = new HulaApiClientPool(serverUrl);
+
+	// 注册 HuLa Channel（带 outbound adapter，支持 agent 直接发送消息）
+	const channel: ChannelPlugin = {
+		...hulaChannel,
+		outbound: {
+			async sendText(params) {
+				const client = pool.get();
+				if (!client) {
+					return { ok: false, error: 'HulaApiClient not available' };
+				}
+				try {
+					await client.sendMessage(Number(params.to), params.text);
+					return { ok: true };
+				} catch (err) {
+					return { ok: false, error: err instanceof Error ? err.message : String(err) };
+				}
+			},
+		},
+	};
+	api.registerChannel({ plugin: channel });
 
 	if (aiclawToken) {
 		// 向后兼容：全局 token 作为默认客户端

@@ -168,6 +168,10 @@ export class OpenclawAdapter implements ClawAdapter {
 			message,
 			sessionKey,
 			idempotencyKey,
+			instructions:
+				'You are an AI assistant in a HuLa chat. When a user sends you a message, ' +
+				'you MUST call the `hula_send_message` tool with roomId and your response content ' +
+				'to reply. Do not just think — always send a reply via the tool.',
 		};
 
 		const frame: RequestFrame = {

@@ -20,7 +20,7 @@ const schema = {
 export function createSendMessageTool(api: HulaApiClient): AgentTool {
 	return {
 		name: 'hula_send_message',
-		description: '通过 HuLa 向指定房间发送文本消息。需要提供房间 ID 和消息内容。',
+			description: '当你需要回复用户消息时，调用此工具向指定房间发送文本消息。必须在思考完成后调用此工具发送你的回复内容。',
 		schema,
 		async execute(params: Record<string, unknown>) {
 			const roomId = params.roomId as number;
