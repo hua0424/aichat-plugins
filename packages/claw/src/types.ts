@@ -67,6 +67,6 @@ export interface ChannelOutboundAdapter {
 export interface AgentTool {
 	name: string;
 	description: string;
-	schema: Record<string, unknown>;
+	parameters: Record<string, unknown>;
 	execute(params: Record<string, unknown>): Promise<unknown>;
 }

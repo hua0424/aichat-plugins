@@ -2,7 +2,7 @@ import { Type } from '@sinclair/typebox';
 import type { HulaApiClient } from '../hula-api.js';
 import type { AgentTool } from '../types.js';
 
-const schema = {
+const parameters = {
 	type: 'object' as const,
 	properties: {
 		roomId: Type.Number({ description: '目标房间 ID' }),
@@ -21,7 +21,7 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 	return {
 		name: 'hula_send_message',
 			description: '当你需要回复用户消息时，调用此工具向指定房间发送文本消息。必须在思考完成后调用此工具发送你的回复内容。',
-		schema,
+		parameters,
 		async execute(params: Record<string, unknown>) {
 			const roomId = params.roomId as number;
 			const content = params.content as string;
