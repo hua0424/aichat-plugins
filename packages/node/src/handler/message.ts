@@ -25,6 +25,8 @@ interface ThinkingSession {
 	accumulatedContent: string;
 	/** 超时清理定时器 ID */
 	timeoutId?: ReturnType<typeof setTimeout>;
+	/** thinkingId 回填前缓存的 delta（防 race condition） */
+	pendingDeltas: Array<{ chunk: string; seq: number }>;
 }
 
 /**
@@ -136,7 +138,7 @@ export class MessageHandler {
 		const isFromAi = data.fromUser.userType === 4; // 4 = AICLAW
 
 		// 4. 【M3】跳过 autoReply 消息
-		const extra = data.message.body?.urlContentMap as Record<string, unknown> | undefined;
+		const extra = (data.message as Record<string, unknown>).extra as Record<string, unknown> | undefined;
 		if (extra?.autoReply === true) {
 			console.log(`[handler] Skipping autoReply message msgId=${msgId}`);
 			return;
@@ -220,6 +222,7 @@ export class MessageHandler {
 			startTime: Date.now(),
 			seq: 0,
 			accumulatedContent: '',
+			pendingDeltas: [],
 		};
 
 		// 设置 5 分钟超时定时器（P-M2-3）
@@ -250,8 +253,13 @@ export class MessageHandler {
 			onThinkingDelta: (chunk) => {
 				session.seq++;
 				session.accumulatedContent += chunk;
+				if (!session.thinkingId) {
+					session.pendingDeltas.push({ chunk, seq: session.seq });
+					console.log(`[thinking] delta buffered (no thinkingId yet) session=${sessionKey} seq=${session.seq}`);
+					return;
+				}
 				this.ws.send(WSReqType.THINKING_DELTA, {
-					thinkingId: session.thinkingId || undefined,
+					thinkingId: session.thinkingId,
 					chunk,
 					seq: session.seq,
 				});
@@ -259,6 +267,10 @@ export class MessageHandler {
 			},
 			onThinkingEnd: (durationMs) => {
 				if (session.timeoutId) clearTimeout(session.timeoutId);
+				if (session.pendingDeltas.length > 0) {
+					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (thinking ended)`);
+					session.pendingDeltas = [];
+				}
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
 					durationMs,
@@ -270,6 +282,10 @@ export class MessageHandler {
 			},
 			onError: (error) => {
 				if (session.timeoutId) clearTimeout(session.timeoutId);
+				if (session.pendingDeltas.length > 0) {
+					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (error)`);
+					session.pendingDeltas = [];
+				}
 				console.error(`[thinking] error session=${sessionKey} reason=${error.message}`);
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
@@ -308,6 +324,19 @@ export class MessageHandler {
 		// 回填 thinkingId
 		session.thinkingId = data.thinkingId || '';
 		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
+
+		// 刷新缓存的 deltas
+		if (session.pendingDeltas.length > 0) {
+			console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas`);
+			for (const { chunk, seq } of session.pendingDeltas) {
+				this.ws.send(WSReqType.THINKING_DELTA, {
+					thinkingId: session.thinkingId,
+					chunk,
+					seq,
+				});
+			}
+			session.pendingDeltas = [];
+		}
 	}
 
 	/** M3: 群配置变更通知处理 */
