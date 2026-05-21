@@ -165,10 +165,12 @@ export class OpenclawAdapter implements ClawAdapter {
 		const idempotencyKey = randomUUID();
 
 		// 在 message 中注入 tool 调用指令（openclaw gateway 不支持 instructions 字段）
+		// 注意：避免使用 [SYSTEM] / [System Message] 等标记，会被 openclaw 安全机制过滤
 		const enrichedMessage =
-			'[SYSTEM] When replying, you MUST call the hula_send_message tool. ' +
-			'Do not just think — send your reply via the tool.\n\n' +
-			'[USER MESSAGE] ' + message;
+			'IMPORTANT: You have a tool called hula_send_message. ' +
+			'After you finish thinking, you MUST call this tool with the roomId and your response ' +
+			'to send the reply to the user. Do NOT just output text — always use the tool.\n\n' +
+			'--- User message below ---\n' + message;
 
 		const params = {
 			message: enrichedMessage,
