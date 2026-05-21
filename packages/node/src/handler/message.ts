@@ -321,8 +321,27 @@ export class MessageHandler {
 	private handleThinkingEndBroadcast(data: ThinkingEndDTO): void {
 		const { thinkingId, roomId, status, error } = data;
 
-		// 无 thinkingId 的是 THINKING_START 直接拒绝，server-dev 说不需要处理
-		if (!thinkingId) return;
+		// 无 thinkingId 的是 THINKING_START 直接拒绝
+		if (!thinkingId) {
+			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 session
+			if (status === 'error' && (error === 'rate_limit_exceeded' || error === 'daily_limit_exceeded')) {
+				if (String(data.fromUid) === String(this.selfUid)) {
+					const sessionKey = `aiclaw-${this.selfUid}-room-${Number(roomId)}`;
+					const session = this.thinkingSessions.get(sessionKey);
+					if (session) {
+						if (session.timeoutId) clearTimeout(session.timeoutId);
+						const reason = error === 'rate_limit_exceeded'
+							? '发言频率限制，已自动跳过本次响应'
+							: '今日发言上限已达，已自动跳过本次响应';
+						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
+						this.sendAutoReply(Number(roomId), reason);
+						this.thinkingSessions.delete(sessionKey);
+						this.flushPendingMessages();
+					}
+				}
+			}
+			return;
+		}
 
 		// 查找 active session（可能已被 onThinkingEnd/onError 清理）
 		let session: ThinkingSession | undefined;
