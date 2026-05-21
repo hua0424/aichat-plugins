@@ -13,7 +13,7 @@ export const hulaChannel: ChannelPlugin = {
 		blurb: 'HuLa IM platform channel',
 	},
 	capabilities: {
-		chatTypes: ['direct'],
+		chatTypes: ['direct', 'group'],
 	},
 	config: createHulaConfigAdapter(),
 	outbound: createHulaOutboundAdapter(),
