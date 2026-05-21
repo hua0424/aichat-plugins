@@ -8,6 +8,8 @@ export interface HulaWSClientOptions {
 	onMessage: (msg: WSResponse) => void;
 	onConnected?: () => void;
 	onDisconnected?: () => void;
+	/** 认证失败时回调（如 token 过期 401/406），返回 true 表示已刷新可重连 */
+	onAuthError?: () => Promise<boolean>;
 }
 
 /**
@@ -59,8 +61,32 @@ export class HulaWSClient {
 			}
 		});
 
-		this.ws.on('error', (err) => {
+		this.ws.on('error', async (err) => {
 			console.error('[hula-ws] Error:', err.message);
+			// 检测 WS 握手失败（非 101 响应，通常是认证问题）
+			if (err.message.includes('Unexpected server response')) {
+				const statusCode = err.message.match(/(\d{3})/)?.[1];
+				if (statusCode && statusCode !== '101') {
+					console.warn(`[hula-ws] Auth/connection failed with HTTP ${statusCode}, stopping reconnect`);
+					this.closed = true;
+					this.stopHeartbeat();
+					if (this.reconnectTimer) {
+						clearTimeout(this.reconnectTimer);
+						this.reconnectTimer = null;
+					}
+					if (this.options.onAuthError) {
+						try {
+							const canRetry = await this.options.onAuthError();
+							if (canRetry) {
+								this.closed = false;
+								this.scheduleReconnect();
+							}
+						} catch (e) {
+							console.error('[hula-ws] onAuthError failed:', e);
+						}
+					}
+				}
+			}
 		});
 	}
 

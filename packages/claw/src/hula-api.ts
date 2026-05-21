@@ -30,13 +30,18 @@ export class HulaApiClient {
 
 	/**
 	 * 发送消息
+	 * @param extra 额外字段（如 { autoReply: true, thinkingId: string }），server 侧不入库
 	 */
-	async sendMessage(roomId: number, content: string): Promise<{ msgId: number }> {
-		const resp = await this.post('/api/im/chat/msg', {
+	async sendMessage(roomId: number, content: string, extra?: Record<string, unknown>): Promise<{ msgId: number }> {
+		const body: Record<string, unknown> = {
 			roomId,
 			msgType: 1, // 文本消息
 			body: { content },
-		});
+		};
+		if (extra) {
+			body.extra = extra;
+		}
+		const resp = await this.post('/api/im/chat/msg', body);
 		return resp.data as { msgId: number };
 	}
 
