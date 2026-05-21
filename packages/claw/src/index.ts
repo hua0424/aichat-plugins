@@ -4,6 +4,48 @@ import { HulaApiClientPool } from './hula-api-pool.js';
 import { registerTools } from './tools/index.js';
 
 /**
+ * 从多个可能的路径读取 hula 配置（兼容不同 openclaw 版本的 config 传递方式）
+ */
+function resolveHulaConfig(
+	runtimeConfig: Record<string, unknown>
+): { serverUrl?: string; aiclawToken?: string; tokens?: Record<string, string> } {
+	// 路径 1: runtime.config.hula（标准路径）
+	const direct = runtimeConfig.hula as Record<string, unknown> | undefined;
+	if (direct?.aiclawToken || direct?.serverUrl) {
+		return {
+			serverUrl: direct.serverUrl as string | undefined,
+			aiclawToken: direct.aiclawToken as string | undefined,
+			tokens: direct.tokens as Record<string, string> | undefined,
+		};
+	}
+
+	// 路径 2: runtime.config.plugins.entries.aichat-claw.config.hula（某些 openclaw 版本）
+	const plugins = runtimeConfig.plugins as Record<string, unknown> | undefined;
+	const entries = plugins?.entries as Record<string, unknown> | undefined;
+	const pluginConfig = entries?.['aichat-claw'] as Record<string, unknown> | undefined;
+	const nestedHula = pluginConfig?.config as Record<string, unknown> | undefined;
+	if (nestedHula?.hula) {
+		const h = nestedHula.hula as Record<string, unknown>;
+		return {
+			serverUrl: h.serverUrl as string | undefined,
+			aiclawToken: h.aiclawToken as string | undefined,
+			tokens: h.tokens as Record<string, string> | undefined,
+		};
+	}
+
+	// 路径 3: runtime.config 直接就是 hula 对象（fallback）
+	if (runtimeConfig.aiclawToken || runtimeConfig.serverUrl) {
+		return {
+			serverUrl: runtimeConfig.serverUrl as string | undefined,
+			aiclawToken: runtimeConfig.aiclawToken as string | undefined,
+			tokens: runtimeConfig.tokens as Record<string, string> | undefined,
+		};
+	}
+
+	return {};
+}
+
+/**
  * aichat-claw Plugin 入口
  * 注册 HuLa Channel + Agent Tools
  *
@@ -12,10 +54,31 @@ import { registerTools } from './tools/index.js';
 export default function register(api: OpenClawPluginApi) {
 	api.logger.info('aichat-claw loading');
 
-	// 创建 API 客户端池
-	const config = api.runtime.config as { hula?: { serverUrl?: string; aiclawToken?: string } };
-	const serverUrl = config.hula?.serverUrl || 'http://localhost:18760';
-	const aiclawToken = config.hula?.aiclawToken || '';
+	// DEBUG: 输出 runtime.config 完整结构，帮助诊断 config 传递问题
+	api.logger.info('runtime.config keys: ' + Object.keys(api.runtime.config || {}).join(', '));
+	api.logger.info('runtime.config: ' + JSON.stringify(api.runtime.config, null, 2));
+
+	// 多路径解析 hula 配置
+	const hulaConfig = resolveHulaConfig(api.runtime.config || {});
+	let serverUrl = hulaConfig.serverUrl || 'http://localhost:18760';
+	let aiclawToken = hulaConfig.aiclawToken || '';
+
+	// 环境变量 fallback（容器部署时最可靠）
+	if (!aiclawToken) {
+		aiclawToken = process.env.HULA_AICLAW_TOKEN || '';
+		if (aiclawToken) {
+			api.logger.info('aichat-claw: using HULA_AICLAW_TOKEN from env');
+		}
+	}
+	if (!serverUrl || serverUrl === 'http://localhost:18760') {
+		const envUrl = process.env.HULA_SERVER_URL;
+		if (envUrl) {
+			serverUrl = envUrl;
+			api.logger.info('aichat-claw: using HULA_SERVER_URL from env');
+		}
+	}
+
+	api.logger.info(`aichat-claw: resolved serverUrl=${serverUrl}, token=${aiclawToken ? '***' : '(empty)'}`);
 
 	const pool = new HulaApiClientPool(serverUrl);
 
@@ -44,9 +107,7 @@ export default function register(api: OpenClawPluginApi) {
 		pool.setDefault(aiclawToken);
 
 		// REQ-004: 若配置中存在多 aiclaw token 映射，注册到实例池
-		const tokens = (config.hula as Record<string, unknown> | undefined)?.tokens as
-			| Record<string, string>
-			| undefined;
+		const tokens = hulaConfig.tokens;
 		if (tokens) {
 			for (const [uid, token] of Object.entries(tokens)) {
 				pool.register(uid, token);
