@@ -51,7 +51,7 @@ export class HulaApiClient {
 	 * 获取 aiclaw 群配置
 	 */
 	async getGroupConfig(aiclawUid: number, roomId: number): Promise<Record<string, unknown>> {
-		const resp = await this.get(`/aiclaw/group/config?aiclawUid=${aiclawUid}&roomId=${roomId}`);
+		const resp = await this.get(`/api/im/aiclaw/group/config?aiclawUid=${aiclawUid}&roomId=${roomId}`);
 		return (resp.data as Record<string, unknown>) ?? {};
 	}
 
@@ -63,7 +63,7 @@ export class HulaApiClient {
 		roomId: number,
 		config: Record<string, unknown>
 	): Promise<void> {
-		await this.put('/aiclaw/group/config', { aiclawUid, roomId, ...config });
+		await this.put('/api/im/aiclaw/group/config', { aiclawUid, roomId, ...config });
 	}
 
 	// ─── HTTP helpers ───
@@ -102,7 +102,7 @@ export class HulaApiClient {
 
 	private headers(): Record<string, string> {
 		return {
-			Authorization: `Bearer ${this.token}`,
+			token: this.token,
 		};
 	}
 

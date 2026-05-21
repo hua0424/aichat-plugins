@@ -13,8 +13,8 @@ export async function handleGroupConfig(args: string[]): Promise<void> {
 		if (args[i] === '--room' && args[i + 1]) roomId = Number(args[++i]);
 		if (args[i] === '--rate-limit' && args[i + 1]) updates.rateLimitPerMinute = Number(args[++i]);
 		if (args[i] === '--daily-limit' && args[i + 1]) updates.dailyLimit = Number(args[++i]);
-		if (args[i] === '--respond-to-ai' && args[i + 1]) updates.respondToAi = args[++i] === 'true';
-		if (args[i] === '--mention-required' && args[i + 1]) updates.mentionRequired = args[++i] === 'true';
+		if (args[i] === '--respond-to-ai' && args[i + 1]) updates.respondToAi = args[++i] === 'true' ? 1 : 0;
+		if (args[i] === '--mention-required' && args[i + 1]) updates.mentionRequired = args[++i] === 'true' ? 1 : 0;
 	}
 
 	if (!roomId) {
