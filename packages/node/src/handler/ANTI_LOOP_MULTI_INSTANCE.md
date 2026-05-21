@@ -9,7 +9,6 @@
 如果同一 aiclaw 运行多个 aichat-node 实例（水平扩展）：
 
 - 各实例的 `aiRoundCount` 互不同步，指数退避效果减弱
-- `recentReplyLengths` 同样不同步，短回复跳过可能失效
 
 ## 当前部署假设
 
@@ -17,4 +16,4 @@
 
 ## 未来扩展
 
-若需水平扩展，需引入 Redis 或共享存储同步 `aiRoundCount` 与 `recentReplyLengths`。
+若需水平扩展，需引入 Redis 或共享存储同步 `aiRoundCount`。

@@ -1,9 +1,9 @@
 /**
- * REQ-004 M3: AntiLoopGuard
- * 5 层防循环的 Node 内存层实现：AI 互触发、短回复跳过、指数退避
+ * REQ-004 M4: AntiLoopGuard
+ * Node 内存层防循环：AI 互触发、指数退避
  *
  * 【S4 限制】roomStates 维护在单 aichat-node 进程内存中。
- * 同一 aiclaw 多实例（水平扩展）时，aiRoundCount 与 recentReplyLengths 互不同步。
+ * 同一 aiclaw 多实例（水平扩展）时，aiRoundCount 互不同步。
  * 当前部署假设：每个 aiclaw 仅运行单实例。
  */
 
@@ -28,8 +28,6 @@ interface RoomState {
 	lastMessageFromAi: boolean;
 	/** 最后一条消息的 fromUid */
 	lastFromUid: number;
-	/** 最近 3 条本 aiclaw 回复的长度 */
-	recentReplyLengths: number[];
 	/** 更新时间 */
 	lastUpdateTime: number;
 }
@@ -55,7 +53,6 @@ export class AntiLoopGuard {
 				aiRoundCount: 0,
 				lastMessageFromAi: false,
 				lastFromUid: 0,
-				recentReplyLengths: [],
 				lastUpdateTime: Date.now(),
 			};
 			this.roomStates.set(roomKey, state);
@@ -84,47 +81,6 @@ export class AntiLoopGuard {
 		state.lastUpdateTime = Date.now();
 
 		return { action: 'allow' };
-	}
-
-	/** 短回复跳过检查：agent 决定发送时调用 */
-	shouldSkipShortReply(roomId: number, replyContent: string): boolean {
-		const roomKey = String(roomId);
-		const state = this.roomStates.get(roomKey);
-		if (!state) return false;
-
-		const length = replyContent.trim().length;
-		state.recentReplyLengths.push(length);
-		if (state.recentReplyLengths.length > 3) {
-			state.recentReplyLengths.shift();
-		}
-		state.lastUpdateTime = Date.now();
-
-		// 最近 3 条均 < 10 字符时跳过
-		if (state.recentReplyLengths.length === 3) {
-			return state.recentReplyLengths.every((l) => l < 10);
-		}
-		return false;
-	}
-
-	/** 记录一次本 aiclaw 的回复（用于短回复跟踪） */
-	recordReply(roomId: number, content: string): void {
-		const roomKey = String(roomId);
-		let state = this.roomStates.get(roomKey);
-		if (!state) {
-			state = {
-				aiRoundCount: 0,
-				lastMessageFromAi: false,
-				lastFromUid: 0,
-				recentReplyLengths: [],
-				lastUpdateTime: Date.now(),
-			};
-			this.roomStates.set(roomKey, state);
-		}
-		state.recentReplyLengths.push(content.trim().length);
-		if (state.recentReplyLengths.length > 3) {
-			state.recentReplyLengths.shift();
-		}
-		state.lastUpdateTime = Date.now();
 	}
 
 	/** 获取指定房间的 AI-to-AI 轮数（仅用于日志/debug） */
