@@ -27,6 +27,8 @@ interface ThinkingSession {
 	timeoutId?: ReturnType<typeof setTimeout>;
 	/** thinkingId 回填前缓存的 delta（防 race condition） */
 	pendingDeltas: Array<{ chunk: string; seq: number }>;
+	/** 是否已 finalized（防止 onThinkingEnd / handleThinkingEndBroadcast 双重清理） */
+	finalized: boolean;
 }
 
 /**
@@ -223,10 +225,13 @@ export class MessageHandler {
 			seq: 0,
 			accumulatedContent: '',
 			pendingDeltas: [],
+			finalized: false,
 		};
 
 		// 设置 5 分钟超时定时器（P-M2-3）
 		session.timeoutId = setTimeout(() => {
+			if (session.finalized) return;
+			session.finalized = true;
 			console.error(`[thinking] timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
 			this.ws.send(WSReqType.THINKING_END, {
 				thinkingId: session.thinkingId || undefined,
@@ -266,9 +271,19 @@ export class MessageHandler {
 				console.log(`[thinking] delta session=${sessionKey} seq=${session.seq} chunkLen=${chunk.length}`);
 			},
 			onThinkingEnd: (durationMs) => {
+				if (session.finalized) return;
+				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
-				if (session.pendingDeltas.length > 0) {
-					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (thinking ended)`);
+				// CR-S6: if thinkingId backfilled but pendingDeltas not flushed yet, flush first
+				if (session.thinkingId && session.pendingDeltas.length > 0) {
+					console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas before end`);
+					for (const { chunk, seq } of session.pendingDeltas) {
+						this.ws.send(WSReqType.THINKING_DELTA, {
+							thinkingId: session.thinkingId,
+							chunk,
+							seq,
+						});
+					}
 					session.pendingDeltas = [];
 				}
 				this.ws.send(WSReqType.THINKING_END, {
@@ -281,6 +296,8 @@ export class MessageHandler {
 				this.flushPendingMessages();
 			},
 			onError: (error) => {
+				if (session.finalized) return;
+				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
 				if (session.pendingDeltas.length > 0) {
 					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (error)`);
@@ -384,6 +401,11 @@ export class MessageHandler {
 		if (session?.timeoutId) {
 			clearTimeout(session.timeoutId);
 		}
+		if (session?.finalized) {
+			this.thinkingSessions.delete(session.sessionKey);
+			this.flushPendingMessages();
+			return;
+		}
 
 		if (status === 'error' && error) {
 			switch (error) {
@@ -405,6 +427,7 @@ export class MessageHandler {
 		}
 
 		if (session) {
+			session.finalized = true;
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages();
 		}
@@ -424,6 +447,24 @@ export class MessageHandler {
 			.catch((err) => {
 				console.error('[anti-loop] autoReply failed:', err instanceof Error ? err.message : String(err));
 			});
+	}
+
+	/** CR-S7: 清理所有 active session（进程退出时调用） */
+	destroy(): void {
+		for (const session of this.thinkingSessions.values()) {
+			if (session.timeoutId) clearTimeout(session.timeoutId);
+			if (!session.finalized) {
+				session.finalized = true;
+				this.ws.send(WSReqType.THINKING_END, {
+					thinkingId: session.thinkingId || undefined,
+					durationMs: Date.now() - session.startTime,
+					status: 'error',
+					error: 'handler_destroyed',
+				});
+			}
+		}
+		this.thinkingSessions.clear();
+		this.pendingMessages = [];
 	}
 
 	private flushPendingMessages(): void {

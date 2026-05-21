@@ -19,7 +19,13 @@ export class GroupConfigCache {
 	}
 
 	set(aiclawUid: number, roomId: number, config: GroupConfig): void {
-		this.cache.set(`${aiclawUid}:${roomId}`, config);
+		// CR-S8: normalize boolean fields — server sends 0/1, enforce boolean
+		const normalized: GroupConfig = {
+			...config,
+			respondToAi: Boolean(config.respondToAi),
+			mentionRequired: Boolean(config.mentionRequired),
+		};
+		this.cache.set(`${aiclawUid}:${roomId}`, normalized);
 	}
 
 	delete(aiclawUid: number, roomId: number): void {
