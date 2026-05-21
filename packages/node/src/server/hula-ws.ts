@@ -31,10 +31,14 @@ export class HulaWSClient {
 
 	connect(): void {
 		this.closed = false;
-		const url = `${this.options.url}?token=${this.options.token}&clientId=${this.options.clientId}`;
 		console.log(`[hula-ws] Connecting to ${this.options.url}...`);
 
-		this.ws = new WebSocket(url);
+		// CR-M1: token 走 header，clientId 走 sub-protocol，不再暴露在 URL query 中
+		this.ws = new WebSocket(
+			this.options.url,
+			['aiclaw-v1', `clientId_${this.options.clientId}`],
+			{ headers: { 'Token': this.options.token } }
+		);
 
 		this.ws.on('open', () => {
 			console.log('[hula-ws] Connected');
