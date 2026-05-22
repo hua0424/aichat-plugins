@@ -23,12 +23,14 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 			description: '当你需要回复用户消息时，调用此工具向指定房间发送文本消息。必须在思考完成后调用此工具发送你的回复内容。',
 		parameters,
 		async execute(_toolCallId: string, args: Record<string, unknown>) {
-			const roomId = Number(args.roomId);
+			const rawRoomId = args.roomId;
+			const roomId = Number(rawRoomId);
 			const content = args.content as string;
 			const extra = args.extra as Record<string, unknown> | undefined;
 
-			if (!roomId || !Number.isFinite(roomId)) {
-				return { error: `房间 ID 无效: ${JSON.stringify(args.roomId)}` };
+			if (!rawRoomId || !Number.isFinite(roomId)) {
+				console.warn(`[hula_send_message] invalid roomId: ${JSON.stringify(rawRoomId)}, full args: ${JSON.stringify(args)}`);
+				return { error: `房间 ID 无效: ${JSON.stringify(rawRoomId)}` };
 			}
 			if (!content?.trim()) {
 				return { error: '消息内容不能为空' };
@@ -39,6 +41,7 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 				console.log(`[hula_send_message] sent roomId=${roomId} msgId=${result.msgId}`);
 				return { ok: true, msgId: result.msgId };
 			} catch (err) {
+				console.error(`[hula_send_message] send failed roomId=${roomId}: ${err instanceof Error ? err.message : String(err)}`);
 				return { error: err instanceof Error ? err.message : '发送失败' };
 			}
 		},
