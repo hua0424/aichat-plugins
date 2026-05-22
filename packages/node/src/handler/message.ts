@@ -1,7 +1,7 @@
 import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
-import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
+import type { ClawAdapter, ChatContext, ThinkingCallbacks } from '../claw/interface.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -315,7 +315,7 @@ export class MessageHandler {
 			},
 		};
 
-		await this.adapter.chat(message, sessionKey, callbacks);
+		await this.adapter.chat(message, sessionKey, callbacks, { roomId });
 	}
 
 	/** P-M2-2: 接收 server 的 thinkingStart 广播，回填 thinkingId */

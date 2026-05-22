@@ -3,7 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import type { ClawAdapter, ThinkingCallbacks } from './interface.js';
+import type { ClawAdapter, ChatContext, ThinkingCallbacks } from './interface.js';
 
 /**
  * Device identity for gateway authentication
@@ -155,7 +155,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.ws = null;
 	}
 
-	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks): Promise<void> {
+	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks, context?: ChatContext): Promise<void> {
 		if (!this.connected || !this.ws) {
 			callbacks.onError(new Error('openclaw gateway not connected'));
 			return;
@@ -166,8 +166,12 @@ export class OpenclawAdapter implements ClawAdapter {
 
 		// 在 message 中注入 tool 调用指令（openclaw gateway 不支持 instructions 字段）
 		// 注意：避免使用 [SYSTEM] / [System Message] 等标记，会被 openclaw 安全机制过滤
+		const roomIdHint = context?.roomId
+			? `The current room ID is ${context.roomId}. You MUST use exactly this roomId value when calling hula_send_message. `
+			: '';
 		const enrichedMessage =
 			'IMPORTANT: You have a tool called hula_send_message. ' +
+			roomIdHint +
 			'After you finish thinking, you MUST call this tool with the roomId and your response ' +
 			'to send the reply to the user. Do NOT just output text — always use the tool.\n\n' +
 			'--- User message below ---\n' + message;
