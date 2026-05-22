@@ -15,8 +15,8 @@ export function createFindFriendTool(api: HulaApiClient): AgentTool {
 		name: 'hula_find_friend',
 		description: '在 HuLa 中搜索好友。输入关键词，返回匹配的好友列表（uid、名称、头像）。',
 		parameters,
-		async execute(params: Record<string, unknown>) {
-			const keyword = params.keyword as string;
+		async execute(_toolCallId: string, args: Record<string, unknown>) {
+			const keyword = args.keyword as string;
 			if (!keyword?.trim()) {
 				return { error: '关键词不能为空' };
 			}

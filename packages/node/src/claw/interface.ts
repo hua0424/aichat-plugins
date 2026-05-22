@@ -17,8 +17,9 @@ export interface ClawAdapter {
 	 * @param message 用户消息
 	 * @param sessionKey 会话标识（格式：aiclaw-{uid}-room-{roomId}）
 	 * @param callbacks thinking 流式回调
+	 * @param context 上下文信息（如 roomId，供 agent 调用 tool 时使用）
 	 */
-	chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks): Promise<void>;
+	chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks, context?: ChatContext): Promise<void>;
 
 	/** 当前是否已连接 */
 	get isConnected(): boolean;
@@ -41,4 +42,9 @@ export interface ThinkingCallbacks {
 	onThinkingEnd: (durationMs: number) => void;
 	/** 处理出错 */
 	onError: (error: Error) => void;
+}
+
+/** Agent 调用上下文，传递 roomId 等信息供 tool 调用使用 */
+export interface ChatContext {
+	roomId: number;
 }
