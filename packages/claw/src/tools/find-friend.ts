@@ -21,6 +21,7 @@ export function createFindFriendTool(api: HulaApiClient): AgentTool {
 				return { error: '关键词不能为空' };
 			}
 			const friends = await api.searchFriends(keyword);
+			console.log(`[hula_find_friend] found ${friends.length} results for "${keyword.substring(0, 30)}"`);
 			return { friends };
 		},
 	};
