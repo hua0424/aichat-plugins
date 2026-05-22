@@ -5,7 +5,7 @@ import type { AgentTool } from '../types.js';
 const parameters = {
 	type: 'object' as const,
 	properties: {
-		roomId: Type.Number({ description: '目标房间 ID' }),
+		roomId: Type.Union([Type.Number(), Type.String()], { description: '目标房间 ID' }),
 		content: Type.String({ description: '消息内容' }),
 		extra: Type.Optional(
 			Type.Object(
@@ -23,12 +23,15 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 			description: '当你需要回复用户消息时，调用此工具向指定房间发送文本消息。必须在思考完成后调用此工具发送你的回复内容。',
 		parameters,
 		async execute(params: Record<string, unknown>) {
-			const roomId = params.roomId as number;
+			const rawRoomId = params.roomId;
+			const roomId = typeof rawRoomId === 'string' ? parseInt(rawRoomId, 10) : (rawRoomId as number);
 			const content = params.content as string;
 			const extra = params.extra as Record<string, unknown> | undefined;
 
-			if (!roomId) {
-				return { error: '房间 ID 不能为空' };
+			console.log(`[hula_send_message] execute called: rawRoomId=${JSON.stringify(rawRoomId)} roomId=${roomId} contentLen=${content?.length ?? 0}`);
+
+			if (!roomId || isNaN(roomId)) {
+				return { error: `房间 ID 无效: ${JSON.stringify(rawRoomId)}` };
 			}
 			if (!content?.trim()) {
 				return { error: '消息内容不能为空' };
