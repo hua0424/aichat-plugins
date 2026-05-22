@@ -5,7 +5,7 @@ import type { AgentTool } from '../types.js';
 const parameters = {
 	type: 'object' as const,
 	properties: {
-		roomId: Type.Union([Type.Number(), Type.String()], { description: '目标房间 ID' }),
+		roomId: Type.Number({ description: '目标房间 ID' }),
 		content: Type.String({ description: '消息内容' }),
 		extra: Type.Optional(
 			Type.Object(
@@ -22,16 +22,13 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 		name: 'hula_send_message',
 			description: '当你需要回复用户消息时，调用此工具向指定房间发送文本消息。必须在思考完成后调用此工具发送你的回复内容。',
 		parameters,
-		async execute(params: Record<string, unknown>) {
-			const rawRoomId = params.roomId;
-			const roomId = typeof rawRoomId === 'string' ? parseInt(rawRoomId, 10) : (rawRoomId as number);
-			const content = params.content as string;
-			const extra = params.extra as Record<string, unknown> | undefined;
+		async execute(_toolCallId: string, args: Record<string, unknown>) {
+			const roomId = Number(args.roomId);
+			const content = args.content as string;
+			const extra = args.extra as Record<string, unknown> | undefined;
 
-			console.log(`[hula_send_message] execute called: rawRoomId=${JSON.stringify(rawRoomId)} roomId=${roomId} contentLen=${content?.length ?? 0}`);
-
-			if (!roomId || isNaN(roomId)) {
-				return { error: `房间 ID 无效: ${JSON.stringify(rawRoomId)}` };
+			if (!roomId || !Number.isFinite(roomId)) {
+				return { error: `房间 ID 无效: ${JSON.stringify(args.roomId)}` };
 			}
 			if (!content?.trim()) {
 				return { error: '消息内容不能为空' };
@@ -39,6 +36,7 @@ export function createSendMessageTool(api: HulaApiClient): AgentTool {
 
 			try {
 				const result = await api.sendMessage(roomId, content, extra);
+				console.log(`[hula_send_message] sent roomId=${roomId} msgId=${result.msgId}`);
 				return { ok: true, msgId: result.msgId };
 			} catch (err) {
 				return { error: err instanceof Error ? err.message : '发送失败' };
