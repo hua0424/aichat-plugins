@@ -69,7 +69,7 @@ export class HulaApiClient {
 
 	private headers(): Record<string, string> {
 		return {
-			Authorization: `Bearer ${this.token}`,
+			Token: this.token,
 		};
 	}
 
