@@ -110,39 +110,6 @@ Config files (JSONC with `//` comment support):
 - `~/.openclaw/openclaw.json` — auto-detected for gateway token
 - Environment vars: `HULA_AICLAW_TOKEN`, `HULA_SERVER_URL`, `OPENCLAW_TOKEN`, `OPENCLAW_GATEWAY_URL`
 
-## Scope Rules
-
-This repo is part of the AIChat(HuLa) project collaboration network via `claude-peers`.
-
-**Identity:** Use `whoami` to confirm your current peer ID and role. Do NOT assume a fixed identity.
-
-| Peer ID | Role | Scope |
-|---------|------|-------|
-| manager | manager | PRD, task coordination, teamdocs maintenance |
-| frontend-dev | developer | HuLa + HuLa-Admin frontend |
-| server-dev | developer | HuLa-Server backend |
-| plugin-dev | developer | aichat-plugins bridge |
-| backend-tester | tester | API/integration testing, CI/CD, runtime env |
-| ui-tester | tester | Windows/Android client testing |
-| reviewer | reviewer | PRD review, code review (reports to manager) |
-
-**Code ownership:** Only modify `packages/` files. All code changes must go through PR — no direct push to `dev` or `master`. Coordinate with the relevant peer before cross-package changes.
-
-**Coordination:** Update `set_summary` daily. Use `send_message` for short comms; write to `teamdocs/` for docs/reports.
-
-## graphify
-
-This project maintains a knowledge graph at `graphify-out/`.
-
-- Before answering architecture questions, read `graphify-out/GRAPH_REPORT.md` for god nodes and community structure
-- After modifying code files in a session, run: `python3 -c "from graphify.watch import _rebuild_code; from pathlib import Path; _rebuild_code(Path('.'))"` to keep the graph current
-
-## Git Submodules
-
-- `teamdocs/` is a git submodule pointing to `https://github.com/hua0424/aichat-hula-docs.git`
-- To update: `git submodule update --remote teamdocs` then commit the updated submodule ref
-- Do not directly commit files inside `teamdocs/` from this repo — go into `teamdocs/` and commit from there
-
 ## Key Invariants
 
 1. **Tool interface field name:** `AgentTool.parameters` (not `schema`). Mismatch causes `tool.parameters === undefined` → agent tool call throws.
