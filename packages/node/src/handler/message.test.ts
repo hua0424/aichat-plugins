@@ -44,12 +44,68 @@ function fakeWs() {
 	return { ws, sent };
 }
 
-/** 构造一条来自普通用户的文本 receiveMessage */
+/**
+ * 构造一条来自普通用户的文本 receiveMessage。
+ * 默认 roomType=2（私聊），始终触发——保持既有 S2/S3/S4 用例语义（不受 S5 @ 闸门影响）。
+ */
 function humanMessage(roomId: number, fromUid: number, content: string, msgId: number): ReceivedMessage {
 	return {
 		fromUser: { uid: fromUid, name: 'user', userType: 1 },
-		message: { id: msgId, roomId, type: 1, body: { content } },
+		message: { id: msgId, roomId, type: 1, roomType: 2, body: { content } },
 	} as unknown as ReceivedMessage;
+}
+
+/** 构造一条群聊文本消息（roomType=1），可选 atUidList / name。 */
+function groupMessage(
+	roomId: number,
+	fromUid: number,
+	content: string,
+	msgId: number,
+	opts?: { atUidList?: Array<string | number>; name?: string },
+): ReceivedMessage {
+	return {
+		fromUser: { uid: fromUid, name: opts?.name ?? 'user', userType: 1 },
+		message: {
+			id: msgId,
+			roomId,
+			type: 1,
+			roomType: 1,
+			body: { content, ...(opts?.atUidList ? { atUidList: opts.atUidList } : {}) },
+		},
+	} as unknown as ReceivedMessage;
+}
+
+/** 读取指定房间的积累缓冲（白盒断言用） */
+function getAccumulated(handler: MessageHandler, roomId: number): string[] {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.roomChannels.get(roomId)?.accumulatedMessages ?? [];
+}
+
+/** 读取指定房间的 pendingMessages（白盒断言用） */
+function getPending(handler: MessageHandler, roomId: number): string[] {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.roomChannels.get(roomId)?.pendingMessages ?? [];
+}
+
+/** 向 handler 注入一条群配置（mentionRequired 等） */
+function setGroupConfig(
+	handler: MessageHandler,
+	roomId: number,
+	config: { mentionRequired?: boolean; respondToAi?: boolean; rateLimitPerMinute?: number; dailyLimit?: number },
+): void {
+	handler.handle({
+		type: 'groupConfigChange',
+		data: {
+			aiclawUid: SELF_UID,
+			roomId,
+			config: {
+				rateLimitPerMinute: config.rateLimitPerMinute ?? 0,
+				mentionRequired: config.mentionRequired ?? true,
+				dailyLimit: config.dailyLimit ?? 0,
+				respondToAi: config.respondToAi ?? false,
+			},
+		},
+	} as never);
 }
 
 async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
@@ -431,5 +487,222 @@ describe('MessageHandler per-room isolation', () => {
 
 		// @ts-expect-error 访问私有字段做白盒断言
 		expect(handler.roomChannels.has(7)).toBe(false);
+	});
+});
+
+describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
+	it('group + mention_required + @bot → triggers the agent loop', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }),
+		} as never);
+
+		await waitFor(() => calls.length >= 1);
+		expect(calls[0].context?.roomId).toBe(1);
+		expect(calls[0].message).toBe('hey bot');
+		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	it('group + mention_required + NO @bot → NOT triggered, message accumulated', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 100, 'just chatting', 1, { name: 'alice' }),
+		} as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1)).toEqual(['[alice(100)]: just chatting']);
+		expect(getPending(handler, 1).length).toBe(0);
+	});
+
+	it('group + mention_required + atUidList=[0] (@所有人) → NOT triggered BUT accumulated', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 100, '@all 通知', 1, { atUidList: [0], name: 'bob' }),
+		} as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1)).toEqual(['[bob(100)]: @all 通知']);
+	});
+
+	it('cap: 51 un-@ messages → buffer holds 50, oldest dropped', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		for (let i = 0; i < 51; i++) {
+			handler.handle({
+				type: 'receiveMessage',
+				data: groupMessage(1, 100, `m${i}`, i + 1, { name: 'u' }),
+			} as never);
+		}
+
+		await new Promise((r) => setTimeout(r, 40));
+		const buf = getAccumulated(handler, 1);
+		expect(calls.length).toBe(0);
+		expect(buf.length).toBe(50);
+		// 最旧（m0）被丢弃，最新（m50）保留
+		expect(buf[0]).toBe('[u(100)]: m1');
+		expect(buf[49]).toBe('[u(100)]: m50');
+	});
+
+	it('private (roomType=2) → always triggers, no @ needed; not accumulated', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: { fromUser: { uid: 100, name: 'u', userType: 1 }, message: { id: 1, roomId: 3, type: 1, roomType: 2, body: { content: 'dm hi' } } },
+		} as never);
+
+		await waitFor(() => calls.length >= 1);
+		expect(calls[0].message).toBe('dm hi');
+		expect(getAccumulated(handler, 3).length).toBe(0);
+	});
+
+	it('group + mention_required=0 (cached config) → every message triggers', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: false });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 100, 'no mention needed', 1),
+		} as never);
+
+		await waitFor(() => calls.length >= 1);
+		expect(calls[0].message).toBe('no mention needed');
+		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	it('annotation format is exactly [name(uid)]: content', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 42, 'hello world', 1, { name: 'Carol' }),
+		} as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+		expect(getAccumulated(handler, 1)).toEqual(['[Carol(42)]: hello world']);
+	});
+
+	it('injection: accumulate N un-@ messages, then @bot → adapter message includes accumulated history (prepended) and buffer cleared', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// 2 条未点名 → 积累
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 101, 'second', 2, { name: 'bob' }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1).length).toBe(2);
+
+		// 第 3 条点名机器人 → 触发，注入历史
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		const sent = calls[0].message;
+		expect(sent).toContain('[群聊上下文 · 自上次回复以来未点名你的消息]');
+		expect(sent).toContain('[alice(100)]: first');
+		expect(sent).toContain('[bob(101)]: second');
+		expect(sent).toContain('[当前消息]');
+		expect(sent).toContain('hey bot');
+		// 历史在当前消息之前
+		expect(sent.indexOf('[alice(100)]: first')).toBeLessThan(sent.indexOf('hey bot'));
+		// 注入后缓冲清空
+		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	it('TIMING: with thinking ACTIVE, un-@ group message is accumulated, NOT queued to pendingMessages, and does NOT trigger after thinking ends', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// 点名机器人 → 触发 thinking（adapter.chat 不结束，session 保持 active）
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// thinking 进行中，来一条未点名群消息 → 必须积累、不入 pendingMessages、不触发
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 101, 'chatter', 2, { name: 'eve' }) } as never);
+		expect(getAccumulated(handler, 1)).toEqual(['[eve(101)]: chatter']);
+		expect(getPending(handler, 1).length).toBe(0);
+
+		// 结束 thinking → 不得 flush 未点名消息触发新 chat
+		calls[0].callbacks.onThinkingEnd(100);
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls.length).toBe(1);
+		// 未点名消息仍留在积累缓冲（等下次点名注入）
+		expect(getAccumulated(handler, 1)).toEqual(['[eve(101)]: chatter']);
+	});
+
+	it('P1-a: triggerAgentLoop early-return (session already active for sessionKey) does NOT clear accumulated buffer (context preserved)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// 1 条未点名 → 积累，并建立 lastCtx（首条点名提供 msgId）
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'context', 1, { name: 'alice' }) } as never);
+		// 点名机器人 → 触发 thinking（fake adapter 不结束 → session 保持 active），积累被注入并清空
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 101, 'hey bot', 2, { atUidList: [SELF_UID] }) } as never);
+		await waitFor(() => calls.length >= 1);
+		expect(getAccumulated(handler, 1).length).toBe(0);
+
+		// session 仍 active 时，又积累一条未点名群消息
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'more context', 3, { name: 'bob' }) } as never);
+		expect(getAccumulated(handler, 1)).toEqual(['[bob(102)]: more context']);
+
+		// 直接驱动 triggerAgentLoop（session 已 active）→ 命中并发防护早返回；
+		// 缓冲必须保留（P1-a 修复：消费/清空发生在并发防护之后，而非方法顶部）
+		// @ts-expect-error 调用私有方法做白盒断言
+		await handler.triggerAgentLoop(1, 'direct retrigger');
+		expect(calls.length).toBe(1); // 没有发起第二次 chat（早返回）
+		expect(getAccumulated(handler, 1)).toEqual(['[bob(102)]: more context']); // 缓冲未被清空
+	});
+
+	it('regression: self / autoReply / non-text / AI(respondToAi=false) are neither accumulated nor triggered', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true, respondToAi: false });
+
+		// self
+		handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: SELF_UID, name: 'me', userType: 1 }, message: { id: 1, roomId: 1, type: 1, roomType: 1, body: { content: 'self' } } } } as never);
+		// autoReply
+		handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 100, name: 'u', userType: 1 }, message: { id: 2, roomId: 1, type: 1, roomType: 1, extra: { autoReply: true }, body: { content: 'auto' } } } } as never);
+		// non-text
+		handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 100, name: 'u', userType: 1 }, message: { id: 3, roomId: 1, type: 2, roomType: 1, body: { content: 'img' } } } } as never);
+		// AI with respondToAi=false
+		handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 200, name: 'ai', userType: 4 }, message: { id: 4, roomId: 1, type: 1, roomType: 1, body: { content: 'ai msg' } } } } as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1).length).toBe(0);
 	});
 });

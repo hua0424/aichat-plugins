@@ -62,11 +62,17 @@ export interface ReceivedMessage {
 		id: string | number;
 		roomId: string | number;
 		type: number;
+		/** REQ-004 S5: 会话类型（server 下发）。1=GROUP，2=FRIEND（1:1 私聊）。缺省视为群聊（保守）。 */
+		roomType?: number;
 		sendTime: string;
 		body: {
 			content: string;
 			urlContentMap?: Record<string, unknown>;
-			atUidList?: unknown;
+			/**
+			 * REQ-004 S5: @ 的 uid 列表（Java List<Long>，序列化为 string/number 数组）。
+			 * 元素 0 = @所有人/@all；显式 @ 机器人时含 selfUid。
+			 */
+			atUidList?: Array<string | number>;
 			reply?: unknown;
 		};
 	};

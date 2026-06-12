@@ -86,7 +86,16 @@ interface RoomChannel {
 	debouncer: MessageDebouncer;
 	pendingMessages: string[];
 	lastCtx: LastMessageContext;
+	/**
+	 * REQ-004 S5: 群聊惰性积累缓冲。
+	 * 未触发（未点名机器人）的群消息以 `[name(uid)]: content` 形式 FIFO 入此缓冲，
+	 * 上限 50，超出 shift 最旧；下次真正触发时一次性注入 session 再清空。
+	 */
+	accumulatedMessages: string[];
 }
+
+/** REQ-004 S5: 群聊惰性积累缓冲上限（FIFO） */
+const ACCUMULATED_MESSAGES_CAP = 50;
 
 /**
  * 消息处理器（REQ-004 Agent Loop 模型）
@@ -151,7 +160,7 @@ export class MessageHandler {
 					console.error(`[handler] triggerAgentLoop unhandled error (room ${roomId}):`, err.message);
 				});
 			}, this.debounceOptions);
-			channel = { debouncer, pendingMessages: [], lastCtx: { roomId, fromUid: 0, msgId: '' } };
+			channel = { debouncer, pendingMessages: [], lastCtx: { roomId, fromUid: 0, msgId: '' }, accumulatedMessages: [] };
 			this.roomChannels.set(roomId, channel);
 		}
 		return channel;
@@ -230,8 +239,43 @@ export class MessageHandler {
 			}
 		}
 
-		// 缓存消息上下文（按房间隔离）
 		const channel = this.getRoomChannel(roomId);
+
+		// 5.5. 【S5】@ 触发闸门 + 惰性积累
+		//   私聊（roomType=2）始终触发；群聊默认需点名（mention_required），缺省/未知 roomType 视为群聊（保守）。
+		//   未触发的群消息以 `[name(uid)]: content` 入积累缓冲，**不**入 pendingMessages、**不**触发；
+		//   下次触发时由 triggerAgentLoop 一次性注入。
+		//   注意：此判定必须在「thinking 活跃入队」(step 6) 之前——否则未点名消息会被错误地排入 pendingMessages 并在本轮思考结束后误触发。
+		const roomType = data.message.roomType;
+		const isPrivate = roomType === 2;
+		let triggerEligible: boolean;
+		if (isPrivate) {
+			triggerEligible = true;
+		} else {
+			// 群聊：默认需点名（与 server 新默认 1 对齐：配置未缓存时按需点名处理）
+			const mentionRequired = this.groupConfigCache.get(this.selfUid, roomId)?.mentionRequired ?? true;
+			if (!mentionRequired) {
+				triggerEligible = true;
+			} else {
+				const atUidList = data.message.body?.atUidList ?? [];
+				// 仅显式 @ 机器人（atUidList 含 selfUid）才算点名；0=@所有人 不算点名（裁决）。
+				const isMentioned = atUidList.map(String).includes(String(this.selfUid));
+				triggerEligible = isMentioned;
+			}
+		}
+
+		if (!triggerEligible) {
+			// 惰性积累：标注发言者，FIFO 上限 50。@所有人 落在此处（不触发但仍积累）。
+			const name = data.fromUser.name ?? 'unknown';
+			channel.accumulatedMessages.push(`[${name}(${fromUid})]: ${content}`);
+			if (channel.accumulatedMessages.length > ACCUMULATED_MESSAGES_CAP) {
+				channel.accumulatedMessages.shift();
+			}
+			console.log(`[handler] Message accumulated (not mentioned) room=${roomId}, buffer: ${channel.accumulatedMessages.length}`);
+			return;
+		}
+
+		// 缓存消息上下文（按房间隔离）
 		channel.lastCtx = { roomId, fromUid, msgId };
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
@@ -292,6 +336,16 @@ export class MessageHandler {
 			console.warn(`[handler] Thinking session already active for ${sessionKey}`);
 			return;
 		}
+
+		// REQ-004 S5: 注入惰性积累的群聊上下文（自上次回复以来未点名的消息），随后清空缓冲。
+		// 必须放在并发防护早返回之后——只有真正进入 agent loop（创建 thinking session）时才消费/清空缓冲，
+		// 否则早返回会丢弃已清空但从未发送的群聊上下文。
+		const accumulated = channel.accumulatedMessages;
+		channel.accumulatedMessages = [];
+		const agentMessage =
+			accumulated.length > 0
+				? `[群聊上下文 · 自上次回复以来未点名你的消息]\n${accumulated.join('\n')}\n\n[当前消息]\n${message}`
+				: message;
 
 		// 创建 thinking session（thinkingId 初始为空，等 server 广播回填）
 		const session: ThinkingSession = {
@@ -408,7 +462,7 @@ export class MessageHandler {
 			},
 		};
 
-		await this.adapter.chat(message, sessionKey, callbacks, { roomId });
+		await this.adapter.chat(agentMessage, sessionKey, callbacks, { roomId });
 	}
 
 	/** P-M2-2: 接收 server 的 thinkingStart 广播，回填 thinkingId */
@@ -578,6 +632,8 @@ export class MessageHandler {
 		if (
 			channel.pendingMessages.length === 0 &&
 			channel.debouncer.pending === 0 &&
+			// REQ-004 S5: 仍持有未注入的群聊上下文时不回收，避免丢失积累上下文
+			channel.accumulatedMessages.length === 0 &&
 			!this.thinkingSessions.has(sessionKey)
 		) {
 			this.roomChannels.delete(roomId);
