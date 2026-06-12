@@ -8,6 +8,39 @@ import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 
 /**
+ * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
+ * 256 KiB，**严格高于** server 的 200 KB 截断阈值——这是有意的：
+ * server 是唯一的截断权威，仅当收到 content > 200KB 时才截断并置 status=4。
+ * 若插件在此处也卡在 200KB，server 永远收不到 >200KB，status=4 会被短路。
+ * 本上限只保证 WS 帧不溢出传输层；200KB~256KB 之间的内容仍原样送到 server，
+ * 由 server 截断到 200KB 并标记 status=4。
+ */
+const THINKING_END_MAX_BYTES = 256 * 1024;
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder('utf-8', { fatal: false });
+
+/**
+ * 将字符串截断到至多 maxBytes 个 UTF-8 字节，且不切断多字节字符。
+ * 仅用于 THINKING_END 的帧安全；server 仍是唯一截断权威。
+ *
+ * 注意：不能直接 decode(slice(0, maxBytes))——TextDecoder(fatal:false) 会把尾部
+ * 残缺的多字节序列替换成 U+FFFD（3 字节），反而可能让结果 re-encode 后超出 maxBytes。
+ * 因此先把切点回退到合法的 UTF-8 字符边界（continuation byte 0b10xxxxxx 之前），
+ * 再 decode，保证输出字节数 <= maxBytes 且无乱码。
+ */
+function capUtf8Bytes(text: string, maxBytes: number = THINKING_END_MAX_BYTES): string {
+	const encoded = TEXT_ENCODER.encode(text);
+	if (encoded.length <= maxBytes) return text;
+	// 从 maxBytes 处向前回退，跳过 UTF-8 续字节（高位 0b10xxxxxx）到字符起始边界
+	let end = maxBytes;
+	while (end > 0 && (encoded[end] & 0b1100_0000) === 0b1000_0000) {
+		end--;
+	}
+	return TEXT_DECODER.decode(encoded.subarray(0, end));
+}
+
+/**
  * REQ-004: Thinking 会话状态
  */
 interface ThinkingSession {
@@ -281,7 +314,8 @@ export class MessageHandler {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: 'thinking_session_timeout',
-				content: session.accumulatedContent,
+				// 帧安全截断（256KB）；server 仍是唯一截断权威
+				content: capUtf8Bytes(session.accumulatedContent),
 			});
 			this.thinkingSessions.delete(sessionKey);
 			this.flushPendingMessages(roomId);
@@ -347,7 +381,8 @@ export class MessageHandler {
 					thinkingId: session.thinkingId || undefined,
 					durationMs,
 					status: 'complete',
-					content: session.accumulatedContent,
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 					// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
 					...(skipReason !== undefined ? { skipReason } : {}),
 				});
@@ -365,7 +400,8 @@ export class MessageHandler {
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: error.message,
-					content: session.accumulatedContent,
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 				});
 				this.thinkingSessions.delete(sessionKey);
 				this.flushPendingMessages(roomId);
@@ -500,7 +536,8 @@ export class MessageHandler {
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: 'handler_destroyed',
-					content: session.accumulatedContent,
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 				});
 			}
 		}

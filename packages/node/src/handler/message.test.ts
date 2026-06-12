@@ -368,6 +368,55 @@ describe('MessageHandler per-room isolation', () => {
 		expect(end.content).toBe('x');
 	});
 
+	it('S4: caps THINKING_END content to 256KB UTF-8 without corrupting multibyte chars', async () => {
+		const MAX_BYTES = 256 * 1024;
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		// 用 3 字节的多字节字符（'喵' = E5 96 B5）填充，使总字节数刻意跨越 256KB 边界，
+		// 且 256KB 不是 3 的整数倍 → 边界正好落在某个字符中间，验证不切坏多字节字符。
+		const multibyte = '喵'; // 3 bytes in UTF-8
+		const charCount = Math.ceil((MAX_BYTES + 10) / 3); // 超过上限若干字节
+		const huge = multibyte.repeat(charCount);
+		expect(new TextEncoder().encode(huge).length).toBeGreaterThan(MAX_BYTES);
+
+		cb.onThinkingDelta(huge);
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		const content = end.content as string;
+		const bytes = new TextEncoder().encode(content);
+		// 1) 不超过帧安全上限
+		expect(bytes.length).toBeLessThanOrEqual(MAX_BYTES);
+		// 2) 未被截坏：内容是原文的合法前缀，且不含 U+FFFD 替换字符（无半个字符残留）
+		expect(content).not.toContain('�');
+		expect(huge.startsWith(content)).toBe(true);
+		// 3) 确实接近上限（保留了尽可能多的内容，只丢了不足一个字符的尾字节）
+		expect(bytes.length).toBeGreaterThan(MAX_BYTES - 3);
+	});
+
+	it('S4: content under the 256KB cap passes through unchanged', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		const small = '喵abc'.repeat(1000); // well under 256KB
+		cb.onThinkingDelta(small);
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.content).toBe(small);
+	});
+
 	it('evicts idle room channel after thinking ends with empty pending', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
