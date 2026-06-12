@@ -3,7 +3,7 @@
   "name": "AiChat Claw",
   "description": "HuLa IM Channel + Agent Tools for openclaw",
   "version": "0.1.0",
-  "entry": "src/index.ts",
+  "entry": "dist/index.js",
   "configSchema": {
     "type": "object",
     "properties": {
