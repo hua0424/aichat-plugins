@@ -109,13 +109,14 @@ export function parseHelloOk(payload: unknown): {
 	if (typeof server?.version === 'string') {
 		result.version = server.version;
 	}
-	if (typeof server?.connId === 'string') {
+	if (typeof server?.connId === 'string' && server.connId.length > 0) {
 		result.connId = server.connId;
 	}
 
 	const policy = helloOk.policy as Record<string, unknown> | undefined;
-	if (typeof policy?.tickIntervalMs === 'number') {
-		result.tickIntervalMs = policy.tickIntervalMs;
+	const tick = policy?.tickIntervalMs;
+	if (Number.isFinite(tick) && (tick as number) > 0) {
+		result.tickIntervalMs = tick as number;
 	}
 
 	return result;
@@ -318,6 +319,10 @@ export class OpenclawAdapter implements ClawAdapter {
 			console.log('[openclaw] WebSocket opened, waiting for connect challenge...');
 			this.connectNonce = null;
 			this.connectSent = false;
+			// diagnostic fields negotiated in hello-ok; reset per connection so a
+			// reconnect that downgrades/changes connId does not keep stale values
+			this.negotiatedProtocol = null;
+			this.connId = null;
 			// 设置 challenge 超时
 			this.connectTimer = setTimeout(() => {
 				if (!this.connectSent) {

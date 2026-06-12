@@ -139,6 +139,66 @@ describe('parseHelloOk', () => {
 		expect(result.tickIntervalMs).toBeUndefined();
 	});
 
+	it('ignores NaN tickIntervalMs', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			server: { version: 'x' },
+			policy: { tickIntervalMs: NaN },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.tickIntervalMs).toBeUndefined();
+	});
+
+	it('ignores Infinity tickIntervalMs', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			server: { version: 'x' },
+			policy: { tickIntervalMs: Infinity },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.tickIntervalMs).toBeUndefined();
+	});
+
+	it('ignores zero tickIntervalMs', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			server: { version: 'x' },
+			policy: { tickIntervalMs: 0 },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.tickIntervalMs).toBeUndefined();
+	});
+
+	it('ignores negative tickIntervalMs', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			server: { version: 'x' },
+			policy: { tickIntervalMs: -1 },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.tickIntervalMs).toBeUndefined();
+	});
+
+	it('accepts a valid positive tickIntervalMs', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			server: { version: 'x' },
+			policy: { tickIntervalMs: 15000 },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.tickIntervalMs).toBe(15000);
+	});
+
+	it('treats empty-string connId as absent', () => {
+		const result = parseHelloOk({
+			type: 'hello-ok',
+			protocol: 4,
+			server: { version: 'x', connId: '' },
+		});
+		expect(result.ok).toBe(true);
+		expect(result.connId).toBeUndefined();
+	});
+
 	it('ignores non-integer protocol and non-string connId', () => {
 		const result = parseHelloOk({
 			type: 'hello-ok',
