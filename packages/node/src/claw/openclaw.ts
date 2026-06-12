@@ -44,6 +44,84 @@ function publicKeyRawBase64Url(publicKeyPem: string): string {
 }
 
 /**
+ * Pure builder for the `connect` req params (protocol v4).
+ *
+ * Extracted from sendConnect so the protocol negotiation + client block can be
+ * unit-tested without a live socket. The device identity / signature is built
+ * by the caller and passed in via `device`.
+ */
+export function buildConnectParams(opts: {
+	token?: string;
+	device: Record<string, unknown> | undefined;
+	role: string;
+	scopes: string[];
+	platform: string;
+}): Record<string, unknown> {
+	const { token, device, role, scopes, platform } = opts;
+	return {
+		minProtocol: 4,
+		maxProtocol: 4,
+		client: {
+			id: 'gateway-client',
+			displayName: 'aichat-node',
+			version: '0.1.0',
+			platform,
+			mode: 'backend',
+		},
+		auth: token ? { token } : undefined,
+		role,
+		scopes,
+		device,
+	};
+}
+
+/**
+ * Pure parser for a gateway `hello-ok` payload (protocol v4).
+ *
+ * v4 hello-ok adds `protocol` (integer) and `server.connId` (string); both are
+ * informational/diagnostic so their absence must NOT fail the handshake. The
+ * v3-compatible `server.version` and `policy.tickIntervalMs` are still read.
+ */
+export function parseHelloOk(payload: unknown): {
+	ok: boolean;
+	protocol?: number;
+	connId?: string;
+	version?: string;
+	tickIntervalMs?: number;
+} {
+	if (!payload || typeof payload !== 'object') return { ok: false };
+	const helloOk = payload as Record<string, unknown>;
+	if (helloOk.type !== 'hello-ok') return { ok: false };
+
+	const result: {
+		ok: boolean;
+		protocol?: number;
+		connId?: string;
+		version?: string;
+		tickIntervalMs?: number;
+	} = { ok: true };
+
+	if (Number.isInteger(helloOk.protocol)) {
+		result.protocol = helloOk.protocol as number;
+	}
+
+	const server = helloOk.server as Record<string, unknown> | undefined;
+	if (typeof server?.version === 'string') {
+		result.version = server.version;
+	}
+	if (typeof server?.connId === 'string') {
+		result.connId = server.connId;
+	}
+
+	const policy = helloOk.policy as Record<string, unknown> | undefined;
+	if (typeof policy?.tickIntervalMs === 'number') {
+		result.tickIntervalMs = policy.tickIntervalMs;
+	}
+
+	return result;
+}
+
+/**
  * Gateway 帧类型定义（精简版，基于 openclaw gateway protocol schema）
  */
 
@@ -111,6 +189,11 @@ export class OpenclawAdapter implements ClawAdapter {
 	private tickTimer: ReturnType<typeof setInterval> | null = null;
 	private lastTick: number | null = null;
 	private tickIntervalMs = 30000;
+
+	/** Negotiated protocol version reported by gateway hello-ok (v4) */
+	private negotiatedProtocol: number | null = null;
+	/** Connection id reported by gateway hello-ok (v4) */
+	private connId: string | null = null;
 
 	/** connect challenge nonce */
 	private connectNonce: string | null = null;
@@ -458,21 +541,13 @@ export class OpenclawAdapter implements ClawAdapter {
 			console.log(`[openclaw] Using device identity: ${deviceIdentity.deviceId.substring(0, 8)}...`);
 		}
 
-		const params: Record<string, unknown> = {
-			minProtocol: 3,
-			maxProtocol: 3,
-			client: {
-				id: 'gateway-client',
-				displayName: 'aichat-node',
-				version: '0.1.0',
-				platform,
-				mode: 'backend',
-			},
-			auth: this.token ? { token: this.token } : undefined,
+		const params: Record<string, unknown> = buildConnectParams({
+			token: this.token,
+			device,
 			role,
 			scopes,
-			device,
-		};
+			platform,
+		});
 
 		const requestId = randomUUID();
 		const frame: RequestFrame = {
@@ -494,13 +569,21 @@ export class OpenclawAdapter implements ClawAdapter {
 			this.pending.set(requestId, {
 				resolve: (payload) => {
 					clearTimeout(timeout);
-					const helloOk = payload as Record<string, unknown>;
-					if (helloOk?.type === 'hello-ok') {
-						console.log(`[openclaw] Connected to gateway v${(helloOk.server as Record<string, unknown>)?.version || 'unknown'}`);
-						const policy = helloOk.policy as Record<string, unknown> | undefined;
-						if (typeof policy?.tickIntervalMs === 'number') {
-							this.tickIntervalMs = policy.tickIntervalMs;
+					const parsed = parseHelloOk(payload);
+					if (parsed.ok) {
+						if (typeof parsed.protocol === 'number') {
+							this.negotiatedProtocol = parsed.protocol;
 						}
+						if (typeof parsed.connId === 'string') {
+							this.connId = parsed.connId;
+						}
+						if (typeof parsed.tickIntervalMs === 'number') {
+							this.tickIntervalMs = parsed.tickIntervalMs;
+						}
+						console.log(
+							`[openclaw] Connected to gateway v${parsed.version ?? 'unknown'}` +
+							` protocol=${parsed.protocol ?? 'unknown'} connId=${parsed.connId ?? 'unknown'}`,
+						);
 					}
 					this.connected = true;
 					this.reconnectDelay = 1000;
