@@ -10,7 +10,7 @@ export enum WSReqType {
 	STREAM_END = 19,
 	// REQ-004: THINKING 协议
 	THINKING_START = 20,
-	THINKING_DELTA = 21,
+	THINKING_DELTA = 21, // 21: S4 起废弃，不再发送、不复用
 	THINKING_END = 22,
 }
 
@@ -29,7 +29,6 @@ export type WSRespType =
 	| 'offline'
 	// REQ-004: THINKING 协议 + 群配置更新
 	| 'thinkingStart'
-	| 'thinkingDelta'
 	| 'thinkingEnd'
 	| 'groupConfigChange';
 
@@ -82,14 +81,6 @@ export interface ThinkingStartPayload {
 	triggerMsgId: string;
 }
 
-/** plugin → server: THINKING_DELTA (21) */
-export interface ThinkingDeltaPayload {
-	thinkingId?: string;
-	chunk: string;
-	seq: number;
-	roomId?: string | number;
-}
-
 /** plugin → server: THINKING_END (22) */
 export interface ThinkingEndPayload {
 	thinkingId?: string;
@@ -97,6 +88,8 @@ export interface ThinkingEndPayload {
 	status: 'complete' | 'error';
 	error?: string;
 	roomId?: string | number;
+	/** REQ-004 S4: 完整累计的 thinking 文本（替代逐帧 THINKING_DELTA） */
+	content: string;
 	/**
 	 * REQ-004 S3: 本轮以 skip 终结时的原因（显式 hula_skip_reply 的 reason，
 	 * 或 agent 未调用任何终结动作工具时的兜底 'agent_no_terminal_tool'）。
@@ -111,14 +104,6 @@ export interface ThinkingStartDTO {
 	roomId: string | number;
 	triggerMsgId: string;
 	thinkingId: string;
-}
-
-/** server → client: thinkingDelta 广播 */
-export interface ThinkingDeltaDTO {
-	fromUid: string | number;
-	roomId: string | number;
-	chunk: string;
-	seq: number;
 }
 
 /** server → client: thinkingEnd 广播 */

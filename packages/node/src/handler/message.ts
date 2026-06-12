@@ -19,14 +19,10 @@ interface ThinkingSession {
 	triggerMsgId: string;
 	/** 思考开始时间戳 */
 	startTime: number;
-	/** THINKING_DELTA 序列号 */
-	seq: number;
-	/** 思考内容累计（用于日志/debug） */
+	/** REQ-004 S4: 思考内容累计，THINKING_END 一次性整发 */
 	accumulatedContent: string;
 	/** 超时清理定时器 ID */
 	timeoutId?: ReturnType<typeof setTimeout>;
-	/** thinkingId 回填前缓存的 delta（防 race condition） */
-	pendingDeltas: Array<{ chunk: string; seq: number }>;
 	/** 是否已 finalized（防止 onThinkingEnd / handleThinkingEndBroadcast 双重清理） */
 	finalized: boolean;
 	/**
@@ -270,9 +266,7 @@ export class MessageHandler {
 			thinkingId: '',
 			triggerMsgId: msgId,
 			startTime: Date.now(),
-			seq: 0,
 			accumulatedContent: '',
-			pendingDeltas: [],
 			finalized: false,
 			terminalAction: 'none',
 		};
@@ -287,6 +281,7 @@ export class MessageHandler {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: 'thinking_session_timeout',
+				content: session.accumulatedContent,
 			});
 			this.thinkingSessions.delete(sessionKey);
 			this.flushPendingMessages(roomId);
@@ -304,20 +299,10 @@ export class MessageHandler {
 		});
 
 		const callbacks: ThinkingCallbacks = {
+			// REQ-004 S4: 仅本地累计，不再逐帧发送 THINKING_DELTA；
+			// 完整文本在 THINKING_END 一次性整发。
 			onThinkingDelta: (chunk) => {
-				session.seq++;
 				session.accumulatedContent += chunk;
-				if (!session.thinkingId) {
-					session.pendingDeltas.push({ chunk, seq: session.seq });
-					console.log(`[thinking] delta buffered (no thinkingId yet) session=${sessionKey} seq=${session.seq}`);
-					return;
-				}
-				this.ws.send(WSReqType.THINKING_DELTA, {
-					thinkingId: session.thinkingId,
-					chunk,
-					seq: session.seq,
-				});
-				console.log(`[thinking] delta session=${sessionKey} seq=${session.seq} chunkLen=${chunk.length}`);
 			},
 			// REQ-004 S3: 终结动作账本——send-wins + skip 记录原因
 			onTerminalTool: (info) => {
@@ -347,18 +332,6 @@ export class MessageHandler {
 				if (session.finalized) return;
 				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
-				// CR-S6: if thinkingId backfilled but pendingDeltas not flushed yet, flush first
-				if (session.thinkingId && session.pendingDeltas.length > 0) {
-					console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas before end`);
-					for (const { chunk, seq } of session.pendingDeltas) {
-						this.ws.send(WSReqType.THINKING_DELTA, {
-							thinkingId: session.thinkingId,
-							chunk,
-							seq,
-						});
-					}
-					session.pendingDeltas = [];
-				}
 				// REQ-004 S3: 计算本轮有效终结结果。
 				// 'none' = agent 未调用任何终结动作工具 → auto-skip 兜底。
 				let skipReason: string | undefined;
@@ -374,6 +347,7 @@ export class MessageHandler {
 					thinkingId: session.thinkingId || undefined,
 					durationMs,
 					status: 'complete',
+					content: session.accumulatedContent,
 					// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
 					...(skipReason !== undefined ? { skipReason } : {}),
 				});
@@ -385,16 +359,13 @@ export class MessageHandler {
 				if (session.finalized) return;
 				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
-				if (session.pendingDeltas.length > 0) {
-					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (error)`);
-					session.pendingDeltas = [];
-				}
 				console.error(`[thinking] error session=${sessionKey} reason=${error.message}`);
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: error.message,
+					content: session.accumulatedContent,
 				});
 				this.thinkingSessions.delete(sessionKey);
 				this.flushPendingMessages(roomId);
@@ -424,22 +395,9 @@ export class MessageHandler {
 			return;
 		}
 
-		// 回填 thinkingId
+		// 回填 thinkingId（S4：仅用于 THINKING_END 携带，不再触发 delta flush）
 		session.thinkingId = data.thinkingId || '';
 		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
-
-		// 刷新缓存的 deltas
-		if (session.pendingDeltas.length > 0) {
-			console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas`);
-			for (const { chunk, seq } of session.pendingDeltas) {
-				this.ws.send(WSReqType.THINKING_DELTA, {
-					thinkingId: session.thinkingId,
-					chunk,
-					seq,
-				});
-			}
-			session.pendingDeltas = [];
-		}
 	}
 
 	/** M3: 群配置变更通知处理 */
@@ -542,6 +500,7 @@ export class MessageHandler {
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: 'handler_destroyed',
+					content: session.accumulatedContent,
 				});
 			}
 		}

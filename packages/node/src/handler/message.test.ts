@@ -6,6 +6,7 @@ import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 
 const THINKING_END = WSReqType.THINKING_END;
+const THINKING_DELTA = WSReqType.THINKING_DELTA;
 
 interface ChatCall {
 	message: string;
@@ -161,12 +162,15 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.length >= 1);
 		const cb = calls[0].callbacks;
 
+		cb.onThinkingDelta('reasoning');
 		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
 		cb.onThinkingEnd(100);
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
 		expect(end).not.toHaveProperty('skipReason');
+		// S4: END 帧同时携带累计内容
+		expect(end.content).toBe('reasoning');
 	});
 
 	it('terminal=skipped with reason → THINKING_END carries that skipReason', async () => {
@@ -257,6 +261,111 @@ describe('MessageHandler per-room isolation', () => {
 		expect(sent.filter((f) => f.type === THINKING_END).length).toBe(endFramesBefore);
 		// 已发出的 THINKING_END 仍是兜底 skip，未被迟到 sent 篡改
 		expect((sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>).skipReason).toBe('agent_no_terminal_tool');
+	});
+
+	it('S4: onThinkingDelta accumulates chunks but NEVER sends a THINKING_DELTA frame', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		// 即使没有 thinkingId 回填，也不缓存、不发送 delta 帧
+		cb.onThinkingDelta('hello ');
+		cb.onThinkingDelta('world');
+
+		expect(sent.some((f) => f.type === THINKING_DELTA)).toBe(false);
+	});
+
+	it('S4: THINKING_END carries the full accumulated content', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onThinkingDelta('foo');
+		cb.onThinkingDelta('bar');
+		cb.onThinkingDelta('baz');
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end.content).toBe('foobarbaz');
+	});
+
+	it('S4: error path → END has status error AND content === accumulated (partial)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onThinkingDelta('partial-');
+		cb.onThinkingDelta('text');
+		cb.onError(new Error('boom'));
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('error');
+		expect(end.error).toBe('boom');
+		expect(end.content).toBe('partial-text');
+	});
+
+	it('S4: timeout path → END has status error, error thinking_session_timeout, content === accumulated', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws, sent } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+
+			handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+			// flush debouncer → triggerAgentLoop → adapter.chat called
+			await vi.advanceTimersByTimeAsync(5);
+			expect(calls.length).toBe(1);
+			const cb = calls[0].callbacks;
+
+			cb.onThinkingDelta('before-');
+			cb.onThinkingDelta('timeout');
+
+			// 推进到 5 分钟超时
+			await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 10);
+
+			const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+			expect(end.status).toBe('error');
+			expect(end.error).toBe('thinking_session_timeout');
+			expect(end.content).toBe('before-timeout');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('S4: thinkingId still backfills from thinkingStart broadcast → END carries it', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		// server 广播 thinkingStart 回填 thinkingId
+		handler.handle({
+			type: 'thinkingStart',
+			data: { fromUid: SELF_UID, roomId: 1, triggerMsgId: '1', thinkingId: 'tid-abc' },
+		} as never);
+
+		cb.onThinkingDelta('x');
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.thinkingId).toBe('tid-abc');
+		expect(end.content).toBe('x');
 	});
 
 	it('evicts idle room channel after thinking ends with empty pending', async () => {
