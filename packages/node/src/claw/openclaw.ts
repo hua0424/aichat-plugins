@@ -123,6 +123,46 @@ export function parseHelloOk(payload: unknown): {
 }
 
 /**
+ * REQ-004 S3: 纯函数——把一次 tool 调用分类为终结动作（send / skip）或非终结动作（null）。
+ *
+ * agent 可经两条合法路径回复 HuLa：
+ *  - claw 工具 hula_send_message（→ sent）
+ *  - openclaw 内置 message 工具且 channel==='hula'（→ sent，constraint A②：仅 hula 频道计数）
+ * 跳过则走 hula_skip_reply（→ skipped，可带 reason）。
+ * 其余工具（含 message 打到非 hula 频道、hula_find_friend 等）不是终结动作，返回 null。
+ *
+ * args 来自 tool 流 phase:'start' 事件（result 阶段可能不回显 args，故由调用方按
+ * toolCallId 关联）。channel / reason 都从 args 读取。
+ */
+export function classifyTerminalTool(
+	name: string,
+	args: Record<string, unknown> | undefined,
+): { action: 'sent' | 'skipped'; tool: string; reason?: string } | null {
+	if (name === 'hula_send_message') {
+		return { action: 'sent', tool: 'hula_send_message' };
+	}
+	if (name === 'hula_skip_reply') {
+		const reason = typeof args?.reason === 'string' ? (args.reason as string) : undefined;
+		return { action: 'skipped', tool: 'hula_skip_reply', reason };
+	}
+	if (name === 'message') {
+		// 仅当 message 工具打到 hula 频道时才算终结动作（其他频道与本轮 HuLa 回复无关）。
+		// 容忍 openclaw 可能的大小写/空白归一化与数组形式 channel，但语义锁定：只有 hula 频道计数。
+		const channel = args?.channel;
+		const channelStr = typeof channel === 'string'
+			? channel.trim().toLowerCase()
+			: (Array.isArray(channel) && typeof channel[0] === 'string'
+				? channel[0].trim().toLowerCase()
+				: '');
+		if (channelStr === 'hula') {
+			return { action: 'sent', tool: 'message' };
+		}
+		return null;
+	}
+	return null;
+}
+
+/**
  * Gateway 帧类型定义（精简版，基于 openclaw gateway protocol schema）
  */
 
@@ -170,6 +210,12 @@ interface PendingChat {
 	fullContent: string;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
+	/**
+	 * REQ-004 S3: tool 流 phase:'start' 捕获的 toolCallId → {name,args}。
+	 * result 阶段可能不回显 args（如 channel / skip reason），故按 toolCallId 关联。
+	 * chat 结束时随 cleanup 一并丢弃，天然有界。
+	 */
+	toolStarts: Map<string, { name: string; args: Record<string, unknown> | undefined }>;
 }
 
 /**
@@ -248,17 +294,20 @@ export class OpenclawAdapter implements ClawAdapter {
 		const requestId = randomUUID();
 		const idempotencyKey = randomUUID();
 
-		// 在 message 中注入 tool 调用指令（openclaw gateway 不支持 instructions 字段）
+		// 在 message 中注入角色分工说明（openclaw gateway 不支持 instructions 字段）
 		// 注意：避免使用 [SYSTEM] / [System Message] 等标记，会被 openclaw 安全机制过滤
+		// REQ-004 S3：从「强制 send」改为语义化的角色分工引导——仍优先引导 hula_send_message，
+		// 但允许 hula_skip_reply 作为对等的合法终结动作（send 至少一次或 skip 恰好一次）。
 		const roomIdHint = context?.roomId
-			? `The current room ID is ${context.roomId}. You MUST use exactly this roomId value when calling hula_send_message. `
+			? `当前会话已绑定房间（room ${context.roomId}），hula_send_message 无需也不应再传 roomId。`
 			: '';
 		const enrichedMessage =
-			'IMPORTANT: You have a tool called hula_send_message. ' +
+			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
+			'要回复用户时，请调用 hula_send_message 工具（已绑定当前房间，优先用它），把给用户看的内容写进 content。' +
 			roomIdHint +
-			'After you finish thinking, you MUST call this tool with the roomId and your response ' +
-			'to send the reply to the user. Do NOT just output text — always use the tool.\n\n' +
-			'--- User message below ---\n' + message;
+			'如果判断本轮无需回复（如纯客套、无实质内容、消息不需要回应），请调用 hula_skip_reply。' +
+			'send 至少一次或 skip 恰好一次，二者是本轮的合法终结动作。\n\n' +
+			'--- 用户消息如下 ---\n' + message;
 
 		const params = {
 			message: enrichedMessage,
@@ -296,6 +345,7 @@ export class OpenclawAdapter implements ClawAdapter {
 			fullContent: '',
 			done: false,
 			startTime: Date.now(),
+			toolStarts: new Map(),
 		});
 
 		this.ws.send(JSON.stringify(frame));
@@ -465,6 +515,11 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+		// REQ-004 S3: tool 流 → 终结动作检测（send / skip）
+		if (evt.stream === 'tool') {
+			this.processToolStreamEvent(chat, evt);
+			return;
+		}
 		// assistant 流 → thinking delta (REQ-004)
 		if (evt.stream === 'assistant') {
 			const delta = evt.data.delta as string | undefined;
@@ -480,6 +535,11 @@ export class OpenclawAdapter implements ClawAdapter {
 				chat.done = true;
 				const durationMs = Date.now() - chat.startTime;
 				chat.callbacks.onThinkingEnd(durationMs);
+				// P1-2 假设：openclaw 在 lifecycle phase==='end' 之前已投递本 run 内所有 tool 流
+				// 事件（end 语义即"run 已完成"，按协议先于它的 tool result 都应已处理）。此处同步
+				// cleanup 会丢弃 run:{runId}，若有 tool result 在 end 之后到达将找不到 chat 被丢弃
+				// （→ 可能漏一次 send → 错误自动跳过）。当前未发现 openclaw 会乱序投递，故保留同步
+				// cleanup；如后续观测到 result 晚于 end，需改为延迟 cleanup 或按 runId 暂存终结态。
 				this.cleanupChatByRunId(evt.runId);
 			} else if (phase === 'error') {
 				chat.done = true;
@@ -487,6 +547,49 @@ export class OpenclawAdapter implements ClawAdapter {
 				this.cleanupChatByRunId(evt.runId);
 			}
 		}
+	}
+
+	/**
+	 * REQ-004 S3: 处理 tool 流事件，识别终结动作并回调 onTerminalTool。
+	 * - phase:'start' → 按 toolCallId 记下 {name,args}（result 阶段可能不回显 args）。
+	 * - phase:'result' 且 isError!==true → 仅用 start 阶段捕获的 args 分类（不回退 result，见下方说明）。
+	 */
+	private processToolStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+		const data = evt.data;
+		const phase = data.phase as string | undefined;
+		const name = data.name as string | undefined;
+		const toolCallId = data.toolCallId as string | undefined;
+
+		if (phase === 'start') {
+			if (toolCallId && name) {
+				const args = (data.args as Record<string, unknown> | undefined) ?? undefined;
+				chat.toolStarts.set(toolCallId, { name, args });
+			}
+			return;
+		}
+
+		if (phase !== 'result') return;
+		// 只统计成功的工具结果——失败的 send/skip 不构成终结动作
+		if (data.isError === true) {
+			if (toolCallId) chat.toolStarts.delete(toolCallId);
+			return;
+		}
+		if (!name) return;
+
+		// 仅信任 start 事件捕获的 args（含 channel / reason），不回退到 result 自带字段：
+		// result 不一定回显 channel，若用它替代 args 会把真实的 hula message 误判为 null（漏 send →
+		// 错误自动跳过）。hula_send_message / hula_skip_reply 按 NAME 分类（args 只用于 skip reason），
+		// 故丢弃 result 回退对它们零成本；message 工具缺 start args 时 channel 未知 → null 是保守正确选择。
+		const started = toolCallId ? chat.toolStarts.get(toolCallId) : undefined;
+		const classified = classifyTerminalTool(name, started?.args);
+		if (toolCallId) chat.toolStarts.delete(toolCallId);
+		if (!classified) return;
+
+		chat.callbacks.onTerminalTool?.({
+			action: classified.action,
+			tool: classified.tool,
+			reason: classified.reason,
+		});
 	}
 
 	// ─── Connect handshake ───

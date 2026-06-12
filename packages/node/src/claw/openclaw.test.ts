@@ -1,5 +1,88 @@
 import { describe, it, expect } from 'vitest';
-import { buildConnectParams, parseHelloOk } from './openclaw.js';
+import { buildConnectParams, parseHelloOk, classifyTerminalTool } from './openclaw.js';
+
+describe('classifyTerminalTool (REQ-004 S3 terminal-action classifier)', () => {
+	it('classifies hula_send_message as sent', () => {
+		expect(classifyTerminalTool('hula_send_message', undefined)).toEqual({
+			action: 'sent',
+			tool: 'hula_send_message',
+		});
+	});
+
+	it('classifies hula_skip_reply as skipped (no reason)', () => {
+		expect(classifyTerminalTool('hula_skip_reply', undefined)).toEqual({
+			action: 'skipped',
+			tool: 'hula_skip_reply',
+			reason: undefined,
+		});
+	});
+
+	it('classifies hula_skip_reply as skipped and extracts reason from args', () => {
+		expect(classifyTerminalTool('hula_skip_reply', { reason: '纯客套' })).toEqual({
+			action: 'skipped',
+			tool: 'hula_skip_reply',
+			reason: '纯客套',
+		});
+	});
+
+	it('classifies built-in message tool with channel:hula as sent', () => {
+		expect(classifyTerminalTool('message', { channel: 'hula', text: 'hi' })).toEqual({
+			action: 'sent',
+			tool: 'message',
+		});
+	});
+
+	it('ignores built-in message tool targeting a non-hula channel', () => {
+		expect(classifyTerminalTool('message', { channel: 'slack', text: 'hi' })).toBeNull();
+	});
+
+	it('ignores built-in message tool with no channel', () => {
+		expect(classifyTerminalTool('message', { text: 'hi' })).toBeNull();
+	});
+
+	// P2-1: channel 匹配容忍大小写/空白/数组形式（openclaw 可能归一化），语义仍锁定仅 hula
+	it('classifies message tool with channel "Hula" (case-insensitive) as sent', () => {
+		expect(classifyTerminalTool('message', { channel: 'Hula', text: 'hi' })).toEqual({
+			action: 'sent',
+			tool: 'message',
+		});
+	});
+
+	it('classifies message tool with channel " hula " (trimmed whitespace) as sent', () => {
+		expect(classifyTerminalTool('message', { channel: ' hula ', text: 'hi' })).toEqual({
+			action: 'sent',
+			tool: 'message',
+		});
+	});
+
+	it('classifies message tool with channel ["hula"] (array form) as sent', () => {
+		expect(classifyTerminalTool('message', { channel: ['hula'], text: 'hi' })).toEqual({
+			action: 'sent',
+			tool: 'message',
+		});
+	});
+
+	it('ignores message tool with channel "discord" (string)', () => {
+		expect(classifyTerminalTool('message', { channel: 'discord', text: 'hi' })).toBeNull();
+	});
+
+	it('ignores message tool with empty-string channel', () => {
+		expect(classifyTerminalTool('message', { channel: '', text: 'hi' })).toBeNull();
+	});
+
+	it('ignores message tool with undefined channel', () => {
+		expect(classifyTerminalTool('message', { channel: undefined, text: 'hi' })).toBeNull();
+	});
+
+	it('ignores message tool with channel ["discord"] (array form)', () => {
+		expect(classifyTerminalTool('message', { channel: ['discord'], text: 'hi' })).toBeNull();
+	});
+
+	it('ignores unrelated tools (not a terminal action)', () => {
+		expect(classifyTerminalTool('hula_find_friend', { query: 'bob' })).toBeNull();
+		expect(classifyTerminalTool('some_other_tool', undefined)).toBeNull();
+	});
+});
 
 describe('buildConnectParams', () => {
 	const baseDevice = {

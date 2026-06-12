@@ -97,6 +97,12 @@ export interface ThinkingEndPayload {
 	status: 'complete' | 'error';
 	error?: string;
 	roomId?: string | number;
+	/**
+	 * REQ-004 S3: 本轮以 skip 终结时的原因（显式 hula_skip_reply 的 reason，
+	 * 或 agent 未调用任何终结动作工具时的兜底 'agent_no_terminal_tool'）。
+	 * 以 send 终结时不带此字段；附加字段，不破坏既有 status/thinkingId/durationMs。
+	 */
+	skipReason?: string;
 }
 
 /** server → client: thinkingStart 广播 */

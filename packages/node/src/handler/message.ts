@@ -29,6 +29,15 @@ interface ThinkingSession {
 	pendingDeltas: Array<{ chunk: string; seq: number }>;
 	/** 是否已 finalized（防止 onThinkingEnd / handleThinkingEndBroadcast 双重清理） */
 	finalized: boolean;
+	/**
+	 * REQ-004 S3: 本轮终结动作账本。
+	 * 'sent'：观测到一次 send（send-wins，一旦 sent 不再被后到的 skip 覆盖）；
+	 * 'skipped'：观测到 skip 且尚未 sent；
+	 * 'none'：未观测到任何终结动作（onThinkingEnd 时回退为 auto-skip）。
+	 */
+	terminalAction: 'sent' | 'skipped' | 'none';
+	/** REQ-004 S3: skip 原因（显式 skip 带的 reason，或 auto-skip 的占位原因） */
+	skipReason?: string;
 }
 
 /**
@@ -265,6 +274,7 @@ export class MessageHandler {
 			accumulatedContent: '',
 			pendingDeltas: [],
 			finalized: false,
+			terminalAction: 'none',
 		};
 
 		// 设置 5 分钟超时定时器（P-M2-3）
@@ -309,6 +319,24 @@ export class MessageHandler {
 				});
 				console.log(`[thinking] delta session=${sessionKey} seq=${session.seq} chunkLen=${chunk.length}`);
 			},
+			// REQ-004 S3: 终结动作账本——send-wins + skip 记录原因
+			onTerminalTool: (info) => {
+				if (info.action === 'sent') {
+					if (session.terminalAction === 'skipped') {
+						console.log(`[thinking] terminal override: prior 'skipped' replaced by 'sent' (send-wins) session=${sessionKey}`);
+					}
+					session.terminalAction = 'sent';
+					session.skipReason = undefined;
+				} else {
+					// skip：仅当尚未 sent 时才生效（send-wins）
+					if (session.terminalAction === 'sent') {
+						console.log(`[thinking] ignoring 'skipped' after 'sent' (send-wins) session=${sessionKey}`);
+						return;
+					}
+					session.terminalAction = 'skipped';
+					session.skipReason = info.reason;
+				}
+			},
 			onThinkingEnd: (durationMs) => {
 				if (session.finalized) return;
 				session.finalized = true;
@@ -325,12 +353,25 @@ export class MessageHandler {
 					}
 					session.pendingDeltas = [];
 				}
+				// REQ-004 S3: 计算本轮有效终结结果。
+				// 'none' = agent 未调用任何终结动作工具 → auto-skip 兜底。
+				let skipReason: string | undefined;
+				if (session.terminalAction === 'sent') {
+					skipReason = undefined;
+				} else if (session.terminalAction === 'skipped') {
+					skipReason = session.skipReason;
+				} else {
+					skipReason = 'agent_no_terminal_tool';
+					console.log(`[thinking] no terminal tool observed, auto-skip session=${sessionKey} reason=${skipReason}`);
+				}
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
 					durationMs,
 					status: 'complete',
+					// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
+					...(skipReason !== undefined ? { skipReason } : {}),
 				});
-				console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs}`);
+				console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs} terminal=${session.terminalAction}${skipReason ? ` skipReason=${skipReason}` : ''}`);
 				this.thinkingSessions.delete(sessionKey);
 				this.flushPendingMessages(roomId);
 			},

@@ -55,4 +55,13 @@ export class HulaApiClientPool {
 	get hasAnyClient(): boolean {
 		return this.defaultClient !== null || this.pool.size > 0;
 	}
+
+	/**
+	 * 是否处于多 token 模式（池中已注册按 aiclawUid 区分的独立客户端）。
+	 * 多 token 模式下，无会话上下文的发送路径（如 channel.outbound）无法
+	 * 选择正确身份，必须 loud-fail 而非以默认身份冒名发送。
+	 */
+	get isMultiToken(): boolean {
+		return this.pool.size > 0;
+	}
 }
