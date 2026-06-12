@@ -499,9 +499,10 @@ export class MessageHandler {
 			}
 		}
 		this.thinkingSessions.clear();
-		// 清理所有房间的待处理队列与定时器
+		// 清理所有房间的待处理队列与定时器；用 cancel 而非 flush，
+		// 避免 teardown 时 flush 重新触发 triggerAgentLoop 复活会话。
 		for (const channel of this.roomChannels.values()) {
-			channel.debouncer.flush();
+			channel.debouncer.cancel();
 			channel.pendingMessages = [];
 		}
 		this.roomChannels.clear();
@@ -510,12 +511,33 @@ export class MessageHandler {
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
 	private flushPendingMessages(roomId: number): void {
 		const channel = this.roomChannels.get(roomId);
-		if (!channel || channel.pendingMessages.length === 0) return;
+		if (!channel || channel.pendingMessages.length === 0) {
+			this.maybeEvictRoom(roomId);
+			return;
+		}
 		console.log(`[handler] Flushing ${channel.pendingMessages.length} pending messages for room ${roomId}`);
 		const pending = channel.pendingMessages;
 		channel.pendingMessages = [];
 		for (const msg of pending) {
 			channel.debouncer.push(msg);
+		}
+	}
+
+	/**
+	 * REQ-004 S2: 回收空闲房间通道，防止长生命周期进程下 roomChannels 无界增长。
+	 * 仅当无待处理消息、无缓冲 debounce、无活跃 thinking 会话时回收；
+	 * 下一条消息会按需重建通道（lastCtx 每次收信都会重设）。
+	 */
+	private maybeEvictRoom(roomId: number): void {
+		const channel = this.roomChannels.get(roomId);
+		if (!channel) return;
+		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		if (
+			channel.pendingMessages.length === 0 &&
+			channel.debouncer.pending === 0 &&
+			!this.thinkingSessions.has(sessionKey)
+		) {
+			this.roomChannels.delete(roomId);
 		}
 	}
 }

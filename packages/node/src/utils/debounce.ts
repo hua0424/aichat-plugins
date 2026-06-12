@@ -61,6 +61,16 @@ export class MessageDebouncer {
 		this.onFlush(merged);
 	}
 
+	/** 取消并丢弃缓冲（teardown 时用，避免 flush 重新触发回调） */
+	cancel(): void {
+		if (this.timer) {
+			clearTimeout(this.timer);
+			this.timer = null;
+		}
+		this.buffer = [];
+		this.startTime = 0;
+	}
+
 	get pending(): number {
 		return this.buffer.length;
 	}

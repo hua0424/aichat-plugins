@@ -131,4 +131,37 @@ describe('MessageHandler per-room isolation', () => {
 		await new Promise((r) => setTimeout(r, 60));
 		expect(calls.length).toBe(0);
 	});
+
+	it('destroy() does not resurrect agent loops from buffered messages', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		// 长 debounce，确保消息停在 buffer 里还没 flush
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10000, maxWaitMs: 10000 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'buffered', 1) } as never);
+		// 此刻消息在 debouncer buffer 中，尚未触发 chat
+		expect(calls.length).toBe(0);
+
+		handler.destroy();
+		await new Promise((r) => setTimeout(r, 50));
+
+		// teardown 用 cancel 丢弃缓冲，不得 flush 复活 agent loop
+		expect(calls.length).toBe(0);
+	});
+
+	it('evicts idle room channel after thinking ends with empty pending', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// 结束 thinking，pending 为空 → 通道应被回收
+		calls[0].callbacks.onThinkingEnd(100);
+		await new Promise((r) => setTimeout(r, 20));
+
+		// @ts-expect-error 访问私有字段做白盒断言
+		expect(handler.roomChannels.has(7)).toBe(false);
+	});
 });
