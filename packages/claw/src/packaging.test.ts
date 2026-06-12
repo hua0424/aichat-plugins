@@ -54,4 +54,41 @@ describe('packaging contract', () => {
 				'openclaw would silently skip the plugin. Did the build run? Expected built output under dist/.',
 		).toBe(true);
 	});
+
+	it('package.json "openclaw.extensions" lists string paths that all exist on disk', () => {
+		const pkg = readJson('package.json');
+		const openclaw = pkg.openclaw;
+		expect(
+			openclaw !== null && typeof openclaw === 'object',
+			'package.json must declare an "openclaw" object. openclaw 2026.6.5 discovers/loads ' +
+				'a plugin via openclaw.extensions; without it the gateway SILENTLY skips the plugin.',
+		).toBe(true);
+
+		const extensions = (openclaw as Record<string, unknown>).extensions;
+		expect(
+			Array.isArray(extensions),
+			'package.json "openclaw.extensions" must be an array of built entry paths.',
+		).toBe(true);
+
+		const exts = extensions as unknown[];
+		expect(
+			exts.length > 0,
+			'package.json "openclaw.extensions" must be non-empty; an empty array means openclaw ' +
+				'finds no entry and SILENTLY skips the plugin.',
+		).toBe(true);
+
+		for (const ext of exts) {
+			expect(
+				typeof ext,
+				`package.json "openclaw.extensions" entries must be strings, got ${typeof ext}: ${String(ext)}.`,
+			).toBe('string');
+
+			const extPath = join(packageRoot, ext as string);
+			expect(
+				existsSync(extPath),
+				`package.json "openclaw.extensions" -> "${ext as string}" does not exist at ${extPath}. ` +
+					'openclaw 2026.6.5 would SILENTLY skip the plugin. Did the build run? Expected built output under dist/.',
+			).toBe(true);
+		}
+	});
 });

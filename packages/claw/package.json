@@ -4,6 +4,9 @@
   "description": "aichat-claw：openclaw Channel Plugin（HuLa Channel + Agent Tools）",
   "type": "module",
   "main": "dist/index.js",
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
