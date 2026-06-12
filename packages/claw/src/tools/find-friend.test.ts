@@ -42,6 +42,17 @@ describe('createFindFriendTool (factory)', () => {
 		expect(clientA.searchFriends).not.toHaveBeenCalled();
 	});
 
+	it('returns { error } (does not throw) when searchFriends rejects', async () => {
+		const clientA = fakeClient();
+		// API 失败：searchFriends 拒绝 → execute 必须捕获并返回 { error }，不外抛
+		clientA.searchFriends.mockRejectedValueOnce(new Error('network down'));
+		const pool = fakePool({ '100': clientA });
+		const tool = createFindFriendTool(pool, ctx('aiclaw-100-room-1'));
+
+		const result = await tool.execute('d', { keyword: 'Bob' });
+		expect(result).toHaveProperty('error');
+	});
+
 	it('rejects empty keyword', async () => {
 		const clientA = fakeClient();
 		const pool = fakePool({ '100': clientA });

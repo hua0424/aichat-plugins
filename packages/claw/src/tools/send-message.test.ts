@@ -85,6 +85,17 @@ describe('createSendMessageTool (factory)', () => {
 		expect(clientA.sendMessage).not.toHaveBeenCalled();
 	});
 
+	it('returns { error } (does not throw) when sendMessage rejects', async () => {
+		const clientA = fakeClient();
+		// API 失败：sendMessage 拒绝 → execute 必须捕获并返回 { error }，不外抛
+		clientA.sendMessage.mockRejectedValueOnce(new Error('network down'));
+		const pool = fakePool({ '100': clientA });
+		const tool = createSendMessageTool(pool, ctx('aiclaw-100-room-1'));
+
+		const result = await tool.execute('f', { content: 'hi' });
+		expect(result).toHaveProperty('error');
+	});
+
 	it('does not declare roomId as a tool parameter', () => {
 		const pool = fakePool({ '100': fakeClient() });
 		const tool = createSendMessageTool(pool, ctx('aiclaw-100-room-1'));

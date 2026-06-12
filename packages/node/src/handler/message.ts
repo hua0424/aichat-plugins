@@ -65,7 +65,11 @@ export class MessageHandler {
 	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）
 	private roomChannels = new Map<number, RoomChannel>();
 
-	/** 已处理的 msgId 集合（防重复推送） */
+	/**
+	 * 已处理的 msgId 集合（防重复推送）。
+	 * 全局去重是有意为之：msgId 在所有房间间全局唯一，无需按房间隔离；
+	 * 上限 500、FIFO 淘汰最旧，避免无界增长。
+	 */
 	private processedMsgIds = new Set<string>();
 
 	/** thinking session 超时时间（5 分钟） */
@@ -451,10 +455,6 @@ export class MessageHandler {
 				case 'daily_limit_exceeded':
 					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
 					this.sendAutoReply(Number(roomId), '今日发言上限已达，已自动跳过本次响应');
-					break;
-				case 'short_reply_skip':
-					// 短回复跳过不触发 autoReply，避免短回复+autoReply 互相触发新循环
-					console.log('[anti-loop] short reply skip triggered, no autoReply');
 					break;
 				default:
 					console.log(`[thinking] server error: ${error} (no autoReply)`);

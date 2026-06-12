@@ -42,9 +42,14 @@ export function createFindFriendTool(pool: HulaApiClientPool, ctx: ToolContext):
 				return { error: '发送身份不可用' };
 			}
 
-			const friends = await client.searchFriends(keyword);
-			console.log(`[hula_find_friend] found ${friends.length} results for "${keyword.substring(0, 30)}"`);
-			return { friends };
+			try {
+				const friends = await client.searchFriends(keyword);
+				console.log(`[hula_find_friend] found ${friends.length} results for "${keyword.substring(0, 30)}"`);
+				return { friends };
+			} catch (err) {
+				console.error(`[hula_find_friend] search failed keyword="${keyword.substring(0, 30)}": ${err instanceof Error ? err.message : String(err)}`);
+				return { error: err instanceof Error ? err.message : '搜索失败' };
+			}
 		},
 	};
 }

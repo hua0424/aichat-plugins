@@ -32,8 +32,8 @@ export interface OpenClawPluginApi {
  * 不含 runId / channelId（openclaw 2026.6.5）。
  */
 export interface ToolContext {
-	/** 会话标识，格式 aiclaw-{uid}-room-{roomId}，openclaw 可能规范化为 agent:main:aiclaw-... */
-	sessionKey: string;
+	/** 会话标识，格式 aiclaw-{uid}-room-{roomId}，openclaw 可能规范化为 agent:main:aiclaw-...；某些路径下可能缺失 */
+	sessionKey?: string | null;
 	/** openclaw 内部 sessionId（UUID） */
 	sessionId?: string;
 	/** agent 标识（如 main） */
