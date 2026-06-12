@@ -32,7 +32,7 @@ export class HulaApiClient {
 	 * 发送消息
 	 * @param extra 额外字段（如 { autoReply: true, thinkingId: string }），server 侧不入库
 	 */
-	async sendMessage(roomId: number, content: string, extra?: Record<string, unknown>): Promise<{ msgId: number }> {
+	async sendMessage(roomId: number | string, content: string, extra?: Record<string, unknown>): Promise<{ msgId: number }> {
 		const body: Record<string, unknown> = {
 			roomId,
 			msgType: 1, // 文本消息

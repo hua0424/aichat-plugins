@@ -41,6 +41,16 @@ interface LastMessageContext {
 }
 
 /**
+ * REQ-004 S2: 单房间的处理状态。
+ * debounce 队列 / 待处理消息 / 触发上下文均按房间隔离，杜绝跨房间污染。
+ */
+interface RoomChannel {
+	debouncer: MessageDebouncer;
+	pendingMessages: string[];
+	lastCtx: LastMessageContext;
+}
+
+/**
  * 消息处理器（REQ-004 Agent Loop 模型）
  * 接收用户消息 → ACK → 去重 → 触发 agent loop → THINKING 流式输出
  */
@@ -48,14 +58,18 @@ export class MessageHandler {
 	private ws: HulaWSClient;
 	private adapter: ClawAdapter;
 	private selfUid: number;
-	private debouncer: MessageDebouncer;
 
 	// REQ-004: 替换 streaming boolean 为 thinkingSessions Map
 	private thinkingSessions = new Map<string, ThinkingSession>();
-	private pendingMessages: string[] = [];
-	private lastCtx: LastMessageContext | null = null;
 
-	/** 已处理的 msgId 集合（防重复推送） */
+	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）
+	private roomChannels = new Map<number, RoomChannel>();
+
+	/**
+	 * 已处理的 msgId 集合（防重复推送）。
+	 * 全局去重是有意为之：msgId 在所有房间间全局唯一，无需按房间隔离；
+	 * 上限 500、FIFO 淘汰最旧，避免无界增长。
+	 */
 	private processedMsgIds = new Set<string>();
 
 	/** thinking session 超时时间（5 分钟） */
@@ -68,18 +82,41 @@ export class MessageHandler {
 	// REQ-004 M3: 内嵌 HulaApiClient（仅用于 autoReply / CLI）
 	private apiClient: HulaApiClient | null = null;
 
-	constructor(ws: HulaWSClient, adapter: ClawAdapter, selfUid: number, apiClient?: HulaApiClient) {
+	/** debounce 配置（可注入，便于测试） */
+	private readonly debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number };
+
+	constructor(
+		ws: HulaWSClient,
+		adapter: ClawAdapter,
+		selfUid: number,
+		apiClient?: HulaApiClient,
+		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
+	) {
 		this.ws = ws;
 		this.adapter = adapter;
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
 		this.groupConfigCache = new GroupConfigCache();
 		this.apiClient = apiClient || null;
-		this.debouncer = new MessageDebouncer((merged) => {
-			this.triggerAgentLoop(merged).catch((err) => {
-				console.error('[handler] triggerAgentLoop unhandled error:', err.message);
-			});
-		});
+		this.debounceOptions = debounceOptions;
+	}
+
+	/**
+	 * REQ-004 S2: 获取/创建指定房间的处理通道。
+	 * 每个房间有独立的 debouncer，flush 时只触发该房间的 agent loop。
+	 */
+	private getRoomChannel(roomId: number): RoomChannel {
+		let channel = this.roomChannels.get(roomId);
+		if (!channel) {
+			const debouncer = new MessageDebouncer((merged) => {
+				this.triggerAgentLoop(roomId, merged).catch((err) => {
+					console.error(`[handler] triggerAgentLoop unhandled error (room ${roomId}):`, err.message);
+				});
+			}, this.debounceOptions);
+			channel = { debouncer, pendingMessages: [], lastCtx: { roomId, fromUid: 0, msgId: '' } };
+			this.roomChannels.set(roomId, channel);
+		}
+		return channel;
 	}
 
 	handle(msg: WSResponse): void {
@@ -155,8 +192,9 @@ export class MessageHandler {
 			}
 		}
 
-		// 缓存消息上下文
-		this.lastCtx = { roomId, fromUid, msgId };
+		// 缓存消息上下文（按房间隔离）
+		const channel = this.getRoomChannel(roomId);
+		channel.lastCtx = { roomId, fromUid, msgId };
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
 
@@ -164,8 +202,8 @@ export class MessageHandler {
 
 		// 6. 检查 thinking session 是否已存在
 		if (this.thinkingSessions.has(sessionKey)) {
-			this.pendingMessages.push(content);
-			console.log(`[handler] Message queued (thinking active), pending: ${this.pendingMessages.length}`);
+			channel.pendingMessages.push(content);
+			console.log(`[handler] Message queued (thinking active) room=${roomId}, pending: ${channel.pendingMessages.length}`);
 			return;
 		}
 
@@ -187,27 +225,28 @@ export class MessageHandler {
 		if (guardResult.action === 'delay') {
 			console.log(`[anti-loop] delay roomId=${roomId} delayMs=${guardResult.delayMs} aiRoundCount=${this.antiLoopGuard.getAiRoundCount(roomId)}`);
 			setTimeout(() => {
-				this.debouncer.push(content);
+				this.getRoomChannel(roomId).debouncer.push(content);
 			}, guardResult.delayMs);
 			return;
 		}
 
 		// 正常触发
-		this.debouncer.push(content);
+		channel.debouncer.push(content);
 	}
 
-	private async triggerAgentLoop(message: string): Promise<void> {
+	private async triggerAgentLoop(roomId: number, message: string): Promise<void> {
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
 		}
 
-		if (!this.lastCtx) {
-			console.warn('[handler] No message context, dropping AI request');
+		const channel = this.roomChannels.get(roomId);
+		if (!channel || !channel.lastCtx.msgId) {
+			console.warn(`[handler] No message context for room ${roomId}, dropping AI request`);
 			return;
 		}
 
-		const { roomId, msgId } = this.lastCtx;
+		const { msgId } = channel.lastCtx;
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
 		// 并发防护
@@ -240,7 +279,7 @@ export class MessageHandler {
 				error: 'thinking_session_timeout',
 			});
 			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages();
+			this.flushPendingMessages(roomId);
 		}, this.THINKING_SESSION_TIMEOUT_MS);
 
 		this.thinkingSessions.set(sessionKey, session);
@@ -293,7 +332,7 @@ export class MessageHandler {
 				});
 				console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs}`);
 				this.thinkingSessions.delete(sessionKey);
-				this.flushPendingMessages();
+				this.flushPendingMessages(roomId);
 			},
 			onError: (error) => {
 				if (session.finalized) return;
@@ -311,7 +350,7 @@ export class MessageHandler {
 					error: error.message,
 				});
 				this.thinkingSessions.delete(sessionKey);
-				this.flushPendingMessages();
+				this.flushPendingMessages(roomId);
 			},
 		};
 
@@ -382,7 +421,7 @@ export class MessageHandler {
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(Number(roomId), reason);
 						this.thinkingSessions.delete(sessionKey);
-						this.flushPendingMessages();
+						this.flushPendingMessages(Number(roomId));
 					}
 				}
 			}
@@ -403,7 +442,7 @@ export class MessageHandler {
 		}
 		if (session?.finalized) {
 			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages();
+			this.flushPendingMessages(Number(roomId));
 			return;
 		}
 
@@ -417,10 +456,6 @@ export class MessageHandler {
 					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
 					this.sendAutoReply(Number(roomId), '今日发言上限已达，已自动跳过本次响应');
 					break;
-				case 'short_reply_skip':
-					// 短回复跳过不触发 autoReply，避免短回复+autoReply 互相触发新循环
-					console.log('[anti-loop] short reply skip triggered, no autoReply');
-					break;
 				default:
 					console.log(`[thinking] server error: ${error} (no autoReply)`);
 			}
@@ -429,7 +464,7 @@ export class MessageHandler {
 		if (session) {
 			session.finalized = true;
 			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages();
+			this.flushPendingMessages(Number(roomId));
 		}
 	}
 
@@ -464,15 +499,45 @@ export class MessageHandler {
 			}
 		}
 		this.thinkingSessions.clear();
-		this.pendingMessages = [];
+		// 清理所有房间的待处理队列与定时器；用 cancel 而非 flush，
+		// 避免 teardown 时 flush 重新触发 triggerAgentLoop 复活会话。
+		for (const channel of this.roomChannels.values()) {
+			channel.debouncer.cancel();
+			channel.pendingMessages = [];
+		}
+		this.roomChannels.clear();
 	}
 
-	private flushPendingMessages(): void {
-		if (this.pendingMessages.length === 0) return;
-		console.log(`[handler] Flushing ${this.pendingMessages.length} pending messages`);
-		for (const msg of this.pendingMessages) {
-			this.debouncer.push(msg);
+	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
+	private flushPendingMessages(roomId: number): void {
+		const channel = this.roomChannels.get(roomId);
+		if (!channel || channel.pendingMessages.length === 0) {
+			this.maybeEvictRoom(roomId);
+			return;
 		}
-		this.pendingMessages = [];
+		console.log(`[handler] Flushing ${channel.pendingMessages.length} pending messages for room ${roomId}`);
+		const pending = channel.pendingMessages;
+		channel.pendingMessages = [];
+		for (const msg of pending) {
+			channel.debouncer.push(msg);
+		}
+	}
+
+	/**
+	 * REQ-004 S2: 回收空闲房间通道，防止长生命周期进程下 roomChannels 无界增长。
+	 * 仅当无待处理消息、无缓冲 debounce、无活跃 thinking 会话时回收；
+	 * 下一条消息会按需重建通道（lastCtx 每次收信都会重设）。
+	 */
+	private maybeEvictRoom(roomId: number): void {
+		const channel = this.roomChannels.get(roomId);
+		if (!channel) return;
+		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		if (
+			channel.pendingMessages.length === 0 &&
+			channel.debouncer.pending === 0 &&
+			!this.thinkingSessions.has(sessionKey)
+		) {
+			this.roomChannels.delete(roomId);
+		}
 	}
 }

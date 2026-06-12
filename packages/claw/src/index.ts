@@ -93,6 +93,10 @@ export default function register(api: OpenClawPluginApi) {
 		...hulaChannel,
 		outbound: {
 			async sendText(params) {
+				// 身份限制：channel.outbound 这条路径没有会话上下文（无 ctx.sessionKey），
+				// 因此只能用默认客户端 pool.get() 发送，无法按 aiclaw 归属选择身份。
+				// 多 aiclaw 的逐实例绑定仅在 hula_send_message 的 tool-factory 路径上生效
+				// （工厂从 ctx.sessionKey 解析 aiclawUid，再 pool.get(uid)）。
 				const client = pool.get();
 				if (!client) {
 					return { ok: false, error: 'HulaApiClient not available' };
@@ -121,8 +125,8 @@ export default function register(api: OpenClawPluginApi) {
 			}
 		}
 
-		// 使用默认客户端注册 Tools（当前 execute 无 context，无法动态选择）
-		registerTools(api, pool.get());
+		// REQ-004 S2: tool factory 注册——execute 身份/房间由 ctx.sessionKey 动态绑定
+		registerTools(api, pool);
 		api.logger.info('aichat-claw loaded: channel=hula, tools=hula_find_friend,hula_send_message');
 	} else {
 		api.logger.warn('aichat-claw: hula.aiclawToken not configured, tools disabled');
