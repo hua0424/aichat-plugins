@@ -97,6 +97,15 @@ export default function register(api: OpenClawPluginApi) {
 				// 因此只能用默认客户端 pool.get() 发送，无法按 aiclaw 归属选择身份。
 				// 多 aiclaw 的逐实例绑定仅在 hula_send_message 的 tool-factory 路径上生效
 				// （工厂从 ctx.sessionKey 解析 aiclawUid，再 pool.get(uid)）。
+				//
+				// REQ-004 S3 (Fork B) loud-fail 守卫：多 token 模式下没有会话上下文
+				// 就无法挑选正确身份，绝不以默认身份冒名发送——直接拒绝并报错。
+				if (pool.isMultiToken) {
+					return {
+						ok: false,
+						error: '多 aiclaw 模式下 channel.outbound 无会话上下文，拒绝以默认身份发送（避免冒名）',
+					};
+				}
 				const client = pool.get();
 				if (!client) {
 					return { ok: false, error: 'HulaApiClient not available' };

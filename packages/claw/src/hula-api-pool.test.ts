@@ -40,3 +40,23 @@ describe('HulaApiClientPool.get identity safety', () => {
 		expect(() => pool.get('100')).toThrow(/No HulaApiClient available/);
 	});
 });
+
+describe('HulaApiClientPool.isMultiToken', () => {
+	it('false with only a default client (single-token mode)', () => {
+		const pool = new HulaApiClientPool('http://x');
+		pool.setDefault('tok-default');
+		expect(pool.isMultiToken).toBe(false);
+	});
+
+	it('false when nothing registered', () => {
+		const pool = new HulaApiClientPool('http://x');
+		expect(pool.isMultiToken).toBe(false);
+	});
+
+	it('true after registering a per-aiclaw client (multi-token mode)', () => {
+		const pool = new HulaApiClientPool('http://x');
+		pool.setDefault('tok-default');
+		pool.register('100', 'tok-100');
+		expect(pool.isMultiToken).toBe(true);
+	});
+});

@@ -42,6 +42,8 @@ export interface ThinkingCallbacks {
 	onThinkingEnd: (durationMs: number) => void;
 	/** 处理出错 */
 	onError: (error: Error) => void;
+	/** REQ-004 S3: 观测到一次终结动作工具调用（send / skip）。adapter 从 tool 流解析后回调。 */
+	onTerminalTool?: (info: { action: 'sent' | 'skipped'; tool: string; reason?: string }) => void;
 }
 
 /** Agent 调用上下文，传递 roomId 等信息供 tool 调用使用 */

@@ -1,5 +1,54 @@
 import { describe, it, expect } from 'vitest';
-import { buildConnectParams, parseHelloOk } from './openclaw.js';
+import { buildConnectParams, parseHelloOk, classifyTerminalTool } from './openclaw.js';
+
+describe('classifyTerminalTool (REQ-004 S3 terminal-action classifier — item-event shape)', () => {
+	// openclaw 2026.6.5: tool 调用经 `item` 流到达，end 事件只携带 name + status（无 args）。
+	// 分类纯按 name + status==='completed'。
+
+	it('classifies hula_send_message + completed as sent', () => {
+		expect(classifyTerminalTool('hula_send_message', 'completed')).toEqual({
+			action: 'sent',
+			tool: 'hula_send_message',
+		});
+	});
+
+	it('classifies built-in message tool + completed as sent (no channel check)', () => {
+		expect(classifyTerminalTool('message', 'completed')).toEqual({
+			action: 'sent',
+			tool: 'message',
+		});
+	});
+
+	it('classifies hula_skip_reply + completed as skipped with fixed reason agent_skip_reply', () => {
+		expect(classifyTerminalTool('hula_skip_reply', 'completed')).toEqual({
+			action: 'skipped',
+			tool: 'hula_skip_reply',
+			reason: 'agent_skip_reply',
+		});
+	});
+
+	it('ignores any tool with status "running" (phase:start, not terminal)', () => {
+		expect(classifyTerminalTool('hula_send_message', 'running')).toBeNull();
+		expect(classifyTerminalTool('message', 'running')).toBeNull();
+		expect(classifyTerminalTool('hula_skip_reply', 'running')).toBeNull();
+	});
+
+	it('ignores any tool with status "failed" (not a successful terminal action)', () => {
+		expect(classifyTerminalTool('hula_send_message', 'failed')).toBeNull();
+		expect(classifyTerminalTool('message', 'failed')).toBeNull();
+		expect(classifyTerminalTool('hula_skip_reply', 'failed')).toBeNull();
+	});
+
+	it('ignores undefined status', () => {
+		expect(classifyTerminalTool('hula_send_message', undefined)).toBeNull();
+	});
+
+	it('ignores unknown tool names even when completed', () => {
+		expect(classifyTerminalTool('hula_find_friend', 'completed')).toBeNull();
+		expect(classifyTerminalTool('some_other_tool', 'completed')).toBeNull();
+		expect(classifyTerminalTool(undefined, 'completed')).toBeNull();
+	});
+});
 
 describe('buildConnectParams', () => {
 	const baseDevice = {

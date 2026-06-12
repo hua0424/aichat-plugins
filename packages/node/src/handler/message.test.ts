@@ -2,7 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { MessageHandler } from './message.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import type { ClawAdapter, ThinkingCallbacks, ChatContext } from '../claw/interface.js';
+import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
+
+const THINKING_END = WSReqType.THINKING_END;
 
 interface ChatCall {
 	message: string;
@@ -147,6 +150,113 @@ describe('MessageHandler per-room isolation', () => {
 
 		// teardown 用 cancel 丢弃缓冲，不得 flush 复活 agent loop
 		expect(calls.length).toBe(0);
+	});
+
+	it('terminal=sent → THINKING_END carries NO skipReason', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end).not.toHaveProperty('skipReason');
+	});
+
+	it('terminal=skipped with reason → THINKING_END carries that skipReason', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '纯客套' });
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end.skipReason).toBe('纯客套');
+	});
+
+	it('no terminal tool → onThinkingEnd auto-skips with agent_no_terminal_tool', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		// 不触发任何 onTerminalTool
+		calls[0].callbacks.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end.skipReason).toBe('agent_no_terminal_tool');
+	});
+
+	it('send-wins: skipped THEN sent → effective sent, no skipReason', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '早退' });
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end).not.toHaveProperty('skipReason');
+	});
+
+	it('send-wins: sent THEN skipped → skip ignored, effective sent, no skipReason', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '太晚了' });
+		cb.onThinkingEnd(100);
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end).not.toHaveProperty('skipReason');
+	});
+
+	it('ignores a terminal event arriving AFTER finalize (out-of-order, no double-account)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		// 本轮无终结工具 → onThinkingEnd 兜底补记 auto-skip 并结算
+		cb.onThinkingEnd(100);
+		const endFrame = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(endFrame.skipReason).toBe('agent_no_terminal_tool');
+
+		// finalize 之后到达的迟到 terminal 事件必须被忽略，不得改写已结算账本、不得再发帧
+		const endFramesBefore = sent.filter((f) => f.type === THINKING_END).length;
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		expect(sent.filter((f) => f.type === THINKING_END).length).toBe(endFramesBefore);
+		// 已发出的 THINKING_END 仍是兜底 skip，未被迟到 sent 篡改
+		expect((sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>).skipReason).toBe('agent_no_terminal_tool');
 	});
 
 	it('evicts idle room channel after thinking ends with empty pending', async () => {

@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "entry": "dist/index.js",
   "contracts": {
-    "tools": ["hula_send_message", "hula_find_friend"]
+    "tools": ["hula_send_message", "hula_find_friend", "hula_skip_reply"]
   },
   "configSchema": {
     "type": "object",

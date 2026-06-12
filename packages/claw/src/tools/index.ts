@@ -2,6 +2,7 @@ import type { HulaApiClientPool } from '../hula-api-pool.js';
 import type { OpenClawPluginApi } from '../types.js';
 import { createFindFriendTool } from './find-friend.js';
 import { createSendMessageTool } from './send-message.js';
+import { createSkipReplyTool } from './skip-reply.js';
 
 /**
  * 批量注册所有 HuLa Agent Tools（tool factory 模式）。
@@ -16,4 +17,8 @@ export function registerTools(api: OpenClawPluginApi, pool: HulaApiClientPool): 
 
 	api.registerTool((ctx) => createSendMessageTool(pool, ctx));
 	api.logger.info('registered tool factory: hula_send_message');
+
+	// REQ-004 S3: 终结动作之一——无需回复时调用，不发送任何消息
+	api.registerTool((ctx) => createSkipReplyTool(ctx));
+	api.logger.info('registered tool factory: hula_skip_reply');
 }

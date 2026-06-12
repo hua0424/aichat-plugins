@@ -123,6 +123,44 @@ export function parseHelloOk(payload: unknown): {
 }
 
 /**
+ * REQ-004 S3: 纯函数——把一次 tool item 调用分类为终结动作（send / skip）或非终结动作（null）。
+ *
+ * 真实数据形态（openclaw 2026.6.5 实测）：tool 调用经 `item` 流到达，end 事件只携带
+ * name + status，**没有 args**（无 channel、无 reason）。故只能按 NAME + status==='completed'
+ * 分类，无法从事件读取 channel / model 自填的 skip reason。
+ *
+ * agent 可经两条合法路径回复 HuLa：
+ *  - claw 工具 hula_send_message（→ sent）
+ *  - openclaw 内置 message 工具（→ sent）
+ * 跳过则走 hula_skip_reply（→ skipped，reason 固定为 'agent_skip_reply'）。
+ * 其余工具名（hula_find_friend、command/patch/search 等）不是终结动作，返回 null。
+ *
+ * 仅 status==='completed' 才算终结动作；start / running / failed 一律 null。
+ */
+export function classifyTerminalTool(
+	name: string | undefined,
+	status: string | undefined,
+): { action: 'sent' | 'skipped'; tool: string; reason?: string } | null {
+	// 只统计成功完成的工具——start / running / failed 都不是终结动作
+	if (status !== 'completed') return null;
+
+	if (name === 'hula_send_message') {
+		return { action: 'sent', tool: 'hula_send_message' };
+	}
+	if (name === 'message') {
+		// 本进程仅注册 hula channel；message 只可能投递到 hula，故不校验 channel。
+		// 多 channel 场景下此判定会过计 send——后果是漏补 skip 而非误发消息。openclaw
+		// 未来若在 item 事件暴露 args 再收紧。
+		return { action: 'sent', tool: 'message' };
+	}
+	if (name === 'hula_skip_reply') {
+		// item 事件不含 model 自填的 reason，固定为显式跳过原因（与兜底 'agent_no_terminal_tool' 区分）。
+		return { action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' };
+	}
+	return null;
+}
+
+/**
  * Gateway 帧类型定义（精简版，基于 openclaw gateway protocol schema）
  */
 
@@ -248,17 +286,20 @@ export class OpenclawAdapter implements ClawAdapter {
 		const requestId = randomUUID();
 		const idempotencyKey = randomUUID();
 
-		// 在 message 中注入 tool 调用指令（openclaw gateway 不支持 instructions 字段）
+		// 在 message 中注入角色分工说明（openclaw gateway 不支持 instructions 字段）
 		// 注意：避免使用 [SYSTEM] / [System Message] 等标记，会被 openclaw 安全机制过滤
+		// REQ-004 S3：从「强制 send」改为语义化的角色分工引导——仍优先引导 hula_send_message，
+		// 但允许 hula_skip_reply 作为对等的合法终结动作（send 至少一次或 skip 恰好一次）。
 		const roomIdHint = context?.roomId
-			? `The current room ID is ${context.roomId}. You MUST use exactly this roomId value when calling hula_send_message. `
+			? `当前会话已绑定房间（room ${context.roomId}），hula_send_message 无需也不应再传 roomId。`
 			: '';
 		const enrichedMessage =
-			'IMPORTANT: You have a tool called hula_send_message. ' +
+			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
+			'要回复用户时，请调用 hula_send_message 工具（已绑定当前房间，优先用它），把给用户看的内容写进 content。' +
 			roomIdHint +
-			'After you finish thinking, you MUST call this tool with the roomId and your response ' +
-			'to send the reply to the user. Do NOT just output text — always use the tool.\n\n' +
-			'--- User message below ---\n' + message;
+			'如果判断本轮无需回复（如纯客套、无实质内容、消息不需要回应），请调用 hula_skip_reply。' +
+			'send 至少一次或 skip 恰好一次，二者是本轮的合法终结动作。\n\n' +
+			'--- 用户消息如下 ---\n' + message;
 
 		const params = {
 			message: enrichedMessage,
@@ -465,6 +506,12 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+		// REQ-004 S3: item 流 → 终结动作检测（send / skip）。
+		// openclaw 2026.6.5 实测：tool 调用走 `item` 流（不是 `tool`），故在此分流。
+		if (evt.stream === 'item') {
+			this.processItemStreamEvent(chat, evt);
+			return;
+		}
 		// assistant 流 → thinking delta (REQ-004)
 		if (evt.stream === 'assistant') {
 			const delta = evt.data.delta as string | undefined;
@@ -480,6 +527,11 @@ export class OpenclawAdapter implements ClawAdapter {
 				chat.done = true;
 				const durationMs = Date.now() - chat.startTime;
 				chat.callbacks.onThinkingEnd(durationMs);
+				// P1-2 假设：openclaw 在 lifecycle phase==='end' 之前已投递本 run 内所有 tool 流
+				// 事件（end 语义即"run 已完成"，按协议先于它的 tool result 都应已处理）。此处同步
+				// cleanup 会丢弃 run:{runId}，若有 tool result 在 end 之后到达将找不到 chat 被丢弃
+				// （→ 可能漏一次 send → 错误自动跳过）。当前未发现 openclaw 会乱序投递，故保留同步
+				// cleanup；如后续观测到 result 晚于 end，需改为延迟 cleanup 或按 runId 暂存终结态。
 				this.cleanupChatByRunId(evt.runId);
 			} else if (phase === 'error') {
 				chat.done = true;
@@ -487,6 +539,31 @@ export class OpenclawAdapter implements ClawAdapter {
 				this.cleanupChatByRunId(evt.runId);
 			}
 		}
+	}
+
+	/**
+	 * REQ-004 S3: 处理 item 流事件，识别终结动作并回调 onTerminalTool。
+	 *
+	 * openclaw 2026.6.5 实测：一次 tool 调用产生两个 `item` 事件——phase:'start'（status:'running'）
+	 * 与 phase:'end'（status:'completed' | 'failed'）。事件携带 name + status，**没有 args**。
+	 * 只在 kind==='tool' 且 phase==='end' 时按 name+status 分类（start/running 忽略；
+	 * 非 tool kind 如 command/patch/search/analysis 忽略）。无 args 可捕获，故无需 toolStarts 关联。
+	 */
+	private processItemStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+		const data = evt.data;
+		if (data.kind !== 'tool') return;
+		if (data.phase !== 'end') return;
+
+		const name = data.name as string | undefined;
+		const status = data.status as string | undefined;
+		const classified = classifyTerminalTool(name, status);
+		if (!classified) return;
+
+		chat.callbacks.onTerminalTool?.({
+			action: classified.action,
+			tool: classified.tool,
+			reason: classified.reason,
+		});
 	}
 
 	// ─── Connect handshake ───
