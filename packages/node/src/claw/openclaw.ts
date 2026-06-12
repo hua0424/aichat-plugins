@@ -123,41 +123,39 @@ export function parseHelloOk(payload: unknown): {
 }
 
 /**
- * REQ-004 S3: 纯函数——把一次 tool 调用分类为终结动作（send / skip）或非终结动作（null）。
+ * REQ-004 S3: 纯函数——把一次 tool item 调用分类为终结动作（send / skip）或非终结动作（null）。
+ *
+ * 真实数据形态（openclaw 2026.6.5 实测）：tool 调用经 `item` 流到达，end 事件只携带
+ * name + status，**没有 args**（无 channel、无 reason）。故只能按 NAME + status==='completed'
+ * 分类，无法从事件读取 channel / model 自填的 skip reason。
  *
  * agent 可经两条合法路径回复 HuLa：
  *  - claw 工具 hula_send_message（→ sent）
- *  - openclaw 内置 message 工具且 channel==='hula'（→ sent，constraint A②：仅 hula 频道计数）
- * 跳过则走 hula_skip_reply（→ skipped，可带 reason）。
- * 其余工具（含 message 打到非 hula 频道、hula_find_friend 等）不是终结动作，返回 null。
+ *  - openclaw 内置 message 工具（→ sent）
+ * 跳过则走 hula_skip_reply（→ skipped，reason 固定为 'agent_skip_reply'）。
+ * 其余工具名（hula_find_friend、command/patch/search 等）不是终结动作，返回 null。
  *
- * args 来自 tool 流 phase:'start' 事件（result 阶段可能不回显 args，故由调用方按
- * toolCallId 关联）。channel / reason 都从 args 读取。
+ * 仅 status==='completed' 才算终结动作；start / running / failed 一律 null。
  */
 export function classifyTerminalTool(
-	name: string,
-	args: Record<string, unknown> | undefined,
+	name: string | undefined,
+	status: string | undefined,
 ): { action: 'sent' | 'skipped'; tool: string; reason?: string } | null {
+	// 只统计成功完成的工具——start / running / failed 都不是终结动作
+	if (status !== 'completed') return null;
+
 	if (name === 'hula_send_message') {
 		return { action: 'sent', tool: 'hula_send_message' };
 	}
-	if (name === 'hula_skip_reply') {
-		const reason = typeof args?.reason === 'string' ? (args.reason as string) : undefined;
-		return { action: 'skipped', tool: 'hula_skip_reply', reason };
-	}
 	if (name === 'message') {
-		// 仅当 message 工具打到 hula 频道时才算终结动作（其他频道与本轮 HuLa 回复无关）。
-		// 容忍 openclaw 可能的大小写/空白归一化与数组形式 channel，但语义锁定：只有 hula 频道计数。
-		const channel = args?.channel;
-		const channelStr = typeof channel === 'string'
-			? channel.trim().toLowerCase()
-			: (Array.isArray(channel) && typeof channel[0] === 'string'
-				? channel[0].trim().toLowerCase()
-				: '');
-		if (channelStr === 'hula') {
-			return { action: 'sent', tool: 'message' };
-		}
-		return null;
+		// 本进程仅注册 hula channel；message 只可能投递到 hula，故不校验 channel。
+		// 多 channel 场景下此判定会过计 send——后果是漏补 skip 而非误发消息。openclaw
+		// 未来若在 item 事件暴露 args 再收紧。
+		return { action: 'sent', tool: 'message' };
+	}
+	if (name === 'hula_skip_reply') {
+		// item 事件不含 model 自填的 reason，固定为显式跳过原因（与兜底 'agent_no_terminal_tool' 区分）。
+		return { action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' };
 	}
 	return null;
 }
@@ -210,12 +208,6 @@ interface PendingChat {
 	fullContent: string;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
-	/**
-	 * REQ-004 S3: tool 流 phase:'start' 捕获的 toolCallId → {name,args}。
-	 * result 阶段可能不回显 args（如 channel / skip reason），故按 toolCallId 关联。
-	 * chat 结束时随 cleanup 一并丢弃，天然有界。
-	 */
-	toolStarts: Map<string, { name: string; args: Record<string, unknown> | undefined }>;
 }
 
 /**
@@ -345,7 +337,6 @@ export class OpenclawAdapter implements ClawAdapter {
 			fullContent: '',
 			done: false,
 			startTime: Date.now(),
-			toolStarts: new Map(),
 		});
 
 		this.ws.send(JSON.stringify(frame));
@@ -515,9 +506,10 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
-		// REQ-004 S3: tool 流 → 终结动作检测（send / skip）
-		if (evt.stream === 'tool') {
-			this.processToolStreamEvent(chat, evt);
+		// REQ-004 S3: item 流 → 终结动作检测（send / skip）。
+		// openclaw 2026.6.5 实测：tool 调用走 `item` 流（不是 `tool`），故在此分流。
+		if (evt.stream === 'item') {
+			this.processItemStreamEvent(chat, evt);
 			return;
 		}
 		// assistant 流 → thinking delta (REQ-004)
@@ -550,39 +542,21 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	/**
-	 * REQ-004 S3: 处理 tool 流事件，识别终结动作并回调 onTerminalTool。
-	 * - phase:'start' → 按 toolCallId 记下 {name,args}（result 阶段可能不回显 args）。
-	 * - phase:'result' 且 isError!==true → 仅用 start 阶段捕获的 args 分类（不回退 result，见下方说明）。
+	 * REQ-004 S3: 处理 item 流事件，识别终结动作并回调 onTerminalTool。
+	 *
+	 * openclaw 2026.6.5 实测：一次 tool 调用产生两个 `item` 事件——phase:'start'（status:'running'）
+	 * 与 phase:'end'（status:'completed' | 'failed'）。事件携带 name + status，**没有 args**。
+	 * 只在 kind==='tool' 且 phase==='end' 时按 name+status 分类（start/running 忽略；
+	 * 非 tool kind 如 command/patch/search/analysis 忽略）。无 args 可捕获，故无需 toolStarts 关联。
 	 */
-	private processToolStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+	private processItemStreamEvent(chat: PendingChat, evt: AgentEvent): void {
 		const data = evt.data;
-		const phase = data.phase as string | undefined;
+		if (data.kind !== 'tool') return;
+		if (data.phase !== 'end') return;
+
 		const name = data.name as string | undefined;
-		const toolCallId = data.toolCallId as string | undefined;
-
-		if (phase === 'start') {
-			if (toolCallId && name) {
-				const args = (data.args as Record<string, unknown> | undefined) ?? undefined;
-				chat.toolStarts.set(toolCallId, { name, args });
-			}
-			return;
-		}
-
-		if (phase !== 'result') return;
-		// 只统计成功的工具结果——失败的 send/skip 不构成终结动作
-		if (data.isError === true) {
-			if (toolCallId) chat.toolStarts.delete(toolCallId);
-			return;
-		}
-		if (!name) return;
-
-		// 仅信任 start 事件捕获的 args（含 channel / reason），不回退到 result 自带字段：
-		// result 不一定回显 channel，若用它替代 args 会把真实的 hula message 误判为 null（漏 send →
-		// 错误自动跳过）。hula_send_message / hula_skip_reply 按 NAME 分类（args 只用于 skip reason），
-		// 故丢弃 result 回退对它们零成本；message 工具缺 start args 时 channel 未知 → null 是保守正确选择。
-		const started = toolCallId ? chat.toolStarts.get(toolCallId) : undefined;
-		const classified = classifyTerminalTool(name, started?.args);
-		if (toolCallId) chat.toolStarts.delete(toolCallId);
+		const status = data.status as string | undefined;
+		const classified = classifyTerminalTool(name, status);
 		if (!classified) return;
 
 		chat.callbacks.onTerminalTool?.({
