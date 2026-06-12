@@ -97,8 +97,9 @@ describe('packaging contract', () => {
 		// a plugin's agent tools unless they are declared here first ("plugin must declare
 		// contracts.tools before registering agent tools"). A tool registered in
 		// src/tools/index.ts but missing from this list is SILENTLY dropped at runtime.
-		// These are the tools registered via createSendMessageTool / createFindFriendTool.
-		const expectedTools = ['hula_send_message', 'hula_find_friend'];
+		// These are the tools registered via createSendMessageTool / createFindFriendTool /
+		// createSkipReplyTool (src/tools/index.ts).
+		const expectedTools = ['hula_send_message', 'hula_find_friend', 'hula_skip_reply'];
 
 		const manifest = readJson('openclaw.plugin.json');
 		const contracts = manifest.contracts;

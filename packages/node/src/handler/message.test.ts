@@ -237,6 +237,28 @@ describe('MessageHandler per-room isolation', () => {
 		expect(end).not.toHaveProperty('skipReason');
 	});
 
+	it('ignores a terminal event arriving AFTER finalize (out-of-order, no double-account)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		// 本轮无终结工具 → onThinkingEnd 兜底补记 auto-skip 并结算
+		cb.onThinkingEnd(100);
+		const endFrame = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(endFrame.skipReason).toBe('agent_no_terminal_tool');
+
+		// finalize 之后到达的迟到 terminal 事件必须被忽略，不得改写已结算账本、不得再发帧
+		const endFramesBefore = sent.filter((f) => f.type === THINKING_END).length;
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		expect(sent.filter((f) => f.type === THINKING_END).length).toBe(endFramesBefore);
+		// 已发出的 THINKING_END 仍是兜底 skip，未被迟到 sent 篡改
+		expect((sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>).skipReason).toBe('agent_no_terminal_tool');
+	});
+
 	it('evicts idle room channel after thinking ends with empty pending', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();

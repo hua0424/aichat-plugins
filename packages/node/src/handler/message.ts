@@ -321,6 +321,12 @@ export class MessageHandler {
 			},
 			// REQ-004 S3: 终结动作账本——send-wins + skip 记录原因
 			onTerminalTool: (info) => {
+				// openclaw 事件无顺序保证：若 session 已 finalized（thinkingEnd/超时/错误已清理），
+				// 迟到的 terminal 事件不得再改已结算的账本（与防双重 finalize 同一原则）。
+				if (session.finalized) {
+					console.log(`[thinking] ignoring terminal '${info.action}' after finalize session=${sessionKey}`);
+					return;
+				}
 				if (info.action === 'sent') {
 					if (session.terminalAction === 'skipped') {
 						console.log(`[thinking] terminal override: prior 'skipped' replaced by 'sent' (send-wins) session=${sessionKey}`);
