@@ -121,8 +121,8 @@ export default function register(api: OpenClawPluginApi) {
 			}
 		}
 
-		// 使用默认客户端注册 Tools（当前 execute 无 context，无法动态选择）
-		registerTools(api, pool.get());
+		// REQ-004 S2: tool factory 注册——execute 身份/房间由 ctx.sessionKey 动态绑定
+		registerTools(api, pool);
 		api.logger.info('aichat-claw loaded: channel=hula, tools=hula_find_friend,hula_send_message');
 	} else {
 		api.logger.warn('aichat-claw: hula.aiclawToken not configured, tools disabled');
