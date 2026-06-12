@@ -8,6 +8,39 @@ import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 
 /**
+ * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
+ * 256 KiB，**严格高于** server 的 200 KB 截断阈值——这是有意的：
+ * server 是唯一的截断权威，仅当收到 content > 200KB 时才截断并置 status=4。
+ * 若插件在此处也卡在 200KB，server 永远收不到 >200KB，status=4 会被短路。
+ * 本上限只保证 WS 帧不溢出传输层；200KB~256KB 之间的内容仍原样送到 server，
+ * 由 server 截断到 200KB 并标记 status=4。
+ */
+const THINKING_END_MAX_BYTES = 256 * 1024;
+
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder('utf-8', { fatal: false });
+
+/**
+ * 将字符串截断到至多 maxBytes 个 UTF-8 字节，且不切断多字节字符。
+ * 仅用于 THINKING_END 的帧安全；server 仍是唯一截断权威。
+ *
+ * 注意：不能直接 decode(slice(0, maxBytes))——TextDecoder(fatal:false) 会把尾部
+ * 残缺的多字节序列替换成 U+FFFD（3 字节），反而可能让结果 re-encode 后超出 maxBytes。
+ * 因此先把切点回退到合法的 UTF-8 字符边界（continuation byte 0b10xxxxxx 之前），
+ * 再 decode，保证输出字节数 <= maxBytes 且无乱码。
+ */
+function capUtf8Bytes(text: string, maxBytes: number = THINKING_END_MAX_BYTES): string {
+	const encoded = TEXT_ENCODER.encode(text);
+	if (encoded.length <= maxBytes) return text;
+	// 从 maxBytes 处向前回退，跳过 UTF-8 续字节（高位 0b10xxxxxx）到字符起始边界
+	let end = maxBytes;
+	while (end > 0 && (encoded[end] & 0b1100_0000) === 0b1000_0000) {
+		end--;
+	}
+	return TEXT_DECODER.decode(encoded.subarray(0, end));
+}
+
+/**
  * REQ-004: Thinking 会话状态
  */
 interface ThinkingSession {
@@ -19,14 +52,10 @@ interface ThinkingSession {
 	triggerMsgId: string;
 	/** 思考开始时间戳 */
 	startTime: number;
-	/** THINKING_DELTA 序列号 */
-	seq: number;
-	/** 思考内容累计（用于日志/debug） */
+	/** REQ-004 S4: 思考内容累计，THINKING_END 一次性整发 */
 	accumulatedContent: string;
 	/** 超时清理定时器 ID */
 	timeoutId?: ReturnType<typeof setTimeout>;
-	/** thinkingId 回填前缓存的 delta（防 race condition） */
-	pendingDeltas: Array<{ chunk: string; seq: number }>;
 	/** 是否已 finalized（防止 onThinkingEnd / handleThinkingEndBroadcast 双重清理） */
 	finalized: boolean;
 	/**
@@ -270,9 +299,7 @@ export class MessageHandler {
 			thinkingId: '',
 			triggerMsgId: msgId,
 			startTime: Date.now(),
-			seq: 0,
 			accumulatedContent: '',
-			pendingDeltas: [],
 			finalized: false,
 			terminalAction: 'none',
 		};
@@ -287,6 +314,8 @@ export class MessageHandler {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: 'thinking_session_timeout',
+				// 帧安全截断（256KB）；server 仍是唯一截断权威
+				content: capUtf8Bytes(session.accumulatedContent),
 			});
 			this.thinkingSessions.delete(sessionKey);
 			this.flushPendingMessages(roomId);
@@ -304,20 +333,10 @@ export class MessageHandler {
 		});
 
 		const callbacks: ThinkingCallbacks = {
+			// REQ-004 S4: 仅本地累计，不再逐帧发送 THINKING_DELTA；
+			// 完整文本在 THINKING_END 一次性整发。
 			onThinkingDelta: (chunk) => {
-				session.seq++;
 				session.accumulatedContent += chunk;
-				if (!session.thinkingId) {
-					session.pendingDeltas.push({ chunk, seq: session.seq });
-					console.log(`[thinking] delta buffered (no thinkingId yet) session=${sessionKey} seq=${session.seq}`);
-					return;
-				}
-				this.ws.send(WSReqType.THINKING_DELTA, {
-					thinkingId: session.thinkingId,
-					chunk,
-					seq: session.seq,
-				});
-				console.log(`[thinking] delta session=${sessionKey} seq=${session.seq} chunkLen=${chunk.length}`);
 			},
 			// REQ-004 S3: 终结动作账本——send-wins + skip 记录原因
 			onTerminalTool: (info) => {
@@ -347,18 +366,6 @@ export class MessageHandler {
 				if (session.finalized) return;
 				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
-				// CR-S6: if thinkingId backfilled but pendingDeltas not flushed yet, flush first
-				if (session.thinkingId && session.pendingDeltas.length > 0) {
-					console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas before end`);
-					for (const { chunk, seq } of session.pendingDeltas) {
-						this.ws.send(WSReqType.THINKING_DELTA, {
-							thinkingId: session.thinkingId,
-							chunk,
-							seq,
-						});
-					}
-					session.pendingDeltas = [];
-				}
 				// REQ-004 S3: 计算本轮有效终结结果。
 				// 'none' = agent 未调用任何终结动作工具 → auto-skip 兜底。
 				let skipReason: string | undefined;
@@ -374,6 +381,8 @@ export class MessageHandler {
 					thinkingId: session.thinkingId || undefined,
 					durationMs,
 					status: 'complete',
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 					// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
 					...(skipReason !== undefined ? { skipReason } : {}),
 				});
@@ -385,16 +394,14 @@ export class MessageHandler {
 				if (session.finalized) return;
 				session.finalized = true;
 				if (session.timeoutId) clearTimeout(session.timeoutId);
-				if (session.pendingDeltas.length > 0) {
-					console.log(`[thinking] discarding ${session.pendingDeltas.length} buffered deltas (error)`);
-					session.pendingDeltas = [];
-				}
 				console.error(`[thinking] error session=${sessionKey} reason=${error.message}`);
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: error.message,
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 				});
 				this.thinkingSessions.delete(sessionKey);
 				this.flushPendingMessages(roomId);
@@ -424,22 +431,9 @@ export class MessageHandler {
 			return;
 		}
 
-		// 回填 thinkingId
+		// 回填 thinkingId（S4：仅用于 THINKING_END 携带，不再触发 delta flush）
 		session.thinkingId = data.thinkingId || '';
 		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
-
-		// 刷新缓存的 deltas
-		if (session.pendingDeltas.length > 0) {
-			console.log(`[thinking] flushing ${session.pendingDeltas.length} buffered deltas`);
-			for (const { chunk, seq } of session.pendingDeltas) {
-				this.ws.send(WSReqType.THINKING_DELTA, {
-					thinkingId: session.thinkingId,
-					chunk,
-					seq,
-				});
-			}
-			session.pendingDeltas = [];
-		}
 	}
 
 	/** M3: 群配置变更通知处理 */
@@ -542,6 +536,8 @@ export class MessageHandler {
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: 'handler_destroyed',
+					// 帧安全截断（256KB）；server 仍是唯一截断权威
+					content: capUtf8Bytes(session.accumulatedContent),
 				});
 			}
 		}
