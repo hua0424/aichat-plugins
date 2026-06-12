@@ -91,4 +91,52 @@ describe('packaging contract', () => {
 			).toBe(true);
 		}
 	});
+
+	it('openclaw.plugin.json "contracts.tools" stays in sync with the registered agent tools', () => {
+		// openclaw 2026.6.5 REQUIRES contracts.tools: the gateway refuses to register
+		// a plugin's agent tools unless they are declared here first ("plugin must declare
+		// contracts.tools before registering agent tools"). A tool registered in
+		// src/tools/index.ts but missing from this list is SILENTLY dropped at runtime.
+		// These are the tools registered via createSendMessageTool / createFindFriendTool.
+		const expectedTools = ['hula_send_message', 'hula_find_friend'];
+
+		const manifest = readJson('openclaw.plugin.json');
+		const contracts = manifest.contracts;
+		expect(
+			contracts !== null && typeof contracts === 'object',
+			'openclaw.plugin.json must declare a "contracts" object. openclaw 2026.6.5 refuses to ' +
+				'register agent tools without contracts.tools, SILENTLY dropping every tool the plugin registers.',
+		).toBe(true);
+
+		const tools = (contracts as Record<string, unknown>).tools;
+		expect(
+			Array.isArray(tools),
+			'openclaw.plugin.json "contracts.tools" must be an array of tool-name strings.',
+		).toBe(true);
+
+		const toolList = tools as unknown[];
+		expect(
+			toolList.length > 0,
+			'openclaw.plugin.json "contracts.tools" must be non-empty; an empty contract means ' +
+				'openclaw registers NO agent tools (hula_send_message / hula_find_friend become unavailable).',
+		).toBe(true);
+
+		for (const tool of toolList) {
+			expect(
+				typeof tool,
+				`openclaw.plugin.json "contracts.tools" entries must be strings, got ${typeof tool}: ${String(tool)}.`,
+			).toBe('string');
+		}
+
+		const declared = toolList as string[];
+		for (const expected of expectedTools) {
+			expect(
+				declared.includes(expected),
+				`openclaw.plugin.json "contracts.tools" is missing "${expected}". ` +
+					`It is registered in src/tools/index.ts (declared tools: [${declared.join(', ')}]). ` +
+					'openclaw 2026.6.5 SILENTLY drops any agent tool not listed in contracts.tools — ' +
+					'add it here whenever a tool factory is added/renamed.',
+			).toBe(true);
+		}
+	});
 });

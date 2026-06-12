@@ -4,6 +4,9 @@
   "description": "HuLa IM Channel + Agent Tools for openclaw",
   "version": "0.1.0",
   "entry": "dist/index.js",
+  "contracts": {
+    "tools": ["hula_send_message", "hula_find_friend"]
+  },
   "configSchema": {
     "type": "object",
     "properties": {
