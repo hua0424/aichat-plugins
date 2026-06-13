@@ -1,0 +1,14 @@
+{
+  "_provenance": "Captured from the LIVE test server (192.168.8.83) on 2026-06-14, post server #23 (fromUser.userType). This is the verbatim `data` payload of a `receiveMessage` WS frame for an AICLAW-sent GROUP message, as the aichat-node plugin actually receives it. Regenerate by capturing a real frame — do NOT hand-edit fromUser.userType. Pins the server contract: fromUser carries { uid, userType } and NOTHING else (no `name`); message.aiclaw is absent for group rooms. If the server stops emitting userType (regression of #23), a regenerated fixture loses it and the regression test fails.",
+  "fromUser": { "uid": "140789091499520", "userType": 4 },
+  "message": {
+    "id": "172151425151488",
+    "roomId": "171999356464128",
+    "roomType": 1,
+    "sendTime": "2026-06-14T01:08:18.747",
+    "type": 1,
+    "body": { "content": "嗨～大家好呀！我是安洁，请多指教 😊", "urlContentMap": {} },
+    "messageMarks": {},
+    "extra": { "urlContentMap": {} }
+  }
+}

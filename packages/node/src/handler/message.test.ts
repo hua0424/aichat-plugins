@@ -4,6 +4,7 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import type { ClawAdapter, ThinkingCallbacks, ChatContext } from '../claw/interface.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
+import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
 
 const THINKING_END = WSReqType.THINKING_END;
 const THINKING_DELTA = WSReqType.THINKING_DELTA;
@@ -60,8 +61,10 @@ function humanMessage(roomId: number, fromUid: number, content: string, msgId: n
  * 默认 roomType=2（私聊），始终 trigger-eligible；fromUid 默认与 selfUid 不同（对端 aiclaw）。
  */
 function aiMessage(roomId: number, fromUid: number, content: string, msgId: number): ReceivedMessage {
+	// 真实形状对齐：server 下发的 fromUser 只有 { uid, userType }，不含 name（见 __fixtures__/real-aiclaw-group-push.json）。
+	// AI 检测（message.ts:250 isFromAi）只看 userType，不读 name，故移除手写 name 使既有用例也跑在真实形状上。
 	return {
-		fromUser: { uid: fromUid, name: 'peer-ai', userType: 4 },
+		fromUser: { uid: fromUid, userType: 4 },
 		message: { id: msgId, roomId, type: 1, roomType: 2, body: { content } },
 	} as unknown as ReceivedMessage;
 }
@@ -623,6 +626,9 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		expect(getAccumulated(handler, 1).length).toBe(0);
 	});
 
+	// NOTE: 积累标注 `[name(uid)]:` 真读 fromUser.name，但真实 server 不下发 name（见
+	// __fixtures__/real-aiclaw-group-push.json）→ 线上标注会退化成 `[unknown(uid)]:`。这是与防循环
+	// 无关的独立**外观**缺口，超出本 issue 范围；此处仍用写死 name 的 groupMessage，留作后续 issue 跟进。
 	it('annotation format is exactly [name(uid)]: content', async () => {
 		const { adapter } = fakeAdapter();
 		const { ws } = fakeWs();
@@ -1010,6 +1016,156 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 			const reached = calls.some((c) => c.message.includes('during-delay'));
 			expect(reached).toBe(true);
 			void guard;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+/**
+ * REQ-004 S8-7 anti-false-green: real-shape (server contract) regression.
+ *
+ * 既有 aiMessage/humanMessage/groupMessage helper 手工写死 `fromUser.name`，而真实 server
+ * 下发的 receiveMessage.fromUser 只有 `{ uid, userType }`（无 name）。更早一次 server 修复前
+ * 甚至连 userType 都不下发 —— 那时 `isFromAi = fromUser.userType === 4`（message.ts:250）恒为
+ * false，整个防循环计数永远停在 0，退避形同虚设；而既有 regression-anti-loop 用例（~line 718）
+ * 用写死 userType=4 的 fixture 始终 GREEN，把这个生产环境的死代码盖成绿灯。
+ *
+ * 本 describe 用「与真实 server 完全同形」的 fixture/builder 重做防循环回归：
+ *   - 黄金 fixture 锁死 server 合同（{uid,userType}、无 name、roomType=1）；
+ *   - serverGroupAiMessage 从 fixture 的 key 集派生 fromUser 形状，杜绝飘移；
+ *   - 退避 / respondToAi 闸门 / 人类重置 全部跑在真实形状上。
+ * 这组用例在 server 修复（#23 下发 userType）之前会是 RED（无 userType → isFromAi false →
+ * 计数永不爬升 → 永不退避），正是它要守住的 false-green 缺口。
+ */
+describe('real-shape (server contract) regression', () => {
+	// fixture 是从 LIVE server 抓取的逐字帧（见 JSON 内 _provenance）。
+	// 要更新请重新抓取真实帧，不要手工编辑（尤其 fromUser.userType）。
+	const fixture = realAiclawGroupPush as {
+		fromUser: { uid: string; userType: number };
+		message: { roomType: number };
+	};
+
+	it('contract pin: golden fixture matches the verified live server shape', () => {
+		// 对端 AICLAW 发送者：userType=4
+		expect(fixture.fromUser.userType).toBe(4);
+		// server 不下发 fromUser.name —— 若未来重抓的 fixture 或 server 改动重新引入/丢失字段，此处会捕获
+		expect(Object.prototype.hasOwnProperty.call(fixture.fromUser, 'name')).toBe(false);
+		// 群聊
+		expect(fixture.message.roomType).toBe(1);
+	});
+
+	// 从 fixture 派生 fromUser 的 key 集，确保 builder 形状不会偷偷飘移出 server 合同。
+	const FIXTURE_FROMUSER_KEYS = Object.keys((realAiclawGroupPush as { fromUser: Record<string, unknown> }).fromUser)
+		.filter((k) => k !== '_provenance')
+		.sort();
+
+	/**
+	 * 真实形状 builder：fromUser 完全镜像 fixture —— `{ uid, userType: 4 }`，**无 name**；
+	 * message.roomType=1（群聊）、type=1（文本）。这是反 false-green 的核心：
+	 * 测试里的 AI 消息从此与 server 实际下发的形状一致。
+	 */
+	function serverGroupAiMessage(roomId: number, fromUid: number, content: string, msgId: number): ReceivedMessage {
+		const fromUser = { uid: fromUid, userType: 4 };
+		// 自校验：builder 的 fromUser key 集必须与真实 fixture 一致（无 name 漏写、无多余字段）
+		expect(Object.keys(fromUser).sort()).toEqual(FIXTURE_FROMUSER_KEYS);
+		return {
+			fromUser,
+			message: { id: msgId, roomId, type: 1, roomType: 1, body: { content } },
+		} as unknown as ReceivedMessage;
+	}
+
+	/** 真实形状 HUMAN 群消息：fromUser `{ uid, userType: 3 }`，无 name，roomType=1。 */
+	function serverGroupHumanMessage(roomId: number, fromUid: number, content: string, msgId: number): ReceivedMessage {
+		return {
+			fromUser: { uid: fromUid, userType: 3 },
+			message: { id: msgId, roomId, type: 1, roomType: 1, body: { content } },
+		} as unknown as ReceivedMessage;
+	}
+
+	it('backoff fires on real-shape AI-to-AI rounds (RED before server #23 sent userType)', async () => {
+		// server 修复前：无 userType → isFromAi=false → 计数永不爬升 → 永不退避（本用例会 RED）。
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			// 逐轮投递「真实形状」对端 AI 消息，交替不同 peer uid（≠ selfUid）、不同 msgId、中间无人类消息。
+			// 每轮立刻结束 thinking 走直达路径（镜像 line-718 既有用例风格）。
+			const peerUids = [200, 201];
+			let msgId = 1;
+			let delayedAt = -1;
+			for (let round = 1; round <= 8; round++) {
+				const before = calls.length;
+				const fromUid = peerUids[round % peerUids.length];
+				handler.handle({ type: 'receiveMessage', data: serverGroupAiMessage(1, fromUid, `ai-${round}`, msgId++) } as never);
+				await vi.advanceTimersByTimeAsync(5);
+				if (calls.length > before) {
+					calls[calls.length - 1].callbacks.onThinkingEnd(10);
+					await vi.advanceTimersByTimeAsync(5);
+				} else if (delayedAt < 0) {
+					delayedAt = round;
+				}
+			}
+
+			// 计数爬过 5（真实形状被正确识别为 AI），且某一轮被退避拦截
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+			expect(delayedAt).toBeGreaterThan(0);
+			expect(isDelaying(handler, 1)).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('respondToAi=false skips a real-shape AICLAW message (chat NOT called)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		// 不需点名（排除 @ 闸门），但 respondToAi=false → AI 消息应被第二层开关拦下
+		setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: false });
+
+		handler.handle({ type: 'receiveMessage', data: serverGroupAiMessage(1, 200, 'ai chatter', 1) } as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+		// userType 缺失时此开关亦失效（isFromAi false → 不进 respondToAi 分支 → 误触发）；
+		// 真实形状下 userType=4 被识别 → respondToAi=false 生效 → 不发起 chat。
+		expect((adapter as unknown as { chat: ReturnType<typeof vi.fn> }).chat).not.toHaveBeenCalled();
+		expect(calls.length).toBe(0);
+	});
+
+	it('real-shape HUMAN message resets the AI-to-AI round count', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			// 先用真实形状 AI 轮把计数顶起来
+			let msgId = 1;
+			for (let round = 1; round <= 4; round++) {
+				const before = calls.length;
+				handler.handle({ type: 'receiveMessage', data: serverGroupAiMessage(1, 200, `ai-${round}`, msgId++) } as never);
+				await vi.advanceTimersByTimeAsync(5);
+				if (calls.length > before) {
+					calls[calls.length - 1].callbacks.onThinkingEnd(10);
+					await vi.advanceTimersByTimeAsync(5);
+				}
+			}
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(0);
+
+			// 真实形状人类消息（userType=3，无 name）→ 本批按人类轮处理 → 计数归零
+			handler.handle({ type: 'receiveMessage', data: serverGroupHumanMessage(1, 100, 'human breaks in', msgId++) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+			const last = calls[calls.length - 1];
+			last.callbacks.onThinkingEnd(10);
+			await vi.advanceTimersByTimeAsync(5);
+
+			expect(guard.getAiRoundCount(1)).toBe(0);
 		} finally {
 			vi.useRealTimers();
 		}
