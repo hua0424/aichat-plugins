@@ -92,6 +92,24 @@ interface RoomChannel {
 	 * 上限 50，超出 shift 最旧；下次真正触发时一次性注入 session 再清空。
 	 */
 	accumulatedMessages: string[];
+	/**
+	 * REQ-004 S8-7（issue #22）: 本轮触发 BATCH 的防循环标志。
+	 * 守卫已从 handleReceiveMessage 移到 triggerAgentLoop 唯一汇聚点——
+	 * 思考期间排队的消息经 flushPendingMessages 直推 debouncer 时也必经守卫。
+	 * 每条 trigger-eligible 消息（无论是否随即入队）都更新这两个标志：
+	 *   - batchSawHuman：本批是否出现过人类消息（出现则本轮按人类轮处理，计数归零）
+	 *   - batchAiFromUid：本批最近一条对端 AI 消息的 fromUid（0=本批无对端 AI 消息）
+	 * 守卫在 triggerAgentLoop 评估完本批后清零这两个标志（非 skipGuard 路径）。
+	 */
+	batchSawHuman: boolean;
+	batchAiFromUid: number;
+	/**
+	 * REQ-004 S8-7: 指数退避窗口标志。
+	 * 守卫判定 delay 时置 true，rescheduled 触发落地时置 false。
+	 * 为 true 期间，新到的 trigger-eligible 消息须入 pendingMessages（不另起触发），
+	 * 在 rescheduled 轮的思考结束后随 flush 处理——退避窗口内不丢消息。
+	 */
+	antiLoopDelaying: boolean;
 }
 
 /** REQ-004 S5: 群聊惰性积累缓冲上限（FIFO） */
@@ -160,7 +178,15 @@ export class MessageHandler {
 					console.error(`[handler] triggerAgentLoop unhandled error (room ${roomId}):`, err.message);
 				});
 			}, this.debounceOptions);
-			channel = { debouncer, pendingMessages: [], lastCtx: { roomId, fromUid: 0, msgId: '' }, accumulatedMessages: [] };
+			channel = {
+				debouncer,
+				pendingMessages: [],
+				lastCtx: { roomId, fromUid: 0, msgId: '' },
+				accumulatedMessages: [],
+				batchSawHuman: false,
+				batchAiFromUid: 0,
+				antiLoopDelaying: false,
+			};
 			this.roomChannels.set(roomId, channel);
 		}
 		return channel;
@@ -280,43 +306,38 @@ export class MessageHandler {
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
 
+		// 5.6. 【S8-7 issue #22】更新本轮触发 BATCH 的防循环标志。
+		//   必须在「思考活跃/退避入队」(step 6) 之前——无论该消息随即入队还是直接 debounce，
+		//   它都属于「下一次 triggerAgentLoop 的本批」，守卫在汇聚点统一评估整批。
+		//   人类消息一旦出现即标记 batchSawHuman（本轮按人类轮处理，反影子化）；
+		//   对端 AI 消息记录其 fromUid（self 已在 step 3 早返回，这里 isFromAi 必是对端）。
+		if (isFromAi) {
+			channel.batchAiFromUid = fromUid;
+		} else {
+			channel.batchSawHuman = true;
+		}
+
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
-		// 6. 检查 thinking session 是否已存在
-		if (this.thinkingSessions.has(sessionKey)) {
+		// 6. thinking 活跃 **或** 处于退避窗口时入队——退避窗口内不另起触发、不丢消息，
+		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
+		if (this.thinkingSessions.has(sessionKey) || channel.antiLoopDelaying) {
 			channel.pendingMessages.push(content);
-			console.log(`[handler] Message queued (thinking active) room=${roomId}, pending: ${channel.pendingMessages.length}`);
+			console.log(`[handler] Message queued (thinking active or anti-loop delaying) room=${roomId}, pending: ${channel.pendingMessages.length}`);
 			return;
 		}
 
-		// 7. 【M3】防循环检查
-		const guardResult = this.antiLoopGuard.check({
-			roomId,
-			fromUid,
-			selfUid: this.selfUid,
-			content,
-			isFromAi,
-		});
-
-		if (guardResult.action === 'block') {
-			console.log(`[anti-loop] block roomId=${roomId} reason=${guardResult.reason}`);
-			this.sendAutoReply(roomId, guardResult.reason ?? 'rate limited');
-			return;
-		}
-
-		if (guardResult.action === 'delay') {
-			console.log(`[anti-loop] delay roomId=${roomId} delayMs=${guardResult.delayMs} aiRoundCount=${this.antiLoopGuard.getAiRoundCount(roomId)}`);
-			setTimeout(() => {
-				this.getRoomChannel(roomId).debouncer.push(content);
-			}, guardResult.delayMs);
-			return;
-		}
-
-		// 正常触发
+		// 7. 正常触发（防循环守卫已移至 triggerAgentLoop 唯一汇聚点，按 BATCH 评估）
 		channel.debouncer.push(content);
 	}
 
-	private async triggerAgentLoop(roomId: number, message: string): Promise<void> {
+	/**
+	 * REQ-004 Agent Loop 触发汇聚点。
+	 * 所有触发路径（直达 debounce / pendingMessages flush / 退避 reschedule）都经此进入，
+	 * 因此防循环守卫在此处按本轮 BATCH 统一评估，杜绝排队消息绕过守卫（issue #22）。
+	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
+	 */
+	private async triggerAgentLoop(roomId: number, message: string, skipGuard = false): Promise<void> {
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
@@ -330,6 +351,48 @@ export class MessageHandler {
 
 		const { msgId } = channel.lastCtx;
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+
+		// 【S8-7 issue #22】防循环守卫：在汇聚点按本轮 BATCH 评估，先于创建 thinking / 发 THINKING_START。
+		//   - skipGuard=true（退避 reschedule 落地）跳过：本轮已评估过，不重复评估。
+		//   - 本批仅当「无人类消息 且 出现过对端 AI 消息」才算一轮 AI-to-AI（反影子化：人类消息一票否决）。
+		if (!skipGuard) {
+			const isFromAi = !channel.batchSawHuman && channel.batchAiFromUid !== 0;
+			const fromUid = channel.batchAiFromUid;
+			const guardResult = this.antiLoopGuard.check({
+				roomId,
+				fromUid,
+				selfUid: this.selfUid,
+				content: message,
+				isFromAi,
+			});
+			// 评估完即清零本批标志（下一批重新积累）
+			channel.batchSawHuman = false;
+			channel.batchAiFromUid = 0;
+
+			if (guardResult.action === 'block') {
+				console.log(`[anti-loop] block roomId=${roomId} reason=${guardResult.reason}`);
+				this.sendAutoReply(roomId, guardResult.reason ?? 'rate limited');
+				return;
+			}
+
+			if (guardResult.action === 'delay') {
+				console.log(`[anti-loop] delay roomId=${roomId} delayMs=${guardResult.delayMs} aiRoundCount=${this.antiLoopGuard.getAiRoundCount(roomId)}`);
+				channel.antiLoopDelaying = true;
+				// 退避结束后**有意**重跑本次捕获的同一条 message：backoff 回答的就是触发它的那条消息。
+				// 退避窗口期间排队的消息不在此处合并，而是随 rescheduled 轮思考结束后的 flush 处理（下一轮），
+				// 不会丢失——这与 triggerAgentLoop 以 channel.lastCtx 为触发键的设计一致。
+				setTimeout(() => {
+					const ch = this.roomChannels.get(roomId);
+					if (ch) ch.antiLoopDelaying = false;
+					// 退避窗口结束：rescheduled 触发不再重复评估守卫（skipGuard=true）
+					this.triggerAgentLoop(roomId, message, true).catch((err) => {
+						console.error(`[handler] triggerAgentLoop (anti-loop reschedule) unhandled error (room ${roomId}):`, err.message);
+					});
+				}, guardResult.delayMs);
+				return;
+			}
+			// 'allow'：继续
+		}
 
 		// 并发防护
 		if (this.thinkingSessions.has(sessionKey)) {

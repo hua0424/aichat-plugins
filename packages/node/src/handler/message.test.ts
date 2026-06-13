@@ -55,6 +55,17 @@ function humanMessage(roomId: number, fromUid: number, content: string, msgId: n
 	} as unknown as ReceivedMessage;
 }
 
+/**
+ * 构造一条来自「另一个 AI」（userType=4=AICLAW）的私聊文本消息。
+ * 默认 roomType=2（私聊），始终 trigger-eligible；fromUid 默认与 selfUid 不同（对端 aiclaw）。
+ */
+function aiMessage(roomId: number, fromUid: number, content: string, msgId: number): ReceivedMessage {
+	return {
+		fromUser: { uid: fromUid, name: 'peer-ai', userType: 4 },
+		message: { id: msgId, roomId, type: 1, roomType: 2, body: { content } },
+	} as unknown as ReceivedMessage;
+}
+
 /** 构造一条群聊文本消息（roomType=1），可选 atUidList / name。 */
 function groupMessage(
 	roomId: number,
@@ -85,6 +96,24 @@ function getAccumulated(handler: MessageHandler, roomId: number): string[] {
 function getPending(handler: MessageHandler, roomId: number): string[] {
 	// @ts-expect-error 访问私有字段做白盒断言
 	return handler.roomChannels.get(roomId)?.pendingMessages ?? [];
+}
+
+/** 读取内嵌 AntiLoopGuard（白盒断言用） */
+function getGuard(handler: MessageHandler): { getAiRoundCount: (roomId: number) => number } {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.antiLoopGuard;
+}
+
+/** 读取指定房间的 antiLoopDelaying 标志（白盒断言用） */
+function isDelaying(handler: MessageHandler, roomId: number): boolean {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.roomChannels.get(roomId)?.antiLoopDelaying === true;
+}
+
+/** 读取指定房间本批的 batchAiFromUid（白盒断言用；0=本批无对端 AI 触发消息） */
+function getBatchAiFromUid(handler: MessageHandler, roomId: number): number {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.roomChannels.get(roomId)?.batchAiFromUid ?? 0;
 }
 
 /** 向 handler 注入一条群配置（mentionRequired 等） */
@@ -686,6 +715,43 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		expect(getAccumulated(handler, 1)).toEqual(['[bob(102)]: more context']); // 缓冲未被清空
 	});
 
+	it('regression-anti-loop: M4 direct-path consecutive AI-to-AI rounds still back off after 5 (non-thinking path)', async () => {
+		// 回归：不经 thinking 队列、纯 debounce 直达路径，连续 AI-to-AI 轮 > 5 后仍触发指数退避。
+		// 用 fake timers 精确控制 debounce flush 与 setTimeout 退避调度。
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+
+			const guard = getGuard(handler);
+
+			// 逐轮：投递对端 AI 消息 → flush debounce → triggerAgentLoop（评估 guard）→ 结束 thinking。
+			// 每轮立刻结束 thinking（同步驱动 onThinkingEnd），保证下一条不会被排队，走直达路径。
+			let msgId = 1;
+			let delayedAt = -1;
+			for (let round = 1; round <= 7; round++) {
+				const before = calls.length;
+				handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, `ai-${round}`, msgId++) } as never);
+				await vi.advanceTimersByTimeAsync(5);
+				if (calls.length > before) {
+					// triggerAgentLoop 已进入（未被退避拦截）→ 结束本轮 thinking
+					calls[calls.length - 1].callbacks.onThinkingEnd(10);
+					await vi.advanceTimersByTimeAsync(5);
+				} else if (delayedAt < 0) {
+					delayedAt = round;
+				}
+			}
+
+			// 阈值后退避必然发生：某一轮 triggerAgentLoop 未直接进入（被 delay 拦截）。
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+			expect(delayedAt).toBeGreaterThan(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it('regression: self / autoReply / non-text / AI(respondToAi=false) are neither accumulated nor triggered', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
@@ -704,5 +770,248 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		await new Promise((r) => setTimeout(r, 40));
 		expect(calls.length).toBe(0);
 		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+});
+
+/**
+ * REQ-004 S8-7: 防循环守卫必须覆盖「思考期间排队」的消息（issue #22）。
+ * 旧实现把 guard.check 放在 handleReceiveMessage 的「思考活跃入队」之后早返回前，
+ * 导致排队消息经 flushPendingMessages 直推 debouncer → triggerAgentLoop 时绕过守卫，
+ * aiRoundCount 永远停在 ~0，指数退避永不触发。修复：把守卫移到 triggerAgentLoop 唯一汇聚点，
+ * 按本轮触发 BATCH 评估。
+ */
+describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (issue #22)', () => {
+	/**
+	 * 模拟「慢 agent」一轮：对端 AI 消息在 thinking 活跃期间到达（被排队），随后 thinking 结束
+	 * → flush → debounce → triggerAgentLoop。返回本轮是否真正进入了一次新的 chat（未被退避拦截）。
+	 */
+	async function driveQueuedAiRound(
+		handler: MessageHandler,
+		calls: ChatCall[],
+		roomId: number,
+		fromUid: number,
+		content: string,
+		msgId: number,
+	): Promise<boolean> {
+		const before = calls.length;
+		// 此刻应有一个 active thinking session（上一轮 chat 未结束）→ 新 AI 消息排队
+		handler.handle({ type: 'receiveMessage', data: aiMessage(roomId, fromUid, content, msgId) } as never);
+		// 结束上一轮 thinking → flush 排队消息 → debounce → triggerAgentLoop
+		const last = calls[calls.length - 1];
+		last.callbacks.onThinkingEnd(10);
+		await vi.advanceTimersByTimeAsync(10);
+		return calls.length > before;
+	}
+
+	it('REPRODUCE: queued AI-to-AI rounds increment aiRoundCount and trigger backoff after threshold', async () => {
+		// 修复前：排队消息绕过守卫 → aiRoundCount 停在 0、永不退避（本断言会失败）。
+		// 修复后：守卫在 triggerAgentLoop 评估每个 BATCH → 计数随每轮递增，> 5 轮后调度退避。
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			// 第 1 条对端 AI 消息：无 active session → 直接 debounce → triggerAgentLoop（thinking 活跃，fake 不结束）
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+			expect(calls.length).toBe(1);
+
+			// 后续每轮：上一轮 thinking 活跃 → 新 AI 消息排队 → 结束上轮 thinking → flush 触发下一轮
+			let delayed = false;
+			for (let round = 2; round <= 8 && !delayed; round++) {
+				const entered = await driveQueuedAiRound(handler, calls, 1, 200, `ai-${round}`, round);
+				if (!entered) delayed = true;
+			}
+
+			// 修复后：守卫确实看到了排队消息 → 计数累增到阈值以上
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+			// 修复后：阈值后某一轮被退避拦截（触发了 [anti-loop] delay 路径，未直接进入新 chat）
+			expect(delayed).toBe(true);
+			expect(isDelaying(handler, 1)).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('REPRODUCE: backoff delayMs follows 5s→15s→30s ladder as queued AI rounds accumulate', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+
+			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+
+			// 跑足够多轮让退避进入 5s 档（aiRoundCount 6..10 → 5000ms）。
+			// 退避一旦生效，driveQueuedAiRound 不会进入新 chat（rescheduled 触发延后），
+			// 此时直接推进退避定时器让 rescheduled trigger 落地继续。
+			let sawDelayMs = -1;
+			for (let round = 2; round <= 9; round++) {
+				const before = calls.length;
+				handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, `ai-${round}`, round) } as never);
+				const last = calls[calls.length - 1];
+				last.callbacks.onThinkingEnd(10);
+				await vi.advanceTimersByTimeAsync(10);
+				if (calls.length === before) {
+					// 被退避拦截，抓取 delay 日志里的 delayMs
+					const delayLog = logSpy.mock.calls.map((c) => String(c[0])).find((s) => s.includes('[anti-loop] delay'));
+					expect(delayLog).toBeDefined();
+					const m = /delayMs=(\d+)/.exec(delayLog!);
+					sawDelayMs = m ? Number(m[1]) : -1;
+					break;
+				}
+			}
+
+			// 退避档位首次落在 5000ms（aiRoundCount 进入 6..10 区间）
+			expect(sawDelayMs).toBe(5000);
+			logSpy.mockRestore();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('human-batch reset / anti-shadowing: human queued THEN AI queued (AI last) → batchSawHuman wins, count resets, no delay', async () => {
+		// manager-required：单纯看「最后一条」会被 AI 影子化（AI 在后）。BATCH 语义要求：
+		// 只要本批含人类消息，本轮即按人类轮处理 → aiRoundCount 归零、不退避。
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			// 先把 aiRoundCount 顶到阈值以上（纯 AI 排队轮）
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+			expect(calls.length).toBe(1);
+			let delayed = false;
+			for (let round = 2; round <= 8 && !delayed; round++) {
+				const entered = await driveQueuedAiRound(handler, calls, 1, 200, `ai-${round}`, round);
+				if (!entered) delayed = true;
+			}
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+
+			// 退避生效中（antiLoopDelaying=true）。推进退避定时器让 rescheduled trigger 落地，
+			// 重新进入一个 active thinking session 以便下面入队。
+			await vi.advanceTimersByTimeAsync(35000);
+			// 此时应有新的 thinking session（rescheduled skipGuard 触发）
+			const beforeMix = calls.length;
+
+			// 在 thinking 活跃期间：先排队一条人类消息，再排队一条 AI 消息（AI 在后 = 影子化场景）
+			handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'human says hi', 50) } as never);
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai after human', 51) } as never);
+			expect(getPending(handler, 1).length).toBe(2);
+
+			// 结束 thinking → flush 两条 → debounce 合并为一个 BATCH → triggerAgentLoop
+			calls[calls.length - 1].callbacks.onThinkingEnd(10);
+			await vi.advanceTimersByTimeAsync(10);
+
+			// 本批含人类消息 → 计数归零、无退避 → 直接进入新 chat
+			expect(guard.getAiRoundCount(1)).toBe(0);
+			expect(calls.length).toBeGreaterThan(beforeMix);
+			expect(isDelaying(handler, 1)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('normal single AI-to-AI round (count <= 5) → triggerAgentLoop proceeds immediately, no delay', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+
+			// 立即进入一次 chat，无退避
+			expect(calls.length).toBe(1);
+			expect(calls[0].message).toBe('ai-1');
+			expect(isDelaying(handler, 1)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('@-gate negative: in a mention-required group, an un-@\'d peer-AI message is accumulated, never counts as an AI-to-AI round (no batchAiFromUid, aiRoundCount stays 0)', async () => {
+		// S8-7 覆盖缺口：既有用例均为私聊/不需点名场景。本用例锁死 @ 闸门的反例——
+		// 需点名群里**未点名**的对端 AI 消息只应进积累缓冲，绝不计入防循环计数。
+		// 守卫只对「触发的」（@到 / eligible）对端 AI 消息累加 aiRoundCount。
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		// 需点名群，且允许响应 AI（排除 respondToAi=false 提前短路，确保是 @ 闸门拦下而非 AI 开关）
+		setGroupConfig(handler, 1, { mentionRequired: true, respondToAi: true });
+		const guard = getGuard(handler);
+
+		// 群聊（roomType=1）+ 对端 AI（userType=4）+ 未 @ 机器人
+		handler.handle({
+			type: 'receiveMessage',
+			data: {
+				fromUser: { uid: 200, name: 'peer-ai', userType: 4 },
+				message: { id: 1, roomId: 1, type: 1, roomType: 1, body: { content: 'ai chatter, no @' } },
+			},
+		} as never);
+
+		await new Promise((r) => setTimeout(r, 40));
+
+		// 未触发：消息只进积累缓冲，不入 pending、不发起 chat
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1)).toEqual(['[peer-ai(200)]: ai chatter, no @']);
+		expect(getPending(handler, 1).length).toBe(0);
+		// 关键：未点名 AI 消息既不设 batchAiFromUid，也不喂防循环计数
+		expect(getBatchAiFromUid(handler, 1)).toBe(0);
+		expect(guard.getAiRoundCount(1)).toBe(0);
+	});
+
+	it('delay window does NOT drop messages: a message arriving during antiLoopDelaying is queued and reaches a later trigger', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter, calls } = fakeAdapter();
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			// 顶到退避阈值
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
+			await vi.advanceTimersByTimeAsync(5);
+			let delayed = false;
+			for (let round = 2; round <= 8 && !delayed; round++) {
+				const entered = await driveQueuedAiRound(handler, calls, 1, 200, `ai-${round}`, round);
+				if (!entered) delayed = true;
+			}
+			expect(delayed).toBe(true);
+			expect(isDelaying(handler, 1)).toBe(true);
+
+			// 退避窗口内到达一条消息 → 必须排队（不丢、不另起触发）
+			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'during-delay', 90) } as never);
+			expect(getPending(handler, 1)).toContain('during-delay');
+
+			// 推进退避定时器 → rescheduled trigger 落地，thinking 结束后 flush 排队消息
+			await vi.advanceTimersByTimeAsync(35000);
+			const idxAfterReschedule = calls.length;
+			expect(idxAfterReschedule).toBeGreaterThan(0);
+			// 结束 rescheduled 轮的 thinking → flush during-delay
+			calls[calls.length - 1].callbacks.onThinkingEnd(10);
+			await vi.advanceTimersByTimeAsync(35000);
+
+			// during-delay 消息最终到达某次 triggerAgentLoop（未丢失）
+			const reached = calls.some((c) => c.message.includes('during-delay'));
+			expect(reached).toBe(true);
+			void guard;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
