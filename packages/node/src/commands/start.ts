@@ -50,6 +50,9 @@ export async function start(): Promise<void> {
 		onMessage: (msg) => handler.handle(msg),
 		onConnected: () => {
 			console.log('[start] Connected! Ready to receive messages.');
+			// REQ #26: 首连 + 每次重连都主动拉一次全量群配置预热内存 cache
+			// （fire-and-forget，不阻塞 ws onopen 后续逻辑；内部已 try/catch 容错）
+			handler.prewarmGroupConfigs().catch(() => {});
 		},
 		onDisconnected: () => {
 			console.log('[start] Disconnected, will auto-reconnect...');
