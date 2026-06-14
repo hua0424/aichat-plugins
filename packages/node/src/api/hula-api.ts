@@ -57,6 +57,30 @@ export class HulaApiClient {
 	}
 
 	/**
+	 * REQ #26: 拉取本 aiclaw（按 token 认证身份）的全部群配置，用于启动/重连预热。
+	 * 无 query 参数；server 把大整数 roomId 序列化为字符串，这里统一 Number(...) 化。
+	 */
+	async listSelfGroupConfigs(): Promise<
+		Array<{
+			roomId: number;
+			mentionRequired?: number;
+			respondToAi?: number;
+			rateLimitPerMinute?: number;
+			dailyLimit?: number;
+		}>
+	> {
+		const resp = await this.get('/api/im/aiclaw/group/config/list');
+		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
+		return list.map((item) => ({
+			roomId: Number(item.roomId),
+			mentionRequired: item.mentionRequired === undefined ? undefined : Number(item.mentionRequired),
+			respondToAi: item.respondToAi === undefined ? undefined : Number(item.respondToAi),
+			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
+			dailyLimit: item.dailyLimit === undefined ? undefined : Number(item.dailyLimit),
+		}));
+	}
+
+	/**
 	 * 更新 aiclaw 群配置
 	 */
 	async updateGroupConfig(

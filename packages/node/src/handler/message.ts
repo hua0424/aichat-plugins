@@ -553,6 +553,32 @@ export class MessageHandler {
 		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
 	}
 
+	/**
+	 * REQ #26: 启动连上 / 每次重连后主动拉一次本 aiclaw 的全部群配置预热内存 cache。
+	 * 唯一其它填充点是 server 的 groupConfigChange 广播（仅 on-change），node 重启后
+	 * cache 清空、自定义群配置会静默退默认；这里在 onConnected 时补一次全量拉取。
+	 *
+	 * 失败容错：整段 try/catch，网络抖动只记日志、不抛、不破坏已有 cache（启动期不能让
+	 * node 崩或阻塞收消息）。apiClient 为 null（未注入）时直接 noop。
+	 */
+	async prewarmGroupConfigs(): Promise<void> {
+		if (!this.apiClient) return;
+		try {
+			const list = await this.apiClient.listSelfGroupConfigs();
+			for (const item of list) {
+				this.groupConfigCache.set(this.selfUid, item.roomId, {
+					mentionRequired: Boolean(item.mentionRequired),
+					respondToAi: Boolean(item.respondToAi),
+					rateLimitPerMinute: item.rateLimitPerMinute ?? 0,
+					dailyLimit: item.dailyLimit ?? 0,
+				});
+			}
+			console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
+		} catch (err) {
+			console.error(`[config] prewarmGroupConfigs failed (cache preserved):`, (err as Error).message);
+		}
+	}
+
 	/** M3: 群配置变更通知处理 */
 	private handleGroupConfigChange(data: GroupConfigChangeDTO): void {
 		if (data.aiclawUid !== this.selfUid) return;

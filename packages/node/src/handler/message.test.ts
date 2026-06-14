@@ -119,6 +119,15 @@ function getBatchAiFromUid(handler: MessageHandler, roomId: number): number {
 	return handler.roomChannels.get(roomId)?.batchAiFromUid ?? 0;
 }
 
+/** 读取内嵌 GroupConfigCache 中某房间的配置（白盒断言用） */
+function getCachedConfig(
+	handler: MessageHandler,
+	roomId: number,
+): { mentionRequired: boolean; respondToAi: boolean; rateLimitPerMinute: number; dailyLimit: number } | undefined {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.groupConfigCache.get(SELF_UID, roomId);
+}
+
 /** 向 handler 注入一条群配置（mentionRequired 等） */
 function setGroupConfig(
 	handler: MessageHandler,
@@ -1169,5 +1178,92 @@ describe('real-shape (server contract) regression', () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
+	/** fake HulaApiClient：仅实现 listSelfGroupConfigs，记录调用次数 */
+	function fakeApiClient(
+		impl: () => Promise<Array<{ roomId: number; mentionRequired?: number; respondToAi?: number; rateLimitPerMinute?: number; dailyLimit?: number }>>,
+	) {
+		const listSelfGroupConfigs = vi.fn(impl);
+		const apiClient = { listSelfGroupConfigs } as unknown as import('../api/hula-api.js').HulaApiClient & {
+			listSelfGroupConfigs: ReturnType<typeof vi.fn>;
+		};
+		return { apiClient, listSelfGroupConfigs };
+	}
+
+	it('prewarmFillsCacheFromListApi: 用 list API 填充两条不同房间的配置', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeApiClient(async () => [
+			{ roomId: 10, mentionRequired: 0, respondToAi: 1, rateLimitPerMinute: 5, dailyLimit: 100 },
+			{ roomId: 20, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 3, dailyLimit: 50 },
+		]);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+
+		await handler.prewarmGroupConfigs();
+
+		const c10 = getCachedConfig(handler, 10);
+		expect(c10).toBeDefined();
+		expect(c10!.mentionRequired).toBe(false);
+		expect(c10!.respondToAi).toBe(true);
+		expect(c10!.rateLimitPerMinute).toBe(5);
+		expect(c10!.dailyLimit).toBe(100);
+
+		const c20 = getCachedConfig(handler, 20);
+		expect(c20).toBeDefined();
+		expect(c20!.mentionRequired).toBe(true);
+		expect(c20!.respondToAi).toBe(false);
+		expect(c20!.rateLimitPerMinute).toBe(3);
+		expect(c20!.dailyLimit).toBe(50);
+	});
+
+	it('prewarmIsIdempotent: 连续两次调用 cache 一致且不抛', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, listSelfGroupConfigs } = fakeApiClient(async () => [
+			{ roomId: 10, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100 },
+		]);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+
+		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+
+		expect(listSelfGroupConfigs).toHaveBeenCalledTimes(2);
+		const c10 = getCachedConfig(handler, 10);
+		expect(c10).toBeDefined();
+		expect(c10!.mentionRequired).toBe(true);
+		expect(c10!.rateLimitPerMinute).toBe(5);
+	});
+
+	it('prewarmToleratesApiFailure: list API 抛错时不抛、且不破坏已有 cache', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeApiClient(async () => {
+			throw new Error('network jitter');
+		});
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+
+		// 预置一条已有 cache（模拟 groupConfigChange 已填充）
+		setGroupConfig(handler, 7, { mentionRequired: false, rateLimitPerMinute: 9 });
+
+		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+
+		// 原有条目仍在，未被破坏
+		const c7 = getCachedConfig(handler, 7);
+		expect(c7).toBeDefined();
+		expect(c7!.mentionRequired).toBe(false);
+		expect(c7!.rateLimitPerMinute).toBe(9);
+	});
+
+	it('prewarmNoApiClientIsNoop: apiClient 为 null 时不抛、cache 空', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined);
+
+		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+
+		expect(getCachedConfig(handler, 10)).toBeUndefined();
 	});
 });
