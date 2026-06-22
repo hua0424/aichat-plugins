@@ -6,6 +6,7 @@ import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
+import { buildAgentInjection } from './media-inject.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -239,10 +240,8 @@ export class MessageHandler {
 
 		// 3. 忽略自己发的消息
 		if (String(data.fromUser.uid) === String(this.selfUid)) return;
-		// 只处理文本消息 (type=1)
-		if (data.message.type !== 1) return;
-
-		const content = data.message.body?.content;
+		// REQ-007 #73: 文本(1)直接用；图片(3)/文件(4)注入 file-attachment；其余类型跳过
+		const content = buildAgentInjection(data.message);
 		if (!content?.trim()) return;
 
 		const roomId = Number(data.message.roomId);
