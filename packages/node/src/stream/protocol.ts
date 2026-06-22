@@ -49,6 +49,49 @@ export interface WSResponse<T = unknown> {
 }
 
 /**
+ * 文本消息 body（message.type=1）。
+ */
+export interface TextMessageBody {
+	content: string;
+	urlContentMap?: Record<string, unknown>;
+	/**
+	 * REQ-004 S5: @ 的 uid 列表（Java List<Long>，序列化为 string/number 数组）。
+	 * 元素 0 = @所有人/@all；显式 @ 机器人时含 selfUid。
+	 */
+	atUidList?: Array<string | number>;
+	reply?: unknown;
+}
+
+/**
+ * REQ-007 #73: 媒体消息 body（message.type=3=IMG / 4=FILE）。
+ * `url` 为可直接 GET 的预签名地址；FILE 必带 `fileName`，IMG 可能缺省。
+ * `content` 为可选文字附言（媒体随附文本）。
+ */
+export interface MediaMessageBody {
+	url: string;
+	size: number;
+	mime?: string;
+	fileName?: string;
+	width?: number;
+	height?: number;
+	content?: string;
+	atUidList?: Array<string | number>;
+	reply?: unknown;
+}
+
+/**
+ * receiveMessage body 联合体。**外部判别**：由 `message.type` 决定具体形状
+ * （1=文本 → TextMessageBody；3=IMG / 4=FILE → MediaMessageBody），
+ * 而非 body 自身的判别字段。运行期可用 {@link isMediaMessageBody} 收窄。
+ */
+export type ReceivedMessageBody = TextMessageBody | MediaMessageBody;
+
+/** 运行期收窄：body 是否为媒体 body（以 `url` 字段存在为判据）。 */
+export function isMediaMessageBody(b: ReceivedMessageBody): b is MediaMessageBody {
+	return 'url' in b;
+}
+
+/**
  * 收到的 IM 消息结构（receiveMessage 中的 data）
  */
 export interface ReceivedMessage {
@@ -65,16 +108,11 @@ export interface ReceivedMessage {
 		/** REQ-004 S5: 会话类型（server 下发）。1=GROUP，2=FRIEND（1:1 私聊）。缺省视为群聊（保守）。 */
 		roomType?: number;
 		sendTime: string;
-		body: {
-			content: string;
-			urlContentMap?: Record<string, unknown>;
-			/**
-			 * REQ-004 S5: @ 的 uid 列表（Java List<Long>，序列化为 string/number 数组）。
-			 * 元素 0 = @所有人/@all；显式 @ 机器人时含 selfUid。
-			 */
-			atUidList?: Array<string | number>;
-			reply?: unknown;
-		};
+		/**
+		 * 消息体。判别由 `message.type` 决定（1=文本 TextMessageBody，
+		 * 3=IMG / 4=FILE MediaMessageBody）。
+		 */
+		body: ReceivedMessageBody;
 	};
 }
 
