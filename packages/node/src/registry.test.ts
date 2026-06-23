@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadAgentRegistry, resolveAgentCredential, type AgentEntry } from './registry.js';
+import { loadAgentRegistry, resolveAgentCredential, cacheFilePath, type AgentEntry } from './registry.js';
 import type { AichatConfig } from './config.js';
 
 /** 构造一个返回给定 JSON envelope 的 fake fetch Response */
@@ -88,10 +88,13 @@ describe('resolveAgentCredential', () => {
 
 	const entry: AgentEntry = { tool: 'openclaw', token: 'activation-token-123' };
 
-	it('cache MISS → calls fetch, writes cache, returns credential; second call is a cache HIT (no 2nd fetch)', async () => {
-		const fetchImpl = vi
-			.fn()
-			.mockResolvedValue(jsonResponse({ success: true, data: { uid: 42, connectionToken: 'conn-tok' } }));
+	it('cache MISS → coerces server STRING uid to number, writes cache, round-trips as a cache HIT (no 2nd fetch)', async () => {
+		// SERVER CONTRACT (confirmed on real server): server serializes the Java Long uid as a STRING.
+		// A numeric-uid mock would NOT have caught the brick: the cache it writes (string uid) could
+		// never be read back, forcing a re-activate that the server rejects with 「已激活」.
+		const fetchImpl = vi.fn().mockResolvedValue(
+			jsonResponse({ success: true, data: { uid: '163589881742848', connectionToken: 'conn-tok' } }),
+		);
 
 		const cred = await resolveAgentCredential(entry, {
 			machineCode: 'machine-xyz',
@@ -100,7 +103,9 @@ describe('resolveAgentCredential', () => {
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 
-		expect(cred.uid).toBe(42);
+		// returned uid is coerced to a NUMBER
+		expect(cred.uid).toBe(163589881742848);
+		expect(typeof cred.uid).toBe('number');
 		expect(cred.connectionToken).toBe('conn-tok');
 		expect(cred.machineCode).toBe('machine-xyz');
 		expect(typeof cred.activatedAt).toBe('string');
@@ -114,13 +119,14 @@ describe('resolveAgentCredential', () => {
 			machineCode: 'machine-xyz',
 		});
 
-		// cache file written
+		// cache file written with a NUMBER uid (so it can be read back)
 		const files = readdirSync(dir);
 		expect(files).toHaveLength(1);
 		const written = JSON.parse(readFileSync(join(dir, files[0]), 'utf-8'));
-		expect(written.uid).toBe(42);
+		expect(written.uid).toBe(163589881742848);
+		expect(typeof written.uid).toBe('number');
 
-		// second call → cache HIT, fetch NOT called again
+		// second call → cache HIT (the round-trip works), fetch NOT called again
 		const cred2 = await resolveAgentCredential(entry, {
 			machineCode: 'machine-xyz',
 			httpBase: 'http://host:18760/api',
@@ -128,7 +134,41 @@ describe('resolveAgentCredential', () => {
 			fetchImpl: fetchImpl as unknown as typeof fetch,
 		});
 		expect(cred2).toEqual(cred);
+		expect(cred2.uid).toBe(163589881742848);
 		expect(fetchImpl).toHaveBeenCalledTimes(1);
+	});
+
+	it('recovers an already-written STRING-uid cache file: coerces uid to number, cache HIT (no fetch)', async () => {
+		// Simulate a cache file written by the buggy build (uid stored as a STRING) — these identities
+		// were bricked because readCachedCredential rejected the string uid. readCachedCredential must
+		// now tolerate + coerce it so the identity recovers on next boot without re-activating.
+		const path = cacheFilePath(entry.token, dir);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			path,
+			JSON.stringify({
+				uid: '163589881742848',
+				connectionToken: 'legacy-conn',
+				machineCode: 'legacy-mc',
+				activatedAt: '2026-01-01T00:00:00.000Z',
+			}),
+			'utf-8',
+		);
+
+		const fetchImpl = vi.fn();
+		const cred = await resolveAgentCredential(entry, {
+			machineCode: 'machine-xyz',
+			httpBase: 'http://host:18760/api',
+			credentialsDir: dir,
+			fetchImpl: fetchImpl as unknown as typeof fetch,
+		});
+
+		expect(cred.uid).toBe(163589881742848);
+		expect(typeof cred.uid).toBe('number');
+		expect(cred.connectionToken).toBe('legacy-conn');
+		expect(cred.machineCode).toBe('legacy-mc');
+		// cache HIT → fetch never called (no re-activate → no 「已激活」 brick)
+		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
 	it('cache HIT → returns cached without calling fetch', async () => {
