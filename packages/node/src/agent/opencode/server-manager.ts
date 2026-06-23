@@ -29,11 +29,21 @@ export interface OpencodeServerManagerDeps {
 	requirePassword?: boolean;
 }
 
+/** REQ-008: opencode serve enforces HTTP Basic auth (user "opencode" + OPENCODE_SERVER_PASSWORD).
+ * Returns the Authorization header value, or undefined when no password is set. */
+export function opencodeBasicAuthHeader(password: string | undefined): string | undefined {
+	if (!password) return undefined;
+	return 'Basic ' + Buffer.from(`opencode:${password}`).toString('base64');
+}
+
 /** Real deps wiring @opencode-ai/sdk. */
 export function defaultServerManagerDeps(): OpencodeServerManagerDeps {
 	return {
 		startServer: (opts) => createOpencodeServer(opts),
-		makeClient: (baseUrl) => createOpencodeClient({ baseUrl }),
+		makeClient: (baseUrl) => {
+			const auth = opencodeBasicAuthHeader(process.env.OPENCODE_SERVER_PASSWORD);
+			return createOpencodeClient({ baseUrl, ...(auth ? { headers: { Authorization: auth } } : {}) });
+		},
 		requirePassword: true,
 	};
 }
