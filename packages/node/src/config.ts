@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
+import type { AgentEntry } from './registry.js';
 
 /**
  * ~/.aichat/ 目录
@@ -31,6 +32,11 @@ export interface AichatConfig {
 			token?: string;
 		};
 	};
+	/**
+	 * REQ-008 #76: 多身份监督器的静态 agent 注册表。
+	 * 每项 = 一个 aiclaw 身份（激活 token + 工具类型）；缺省/空表时回退单身份路径。
+	 */
+	agents?: AgentEntry[];
 }
 
 /**

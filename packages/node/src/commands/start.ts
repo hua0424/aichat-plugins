@@ -1,16 +1,87 @@
-import { loadConfig, loadCredentials, getServerUrl, detectClawConfig } from '../config.js';
+import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawAdapter } from '../claw/openclaw.js';
 import { OpenclawDriver } from '../agent/openclaw-driver.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
+import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
+import { Supervisor } from '../supervisor.js';
+import { getMachineCode } from '../auth/machine.js';
 
 /**
- * aichat start — 读取本地 credentials 自动连接
+ * aichat start — 读取本地配置自动连接。
+ * REQ-008 #76: 若 config.agents 非空 → 多身份监督器路径；否则回退既有单身份路径（不回归）。
  */
 export async function start(): Promise<void> {
 	const config = loadConfig();
+	const registry = loadAgentRegistry(config);
+
+	if (registry.length > 0) {
+		await startMultiIdentity(config);
+		return;
+	}
+
+	await startSingleIdentity(config);
+}
+
+/**
+ * REQ-008 #76 多身份路径：用真实 deps 构建 Supervisor 并拉起 N 条身份链路（per-agent 隔离）。
+ */
+async function startMultiIdentity(config: AichatConfig): Promise<void> {
+	const registry = loadAgentRegistry(config);
+	const serverUrl = getServerUrl(config);
+	const clawConfig = detectClawConfig(config);
+	// 与 activate.ts 同源：ws://host:port/api/ws/ws → http://host:port/api
+	const httpBase = serverUrl
+		.replace('ws://', 'http://')
+		.replace('wss://', 'https://')
+		.replace(/\/ws\/ws$/, '');
+	const restBaseUrl = restBaseUrlFromWsUrl(serverUrl);
+
+	console.log(`[start] Multi-identity mode: ${registry.length} agent(s)`);
+	console.log(`[start] Server: ${serverUrl}`);
+	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
+
+	const supervisor = new Supervisor({
+		resolveCredential: (entry) =>
+			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
+		buildDriver: (entry) => {
+			if (entry.tool === 'openclaw') {
+				return new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token));
+			}
+			// opencode 等在 #77 接线；未知 tool 抛错使该身份降级，不影响其它身份。
+			throw new Error('unsupported agent tool: ' + entry.tool);
+		},
+		buildApiClient: (cred) => new HulaApiClient(restBaseUrl, cred.connectionToken),
+		buildWs: (cred, hooks) =>
+			new HulaWSClient({
+				url: serverUrl,
+				token: cred.connectionToken,
+				clientId: cred.machineCode,
+				onMessage: hooks.onMessage,
+				onConnected: hooks.onConnected,
+				onDisconnected: hooks.onDisconnected,
+			}),
+		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
+			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
+	});
+
+	await supervisor.start(registry);
+
+	const shutdown = () => {
+		console.log('\n[start] Shutting down...');
+		supervisor.stop().catch(() => {});
+		process.exit(0);
+	};
+	process.on('SIGINT', shutdown);
+	process.on('SIGTERM', shutdown);
+}
+
+/**
+ * 既有单身份路径（保持行为不变，含 tokenExpired → process.exit(1)）。
+ */
+async function startSingleIdentity(config: AichatConfig): Promise<void> {
 	const credentials = loadCredentials();
 
 	if (!credentials) {

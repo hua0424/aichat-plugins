@@ -159,12 +159,19 @@ export class MessageHandler {
 	/** debounce 配置（可注入，便于测试） */
 	private readonly debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number };
 
+	/**
+	 * REQ-008 #76: token 过期回调。多身份监督器注入此回调以「降级单个身份」
+	 * 而非 process.exit 整个进程；未注入（单身份路径）时保持原 process.exit(1) 语义。
+	 */
+	private readonly onTokenExpired?: () => void;
+
 	constructor(
 		ws: HulaWSClient,
 		driver: AgentDriver,
 		selfUid: number,
 		apiClient?: HulaApiClient,
 		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
+		onTokenExpired?: () => void,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -173,6 +180,7 @@ export class MessageHandler {
 		this.groupConfigCache = new GroupConfigCache();
 		this.apiClient = apiClient || null;
 		this.debounceOptions = debounceOptions;
+		this.onTokenExpired = onTokenExpired;
 	}
 
 	/**
@@ -216,8 +224,15 @@ export class MessageHandler {
 				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
 				break;
 			case 'tokenExpired':
-				console.error('[handler] Token expired, shutting down...');
-				process.exit(1);
+				// REQ-008 #76: 有 onTokenExpired（多身份）→ 仅降级本身份，不退进程；
+				// 无（单身份路径）→ 保持原 process.exit(1) 向后兼容。
+				if (this.onTokenExpired) {
+					console.error('[handler] Token expired, degrading this identity...');
+					this.onTokenExpired();
+				} else {
+					console.error('[handler] Token expired, shutting down...');
+					process.exit(1);
+				}
 				break;
 			case 'aiclawAuthRequest':
 				console.warn('[handler] Machine code auth request received. Waiting for owner approval...');
