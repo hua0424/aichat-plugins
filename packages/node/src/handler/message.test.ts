@@ -20,7 +20,8 @@ const THINKING_DELTA = WSReqType.THINKING_DELTA;
  */
 interface CallbacksShim {
 	onThinkingDelta(text: string): void;
-	onTerminalTool(info: { action: 'sent' | 'skipped'; tool?: string; reason?: string }): void;
+	// REQ-008 #78: terminal may carry `content` (opencode sent path) → handler sends a real reply.
+	onTerminalTool(info: { action: 'sent' | 'skipped'; tool?: string; reason?: string; content?: string }): void;
 	onThinkingEnd(durationMs: number): void;
 	onError(err: Error): void;
 }
@@ -73,7 +74,13 @@ function fakeAdapter() {
 
 					const callbacks: CallbacksShim = {
 						onThinkingDelta: (text) => push({ type: 'thinking', text }),
-						onTerminalTool: (info) => push({ type: 'terminal', action: info.action, reason: info.reason }),
+						onTerminalTool: (info) =>
+							push({
+								type: 'terminal',
+								action: info.action,
+								reason: info.reason,
+								...(info.content !== undefined ? { content: info.content } : {}),
+							}),
 						onThinkingEnd: (durationMs) => {
 							push({ type: 'done', durationMs });
 							finish();
@@ -435,6 +442,54 @@ describe('MessageHandler per-room isolation', () => {
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
 		expect(end).not.toHaveProperty('skipReason');
+	});
+
+	// REQ-008 #78 — opencode reply path: a terminal sent WITH content → handler sends a REAL reply
+	// via the per-identity apiClient to the BOUND roomId (no autoReply extra).
+	it('terminal sent WITH content → apiClient.sendMessage(roomId, content) (no autoReply)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const sendMessage = vi.fn(async () => ({ msgId: 1 }));
+		const apiClient = { sendMessage } as unknown as import('../api/hula-api.js').HulaApiClient;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+
+		// roomType=2 (private) → triggers; roomId = 7
+		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onThinkingDelta('analysis');
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message', content: '你好，这是回复' });
+		cb.onThinkingEnd(100);
+		await calls[0].flush();
+
+		// real reply sent to the bound roomId with the event content, NO extra (autoReply absent)
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+		expect(sendMessage).toHaveBeenCalledWith(7, '你好，这是回复');
+		expect(sendMessage.mock.calls[0].length).toBe(2); // no 3rd arg → no autoReply extra
+		// ledger still accounts terminal:sent → THINKING_END carries no skipReason (unchanged)
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end).not.toHaveProperty('skipReason');
+	});
+
+	// openclaw-style terminal: sent WITHOUT content → handler does NOT send (aichat-claw already
+	// sent inside the gateway). Behavior unchanged.
+	it('terminal sent WITHOUT content → apiClient.sendMessage NOT called (openclaw path unchanged)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const sendMessage = vi.fn(async () => ({ msgId: 1 }));
+		const apiClient = { sendMessage } as unknown as import('../api/hula-api.js').HulaApiClient;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		const cb = calls[0].callbacks;
+
+		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' }); // no content (openclaw)
+		cb.onThinkingEnd(100);
+		await calls[0].flush();
+
+		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
 	it('ignores a terminal event arriving AFTER finalize (out-of-order, no double-account)', async () => {

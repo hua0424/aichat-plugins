@@ -555,8 +555,23 @@ export class MessageHandler {
 				} else if (ev.type === 'error') {
 					finalizeError(ev.message);
 					break;
+				} else if (ev.type === 'terminal' && ev.action === 'sent' && ev.content) {
+					// REQ-008 #78: opencode 回复路径——driver 把 agent 调用 hula_send_message 的 args.content
+					// 作为带 content 的 terminal:sent 事件传上来，这里用本身份 apiClient 发到「本会话绑定的
+					// roomId」。房间/身份**只**取自会话绑定（this.apiClient + 本 roomId），**绝不**取自事件，
+					// 防伪造。这是一条**真实**回复——不带 autoReply extra（autoReply 是 server 限流/退避用的）。
+					// openclaw 路径的 terminal:sent **不带 content**（aichat-claw 内部已直接发过），故这里不会重发，
+					// 行为不变。事件仍照常 push 进 session.events 供 reduceThinking 记账（terminal sent → 'sent'）。
+					if (this.apiClient) {
+						this.apiClient.sendMessage(roomId, ev.content).catch((err) => {
+							console.error('[handler] opencode reply sendMessage failed:', err instanceof Error ? err.message : String(err));
+						});
+					} else {
+						console.warn('[handler] opencode reply skipped: no apiClient bound');
+					}
 				}
-				// 'terminal' / 'tool' 事件无需即时副作用——reduceThinking 在 done 时统一结算账本。
+				// 其余 'terminal'（无 content 的 sent / skipped）与 'tool' 事件无需即时副作用——
+				// reduceThinking 在 done 时统一结算账本。
 			}
 		} catch (err) {
 			finalizeError(err instanceof Error ? err.message : String(err));

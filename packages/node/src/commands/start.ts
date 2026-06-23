@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
@@ -50,7 +51,10 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// REQ-008 #77: 单例 opencode server manager——「1 个 server 服务 N 个身份」。
 	// 在此构建一次并被所有 opencode 身份的 buildDriver 闭包共享；仅当注册表里真有
 	// opencode 身份、且该身份 connect() 时才惰性 ensureStarted（lazy）。
-	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps());
+	// REQ-008 #78: 注入已构建的 hula 插件绝对路径（dist/.../hula-plugin.js），spawned server
+	// 据此 config.plugin 加载它，使 agent 能调用 hula_send_message / hula_skip_reply。
+	const hulaPluginPath = fileURLToPath(new URL('../agent/opencode/hula-plugin.js', import.meta.url));
+	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [hulaPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
 
 	const supervisor = new Supervisor({

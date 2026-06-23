@@ -3,35 +3,44 @@ import { join } from 'node:path';
 import { deriveWorkspaceDir } from './workspace.js';
 
 const BASE = '/tmp/ws';
+const UID = 5; // REQ-008 #77 fix: every path is namespaced by aiclawUid first.
 
 describe('deriveWorkspaceDir', () => {
-	it('group (roomType=1) → <base>/group/<roomId>', () => {
-		expect(deriveWorkspaceDir(BASE, { roomType: 1, roomId: 42 })).toBe(join(BASE, 'group', '42'));
+	it('group (roomType=1) → <base>/<aiclawUid>/group/<roomId>', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42 })).toBe(join(BASE, '5', 'group', '42'));
 	});
 
-	it('owner dm (roomType=2, isOwner) → <base>/owner', () => {
+	it('owner dm (roomType=2, isOwner) → <base>/<aiclawUid>/owner', () => {
 		expect(
-			deriveWorkspaceDir(BASE, { roomType: 2, roomId: 7, counterpartUid: 10937, isOwner: true }),
-		).toBe(join(BASE, 'owner'));
+			deriveWorkspaceDir(BASE, UID, { roomType: 2, roomId: 7, counterpartUid: 10937, isOwner: true }),
+		).toBe(join(BASE, '5', 'owner'));
 	});
 
-	it('friend dm (roomType=2, isOwner=false) → <base>/dm/<counterpartUid>', () => {
+	it('friend dm (roomType=2, isOwner=false) → <base>/<aiclawUid>/dm/<counterpartUid>', () => {
 		expect(
-			deriveWorkspaceDir(BASE, { roomType: 2, roomId: 7, counterpartUid: 1001, isOwner: false }),
-		).toBe(join(BASE, 'dm', '1001'));
+			deriveWorkspaceDir(BASE, UID, { roomType: 2, roomId: 7, counterpartUid: 1001, isOwner: false }),
+		).toBe(join(BASE, '5', 'dm', '1001'));
 	});
 
-	it('dm (roomType=2) → <base>/dm/<counterpartUid>', () => {
-		expect(deriveWorkspaceDir(BASE, { roomType: 2, roomId: 7, counterpartUid: 1001 })).toBe(
-			join(BASE, 'dm', '1001'),
+	it('dm (roomType=2) → <base>/<aiclawUid>/dm/<counterpartUid>', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 2, roomId: 7, counterpartUid: 1001 })).toBe(
+			join(BASE, '5', 'dm', '1001'),
 		);
 	});
 
 	it('dm without counterpartUid → falls back to roomId (never collide all DMs)', () => {
-		expect(deriveWorkspaceDir(BASE, { roomType: 2, roomId: 7 })).toBe(join(BASE, 'dm', '7'));
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 2, roomId: 7 })).toBe(join(BASE, '5', 'dm', '7'));
 	});
 
 	it('unknown roomType → conservative group-by-roomId fallback', () => {
-		expect(deriveWorkspaceDir(BASE, { roomType: 99, roomId: 5 })).toBe(join(BASE, 'group', '5'));
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 99, roomId: 5 })).toBe(join(BASE, '5', 'group', '5'));
+	});
+
+	it('#77 fix: two aiclaw identities NEVER collide on the same owner/group/dm dir', () => {
+		const a = deriveWorkspaceDir(BASE, 1, { roomType: 2, roomId: 7, isOwner: true });
+		const b = deriveWorkspaceDir(BASE, 2, { roomType: 2, roomId: 7, isOwner: true });
+		expect(a).not.toBe(b);
+		expect(a).toBe(join(BASE, '1', 'owner'));
+		expect(b).toBe(join(BASE, '2', 'owner'));
 	});
 });

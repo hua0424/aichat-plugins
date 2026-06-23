@@ -5,15 +5,20 @@ import type { SessionStore, StoredSession } from './session-store.js';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentEvent } from '../events.js';
 
-/** In-memory SessionStore fake. */
-function memStore(): SessionStore & { map: Map<string, StoredSession> } {
+/** In-memory SessionStore fake. `del` is a spy so tests can assert lazy-rebuild invalidation. */
+function memStore(): SessionStore & { map: Map<string, StoredSession>; del: ReturnType<typeof vi.fn> } {
 	const map = new Map<string, StoredSession>();
+	const del = vi.fn((k: string) => {
+		map.delete(k);
+	});
 	return {
 		map,
+		del,
 		get: (k) => map.get(k),
 		set: (k, v) => {
 			map.set(k, v);
 		},
+		delete: del,
 	};
 }
 
@@ -91,13 +96,14 @@ function mockClient(opts?: { sessionID?: string; stream?: { stream: AsyncIterabl
 	return { client, create, prompt, subscribe, ctl };
 }
 
-/** No-op server manager that just hands back the given client. */
-function noopServer(client: OpencodeClient): OpencodeServerManager {
+/** No-op server manager that just hands back the given client. `restart` is an observable spy. */
+function noopServer(client: OpencodeClient): OpencodeServerManager & { restart: ReturnType<typeof vi.fn> } {
 	return {
 		ensureStarted: vi.fn().mockResolvedValue(undefined),
 		stop: vi.fn().mockResolvedValue(undefined),
+		restart: vi.fn().mockResolvedValue(undefined),
 		getClient: () => client,
-	} as unknown as OpencodeServerManager;
+	} as unknown as OpencodeServerManager & { restart: ReturnType<typeof vi.fn> };
 }
 
 /**
@@ -314,5 +320,88 @@ describe('OpencodeSession.send', () => {
 		await Promise.race([consumed, timeout]);
 		// The parked SSE subscription was actively closed, not just abandoned.
 		expect(spied.returnSpy).toHaveBeenCalled();
+	});
+
+	// REQ-008 #78 — terminal events pass through send() (NOT swallowed by the tool de-dup).
+	it('completed hula_send_message → exactly ONE terminal sent+content per call, passes through', async () => {
+		const { client, ctl } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const stream = session.send('m');
+		await new Promise((r) => setImmediate(r));
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'thinking' }, delta: 'thinking' } });
+		ctl.emit({
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_send_message', callID: 't1', state: { status: 'completed', input: { content: 'hi user' } } } },
+		});
+		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
+		const events = await drain(stream);
+		const terminals = events.filter((e) => e.type === 'terminal');
+		expect(terminals).toEqual([{ type: 'terminal', action: 'sent', content: 'hi user' }]);
+		// terminal sits between thinking and done; tool de-dup never swallowed it.
+		expect(events[0]).toEqual({ type: 'thinking', text: 'thinking' });
+		expect(events[events.length - 1].type).toBe('done');
+	});
+
+	it('completed hula_skip_reply → terminal skipped passes through send()', async () => {
+		const { client, ctl } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const stream = session.send('m');
+		await new Promise((r) => setImmediate(r));
+		ctl.emit({
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_skip_reply', callID: 's1', state: { status: 'completed', input: { reason: '客套' } } } },
+		});
+		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
+		const events = await drain(stream);
+		expect(events.filter((e) => e.type === 'terminal')).toEqual([{ type: 'terminal', action: 'skipped', reason: '客套' }]);
+	});
+
+	// REQ-008 #78 — REQ-004 role-instruction prefix is applied to the prompt body.
+	it('REQ-004 role prompt prefix is prepended to the prompt body (user message preserved)', async () => {
+		const { client, prompt } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		session.send('原始用户消息');
+		await new Promise((r) => setImmediate(r));
+		expect(prompt).toHaveBeenCalledOnce();
+		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body;
+		const text = body.parts[0].text;
+		expect(text).toContain('hula_send_message');
+		expect(text).toContain('hula_skip_reply');
+		expect(text.endsWith('原始用户消息')).toBe(true);
+		// no [SYSTEM] markers (gateway security hardening)
+		expect(text).not.toContain('[SYSTEM]');
+	});
+
+	// REQ-008 #78 P2③ — onSessionError invalidates the store entry on a send error.
+	it('prompt rejection invalidates the stored session (store.delete + server.restart) for lazy rebuild', async () => {
+		const { client, prompt } = mockClient();
+		(prompt as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('session gone'));
+		const server = noopServer(client);
+		const store = memStore();
+		const driver = new OpencodeDriver({ server, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({ aiclawUid: 4, roomId: 8, chatContext: { roomType: 1, roomId: 8 } });
+		expect(store.map.has('aiclaw-4-room-8')).toBe(true);
+		const events = await drain(session.send('m'));
+		expect(events).toEqual([{ type: 'error', message: 'session gone' }]);
+		// the stale binding is dropped so the NEXT openSession recreates it lazily
+		expect(store.del).toHaveBeenCalledWith('aiclaw-4-room-8');
+		expect(store.map.has('aiclaw-4-room-8')).toBe(false);
+		expect(server.restart).toHaveBeenCalled();
+	});
+
+	it('subscribe rejection invalidates the stored session (store.delete) for lazy rebuild', async () => {
+		const { client, subscribe } = mockClient();
+		(subscribe as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('server down'));
+		const server = noopServer(client);
+		const store = memStore();
+		const driver = new OpencodeDriver({ server, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({ aiclawUid: 4, roomId: 8, chatContext: { roomType: 1, roomId: 8 } });
+		const events = await drain(session.send('m'));
+		expect(events).toEqual([{ type: 'error', message: 'server down' }]);
+		expect(store.del).toHaveBeenCalledWith('aiclaw-4-room-8');
+		expect(server.restart).toHaveBeenCalled();
 	});
 });

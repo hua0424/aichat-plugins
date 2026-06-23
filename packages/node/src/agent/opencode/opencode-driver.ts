@@ -78,7 +78,8 @@ export class OpencodeDriver implements AgentDriver {
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const ctx = o.chatContext as unknown as OpencodeChatContext;
-		const directory = deriveWorkspaceDir(this.workspaceBase, ctx);
+		// REQ-008 #77 fix: namespace the workspace by aiclawUid so two identities never collide.
+		const directory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(directory, { recursive: true });
 
 		const key = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
@@ -99,7 +100,19 @@ export class OpencodeDriver implements AgentDriver {
 			this.sessionStore.set(key, { sessionID, directory });
 		}
 
-		return new OpencodeSession(client, sessionID, directory, parseModel(this.model));
+		// REQ-008 #78 P2③ lazy rebuild: if send() fails because the server/session is gone,
+		// drop the stored binding so the NEXT openSession recreates the session, and best-effort
+		// restart the shared server. Lazy rebuild = recover on the next turn, not same-turn retry.
+		// TODO(#78): fuller crash detection / auto-retry (probe + same-turn re-prompt) is a future
+		// refinement; for now we only invalidate so we don't keep prompting a dead session.
+		const onSessionError = () => {
+			this.sessionStore.delete(key);
+			void this.server.restart().catch(() => {
+				/* best-effort: the next openSession's getClient()/ensureStarted() recovers */
+			});
+		};
+
+		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), onSessionError);
 	}
 }
 
@@ -121,6 +134,12 @@ class OpencodeSession implements AgentSession {
 		private readonly sessionID: string,
 		private readonly directory: string,
 		private readonly model: ParsedModel | undefined,
+		/**
+		 * REQ-008 #78 P2③: invoked once when send()'s subscribe/prompt throws (server/session
+		 * gone), AFTER the terminal error has been emitted. The driver wires this to drop the
+		 * stale session binding (lazy rebuild on the next turn) + best-effort restart the server.
+		 */
+		private readonly onSessionError?: () => void,
 	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
@@ -202,6 +221,21 @@ class OpencodeSession implements AgentSession {
 			return false;
 		};
 
+		// REQ-008 #78 (mirrors openclaw.ts enrichedMessage, REQ-004 S3): prepend a role-instruction
+		// so the agent treats its text output as thinking/analysis (NOT shown to the user) and
+		// replies ONLY by calling hula_send_message (user-facing content in `content`), or calls
+		// hula_skip_reply when no reply is warranted. The session is already bound to the room — the
+		// agent must NOT pass any room/identity (anti-spoofing). Plain string prefix, no [SYSTEM]
+		// markers (those get filtered by gateway security hardening).
+		const enrichedMessage =
+			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
+			'要回复用户时，请调用 hula_send_message 工具，把给用户看的内容写进 content。' +
+			'当前会话已绑定房间与身份，hula_send_message 无需也不应再传 roomId 或任何身份信息。' +
+			'如果判断本轮无需回复（如纯客套、无实质内容、消息不需要回应），请调用 hula_skip_reply。' +
+			'send 至少一次或 skip 恰好一次，二者是本轮的合法终结动作。\n\n' +
+			'--- 用户消息如下 ---\n' +
+			message;
+
 		// Drive the SDK: subscribe first (avoid the race), then prompt, then pump events.
 		void (async () => {
 			try {
@@ -213,7 +247,7 @@ class OpencodeSession implements AgentSession {
 					path: { id: this.sessionID },
 					query: { directory: this.directory },
 					body: {
-						parts: [{ type: 'text', text: message }],
+						parts: [{ type: 'text', text: enrichedMessage }],
 						...(this.model ? { model: this.model } : {}),
 					},
 				});
@@ -225,6 +259,8 @@ class OpencodeSession implements AgentSession {
 					(err: unknown) => {
 						push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
 						finish();
+						// P2③: prompt rejected (session/server gone) → invalidate for lazy rebuild.
+						this.onSessionError?.();
 					},
 				);
 
@@ -249,6 +285,8 @@ class OpencodeSession implements AgentSession {
 				}
 			} catch (err) {
 				push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+				// P2③: subscribe (or other setup) threw → invalidate for lazy rebuild on next turn.
+				this.onSessionError?.();
 			} finally {
 				finish();
 			}

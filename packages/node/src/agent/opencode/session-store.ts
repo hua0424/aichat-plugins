@@ -15,6 +15,8 @@ export interface StoredSession {
 export interface SessionStore {
 	get(key: string): StoredSession | undefined;
 	set(key: string, val: StoredSession): void;
+	/** REQ-008 #78 P2③: drop a stale binding so the next openSession recreates it lazily. */
+	delete(key: string): void;
 }
 
 /** Default location: persists under ~/.aichat/ (a persistent volume) so reuse survives restarts. */
@@ -52,11 +54,21 @@ export class FileSessionStore implements SessionStore {
 
 	set(key: string, val: StoredSession): void {
 		this.map[key] = val;
+		this.persist();
+	}
+
+	delete(key: string): void {
+		if (!(key in this.map)) return;
+		delete this.map[key];
+		this.persist();
+	}
+
+	private persist(): void {
 		try {
 			mkdirSync(dirname(this.path), { recursive: true });
 			writeFileSync(this.path, JSON.stringify(this.map, null, 2), 'utf-8');
 		} catch {
-			/* best-effort: keep the in-memory binding even if the disk write fails */
+			/* best-effort: keep the in-memory map even if the disk write fails */
 		}
 	}
 }

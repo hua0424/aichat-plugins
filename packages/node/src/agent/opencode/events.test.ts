@@ -60,6 +60,68 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'bash', phase: 'end' });
 	});
 
+	// REQ-008 #78 — terminal-tool detection (hula_send_message / hula_skip_reply when completed).
+	it('completed hula_send_message → terminal sent + content (from state.input.content)', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: {
+				part: {
+					type: 'tool',
+					sessionID: SID,
+					tool: 'hula_send_message',
+					callID: 'c9',
+					state: { status: 'completed', input: { content: '你好，我帮你查一下。' } },
+				},
+			},
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'terminal', action: 'sent', content: '你好，我帮你查一下。' });
+	});
+
+	it('completed hula_send_message with no input.content → terminal sent + empty content', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_send_message', callID: 'c9', state: { status: 'completed' } } },
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'terminal', action: 'sent', content: '' });
+	});
+
+	it('completed hula_skip_reply with reason → terminal skipped + that reason', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: {
+				part: { type: 'tool', sessionID: SID, tool: 'hula_skip_reply', callID: 'c8', state: { status: 'completed', input: { reason: '纯客套' } } },
+			},
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'terminal', action: 'skipped', reason: '纯客套' });
+	});
+
+	it('completed hula_skip_reply with no reason → terminal skipped + default reason', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_skip_reply', callID: 'c8', state: { status: 'completed' } } },
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'terminal', action: 'skipped', reason: 'agent_skip_reply' });
+	});
+
+	// Documented choice: a RUNNING hula_send_message (status!=completed) is NOT terminal — it is
+	// treated as an ordinary tool START, consistent with every other tool (we only act on a tool
+	// once it has truly completed; we never send a half-formed/aborted reply).
+	it('running hula_send_message (not completed) → tool start, NOT terminal', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_send_message', callID: 'c9', state: { status: 'running', input: { content: 'x' } } } },
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'hula_send_message', phase: 'start' });
+	});
+
+	it('a NORMAL tool completed is still a tool end (terminal detection only fires for hula_* tools)', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'tool', sessionID: SID, tool: 'read', callID: 'c1', state: { status: 'completed', input: { content: 'not a reply' } } } },
+		};
+		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'read', phase: 'end' });
+	});
+
 	it('session.idle for matching session → done with durationMs:0 (session fills real value)', () => {
 		const evt = { type: 'session.idle', properties: { sessionID: SID } };
 		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'done', durationMs: 0 });
