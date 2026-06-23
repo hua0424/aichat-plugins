@@ -2,6 +2,7 @@ import { loadConfig, loadCredentials, getServerUrl, detectClawConfig } from '../
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawAdapter } from '../claw/openclaw.js';
+import { OpenclawDriver } from '../agent/openclaw-driver.js';
 import { ClawRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
@@ -25,15 +26,15 @@ export async function start(): Promise<void> {
 	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
 	console.log(`[start] Machine: ${credentials.machineCode}`);
 
-	// 创建路由器并注册适配器
+	// 创建路由器并注册驱动（OpenclawDriver 包裹未改动的 OpenclawAdapter WS 引擎）
 	const router = new ClawRouter();
-	router.register(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token));
+	router.register(new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token)));
 
-	// 连接所有适配器
+	// 连接所有驱动
 	await router.connectAll();
 
-	// 获取默认适配器
-	const adapter = router.getDefault()!;
+	// 获取默认驱动
+	const driver = router.getDefault()!;
 
 	// REQ-004 M3: 内嵌轻量 HulaApiClient（autoReply / CLI 使用）
 	const restBaseUrl = restBaseUrlFromWsUrl(serverUrl);
@@ -59,7 +60,7 @@ export async function start(): Promise<void> {
 		},
 	});
 
-	handler = new MessageHandler(ws, adapter, credentials.uid, internalApiClient);
+	handler = new MessageHandler(ws, driver, credentials.uid, internalApiClient);
 
 	ws.connect();
 

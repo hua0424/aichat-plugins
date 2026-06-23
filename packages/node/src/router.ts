@@ -1,16 +1,16 @@
-import type { ClawAdapter } from './claw/interface.js';
+import type { AgentDriver } from './agent/events.js';
 
 /**
  * Claw 路由器
- * 管理多个 ClawAdapter，按 type 路由请求
+ * 管理多个 AgentDriver，按 type 路由请求
  */
 export class ClawRouter {
-	private adapters = new Map<string, ClawAdapter>();
+	private adapters = new Map<string, AgentDriver>();
 
 	/**
 	 * 注册适配器
 	 */
-	register(adapter: ClawAdapter): void {
+	register(adapter: AgentDriver): void {
 		if (this.adapters.has(adapter.type)) {
 			throw new Error(`ClawAdapter type "${adapter.type}" already registered`);
 		}
@@ -20,14 +20,14 @@ export class ClawRouter {
 	/**
 	 * 获取适配器
 	 */
-	getAdapter(type: string): ClawAdapter | undefined {
+	getAdapter(type: string): AgentDriver | undefined {
 		return this.adapters.get(type);
 	}
 
 	/**
 	 * 获取默认适配器（第一个注册的）
 	 */
-	getDefault(): ClawAdapter | undefined {
+	getDefault(): AgentDriver | undefined {
 		return this.adapters.values().next().value;
 	}
 

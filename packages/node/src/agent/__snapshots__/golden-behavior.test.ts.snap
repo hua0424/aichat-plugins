@@ -1,0 +1,178 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > a) send: deltas + terminal sent + done 1`] = `
+[
+  {
+    "data": {
+      "msgId": 1,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "1",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "reason-1",
+      "durationMs": "<durationMs:number>",
+      "status": "complete",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) explicit skip: terminal skipped (agent_skip_reply) + done 1`] = `
+[
+  {
+    "data": {
+      "msgId": 2,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "2",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "analysing",
+      "durationMs": "<durationMs:number>",
+      "skipReason": "agent_skip_reply",
+      "status": "complete",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) no-terminal: deltas + done only → fallback agent_no_terminal_tool 1`] = `
+[
+  {
+    "data": {
+      "msgId": 3,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "3",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "just thinking",
+      "durationMs": "<durationMs:number>",
+      "skipReason": "agent_no_terminal_tool",
+      "status": "complete",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > d) error 1`] = `
+[
+  {
+    "data": {
+      "msgId": 4,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "4",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "partial-work",
+      "durationMs": "<durationMs:number>",
+      "error": "boom",
+      "status": "error",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > e) send-then-skip (send-wins) 1`] = `
+[
+  {
+    "data": {
+      "msgId": 5,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "5",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "x",
+      "durationMs": "<durationMs:number>",
+      "status": "complete",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
+
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > f) two thinking deltas concatenated 1`] = `
+[
+  {
+    "data": {
+      "msgId": 6,
+      "timestamp": "<timestamp:number>",
+    },
+    "type": "ACK",
+  },
+  {
+    "data": {
+      "fromUid": 999,
+      "roomId": 1,
+      "triggerMsgId": "6",
+    },
+    "type": "THINKING_START",
+  },
+  {
+    "data": {
+      "content": "foobar",
+      "durationMs": "<durationMs:number>",
+      "status": "complete",
+      "thinkingId": undefined,
+    },
+    "type": "THINKING_END",
+  },
+]
+`;
