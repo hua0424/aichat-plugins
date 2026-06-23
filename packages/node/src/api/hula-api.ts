@@ -81,9 +81,12 @@ export class HulaApiClient {
 			respondToAi: item.respondToAi === undefined ? undefined : Number(item.respondToAi),
 			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
 			dailyLimit: item.dailyLimit === undefined ? undefined : Number(item.dailyLimit),
-			// REQ-009 #85: server serializes these under exactly these names; pass through as-is.
-			workspaceDir: item.workspaceDir === undefined ? undefined : String(item.workspaceDir),
-			account: item.account === undefined ? undefined : String(item.account),
+			// REQ-009 #85: server serializes these under exactly these names. Use `== null` to catch
+			// BOTH JSON null (workspace_dir 默认 NULL) AND undefined — else String(null) → the literal
+			// string "null", which deriveWorkspaceDir treats as an absolute override and feeds opencode
+			// session.create as directory:"null" (fails the whole group round). null → undefined = default-derive.
+			workspaceDir: item.workspaceDir == null ? undefined : String(item.workspaceDir),
+			account: item.account == null ? undefined : String(item.account),
 		}));
 	}
 

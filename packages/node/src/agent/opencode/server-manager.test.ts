@@ -31,6 +31,7 @@ function makeDeps(overrides?: Partial<OpencodeServerManagerDeps>) {
 
 afterEach(() => {
 	delete process.env.OPENCODE_SERVER_PASSWORD;
+	delete process.env.OPENCODE_SERVER_START_TIMEOUT_MS;
 	vi.restoreAllMocks();
 });
 
@@ -108,6 +109,40 @@ describe('OpencodeServerManager', () => {
 		await mgr.ensureStarted();
 		const opts = startServer.mock.calls[0][0] as { config?: { plugin?: string[] } };
 		expect(opts.config).toBeUndefined();
+	});
+
+	// REQ-008 — the SDK's default 5000ms start timeout killed every cold start (~6s); the manager
+	// must pass a generous timeout to startServer so spawns survive the cold start.
+	it('ensureStarted passes a generous default start timeout to startServer', async () => {
+		delete process.env.OPENCODE_SERVER_START_TIMEOUT_MS;
+		const { deps, startServer } = makeDeps();
+		const mgr = new OpencodeServerManager(deps);
+		await mgr.ensureStarted();
+		const opts = startServer.mock.calls[0][0] as { timeout?: number };
+		expect(opts.timeout).toBe(30000);
+		expect(opts.timeout).toBeGreaterThanOrEqual(30000);
+	});
+
+	it('timeout is also passed alongside config.plugin when pluginPaths are set', async () => {
+		const { deps, startServer } = makeDeps();
+		const mgr = new OpencodeServerManager(deps, { pluginPaths: ['/abs/hula-plugin.js'] });
+		await mgr.ensureStarted();
+		const opts = startServer.mock.calls[0][0] as { timeout?: number; config?: { plugin?: string[] } };
+		expect(opts.timeout).toBe(30000);
+		expect(opts.config?.plugin).toEqual(['/abs/hula-plugin.js']);
+	});
+
+	it('OPENCODE_SERVER_START_TIMEOUT_MS overrides the default start timeout', async () => {
+		process.env.OPENCODE_SERVER_START_TIMEOUT_MS = '45000';
+		try {
+			const { deps, startServer } = makeDeps();
+			const mgr = new OpencodeServerManager(deps);
+			await mgr.ensureStarted();
+			const opts = startServer.mock.calls[0][0] as { timeout?: number };
+			expect(opts.timeout).toBe(45000);
+		} finally {
+			delete process.env.OPENCODE_SERVER_START_TIMEOUT_MS;
+		}
 	});
 });
 
