@@ -151,6 +151,8 @@ async function startSingleIdentity(config: AichatConfig): Promise<void> {
 			// REQ #26: 首连 + 每次重连都主动拉一次全量群配置预热内存 cache
 			// （fire-and-forget，不阻塞 ws onopen 后续逻辑；内部已 try/catch 容错）
 			handler.prewarmGroupConfigs().catch(() => {});
+			// REQ-009 #83: 上报 agent 类型（legacy 单身份路径恒为 openclaw；fire-and-forget）。
+			internalApiClient.reportAgentType('openclaw').catch(() => {});
 		},
 		onDisconnected: () => {
 			console.log('[start] Disconnected, will auto-reconnect...');

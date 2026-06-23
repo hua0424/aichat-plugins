@@ -91,6 +91,15 @@ export class HulaApiClient {
 		await this.put('/api/im/aiclaw/group/config', { aiclawUid, roomId, ...config });
 	}
 
+	/**
+	 * REQ-009 #83：连接成功后上报本 aiclaw（按 token 认证身份）的 agent 类型，
+	 * 供 server 持久化（覆盖只从 cache 预置、不再重新 activate 的身份）。
+	 * server 按 connectionToken 识别身份，body 只带类型；upsert 幂等。
+	 */
+	async reportAgentType(agentType: string): Promise<void> {
+		await this.post('/api/im/aiclaw/report-agent-type', { agentType });
+	}
+
 	// ─── HTTP helpers ───
 
 	private async get(path: string): Promise<ApiResponse> {
