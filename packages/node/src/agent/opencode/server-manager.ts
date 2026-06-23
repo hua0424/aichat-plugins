@@ -11,6 +11,13 @@ export interface StartServerOpts {
 	hostname?: string;
 	port?: number;
 	/**
+	 * REQ-008: ms to wait for the spawned `opencode serve` to be listening before the SDK
+	 * gives up. The SDK default is 5000ms, but cold-starts in the deployed container take ~6s,
+	 * so every spawn was killed at 5s. We pass a generous, env-overridable timeout — see
+	 * `ensureStarted()` / `OPENCODE_SERVER_START_TIMEOUT_MS`. Forwarded to `createOpencodeServer`.
+	 */
+	timeout?: number;
+	/**
 	 * REQ-008 #78: opencode server `config` (the subset we use). `plugin` is the list of
 	 * module paths the spawned `opencode serve` loads — we inject the built hula plugin here so
 	 * the agent can call hula_send_message / hula_skip_reply.
@@ -99,9 +106,16 @@ export class OpencodeServerManager {
 		if (this.requirePassword && !process.env.OPENCODE_SERVER_PASSWORD) {
 			throw new Error('OPENCODE_SERVER_PASSWORD must be set');
 		}
+		// REQ-008: opencode serve cold-starts in ~6s in the deployed container; the SDK's default
+		// 5000ms start timeout killed every spawn (connectWithRetry can't help — each spawn dies
+		// at 5s). Pass a generous, env-overridable timeout (30s default) so cold starts succeed.
+		const startTimeoutMs = Number(process.env.OPENCODE_SERVER_START_TIMEOUT_MS) || 30000;
 		// REQ-008 #78: inject the configured plugin module paths into the spawned server's config
 		// so the agent can call the hula terminal tools. Empty list → omit config.plugin entirely.
-		const opts: StartServerOpts = this.pluginPaths.length > 0 ? { config: { plugin: this.pluginPaths } } : {};
+		const opts: StartServerOpts =
+			this.pluginPaths.length > 0
+				? { timeout: startTimeoutMs, config: { plugin: this.pluginPaths } }
+				: { timeout: startTimeoutMs };
 		const handle = await this.deps.startServer(opts);
 		this.server = handle;
 		this.client = this.deps.makeClient(handle.url);
