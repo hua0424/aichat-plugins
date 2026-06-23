@@ -8,6 +8,17 @@ export interface GroupConfig {
 	mentionRequired: boolean;
 	dailyLimit: number;
 	respondToAi: boolean;
+	/**
+	 * REQ-009 #85: owner-configured absolute host path for the opencode workspace of this
+	 * (aiclaw, group). Empty/absent → plugins derives a default. Absolute override wins.
+	 */
+	workspaceDir?: string;
+	/**
+	 * REQ-009 #85: the group's human-readable group number ("groupkey"). Used as the default
+	 * workspace-dir segment (`<base>/<aiclawUid>/group/<account>`) so the owner can cd into a
+	 * stable, human-readable path on the host. Falls back to roomId when missing.
+	 */
+	account?: string;
 }
 
 export class GroupConfigCache {
@@ -24,6 +35,9 @@ export class GroupConfigCache {
 			...config,
 			respondToAi: Boolean(config.respondToAi),
 			mentionRequired: Boolean(config.mentionRequired),
+			// REQ-009 #85: carry workspaceDir/account through as-is when present, else undefined.
+			workspaceDir: config.workspaceDir,
+			account: config.account,
 		};
 		this.cache.set(`${aiclawUid}:${roomId}`, normalized);
 	}

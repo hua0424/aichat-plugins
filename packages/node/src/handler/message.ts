@@ -493,10 +493,20 @@ export class MessageHandler {
 		// session 存到 thinkingSession 上，供超时/广播/destroy finalize 时 best-effort close。
 		// REQ-008 #77: 透传会话上下文给 driver。openclaw driver 忽略 chatContext（行为不变）；
 		// opencode driver 据此派生隔离 workspace 目录。私聊（roomType=2）的对端 = fromUid。
+		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
+		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
+		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
 		const agentSession = await this.driver.openSession({
 			aiclawUid: this.selfUid,
 			roomId,
-			chatContext: { roomType, roomId, counterpartUid: fromUid, isOwner },
+			chatContext: {
+				roomType,
+				roomId,
+				counterpartUid: fromUid,
+				isOwner,
+				workspaceDir: cfg?.workspaceDir,
+				account: cfg?.account,
+			},
 		});
 		session.agentSession = agentSession;
 
@@ -625,6 +635,9 @@ export class MessageHandler {
 					respondToAi: Boolean(item.respondToAi),
 					rateLimitPerMinute: item.rateLimitPerMinute ?? 0,
 					dailyLimit: item.dailyLimit ?? 0,
+					// REQ-009 #85: carry owner workspace override + groupkey through the cache.
+					workspaceDir: item.workspaceDir,
+					account: item.account,
 				});
 			}
 			console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
@@ -636,7 +649,12 @@ export class MessageHandler {
 	/** M3: 群配置变更通知处理 */
 	private handleGroupConfigChange(data: GroupConfigChangeDTO): void {
 		if (data.aiclawUid !== this.selfUid) return;
-		this.groupConfigCache.set(this.selfUid, data.roomId, data.config);
+		// REQ-009 #85: workspaceDir rides inside config; account rides on the outer message.
+		this.groupConfigCache.set(this.selfUid, data.roomId, {
+			...data.config,
+			workspaceDir: data.config.workspaceDir,
+			account: data.account,
+		});
 		console.log(`[config] update roomId=${data.roomId} rateLimit=${data.config.rateLimitPerMinute} respondToAi=${data.config.respondToAi}`);
 	}
 

@@ -172,11 +172,15 @@ export interface ThinkingEndDTO {
 export interface GroupConfigChangeDTO {
 	aiclawUid: number;
 	roomId: number;
+	/** REQ-009 #85: the group's human-readable group number ("groupkey"), carried on the outer message. */
+	account?: string;
 	config: {
 		rateLimitPerMinute: number;
 		mentionRequired: boolean;
 		dailyLimit: number;
 		respondToAi: boolean;
+		/** REQ-009 #85: owner-configured absolute host workspace path (empty/absent → derive default). */
+		workspaceDir?: string;
 	};
 }
 

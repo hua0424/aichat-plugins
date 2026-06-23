@@ -218,7 +218,16 @@ function getBatchAiFromUid(handler: MessageHandler, roomId: number): number {
 function getCachedConfig(
 	handler: MessageHandler,
 	roomId: number,
-): { mentionRequired: boolean; respondToAi: boolean; rateLimitPerMinute: number; dailyLimit: number } | undefined {
+):
+	| {
+			mentionRequired: boolean;
+			respondToAi: boolean;
+			rateLimitPerMinute: number;
+			dailyLimit: number;
+			workspaceDir?: string;
+			account?: string;
+	  }
+	| undefined {
 	// @ts-expect-error 访问私有字段做白盒断言
 	return handler.groupConfigCache.get(SELF_UID, roomId);
 }
@@ -227,18 +236,29 @@ function getCachedConfig(
 function setGroupConfig(
 	handler: MessageHandler,
 	roomId: number,
-	config: { mentionRequired?: boolean; respondToAi?: boolean; rateLimitPerMinute?: number; dailyLimit?: number },
+	config: {
+		mentionRequired?: boolean;
+		respondToAi?: boolean;
+		rateLimitPerMinute?: number;
+		dailyLimit?: number;
+		/** REQ-009 #85: owner workspace override (rides inside config). */
+		workspaceDir?: string;
+		/** REQ-009 #85: group human-readable groupkey (rides on the outer message). */
+		account?: string;
+	},
 ): void {
 	handler.handle({
 		type: 'groupConfigChange',
 		data: {
 			aiclawUid: SELF_UID,
 			roomId,
+			...(config.account !== undefined ? { account: config.account } : {}),
 			config: {
 				rateLimitPerMinute: config.rateLimitPerMinute ?? 0,
 				mentionRequired: config.mentionRequired ?? true,
 				dailyLimit: config.dailyLimit ?? 0,
 				respondToAi: config.respondToAi ?? false,
+				...(config.workspaceDir !== undefined ? { workspaceDir: config.workspaceDir } : {}),
 			},
 		},
 	} as never);
@@ -735,6 +755,24 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		expect(calls[0].context?.roomId).toBe(1);
 		expect(calls[0].message).toBe('hey bot');
 		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	it('REQ-009 #85: group openSession chatContext carries workspaceDir + account from cache', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true, workspaceDir: '/srv/proj', account: '888888' });
+
+		handler.handle({
+			type: 'receiveMessage',
+			data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }),
+		} as never);
+
+		await waitFor(() => calls.length >= 1);
+		const ctx = openSession.mock.calls[0][0].chatContext as { workspaceDir?: string; account?: string };
+		expect(ctx.workspaceDir).toBe('/srv/proj');
+		expect(ctx.account).toBe('888888');
 	});
 
 	it('group + mention_required + NO @bot → NOT triggered, message accumulated', async () => {
@@ -1372,7 +1410,17 @@ describe('real-shape (server contract) regression', () => {
 describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 	/** fake HulaApiClient：仅实现 listSelfGroupConfigs，记录调用次数 */
 	function fakeApiClient(
-		impl: () => Promise<Array<{ roomId: number; mentionRequired?: number; respondToAi?: number; rateLimitPerMinute?: number; dailyLimit?: number }>>,
+		impl: () => Promise<
+			Array<{
+				roomId: number;
+				mentionRequired?: number;
+				respondToAi?: number;
+				rateLimitPerMinute?: number;
+				dailyLimit?: number;
+				workspaceDir?: string;
+				account?: string;
+			}>
+		>,
 	) {
 		const listSelfGroupConfigs = vi.fn(impl);
 		const apiClient = { listSelfGroupConfigs } as unknown as import('../api/hula-api.js').HulaApiClient & {
@@ -1405,6 +1453,27 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		expect(c20!.respondToAi).toBe(false);
 		expect(c20!.rateLimitPerMinute).toBe(3);
 		expect(c20!.dailyLimit).toBe(50);
+	});
+
+	it('REQ-009 #85: prewarm carries workspaceDir + account through the cache', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeApiClient(async () => [
+			{ roomId: 10, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100, workspaceDir: '/srv/proj', account: '888888' },
+			{ roomId: 20, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100 },
+		]);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+
+		await handler.prewarmGroupConfigs();
+
+		const c10 = getCachedConfig(handler, 10);
+		expect(c10!.workspaceDir).toBe('/srv/proj');
+		expect(c10!.account).toBe('888888');
+
+		// roomId 20 had neither → both undefined (default derive downstream)
+		const c20 = getCachedConfig(handler, 20);
+		expect(c20!.workspaceDir).toBeUndefined();
+		expect(c20!.account).toBeUndefined();
 	});
 
 	it('prewarmIsIdempotent: 连续两次调用 cache 一致且不抛', async () => {

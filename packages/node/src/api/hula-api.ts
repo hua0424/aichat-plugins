@@ -67,6 +67,10 @@ export class HulaApiClient {
 			respondToAi?: number;
 			rateLimitPerMinute?: number;
 			dailyLimit?: number;
+			/** REQ-009 #85: owner-configured absolute host workspace path (empty/absent → derive default). */
+			workspaceDir?: string;
+			/** REQ-009 #85: the group's human-readable group number ("groupkey"). */
+			account?: string;
 		}>
 	> {
 		const resp = await this.get('/api/im/aiclaw/group/config/list');
@@ -77,6 +81,9 @@ export class HulaApiClient {
 			respondToAi: item.respondToAi === undefined ? undefined : Number(item.respondToAi),
 			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
 			dailyLimit: item.dailyLimit === undefined ? undefined : Number(item.dailyLimit),
+			// REQ-009 #85: server serializes these under exactly these names; pass through as-is.
+			workspaceDir: item.workspaceDir === undefined ? undefined : String(item.workspaceDir),
+			account: item.account === undefined ? undefined : String(item.account),
 		}));
 	}
 
