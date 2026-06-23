@@ -60,9 +60,18 @@ export class OpencodeDriver implements AgentDriver {
 	}
 
 	async disconnect(): Promise<void> {
-		await this.server.stop();
+		// No-op. The shared opencode server is NOT owned by any single driver — it is a
+		// singleton serving N opencode identities, so stopping it here would kill ALL of
+		// them and break the supervisor's per-agent isolation. It is closed only by GLOBAL
+		// shutdown (see start.ts startMultiIdentity). This driver has no other per-driver
+		// resources to release: per-turn SSE subscriptions are owned by OpencodeSession and
+		// closed via AgentSession.close() by the handler.
 	}
 
+	// ponytail/TODO(#78): shared-server fault-domain recovery — if the singleton server
+	// crashes, the sessionIDs persisted here become stale. A future slice should detect a
+	// crashed server and lazily rebuild the session on the next openSession/send. Not done
+	// now: no crash detection / retry here.
 	async openSession(o: {
 		aiclawUid: number;
 		roomId: number;
@@ -125,6 +134,20 @@ class OpencodeSession implements AgentSession {
 		const toolStarted = new Set<string>();
 		const toolEnded = new Set<string>();
 
+		// Manual async-iterator handle on the SSE stream so we can close it externally even
+		// while a consumer is PARKED on iter.next() (a `for await` can't be interrupted).
+		let streamIter: AsyncIterator<unknown> | null = null;
+		let iterReturned = false;
+		const returnIter = () => {
+			if (iterReturned) return; // call return() at most once
+			iterReturned = true;
+			try {
+				void streamIter?.return?.();
+			} catch {
+				/* best-effort: terminate a parked iter.next() / close the subscription */
+			}
+		};
+
 		const wake = () => {
 			if (resolveNext) {
 				const r = resolveNext;
@@ -137,9 +160,15 @@ class OpencodeSession implements AgentSession {
 			buffer.push(ev);
 			wake();
 		};
+		// Error dedup invariant: the FIRST push+finish wins. Because push() is a no-op once
+		// `done` is set and finish() runs synchronously right after the first error push
+		// (prompt-rejection path) or right after handleRaw returns true (SSE-error path),
+		// a second error can never be buffered — at most ONE 'error' event reaches the
+		// consumer. finish() also closes the SSE iterator so a parked turn ends promptly.
 		const finish = () => {
 			if (done) return;
 			done = true;
+			returnIter();
 			wake();
 		};
 		this.closeActive = finish;
@@ -188,7 +217,9 @@ class OpencodeSession implements AgentSession {
 						...(this.model ? { model: this.model } : {}),
 					},
 				});
-				// Surface a prompt rejection as a terminal error event.
+				// Surface a prompt rejection as a terminal error event. push()+finish() are
+				// sequential with no await between them, so once finish() sets `done`, any
+				// later error push (e.g. an SSE session.error) is dropped — single error.
 				promptPromise.then(
 					() => {},
 					(err: unknown) => {
@@ -197,12 +228,23 @@ class OpencodeSession implements AgentSession {
 					},
 				);
 
-				for await (const raw of stream) {
-					if (done || this.closed) break;
-					const end = handleRaw(raw);
-					if (end) {
-						finish();
-						break;
+				// Iterate the stream MANUALLY (not `for await`) so finish()/close() can call
+				// streamIter.return() to terminate a parked next() and close the subscription.
+				const iter = stream[Symbol.asyncIterator]();
+				streamIter = iter;
+				if (iterReturned) {
+					// finish()/close() already fired before we stored the iterator → honor it.
+					returnIter();
+				} else {
+					while (true) {
+						const { value: raw, done: d } = await iter.next();
+						if (d) break;
+						if (done || this.closed) break;
+						const end = handleRaw(raw);
+						if (end) {
+							finish();
+							break;
+						}
 					}
 				}
 			} catch (err) {

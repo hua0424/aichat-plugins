@@ -87,9 +87,13 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 
 	await supervisor.start(registry);
 
-	const shutdown = () => {
+	const shutdown = async () => {
 		console.log('\n[start] Shutting down...');
-		supervisor.stop().catch(() => {});
+		// Stop per-identity supervision first, THEN close the shared opencode server. The
+		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
+		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
+		await supervisor.stop().catch(() => {});
+		await opencodeServer.stop().catch(() => {});
 		process.exit(0);
 	};
 	process.on('SIGINT', shutdown);

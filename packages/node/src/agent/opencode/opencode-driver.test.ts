@@ -54,12 +54,36 @@ function controllableStream() {
 	};
 }
 
-/** Build a mock OpencodeClient with controllable create/prompt/subscribe. */
-function mockClient(opts?: { sessionID?: string }) {
+/**
+ * A controllable stream whose async ITERATOR exposes a spied `return()`, so a test can
+ * assert the driver closes the underlying SSE subscription (calls iter.return()) on
+ * finish()/close(). `return()` also ends the stream so a parked next() resolves done.
+ */
+function spyableStream() {
 	const ctl = controllableStream();
+	const returnSpy = vi.fn(async () => {
+		ctl.end();
+		return { value: undefined, done: true } as IteratorResult<unknown>;
+	});
+	const inner = ctl.stream[Symbol.asyncIterator]();
+	const iterable: AsyncIterable<unknown> = {
+		[Symbol.asyncIterator](): AsyncIterator<unknown> {
+			return {
+				next: () => inner.next(),
+				return: returnSpy,
+			};
+		},
+	};
+	return { stream: iterable, emit: ctl.emit, end: ctl.end, returnSpy };
+}
+
+/** Build a mock OpencodeClient with controllable create/prompt/subscribe. */
+function mockClient(opts?: { sessionID?: string; stream?: { stream: AsyncIterable<unknown> } }) {
+	const ctl = controllableStream();
+	const streamForSubscribe = opts?.stream?.stream ?? ctl.stream;
 	const create = vi.fn(async () => ({ data: { id: opts?.sessionID ?? 'ses_new' } }));
 	const prompt = vi.fn(async () => ({ data: {} }));
-	const subscribe = vi.fn(async () => ({ stream: ctl.stream }));
+	const subscribe = vi.fn(async () => ({ stream: streamForSubscribe }));
 	const client = {
 		session: { create, prompt },
 		event: { subscribe },
@@ -74,6 +98,25 @@ function noopServer(client: OpencodeClient): OpencodeServerManager {
 		stop: vi.fn().mockResolvedValue(undefined),
 		getClient: () => client,
 	} as unknown as OpencodeServerManager;
+}
+
+/**
+ * A SHARED (singleton) server manager fake: `started` stays true, `stop` is observable, and
+ * `getClient` always returns the same mock client. Mirrors the real "1 server serves N"
+ * manager so we can assert one driver's disconnect() never tears it down.
+ */
+function sharedServer(client: OpencodeClient): OpencodeServerManager & { stop: ReturnType<typeof vi.fn> } {
+	let started = true;
+	return {
+		ensureStarted: vi.fn().mockResolvedValue(undefined),
+		stop: vi.fn(async () => {
+			started = false;
+		}),
+		getClient: () => client,
+		get started() {
+			return started;
+		},
+	} as unknown as OpencodeServerManager & { stop: ReturnType<typeof vi.fn> };
 }
 
 async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
@@ -118,6 +161,30 @@ describe('OpencodeDriver.openSession', () => {
 		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
 
 		expect(create).toHaveBeenCalledOnce(); // second openSession reused, did NOT create again
+	});
+});
+
+describe('OpencodeDriver.disconnect isolation (shared singleton server)', () => {
+	it('disconnect() is a no-op: does NOT stop the shared server; other identities keep working', async () => {
+		const { client, create } = mockClient();
+		const server = sharedServer(client);
+		const store1 = memStore();
+		const store2 = memStore();
+		const driver1 = new OpencodeDriver({ server, workspaceBase: BASE, sessionStore: store1 });
+		const driver2 = new OpencodeDriver({ server, workspaceBase: BASE, sessionStore: store2 });
+
+		// One identity is degraded/disconnected.
+		await driver1.disconnect();
+
+		// The shared server is untouched: stop NOT called, still started.
+		expect(server.stop).not.toHaveBeenCalled();
+		expect(server.started).toBe(true);
+
+		// The OTHER identity still opens sessions against the shared client.
+		const session = await driver2.openSession({ aiclawUid: 7, roomId: 3, chatContext: { roomType: 1, roomId: 3 } });
+		expect(session).toBeDefined();
+		expect(create).toHaveBeenCalledOnce();
+		expect(store2.map.get('aiclaw-7-room-3')?.sessionID).toBe(SID);
 	});
 });
 
@@ -193,6 +260,22 @@ describe('OpencodeSession.send', () => {
 		expect(events).toEqual([{ type: 'error', message: 'prompt failed' }]);
 	});
 
+	it('prompt rejection AND session.error → exactly ONE error event, then ends (dedup)', async () => {
+		const { client, ctl, prompt } = mockClient();
+		(prompt as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('prompt failed'));
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const stream = session.send('m');
+		await new Promise((r) => setImmediate(r));
+		// Both error sources fire for the SAME session: the SSE error AND the rejected prompt.
+		ctl.emit({ type: 'session.error', properties: { sessionID: SID, error: { name: 'UnknownError', data: { message: 'kaboom' } } } });
+		const events = await drain(stream);
+		const errors = events.filter((e) => e.type === 'error');
+		expect(errors).toHaveLength(1); // exactly one error survives the dedup guard
+		// the stream ended (last event is the single error; no events buffered after it)
+		expect(events[events.length - 1].type).toBe('error');
+	});
+
 	it('close() terminates a parked consumer (no terminal event ever arrives)', async () => {
 		const { client } = mockClient();
 		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
@@ -210,5 +293,26 @@ describe('OpencodeSession.send', () => {
 		});
 		await Promise.race([consumed, timeout]);
 		expect(collected).toEqual([]);
+	});
+
+	it('close() mid-park calls the SSE iterator return() (closes the subscription, no leak)', async () => {
+		const spied = spyableStream();
+		const { client } = mockClient({ stream: { stream: spied.stream } });
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const stream = session.send('m');
+		const consumed = (async () => {
+			for await (const _ev of stream) void _ev;
+		})();
+		// Let subscribe()/prompt() run and the SSE loop PARK on iter.next() (no event emitted).
+		await new Promise((r) => setImmediate(r));
+		await session.close();
+		const timeout = new Promise<never>((_, reject) => {
+			const t = setTimeout(() => reject(new Error('iterator did not terminate after close()')), 1000);
+			if (typeof t === 'object' && 'unref' in t) (t as { unref: () => void }).unref();
+		});
+		await Promise.race([consumed, timeout]);
+		// The parked SSE subscription was actively closed, not just abandoned.
+		expect(spied.returnSpy).toHaveBeenCalled();
 	});
 });
