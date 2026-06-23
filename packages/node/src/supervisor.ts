@@ -25,6 +25,39 @@ export interface SupervisorDeps {
 		api: HulaApiClient,
 		onTokenExpired: () => void,
 	) => MessageHandler;
+	/**
+	 * REQ-008 #79：driver.connect() 的瞬态失败重试上限（含首次）。生产缺省 5。测试可注入小值。
+	 */
+	maxConnectAttempts?: number;
+	/**
+	 * 第 attempt 次（1-based）失败后的退避毫秒。生产缺省指数退避（封顶 8s）。
+	 */
+	connectBackoffMs?: (attempt: number) => number;
+	/**
+	 * 可注入的 sleep（测试注入 `() => Promise.resolve()` 跳过真实等待）。缺省基于 setTimeout。
+	 */
+	delay?: (ms: number) => Promise<void>;
+	/**
+	 * 可覆盖的瞬态错误分类器。缺省按错误消息正则匹配（gateway starting / unavailable / 超时 等）。
+	 */
+	isTransientConnectError?: (err: unknown) => boolean;
+}
+
+/** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s。 */
+const defaultConnectBackoffMs = (attempt: number): number => Math.min(1000 * 2 ** (attempt - 1), 8000);
+
+/** 生产缺省 sleep。 */
+const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+
+/**
+ * REQ-008 #79：判断 driver.connect() 失败是否为**瞬态**（可重试）。
+ * 容器启动时 openclaw gateway 约 5s 才就绪，supervisor 约 2s 即连 → 拿到
+ * `[UNAVAILABLE] gateway starting; retry shortly`。这类应退避重试；
+ * 「已激活」等不可恢复错误不走 connect 路径（resolveCredential 阶段就抛，不在此重试）。
+ */
+function defaultIsTransientConnectError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return /gateway starting|unavailable|econnrefused|timeout|starting|temporarily/i.test(msg);
 }
 
 /**
@@ -90,9 +123,9 @@ export class Supervisor {
 	 * 拉起单条身份链路。任一步抛错向上冒泡给 start 隔离处理（本身份不进入 supervised online 列表）。
 	 */
 	private async startAgent(entry: AgentEntry): Promise<void> {
+		// resolveCredential 的失败（如「已激活」不可恢复）**不是瞬态**，绝不重试 → 直接冒泡降级。
 		const cred = await this.deps.resolveCredential(entry);
-		const driver = this.deps.buildDriver(entry);
-		await driver.connect();
+		const driver = await this.connectWithRetry(entry);
 		const api = this.deps.buildApiClient(cred);
 
 		// 显式持有 handler，避免 ws hooks 闭包引用尚未赋值的绑定（移除时序耦合）。
@@ -123,6 +156,48 @@ export class Supervisor {
 
 		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler });
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);
+	}
+
+	/**
+	 * REQ-008 #79：带退避重试地连上 driver。
+	 *
+	 * 容器启动时 openclaw gateway 约 5s 才就绪，而 supervisor 约 2s 即拉起 → driver.connect()
+	 * 可能拿到 `[UNAVAILABLE] gateway starting; retry shortly`。旧单身份路径靠整进程崩溃+重启熬过，
+	 * 但本类 per-agent 隔离会把这种**可恢复**瞬态错当永久失败吞掉 → 该身份被无谓降级。
+	 *
+	 * 策略：最多 maxConnectAttempts 次，每次都 **buildDriver 一个全新 driver** 再 connect()；
+	 * 失败时 best-effort disconnect 旧 driver（避免其内部重连定时器泄漏），瞬态且还有次数则退避后重试，
+	 * 否则向上抛（让 start 像以前一样降级该身份）。
+	 */
+	private async connectWithRetry(entry: AgentEntry): Promise<AgentDriver> {
+		const maxAttempts = this.deps.maxConnectAttempts ?? 5;
+		const backoffMs = this.deps.connectBackoffMs ?? defaultConnectBackoffMs;
+		const delay = this.deps.delay ?? defaultDelay;
+		const isTransient = this.deps.isTransientConnectError ?? defaultIsTransientConnectError;
+
+		let lastErr: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			const driver = this.deps.buildDriver(entry);
+			try {
+				await driver.connect();
+				return driver;
+			} catch (err) {
+				lastErr = err;
+				// 清理失败的 driver，避免其内部重连定时器泄漏。
+				await driver.disconnect().catch(() => {});
+				if (isTransient(err) && attempt < maxAttempts) {
+					const reason = err instanceof Error ? err.message : String(err);
+					console.error(
+						`[supervisor] agent (tool=${entry.tool}) connect attempt ${attempt}/${maxAttempts} failed (transient): ${reason}; retrying...`,
+					);
+					await delay(backoffMs(attempt));
+					continue;
+				}
+				throw err;
+			}
+		}
+		// 仅当 maxAttempts<1（非常规配置）时到达；保底抛出最后一次错误。
+		throw lastErr ?? new Error('connectWithRetry: no attempts made');
 	}
 
 	/**

@@ -150,6 +150,101 @@ describe('Supervisor.start', () => {
 	});
 });
 
+describe('Supervisor connect retry (REQ-008 #79)', () => {
+	const oneEntry: AgentEntry[] = [{ tool: 'openclaw', token: 'tok-1' }];
+
+	it('transient-then-success: connect rejects "gateway starting" twice then resolves on the 3rd → agent online; 3 builds/connects; 2 delays; failed drivers disconnected', async () => {
+		const disconnects: Array<ReturnType<typeof vi.fn>> = [];
+		const connects: Array<ReturnType<typeof vi.fn>> = [];
+		let attempt = 0;
+		const delay = vi.fn(() => Promise.resolve());
+
+		const { deps } = makeDeps({
+			buildDriver: vi.fn((): AgentDriver => {
+				attempt++;
+				const willFail = attempt <= 2;
+				const connect = willFail
+					? vi.fn().mockRejectedValue(new Error('gateway starting'))
+					: vi.fn().mockResolvedValue(undefined);
+				const disconnect = vi.fn().mockResolvedValue(undefined);
+				connects.push(connect);
+				disconnects.push(disconnect);
+				return { type: 'mock', connect, disconnect, openSession: vi.fn() } as unknown as AgentDriver;
+			}),
+			delay,
+			maxConnectAttempts: 5,
+		});
+
+		const sup = new Supervisor(deps);
+		await sup.start(oneEntry);
+
+		expect(sup.agents).toHaveLength(1);
+		expect(sup.agents[0].status).toBe('online');
+		// 3 attempts: build + connect each
+		expect(deps.buildDriver).toHaveBeenCalledTimes(3);
+		expect(connects).toHaveLength(3);
+		for (const c of connects) expect(c).toHaveBeenCalledOnce();
+		// 2 backoff delays
+		expect(delay).toHaveBeenCalledTimes(2);
+		// the 2 failed drivers were disconnected; the successful one was not
+		expect(disconnects[0]).toHaveBeenCalledOnce();
+		expect(disconnects[1]).toHaveBeenCalledOnce();
+		expect(disconnects[2]).not.toHaveBeenCalled();
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('non-transient connect error → no retry: exactly 1 attempt, agent not online, delay never called', async () => {
+		const delay = vi.fn(() => Promise.resolve());
+		const { deps } = makeDeps({
+			buildDriver: vi.fn(
+				(): AgentDriver =>
+					({
+						type: 'mock',
+						connect: vi.fn().mockRejectedValue(new Error('boom')),
+						disconnect: vi.fn().mockResolvedValue(undefined),
+						openSession: vi.fn(),
+					}) as unknown as AgentDriver,
+			),
+			delay,
+			maxConnectAttempts: 5,
+		});
+
+		const sup = new Supervisor(deps);
+		await expect(sup.start(oneEntry)).resolves.toBeUndefined();
+
+		expect(deps.buildDriver).toHaveBeenCalledTimes(1);
+		expect(sup.agents).toHaveLength(0);
+		expect(delay).not.toHaveBeenCalled();
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('all-attempts-transient → degrades after maxConnectAttempts without throwing out of start()', async () => {
+		const delay = vi.fn(() => Promise.resolve());
+		const { deps } = makeDeps({
+			buildDriver: vi.fn(
+				(): AgentDriver =>
+					({
+						type: 'mock',
+						connect: vi.fn().mockRejectedValue(new Error('gateway starting')),
+						disconnect: vi.fn().mockResolvedValue(undefined),
+						openSession: vi.fn(),
+					}) as unknown as AgentDriver,
+			),
+			delay,
+			maxConnectAttempts: 3,
+		});
+
+		const sup = new Supervisor(deps);
+		await expect(sup.start(oneEntry)).resolves.toBeUndefined();
+
+		expect(deps.buildDriver).toHaveBeenCalledTimes(3);
+		// delays only between attempts: 2 for 3 attempts
+		expect(delay).toHaveBeenCalledTimes(2);
+		expect(sup.agents).toHaveLength(0);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
 describe('Supervisor token-expiry degrade', () => {
 	it('firing onTokenExpired degrades only the target agent; others stay online; no process.exit', async () => {
 		const { deps, built } = makeDeps();

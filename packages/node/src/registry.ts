@@ -79,14 +79,18 @@ export interface ResolveCredentialOpts {
  */
 interface ActivateResponse {
 	success: boolean;
-	data?: { uid: number; connectionToken: string };
+	/**
+	 * SERVER CONTRACT：server 把 Java `Long` uid 序列化为 **字符串**（如 "163589881742848"）。
+	 * 这里如实标注 `number | string`，调用方负责 `Number()` 收敛为数字后再落盘/使用。
+	 */
+	data?: { uid: number | string; connectionToken: string };
 	msg?: string;
 }
 
 /**
  * 每身份凭证缓存文件路径 = `${dir}/${sha256(token).slice(0,16)}.jsonc`。
  */
-function cacheFilePath(token: string, dir: string): string {
+export function cacheFilePath(token: string, dir: string): string {
 	const hash = createHash('sha256').update(token).digest('hex').slice(0, 16);
 	return join(dir, `${hash}.jsonc`);
 }
@@ -100,14 +104,19 @@ function readCachedCredential(path: string): AichatCredentials | null {
 		const raw = readFileSync(path, 'utf-8');
 		const json = raw.replace(/^\s*\/\/.*$/gm, '');
 		const parsed = JSON.parse(json) as Partial<AichatCredentials>;
+		// SERVER CONTRACT：旧版/server 写的缓存里 uid 可能是字符串（Java Long 序列化为 string）。
+		// 容忍并收敛为数字，既修新写入也恢复已写入的「字符串 uid」缓存（否则二次启动校验失败 → 重激活 → 砖）。
+		const uid = typeof parsed.uid === 'string' ? Number(parsed.uid) : parsed.uid;
 		if (
-			typeof parsed.uid === 'number' &&
+			typeof uid === 'number' &&
+			Number.isFinite(uid) &&
+			uid > 0 &&
 			typeof parsed.connectionToken === 'string' &&
 			parsed.connectionToken !== '' &&
 			typeof parsed.machineCode === 'string' &&
 			parsed.machineCode !== ''
 		) {
-			return parsed as AichatCredentials;
+			return { ...parsed, uid } as AichatCredentials;
 		}
 		return null;
 	} catch {
@@ -169,7 +178,11 @@ export async function resolveAgentCredential(
 	}
 
 	const credential: AichatCredentials = {
-		uid: result.data.uid,
+		// SERVER CONTRACT：server 把 Long uid 序列化为字符串（如 "163589881742848"）。
+		// 必须 Number() 收敛——否则落盘的 uid 是字符串，下次启动 readCachedCredential 校验失败 →
+		// 缓存永远读不回 → 重激活 → server 抛「已激活」→ 身份不可恢复（砖）。
+		// Number("163589881742848") 远小于 2^53，安全整数。
+		uid: Number(result.data.uid),
 		connectionToken: result.data.connectionToken,
 		machineCode: opts.machineCode,
 		activatedAt: new Date().toISOString(),
