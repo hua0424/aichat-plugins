@@ -3,7 +3,7 @@ import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawAdapter } from '../claw/openclaw.js';
 import { OpenclawDriver } from '../agent/openclaw-driver.js';
-import { ClawRouter } from '../router.js';
+import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
 /**
@@ -27,7 +27,7 @@ export async function start(): Promise<void> {
 	console.log(`[start] Machine: ${credentials.machineCode}`);
 
 	// 创建路由器并注册驱动（OpenclawDriver 包裹未改动的 OpenclawAdapter WS 引擎）
-	const router = new ClawRouter();
+	const router = new AgentRouter();
 	router.register(new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token)));
 
 	// 连接所有驱动

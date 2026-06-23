@@ -110,9 +110,10 @@ function fakeAdapter() {
 						},
 					};
 				},
-				async close() {
+				// REQ-008 #75: spy so tests can assert the handler best-effort closes the session.
+				close: vi.fn(async () => {
 					/* no-op for the fake; handler best-effort close */
-				},
+				}),
 			};
 			return session;
 		}),
@@ -242,6 +243,12 @@ async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
 		if (Date.now() - start > timeoutMs) throw new Error('waitFor timeout');
 		await new Promise((r) => setTimeout(r, 5));
 	}
+}
+
+/** 读取指定 sessionKey 的 active thinking session（白盒断言用） */
+function getThinkingSession(handler: MessageHandler, sessionKey: string): { agentSession?: AgentSession } | undefined {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.thinkingSessions.get(sessionKey);
 }
 
 const SELF_UID = 999;
@@ -560,6 +567,33 @@ describe('MessageHandler per-room isolation', () => {
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.thinkingId).toBe('tid-abc');
 		expect(end.content).toBe('x');
+	});
+
+	it('REQ-008 #75: thinkingEnd broadcast finalize closes the agentSession (best-effort) and removes the session', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		// 私聊触发 → 建立 active thinking session（fake adapter 不结束 → session 保持 active）
+		handler.handle({ type: 'receiveMessage', data: humanMessage(5, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		const sessionKey = `aiclaw-${SELF_UID}-room-5`;
+		const thinking = getThinkingSession(handler, sessionKey);
+		expect(thinking).toBeDefined();
+		const closeSpy = thinking!.agentSession!.close as ReturnType<typeof vi.fn>;
+		expect(closeSpy).not.toHaveBeenCalled();
+
+		// server 限流拒绝（无 thinkingId 兜底分支）：status=error + rate_limit_exceeded + fromUid=selfUid
+		handler.handle({
+			type: 'thinkingEnd',
+			data: { fromUid: SELF_UID, roomId: 5, status: 'error', error: 'rate_limit_exceeded' },
+		} as never);
+
+		// finalize 分支 best-effort close 了 driver session，并移除了 session
+		expect(closeSpy).toHaveBeenCalled();
+		// @ts-expect-error 访问私有字段做白盒断言
+		expect(handler.thinkingSessions.has(sessionKey)).toBe(false);
 	});
 
 	it('S4: caps THINKING_END content to 256KB UTF-8 without corrupting multibyte chars', async () => {

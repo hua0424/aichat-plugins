@@ -1,10 +1,10 @@
 import type { AgentDriver } from './agent/events.js';
 
 /**
- * Claw 路由器
+ * Agent 路由器
  * 管理多个 AgentDriver，按 type 路由请求
  */
-export class ClawRouter {
+export class AgentRouter {
 	private adapters = new Map<string, AgentDriver>();
 
 	/**

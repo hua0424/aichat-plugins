@@ -510,9 +510,8 @@ export class MessageHandler {
 
 		try {
 			for await (const ev of agentSession.send(agentMessage)) {
-				// 超时/广播 finalize 抢先：停止映射后续事件，best-effort 收尾 session。
+				// 超时/广播 finalize 抢先：停止映射后续事件。session 的收尾交给 finally 统一 close。
 				if (session.finalized) {
-					void agentSession.close();
 					break;
 				}
 				session.events.push(ev);
@@ -530,6 +529,10 @@ export class MessageHandler {
 			}
 		} catch (err) {
 			finalizeError(err instanceof Error ? err.message : String(err));
+		} finally {
+			// REQ-008 #75 P2: 无论 done / error / break / throw，总在退出消费循环时收尾 driver session。
+			// 与 Fix 1 配合：close() 唤醒仍 park 在 adapter 上的 for-await。幂等，安全多调。
+			void agentSession.close();
 		}
 	}
 
@@ -609,6 +612,8 @@ export class MessageHandler {
 							: '今日发言上限已达，已自动跳过本次响应';
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(Number(roomId), reason);
+						// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+						void session.agentSession?.close();
 						this.thinkingSessions.delete(sessionKey);
 						this.flushPendingMessages(Number(roomId));
 					}
@@ -630,6 +635,8 @@ export class MessageHandler {
 			clearTimeout(session.timeoutId);
 		}
 		if (session?.finalized) {
+			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(Number(roomId));
 			return;
@@ -652,6 +659,8 @@ export class MessageHandler {
 
 		if (session) {
 			session.finalized = true;
+			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(Number(roomId));
 		}

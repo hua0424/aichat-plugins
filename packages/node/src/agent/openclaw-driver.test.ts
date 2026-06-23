@@ -148,4 +148,36 @@ describe('OpenclawDriver', () => {
 		expect(collected).toEqual([{ type: 'thinking', text: 'hanging' }]);
 		expect(savedCb).not.toBeNull();
 	});
+
+	it('close() wakes a consumer parked in await (close-during-await)', async () => {
+		// chat fires NOTHING and stays pending → the iterator immediately parks on the
+		// await with an empty buffer. close() must wake that parked promise so the
+		// for-await completes (done) rather than hanging forever.
+		const { adapter } = fakeAdapter(() => new Promise<void>(() => {})); // never resolves, no callbacks
+		const driver = new OpenclawDriver(adapter);
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const stream = session.send('m');
+
+		// Consume with NO events buffered → iterator parks on the await.
+		const collected: AgentEvent[] = [];
+		const consumed = (async () => {
+			for await (const ev of stream) collected.push(ev);
+		})();
+
+		// Give the consumer a tick to reach the parked await, then close.
+		await new Promise((r) => setImmediate(r));
+		await session.close();
+
+		// Timeout guard: a regression (hang) loses the race and fails the test
+		// instead of hanging the whole suite.
+		const timeout = new Promise<never>((_, reject) => {
+			const t = setTimeout(() => reject(new Error('iterator did not terminate after close()')), 1000);
+			// don't keep the event loop alive on success
+			if (typeof t === 'object' && 'unref' in t) (t as { unref: () => void }).unref();
+		});
+		await Promise.race([consumed, timeout]);
+
+		// No terminal event was ever pushed → the loop completed with nothing collected.
+		expect(collected).toEqual([]);
+	});
 });

@@ -38,6 +38,14 @@ export class OpenclawDriver implements AgentDriver {
  */
 class OpenclawSession implements AgentSession {
 	private closed = false;
+	/**
+	 * REQ-008 #75 P1-1①: the in-flight stream's `finish` closure, registered when
+	 * send() starts. close() calls it to wake a consumer parked on the await inside
+	 * the async iterator (single-flight per session for this slice). Calling finish
+	 * twice is a no-op (it guards on `done`), so this stays idempotent; after a send
+	 * completes a stale closeActive pointing at an already-finished stream is harmless.
+	 */
+	private closeActive: (() => void) | null = null;
 
 	constructor(
 		private readonly adapter: ClawAdapter,
@@ -67,6 +75,8 @@ class OpenclawSession implements AgentSession {
 			done = true;
 			wake();
 		};
+		// Register this stream's finish so close() can wake a parked iterator.
+		this.closeActive = finish;
 
 		const callbacks: ThinkingCallbacks = {
 			onThinkingDelta: (text) => push({ type: 'thinking', text }),
@@ -106,5 +116,10 @@ class OpenclawSession implements AgentSession {
 
 	async close(): Promise<void> {
 		this.closed = true;
+		// REQ-008 #75 P1-1①: wake a consumer parked on the await inside the iterator.
+		// finish() marks done + wakes the pending resolveNext; the iterator then drains
+		// any remaining buffer (drain-before-done ordering preserved) and returns.
+		// Idempotent: finish guards on `done`, so a repeat / post-completion call is a no-op.
+		if (this.closeActive) this.closeActive();
 	}
 }
