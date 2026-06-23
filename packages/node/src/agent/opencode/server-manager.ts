@@ -10,6 +10,12 @@ export interface OpencodeServerHandle {
 export interface StartServerOpts {
 	hostname?: string;
 	port?: number;
+	/**
+	 * REQ-008 #78: opencode server `config` (the subset we use). `plugin` is the list of
+	 * module paths the spawned `opencode serve` loads — we inject the built hula plugin here so
+	 * the agent can call hula_send_message / hula_skip_reply.
+	 */
+	config?: { plugin?: string[] };
 }
 
 /**
@@ -48,9 +54,15 @@ export class OpencodeServerManager {
 	private starting: Promise<void> | null = null;
 
 	private readonly requirePassword: boolean;
+	/** REQ-008 #78: module paths of opencode plugins to load into the spawned server. */
+	private readonly pluginPaths: string[];
 
-	constructor(private readonly deps: OpencodeServerManagerDeps) {
+	constructor(
+		private readonly deps: OpencodeServerManagerDeps,
+		opts?: { pluginPaths?: string[] },
+	) {
 		this.requirePassword = deps.requirePassword ?? true;
+		this.pluginPaths = opts?.pluginPaths ?? [];
 	}
 
 	/** True once a server has started and not been stopped. */
@@ -77,7 +89,10 @@ export class OpencodeServerManager {
 		if (this.requirePassword && !process.env.OPENCODE_SERVER_PASSWORD) {
 			throw new Error('OPENCODE_SERVER_PASSWORD must be set');
 		}
-		const handle = await this.deps.startServer({});
+		// REQ-008 #78: inject the configured plugin module paths into the spawned server's config
+		// so the agent can call the hula terminal tools. Empty list → omit config.plugin entirely.
+		const opts: StartServerOpts = this.pluginPaths.length > 0 ? { config: { plugin: this.pluginPaths } } : {};
+		const handle = await this.deps.startServer(opts);
 		this.server = handle;
 		this.client = this.deps.makeClient(handle.url);
 	}

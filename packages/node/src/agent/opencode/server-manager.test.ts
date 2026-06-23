@@ -87,4 +87,22 @@ describe('OpencodeServerManager', () => {
 		expect(mgr.started).toBe(false);
 		expect(() => mgr.getClient()).toThrow(/not started/);
 	});
+
+	// REQ-008 #78 — configured pluginPaths flow into config.plugin of the spawned server.
+	it('pluginPaths flow into config.plugin passed to startServer', async () => {
+		const { deps, startServer } = makeDeps();
+		const mgr = new OpencodeServerManager(deps, { pluginPaths: ['/abs/hula-plugin.js'] });
+		await mgr.ensureStarted();
+		expect(startServer).toHaveBeenCalledOnce();
+		const opts = startServer.mock.calls[0][0] as { config?: { plugin?: string[] } };
+		expect(opts.config?.plugin).toEqual(['/abs/hula-plugin.js']);
+	});
+
+	it('no pluginPaths → startServer gets no config.plugin (empty opts)', async () => {
+		const { deps, startServer } = makeDeps();
+		const mgr = new OpencodeServerManager(deps);
+		await mgr.ensureStarted();
+		const opts = startServer.mock.calls[0][0] as { config?: { plugin?: string[] } };
+		expect(opts.config).toBeUndefined();
+	});
 });

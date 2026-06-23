@@ -24,7 +24,13 @@ export function mapOpencodeEvent(evt: unknown, sessionID: string): AgentEvent | 
 	switch (e.type) {
 		case 'message.part.updated': {
 			const part = props.part as
-				| { type?: string; sessionID?: string; text?: string; tool?: string; state?: { status?: string } }
+				| {
+						type?: string;
+						sessionID?: string;
+						text?: string;
+						tool?: string;
+						state?: { status?: string; input?: Record<string, unknown> };
+				  }
 				| undefined;
 			if (!part || part.sessionID !== sessionID) return null;
 			const delta = typeof props.delta === 'string' ? props.delta : undefined;
@@ -36,6 +42,27 @@ export function mapOpencodeEvent(evt: unknown, sessionID: string): AgentEvent | 
 			}
 			if (part.type === 'tool') {
 				const status = part.state?.status;
+
+				// REQ-008 #78 — terminal-tool detection. ONLY a COMPLETED hula terminal tool
+				// becomes a `terminal` AgentEvent; the tool ARGS are in state.input (verified
+				// @opencode-ai/sdk@1.17.9 ToolStateCompleted.input). A NON-completed
+				// hula_send_message (running/pending) is NOT terminal — it falls through to the
+				// generic tool mapping below and surfaces as an ordinary `tool` start (consistent
+				// with every other tool: we only know a tool has truly run when status===completed,
+				// and we never send a half-formed/aborted reply). The real reply send happens in
+				// aichat-node from this terminal event; identity/room come from the session binding,
+				// not from these args (anti-spoofing).
+				if (status === 'completed') {
+					if (part.tool === 'hula_send_message') {
+						const content = part.state?.input?.content;
+						return { type: 'terminal', action: 'sent', content: typeof content === 'string' ? content : '' };
+					}
+					if (part.tool === 'hula_skip_reply') {
+						const reason = part.state?.input?.reason;
+						return { type: 'terminal', action: 'skipped', reason: typeof reason === 'string' ? reason : 'agent_skip_reply' };
+					}
+				}
+
 				let phase: 'start' | 'end';
 				if (status === 'running' || status === 'pending') phase = 'start';
 				else if (status === 'completed' || status === 'error') phase = 'end';

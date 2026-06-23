@@ -9,7 +9,7 @@
 export type AgentEvent =
 	| { type: 'thinking'; text: string }
 	| { type: 'tool'; name: string; phase: 'start' | 'end' }
-	| { type: 'terminal'; action: 'sent' | 'skipped'; reason?: string }
+	| { type: 'terminal'; action: 'sent' | 'skipped'; reason?: string; content?: string }
 	| { type: 'done'; durationMs: number; usage?: Record<string, unknown> }
 	| { type: 'error'; message: string };
 
