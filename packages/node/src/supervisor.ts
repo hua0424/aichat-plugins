@@ -42,6 +42,19 @@ export interface SupervisedAgent {
 /**
  * 多身份监督器。从 N 项注册表拉起 N 条身份链路，每条 = (凭证 + HuLa WS + AgentDriver + MessageHandler)，
  * **per-agent 失败隔离**：任一身份解析/连接抛错只降级该身份，其余照常拉起；token 过期只降级单身份，绝不 process.exit。
+ *
+ * **职责边界（scope boundary）**：
+ *
+ * 本类**负责**：
+ * - 编排：从注册表把 N 个身份逐项拉起（确定性顺序）；
+ * - per-agent 失败隔离：任一身份解析/连接抛错只降级该身份，其余照常拉起；
+ * - per-agent token 过期降级：单身份 token 过期只降级该身份，绝不 process.exit；
+ * - 依赖既有的**每连接 HuLa WS 自动重连**（由 HulaWSClient 自行负责），本类不重复实现。
+ *
+ * 本类**不负责**：
+ * - 跨 agent 的健康监控 / 重启循环（不轮询、不主动复活已降级身份）；
+ * - agent 运行时（如 opencode server）的重启——那是 driver 的职责
+ *   （opencode 自身 server 崩溃/重启在 #77 处理）。
  */
 export class Supervisor {
 	private supervised: SupervisedAgent[] = [];
@@ -75,25 +88,27 @@ export class Supervisor {
 		await driver.connect();
 		const api = this.deps.buildApiClient(cred);
 
-		let handler: MessageHandler;
+		// 显式持有 handler，避免 ws hooks 闭包引用尚未赋值的绑定（移除时序耦合）。
+		// onMessage/onConnected 只在 ws.connect() 之后才会触发，此时 ref.handler 必已就绪。
+		const ref: { handler: MessageHandler | null } = { handler: null };
 		const ws = this.deps.buildWs(cred, {
-			onMessage: (m) => handler.handle(m as never),
+			onMessage: (m) => ref.handler?.handle(m as never),
 			onConnected: () => {
 				// REQ #26: 首连 + 每次重连主动预热全量群配置（fire-and-forget，内部已容错）。
-				handler.prewarmGroupConfigs().catch(() => {});
+				ref.handler?.prewarmGroupConfigs().catch(() => {});
 			},
 			onDisconnected: () => {
 				console.log(`[supervisor] agent uid=${cred.uid} disconnected, will auto-reconnect...`);
 			},
 		});
 
-		handler = this.deps.buildHandler(ws, driver, cred.uid, api, () =>
+		ref.handler = this.deps.buildHandler(ws, driver, cred.uid, api, () =>
 			this.degrade(cred.uid, 'token expired'),
 		);
 
 		ws.connect();
 
-		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler });
+		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler });
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);
 	}
 
@@ -105,6 +120,12 @@ export class Supervisor {
 		const agent = this.supervised.find((a) => a.uid === uid);
 		if (!agent || agent.status === 'offline') return;
 		agent.status = 'offline';
+		// best-effort 收尾 handler：清理 active thinking session + 定时器（避免泄漏）。
+		try {
+			agent.handler.destroy();
+		} catch {
+			/* best-effort */
+		}
 		void agent.ws.close();
 		void agent.driver.disconnect().catch(() => {});
 		console.error(`[supervisor] agent uid=${uid} degraded: ${reason}`);
@@ -115,6 +136,12 @@ export class Supervisor {
 	 */
 	async stop(): Promise<void> {
 		for (const agent of this.supervised) {
+			// 先收尾 handler（清理 active thinking session + 定时器，避免泄漏），再关 ws。
+			try {
+				agent.handler.destroy();
+			} catch {
+				/* best-effort */
+			}
 			try {
 				agent.ws.close();
 			} catch {

@@ -27,6 +27,7 @@ export function loadAgentRegistry(config: AichatConfig): AgentEntry[] {
 	if (!Array.isArray(raw)) return [];
 
 	const valid: AgentEntry[] = [];
+	const seenTokens = new Set<string>();
 	for (let i = 0; i < raw.length; i++) {
 		const entry = raw[i] as Partial<AgentEntry> | undefined;
 		if (!entry || typeof entry !== 'object') {
@@ -41,6 +42,14 @@ export function loadAgentRegistry(config: AichatConfig): AgentEntry[] {
 			console.warn(`[registry] skipping invalid agent entry #${i}: missing/empty 'tool'`);
 			continue;
 		}
+		// 去重：同一 aiclaw 激活 token 配置了两次 → 跳过重复项（保留首次出现），不抛。
+		if (seenTokens.has(entry.token)) {
+			console.warn(
+				`[registry] skipping duplicate agent entry #${i}: token already configured by an earlier entry (keeping the first occurrence)`,
+			);
+			continue;
+		}
+		seenTokens.add(entry.token);
 		valid.push({
 			tool: entry.tool,
 			token: entry.token,

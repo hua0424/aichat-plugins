@@ -52,6 +52,26 @@ describe('loadAgentRegistry', () => {
 		expect(warn).toHaveBeenCalled();
 		warn.mockRestore();
 	});
+
+	it('dedups entries with the SAME token: keeps the first, skips + warns on the duplicate', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const config: AichatConfig = {
+			agents: [
+				{ tool: 'openclaw', token: 'dup-tok', cwd: '/first' },
+				{ tool: 'opencode', token: 'dup-tok', cwd: '/second' },
+				{ tool: 'openclaw', token: 'other-tok' },
+			],
+		};
+		const out = loadAgentRegistry(config);
+		// only the first occurrence of dup-tok survives, plus the distinct token
+		expect(out).toHaveLength(2);
+		expect(out[0]).toEqual({ tool: 'openclaw', token: 'dup-tok', cwd: '/first' });
+		expect(out[1]).toEqual({ tool: 'openclaw', token: 'other-tok' });
+		expect(warn).toHaveBeenCalled();
+		// the warning references the duplicate entry index (#1)
+		expect(warn.mock.calls.some((c) => String(c[0]).includes('#1'))).toBe(true);
+		warn.mockRestore();
+	});
 });
 
 describe('resolveAgentCredential', () => {

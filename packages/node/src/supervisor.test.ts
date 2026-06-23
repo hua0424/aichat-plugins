@@ -18,6 +18,8 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		wsList: [] as Array<{ uid: number; connect: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>,
 		// capture the onTokenExpired handed to each handler so the test can fire it
 		tokenExpiredByUid: new Map<number, () => void>(),
+		// capture each handler's destroy() so teardown tests can assert it was called
+		destroyByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -47,9 +49,12 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		buildHandler: vi.fn(
 			(_ws, _driver, uid: number, _api, onTokenExpired: () => void): MessageHandler => {
 				built.tokenExpiredByUid.set(uid, onTokenExpired);
+				const destroy = vi.fn();
+				built.destroyByUid.set(uid, destroy);
 				return {
 					handle: vi.fn(),
 					prewarmGroupConfigs: vi.fn().mockResolvedValue(undefined),
+					destroy,
 				} as unknown as MessageHandler;
 			},
 		),
@@ -175,6 +180,22 @@ describe('Supervisor token-expiry degrade', () => {
 		fire();
 		expect(ws2.close).toHaveBeenCalledOnce();
 	});
+
+	it('degrade tears down only the target agent handler (destroy called for it, not others)', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		// fire onTokenExpired for uid=2
+		built.tokenExpiredByUid.get(2)!();
+
+		// target handler destroyed exactly once
+		expect(built.destroyByUid.get(2)).toHaveBeenCalledOnce();
+		// other agents' handlers NOT destroyed
+		expect(built.destroyByUid.get(1)).not.toHaveBeenCalled();
+		expect(built.destroyByUid.get(3)).not.toHaveBeenCalled();
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
 });
 
 describe('Supervisor.stop', () => {
@@ -185,5 +206,15 @@ describe('Supervisor.stop', () => {
 		await sup.stop();
 		for (const w of built.wsList) expect(w.close).toHaveBeenCalled();
 		for (const d of built.drivers) expect(d.disconnect).toHaveBeenCalled();
+	});
+
+	it('destroys every agent handler on stop (timers/sessions must not leak)', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+		await sup.stop();
+		for (const uid of [1, 2, 3]) {
+			expect(built.destroyByUid.get(uid)).toHaveBeenCalledOnce();
+		}
 	});
 });
