@@ -1,8 +1,12 @@
-import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, type AichatConfig } from '../config.js';
+import { join } from 'node:path';
+import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawAdapter } from '../claw/openclaw.js';
 import { OpenclawDriver } from '../agent/openclaw-driver.js';
+import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
+import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
+import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
@@ -43,6 +47,12 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	console.log(`[start] Server: ${serverUrl}`);
 	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
 
+	// REQ-008 #77: 单例 opencode server manager——「1 个 server 服务 N 个身份」。
+	// 在此构建一次并被所有 opencode 身份的 buildDriver 闭包共享；仅当注册表里真有
+	// opencode 身份、且该身份 connect() 时才惰性 ensureStarted（lazy）。
+	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps());
+	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
+
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
@@ -50,7 +60,15 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 			if (entry.tool === 'openclaw') {
 				return new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token));
 			}
-			// opencode 等在 #77 接线；未知 tool 抛错使该身份降级，不影响其它身份。
+			if (entry.tool === 'opencode') {
+				return new OpencodeDriver({
+					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
+					workspaceBase: opencodeWorkspaceBase,
+					sessionStore: new FileSessionStore(),
+					...(entry.model !== undefined ? { model: entry.model } : {}),
+				});
+			}
+			// 未知 tool 抛错使该身份降级，不影响其它身份。
 			throw new Error('unsupported agent tool: ' + entry.tool);
 		},
 		buildApiClient: (cred) => new HulaApiClient(restBaseUrl, cred.connectionToken),

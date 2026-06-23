@@ -27,7 +27,14 @@ export interface SupervisorDeps {
 	) => MessageHandler;
 }
 
-export type AgentStatus = 'online' | 'offline';
+/**
+ * 身份链路状态。
+ * - 'online'：已连上、正常服务。
+ * - 'reconnecting'（REQ-008 #76 P2）：HuLa WS 掉线、HulaWSClient 正在自动重连中（瞬态）。
+ * - 'offline'：被降级（token 过期 / 启动失败 / stop）。**terminal**：一旦 offline，
+ *   迟到的重连回调不得把它翻回 online（degrade 已断 ws/driver，链路不可复活）。
+ */
+export type AgentStatus = 'online' | 'reconnecting' | 'offline';
 
 /** 一条已拉起（或曾拉起）的身份链路。 */
 export interface SupervisedAgent {
@@ -94,10 +101,16 @@ export class Supervisor {
 		const ws = this.deps.buildWs(cred, {
 			onMessage: (m) => ref.handler?.handle(m as never),
 			onConnected: () => {
+				// REQ-008 #76 P2: 重连成功 → 回到 online。**但 offline 是 terminal**：
+				// 已降级身份的迟到重连回调不得翻回 online（degrade 已断 ws/driver）。
+				this.markReconnected(cred.uid);
 				// REQ #26: 首连 + 每次重连主动预热全量群配置（fire-and-forget，内部已容错）。
 				ref.handler?.prewarmGroupConfigs().catch(() => {});
 			},
 			onDisconnected: () => {
+				// REQ-008 #76 P2: 掉线 → reconnecting（瞬态，HulaWSClient 自行重连）。
+				// 同样 offline-terminal 守卫：降级身份不进入 reconnecting。
+				this.markReconnecting(cred.uid);
 				console.log(`[supervisor] agent uid=${cred.uid} disconnected, will auto-reconnect...`);
 			},
 		});
@@ -129,6 +142,26 @@ export class Supervisor {
 		void agent.ws.close();
 		void agent.driver.disconnect().catch(() => {});
 		console.error(`[supervisor] agent uid=${uid} degraded: ${reason}`);
+	}
+
+	/**
+	 * REQ-008 #76 P2: WS 掉线 → 置 reconnecting（瞬态）。
+	 * **offline 是 terminal**：已降级身份保持 offline，不进入 reconnecting。
+	 */
+	private markReconnecting(uid: number): void {
+		const agent = this.supervised.find((a) => a.uid === uid);
+		if (!agent || agent.status === 'offline') return;
+		agent.status = 'reconnecting';
+	}
+
+	/**
+	 * REQ-008 #76 P2: WS 重连成功 → 回到 online。
+	 * **offline 是 terminal**：迟到的重连回调不得把已降级身份翻回 online。
+	 */
+	private markReconnected(uid: number): void {
+		const agent = this.supervised.find((a) => a.uid === uid);
+		if (!agent || agent.status === 'offline') return;
+		agent.status = 'online';
 	}
 
 	/**
