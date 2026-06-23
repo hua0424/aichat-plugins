@@ -1,7 +1,8 @@
 import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
-import type { ClawAdapter, ChatContext, ThinkingCallbacks } from '../claw/interface.js';
+import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
+import { reduceThinking } from '../agent/thinking-map.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -68,6 +69,13 @@ interface ThinkingSession {
 	terminalAction: 'sent' | 'skipped' | 'none';
 	/** REQ-004 S3: skip 原因（显式 skip 带的 reason，或 auto-skip 的占位原因） */
 	skipReason?: string;
+	/**
+	 * REQ-008 #75: 本轮 agent 事件全序列，done 时交给 reduceThinking 结算。
+	 * accumulatedContent 仍同步维护（超时/广播 partial 帧用），events 仅在 clean done 时归约。
+	 */
+	events: AgentEvent[];
+	/** REQ-008 #75: 当前轮的 driver session，超时/广播 finalize 时 best-effort close。 */
+	agentSession?: AgentSession;
 }
 
 /**
@@ -122,7 +130,7 @@ const ACCUMULATED_MESSAGES_CAP = 50;
  */
 export class MessageHandler {
 	private ws: HulaWSClient;
-	private adapter: ClawAdapter;
+	private driver: AgentDriver;
 	private selfUid: number;
 
 	// REQ-004: 替换 streaming boolean 为 thinkingSessions Map
@@ -153,13 +161,13 @@ export class MessageHandler {
 
 	constructor(
 		ws: HulaWSClient,
-		adapter: ClawAdapter,
+		driver: AgentDriver,
 		selfUid: number,
 		apiClient?: HulaApiClient,
 		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
 	) {
 		this.ws = ws;
-		this.adapter = adapter;
+		this.driver = driver;
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
 		this.groupConfigCache = new GroupConfigCache();
@@ -418,6 +426,7 @@ export class MessageHandler {
 			accumulatedContent: '',
 			finalized: false,
 			terminalAction: 'none',
+			events: [],
 		};
 
 		// 设置 5 分钟超时定时器（P-M2-3）
@@ -433,6 +442,8 @@ export class MessageHandler {
 				// 帧安全截断（256KB）；server 仍是唯一截断权威
 				content: capUtf8Bytes(session.accumulatedContent),
 			});
+			// REQ-008 #75: best-effort 收尾 driver session，让卡住的迭代器能终止。
+			void session.agentSession?.close();
 			this.thinkingSessions.delete(sessionKey);
 			this.flushPendingMessages(roomId);
 		}, this.THINKING_SESSION_TIMEOUT_MS);
@@ -448,83 +459,81 @@ export class MessageHandler {
 			triggerMsgId: msgId,
 		});
 
-		const callbacks: ThinkingCallbacks = {
-			// REQ-004 S4: 仅本地累计，不再逐帧发送 THINKING_DELTA；
-			// 完整文本在 THINKING_END 一次性整发。
-			onThinkingDelta: (chunk) => {
-				session.accumulatedContent += chunk;
-			},
-			// REQ-004 S3: 终结动作账本——send-wins + skip 记录原因
-			onTerminalTool: (info) => {
-				// openclaw 事件无顺序保证：若 session 已 finalized（thinkingEnd/超时/错误已清理），
-				// 迟到的 terminal 事件不得再改已结算的账本（与防双重 finalize 同一原则）。
-				if (session.finalized) {
-					console.log(`[thinking] ignoring terminal '${info.action}' after finalize session=${sessionKey}`);
-					return;
-				}
-				if (info.action === 'sent') {
-					if (session.terminalAction === 'skipped') {
-						console.log(`[thinking] terminal override: prior 'skipped' replaced by 'sent' (send-wins) session=${sessionKey}`);
-					}
-					session.terminalAction = 'sent';
-					session.skipReason = undefined;
-				} else {
-					// skip：仅当尚未 sent 时才生效（send-wins）
-					if (session.terminalAction === 'sent') {
-						console.log(`[thinking] ignoring 'skipped' after 'sent' (send-wins) session=${sessionKey}`);
-						return;
-					}
-					session.terminalAction = 'skipped';
-					session.skipReason = info.reason;
-				}
-			},
-			onThinkingEnd: (durationMs) => {
-				if (session.finalized) return;
-				session.finalized = true;
-				if (session.timeoutId) clearTimeout(session.timeoutId);
-				// REQ-004 S3: 计算本轮有效终结结果。
-				// 'none' = agent 未调用任何终结动作工具 → auto-skip 兜底。
-				let skipReason: string | undefined;
-				if (session.terminalAction === 'sent') {
-					skipReason = undefined;
-				} else if (session.terminalAction === 'skipped') {
-					skipReason = session.skipReason;
-				} else {
-					skipReason = 'agent_no_terminal_tool';
-					console.log(`[thinking] no terminal tool observed, auto-skip session=${sessionKey} reason=${skipReason}`);
-				}
-				this.ws.send(WSReqType.THINKING_END, {
-					thinkingId: session.thinkingId || undefined,
-					durationMs,
-					status: 'complete',
-					// 帧安全截断（256KB）；server 仍是唯一截断权威
-					content: capUtf8Bytes(session.accumulatedContent),
-					// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
-					...(skipReason !== undefined ? { skipReason } : {}),
-				});
-				console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs} terminal=${session.terminalAction}${skipReason ? ` skipReason=${skipReason}` : ''}`);
-				this.thinkingSessions.delete(sessionKey);
-				this.flushPendingMessages(roomId);
-			},
-			onError: (error) => {
-				if (session.finalized) return;
-				session.finalized = true;
-				if (session.timeoutId) clearTimeout(session.timeoutId);
-				console.error(`[thinking] error session=${sessionKey} reason=${error.message}`);
-				this.ws.send(WSReqType.THINKING_END, {
-					thinkingId: session.thinkingId || undefined,
-					durationMs: Date.now() - session.startTime,
-					status: 'error',
-					error: error.message,
-					// 帧安全截断（256KB）；server 仍是唯一截断权威
-					content: capUtf8Bytes(session.accumulatedContent),
-				});
-				this.thinkingSessions.delete(sessionKey);
-				this.flushPendingMessages(roomId);
-			},
+		// REQ-008 #75: 通过 AgentDriver 抽象消费规范化 AgentEvent 流，再映射成与既有
+		// 完全一致的 WS 发送。openSession 绑定 (aiclawUid, roomId) → sessionKey；
+		// session 存到 thinkingSession 上，供超时/广播/destroy finalize 时 best-effort close。
+		const agentSession = await this.driver.openSession({
+			aiclawUid: this.selfUid,
+			roomId,
+			chatContext: {},
+		});
+		session.agentSession = agentSession;
+
+		// done 事件：clean finalize-complete，用 reduceThinking 归约整段事件序列，
+		// 帧字节必须与既有 onThinkingEnd 完全一致。
+		const finalizeComplete = () => {
+			if (session.finalized) return;
+			session.finalized = true;
+			if (session.timeoutId) clearTimeout(session.timeoutId);
+			const outcome = reduceThinking(session.events);
+			this.ws.send(WSReqType.THINKING_END, {
+				thinkingId: session.thinkingId || undefined,
+				durationMs: outcome.durationMs,
+				status: 'complete',
+				// 帧安全截断（256KB）；server 仍是唯一截断权威
+				content: capUtf8Bytes(outcome.content),
+				// 仅当本轮为 skip（显式或兜底）时附加 skipReason，sent 不带（保持账本可区分）
+				...(outcome.skipReason !== undefined ? { skipReason: outcome.skipReason } : {}),
+			});
+			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}${outcome.skipReason ? ` skipReason=${outcome.skipReason}` : ''}`);
+			this.thinkingSessions.delete(sessionKey);
+			this.flushPendingMessages(roomId);
 		};
 
-		await this.adapter.chat(agentMessage, sessionKey, callbacks, { roomId });
+		// error 事件：与既有 onError 一致的 finalize-error 路径。
+		const finalizeError = (message: string) => {
+			if (session.finalized) return;
+			session.finalized = true;
+			if (session.timeoutId) clearTimeout(session.timeoutId);
+			console.error(`[thinking] error session=${sessionKey} reason=${message}`);
+			this.ws.send(WSReqType.THINKING_END, {
+				thinkingId: session.thinkingId || undefined,
+				durationMs: Date.now() - session.startTime,
+				status: 'error',
+				error: message,
+				// 帧安全截断（256KB）；server 仍是唯一截断权威
+				content: capUtf8Bytes(session.accumulatedContent),
+			});
+			this.thinkingSessions.delete(sessionKey);
+			this.flushPendingMessages(roomId);
+		};
+
+		try {
+			for await (const ev of agentSession.send(agentMessage)) {
+				// 超时/广播 finalize 抢先：停止映射后续事件。session 的收尾交给 finally 统一 close。
+				if (session.finalized) {
+					break;
+				}
+				session.events.push(ev);
+				if (ev.type === 'thinking') {
+					// REQ-004 S4: 仅本地累计（超时/广播 partial 帧用），不再逐帧发 THINKING_DELTA。
+					session.accumulatedContent += ev.text;
+				} else if (ev.type === 'done') {
+					finalizeComplete();
+					break;
+				} else if (ev.type === 'error') {
+					finalizeError(ev.message);
+					break;
+				}
+				// 'terminal' / 'tool' 事件无需即时副作用——reduceThinking 在 done 时统一结算账本。
+			}
+		} catch (err) {
+			finalizeError(err instanceof Error ? err.message : String(err));
+		} finally {
+			// REQ-008 #75 P2: 无论 done / error / break / throw，总在退出消费循环时收尾 driver session。
+			// 与 Fix 1 配合：close() 唤醒仍 park 在 adapter 上的 for-await。幂等，安全多调。
+			void agentSession.close();
+		}
 	}
 
 	/** P-M2-2: 接收 server 的 thinkingStart 广播，回填 thinkingId */
@@ -603,6 +612,8 @@ export class MessageHandler {
 							: '今日发言上限已达，已自动跳过本次响应';
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(Number(roomId), reason);
+						// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+						void session.agentSession?.close();
 						this.thinkingSessions.delete(sessionKey);
 						this.flushPendingMessages(Number(roomId));
 					}
@@ -624,6 +635,8 @@ export class MessageHandler {
 			clearTimeout(session.timeoutId);
 		}
 		if (session?.finalized) {
+			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(Number(roomId));
 			return;
@@ -646,6 +659,8 @@ export class MessageHandler {
 
 		if (session) {
 			session.finalized = true;
+			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
+			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(Number(roomId));
 		}
@@ -671,6 +686,8 @@ export class MessageHandler {
 	destroy(): void {
 		for (const session of this.thinkingSessions.values()) {
 			if (session.timeoutId) clearTimeout(session.timeoutId);
+			// REQ-008 #75: best-effort 收尾 driver session（让卡住的迭代器终止）。
+			void session.agentSession?.close();
 			if (!session.finalized) {
 				session.finalized = true;
 				this.ws.send(WSReqType.THINKING_END, {

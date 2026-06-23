@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { MessageHandler } from './message.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
-import type { ClawAdapter, ThinkingCallbacks, ChatContext } from '../claw/interface.js';
+import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
@@ -9,28 +9,116 @@ import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' ass
 const THINKING_END = WSReqType.THINKING_END;
 const THINKING_DELTA = WSReqType.THINKING_DELTA;
 
+/**
+ * REQ-008 #75: callbacks shim — mirrors the old ThinkingCallbacks surface so the
+ * existing tests keep their `cb.onThinkingDelta(...)` style, but now PUSHES
+ * AgentEvents into the driver's per-send async stream that the handler consumes.
+ *
+ * Because the handler maps events via `for await` (async), after pushing a
+ * terminal/done/error a test must `await flush()` before asserting the resulting
+ * WS sends. `flush()` resolves once the handler has fully drained the stream.
+ */
+interface CallbacksShim {
+	onThinkingDelta(text: string): void;
+	onTerminalTool(info: { action: 'sent' | 'skipped'; tool?: string; reason?: string }): void;
+	onThinkingEnd(durationMs: number): void;
+	onError(err: Error): void;
+}
+
 interface ChatCall {
 	message: string;
 	sessionKey: string;
-	context?: ChatContext;
-	callbacks: ThinkingCallbacks;
+	context?: { roomId: number };
+	callbacks: CallbacksShim;
+	/** resolves once the handler's for-await loop over this send has fully drained */
+	flush: () => Promise<void>;
 }
 
-/** fake ClawAdapter：记录每次 chat 调用，不自动结束 thinking */
+/**
+ * fake AgentDriver：每次 openSession().send() 建立一条受控 async 流，
+ * 记录一个 ChatCall（含与旧 ThinkingCallbacks 同名的 shim + flush）。
+ * fake 不自动结束 thinking——由测试通过 shim 推事件驱动。
+ */
 function fakeAdapter() {
 	const calls: ChatCall[] = [];
-	const adapter = {
+	const driver = {
 		type: 'fake',
 		connect: vi.fn().mockResolvedValue(undefined),
 		disconnect: vi.fn().mockResolvedValue(undefined),
-		get isConnected() {
-			return true;
-		},
-		chat: vi.fn(async (message: string, sessionKey: string, callbacks: ThinkingCallbacks, context?: ChatContext) => {
-			calls.push({ message, sessionKey, context, callbacks });
+		openSession: vi.fn(async (o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }) => {
+			const sessionKey = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+			const session: AgentSession = {
+				send(message: string): AsyncIterable<AgentEvent> {
+					const buffer: AgentEvent[] = [];
+					let done = false;
+					let resolveNext: (() => void) | null = null;
+
+					const wake = () => {
+						if (resolveNext) {
+							const r = resolveNext;
+							resolveNext = null;
+							r();
+						}
+					};
+					const push = (ev: AgentEvent) => {
+						if (done) return;
+						buffer.push(ev);
+						wake();
+					};
+					const finish = () => {
+						if (done) return;
+						done = true;
+						wake();
+					};
+
+					const callbacks: CallbacksShim = {
+						onThinkingDelta: (text) => push({ type: 'thinking', text }),
+						onTerminalTool: (info) => push({ type: 'terminal', action: info.action, reason: info.reason }),
+						onThinkingEnd: (durationMs) => {
+							push({ type: 'done', durationMs });
+							finish();
+						},
+						onError: (err) => {
+							push({ type: 'error', message: err.message });
+							finish();
+						},
+					};
+
+					calls.push({
+						message,
+						sessionKey,
+						context: { roomId: o.roomId },
+						callbacks,
+						// Let the handler's async for-await drain the pushed events.
+						// A macrotask is more than enough (mapping happens within a few
+						// microtasks of each push). Works under real timers; under fake
+						// timers tests advance their own timers as before.
+						flush: () => new Promise<void>((resolve) => setImmediate(resolve)),
+					});
+
+					return {
+						async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+							while (true) {
+								while (buffer.length > 0) {
+									yield buffer.shift()!;
+								}
+								if (done) return;
+								await new Promise<void>((resolve) => {
+									resolveNext = resolve;
+								});
+							}
+						},
+					};
+				},
+				// REQ-008 #75: spy so tests can assert the handler best-effort closes the session.
+				close: vi.fn(async () => {
+					/* no-op for the fake; handler best-effort close */
+				}),
+			};
+			return session;
 		}),
-	} as unknown as ClawAdapter & { chat: ReturnType<typeof vi.fn> };
-	return { adapter, calls };
+	} as unknown as AgentDriver & { openSession: ReturnType<typeof vi.fn> };
+	return { adapter: driver, calls };
 }
 
 /** fake HulaWSClient：记录发送的帧 */
@@ -157,6 +245,12 @@ async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
 	}
 }
 
+/** 读取指定 sessionKey 的 active thinking session（白盒断言用） */
+function getThinkingSession(handler: MessageHandler, sessionKey: string): { agentSession?: AgentSession } | undefined {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.thinkingSessions.get(sessionKey);
+}
+
 const SELF_UID = 999;
 
 describe('MessageHandler per-room isolation', () => {
@@ -262,6 +356,7 @@ describe('MessageHandler per-room isolation', () => {
 		cb.onThinkingDelta('reasoning');
 		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -281,6 +376,7 @@ describe('MessageHandler per-room isolation', () => {
 
 		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '纯客套' });
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -296,6 +392,7 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.length >= 1);
 		// 不触发任何 onTerminalTool
 		calls[0].callbacks.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -314,6 +411,7 @@ describe('MessageHandler per-room isolation', () => {
 		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '早退' });
 		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -332,6 +430,7 @@ describe('MessageHandler per-room isolation', () => {
 		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
 		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '太晚了' });
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -349,12 +448,14 @@ describe('MessageHandler per-room isolation', () => {
 
 		// 本轮无终结工具 → onThinkingEnd 兜底补记 auto-skip 并结算
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 		const endFrame = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(endFrame.skipReason).toBe('agent_no_terminal_tool');
 
 		// finalize 之后到达的迟到 terminal 事件必须被忽略，不得改写已结算账本、不得再发帧
 		const endFramesBefore = sent.filter((f) => f.type === THINKING_END).length;
 		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+		await calls[0].flush();
 		expect(sent.filter((f) => f.type === THINKING_END).length).toBe(endFramesBefore);
 		// 已发出的 THINKING_END 仍是兜底 skip，未被迟到 sent 篡改
 		expect((sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>).skipReason).toBe('agent_no_terminal_tool');
@@ -389,6 +490,7 @@ describe('MessageHandler per-room isolation', () => {
 		cb.onThinkingDelta('bar');
 		cb.onThinkingDelta('baz');
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
@@ -407,6 +509,7 @@ describe('MessageHandler per-room isolation', () => {
 		cb.onThinkingDelta('partial-');
 		cb.onThinkingDelta('text');
 		cb.onError(new Error('boom'));
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('error');
@@ -459,10 +562,38 @@ describe('MessageHandler per-room isolation', () => {
 
 		cb.onThinkingDelta('x');
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.thinkingId).toBe('tid-abc');
 		expect(end.content).toBe('x');
+	});
+
+	it('REQ-008 #75: thinkingEnd broadcast finalize closes the agentSession (best-effort) and removes the session', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		// 私聊触发 → 建立 active thinking session（fake adapter 不结束 → session 保持 active）
+		handler.handle({ type: 'receiveMessage', data: humanMessage(5, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		const sessionKey = `aiclaw-${SELF_UID}-room-5`;
+		const thinking = getThinkingSession(handler, sessionKey);
+		expect(thinking).toBeDefined();
+		const closeSpy = thinking!.agentSession!.close as ReturnType<typeof vi.fn>;
+		expect(closeSpy).not.toHaveBeenCalled();
+
+		// server 限流拒绝（无 thinkingId 兜底分支）：status=error + rate_limit_exceeded + fromUid=selfUid
+		handler.handle({
+			type: 'thinkingEnd',
+			data: { fromUid: SELF_UID, roomId: 5, status: 'error', error: 'rate_limit_exceeded' },
+		} as never);
+
+		// finalize 分支 best-effort close 了 driver session，并移除了 session
+		expect(closeSpy).toHaveBeenCalled();
+		// @ts-expect-error 访问私有字段做白盒断言
+		expect(handler.thinkingSessions.has(sessionKey)).toBe(false);
 	});
 
 	it('S4: caps THINKING_END content to 256KB UTF-8 without corrupting multibyte chars', async () => {
@@ -484,6 +615,7 @@ describe('MessageHandler per-room isolation', () => {
 
 		cb.onThinkingDelta(huge);
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		const content = end.content as string;
@@ -509,6 +641,7 @@ describe('MessageHandler per-room isolation', () => {
 		const small = '喵abc'.repeat(1000); // well under 256KB
 		cb.onThinkingDelta(small);
 		cb.onThinkingEnd(100);
+		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.content).toBe(small);
@@ -1140,8 +1273,8 @@ describe('real-shape (server contract) regression', () => {
 
 		await new Promise((r) => setTimeout(r, 40));
 		// userType 缺失时此开关亦失效（isFromAi false → 不进 respondToAi 分支 → 误触发）；
-		// 真实形状下 userType=4 被识别 → respondToAi=false 生效 → 不发起 chat。
-		expect((adapter as unknown as { chat: ReturnType<typeof vi.fn> }).chat).not.toHaveBeenCalled();
+		// 真实形状下 userType=4 被识别 → respondToAi=false 生效 → 不开 session。
+		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
 		expect(calls.length).toBe(0);
 	});
 
