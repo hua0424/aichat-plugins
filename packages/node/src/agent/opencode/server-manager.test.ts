@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { OpencodeServerManager, type OpencodeServerManagerDeps } from './server-manager.js';
+import {
+	OpencodeServerManager,
+	opencodeBasicAuthHeader,
+	type OpencodeServerManagerDeps,
+} from './server-manager.js';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 
 function fakeClient(tag: string): OpencodeClient {
@@ -104,5 +108,20 @@ describe('OpencodeServerManager', () => {
 		await mgr.ensureStarted();
 		const opts = startServer.mock.calls[0][0] as { config?: { plugin?: string[] } };
 		expect(opts.config).toBeUndefined();
+	});
+});
+
+// REQ-008: opencode serve enforces HTTP Basic auth (user "opencode" + OPENCODE_SERVER_PASSWORD).
+describe('opencodeBasicAuthHeader', () => {
+	it('builds a Basic header for the "opencode" user that decodes back to opencode:<password>', () => {
+		const header = opencodeBasicAuthHeader('secret');
+		expect(header).toBe('Basic ' + Buffer.from('opencode:secret').toString('base64'));
+		const decoded = Buffer.from(header!.slice('Basic '.length), 'base64').toString('utf8');
+		expect(decoded).toBe('opencode:secret');
+	});
+
+	it('returns undefined when no password is set', () => {
+		expect(opencodeBasicAuthHeader(undefined)).toBeUndefined();
+		expect(opencodeBasicAuthHeader('')).toBeUndefined();
 	});
 });
