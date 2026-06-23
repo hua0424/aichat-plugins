@@ -20,6 +20,8 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		tokenExpiredByUid: new Map<number, () => void>(),
 		// capture each handler's destroy() so teardown tests can assert it was called
 		destroyByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// REQ-008 #76 P2: capture the ws hooks per uid so tests can drive reconnect transitions
+		hooksByUid: new Map<number, { onConnected: () => void; onDisconnected: () => void }>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -40,12 +42,15 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 			} as unknown as AgentDriver;
 		}),
 		buildApiClient: vi.fn((): HulaApiClient => ({}) as unknown as HulaApiClient),
-		buildWs: vi.fn((cred: AichatCredentials): HulaWSClient => {
-			const connect = vi.fn();
-			const close = vi.fn();
-			built.wsList.push({ uid: cred.uid, connect, close });
-			return { connect, close } as unknown as HulaWSClient;
-		}),
+		buildWs: vi.fn(
+			(cred: AichatCredentials, hooks: { onConnected: () => void; onDisconnected: () => void }): HulaWSClient => {
+				const connect = vi.fn();
+				const close = vi.fn();
+				built.wsList.push({ uid: cred.uid, connect, close });
+				built.hooksByUid.set(cred.uid, hooks);
+				return { connect, close } as unknown as HulaWSClient;
+			},
+		),
 		buildHandler: vi.fn(
 			(_ws, _driver, uid: number, _api, onTokenExpired: () => void): MessageHandler => {
 				built.tokenExpiredByUid.set(uid, onTokenExpired);
@@ -194,6 +199,44 @@ describe('Supervisor token-expiry degrade', () => {
 		// other agents' handlers NOT destroyed
 		expect(built.destroyByUid.get(1)).not.toHaveBeenCalled();
 		expect(built.destroyByUid.get(3)).not.toHaveBeenCalled();
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('Supervisor reconnect status (REQ-008 #76 P2)', () => {
+	it('onDisconnected → reconnecting; onConnected → back to online', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		const agent2 = sup.agents.find((a) => a.uid === 2)!;
+		expect(agent2.status).toBe('online');
+
+		const hooks = built.hooksByUid.get(2)!;
+		hooks.onDisconnected();
+		expect(agent2.status).toBe('reconnecting');
+
+		hooks.onConnected();
+		expect(agent2.status).toBe('online');
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('a degraded(offline) agent stays offline across a reconnect callback (offline is terminal)', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		// degrade uid=2 via token expiry
+		built.tokenExpiredByUid.get(2)!();
+		const agent2 = sup.agents.find((a) => a.uid === 2)!;
+		expect(agent2.status).toBe('offline');
+
+		// a late reconnect callback must NOT flip it back to online/reconnecting
+		const hooks = built.hooksByUid.get(2)!;
+		hooks.onDisconnected();
+		expect(agent2.status).toBe('offline');
+		hooks.onConnected();
+		expect(agent2.status).toBe('offline');
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

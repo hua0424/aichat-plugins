@@ -85,6 +85,17 @@ interface LastMessageContext {
 	roomId: number;
 	fromUid: number;
 	msgId: string;
+	/**
+	 * REQ-008 #77: 触发消息的会话类型（1=GROUP，2=FRIEND/私聊）。缺省视为群聊（保守）。
+	 * opencode driver 据此 + fromUid（私聊的对端）派生隔离的 workspace 目录。
+	 */
+	roomType: number;
+	/**
+	 * REQ-008 #77: 私聊对端是否为本 aiclaw 的主人（owner）。
+	 * 取自 inbound 消息的 `message.aiclaw.isOwner`（server 算 senderUid==ownerUid，仅私聊推送带）。
+	 * 主人私聊 → workspace/owner；非主人私聊 → workspace/<对端uid>。
+	 */
+	isOwner: boolean;
 }
 
 /**
@@ -198,7 +209,7 @@ export class MessageHandler {
 			channel = {
 				debouncer,
 				pendingMessages: [],
-				lastCtx: { roomId, fromUid: 0, msgId: '' },
+				lastCtx: { roomId, fromUid: 0, msgId: '', roomType: 1, isOwner: false },
 				accumulatedMessages: [],
 				batchSawHuman: false,
 				batchAiFromUid: 0,
@@ -323,8 +334,11 @@ export class MessageHandler {
 			return;
 		}
 
-		// 缓存消息上下文（按房间隔离）
-		channel.lastCtx = { roomId, fromUid, msgId };
+		// 缓存消息上下文（按房间隔离）。REQ-008 #77: roomType 透传给 driver 的 chatContext，
+		// 缺省/未知 roomType 与上方 @ 闸门一致按群聊（1）保守处理。
+		// isOwner 取自 inbound 的 message.aiclaw.isOwner（仅私聊推送带 aiclaw ext；群聊缺省 false）。
+		const isOwner = data.message.aiclaw?.isOwner === true;
+		channel.lastCtx = { roomId, fromUid, msgId, roomType: roomType ?? 1, isOwner };
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
 
@@ -371,7 +385,7 @@ export class MessageHandler {
 			return;
 		}
 
-		const { msgId } = channel.lastCtx;
+		const { msgId, roomType, fromUid, isOwner } = channel.lastCtx;
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
 
 		// 【S8-7 issue #22】防循环守卫：在汇聚点按本轮 BATCH 评估，先于创建 thinking / 发 THINKING_START。
@@ -477,10 +491,12 @@ export class MessageHandler {
 		// REQ-008 #75: 通过 AgentDriver 抽象消费规范化 AgentEvent 流，再映射成与既有
 		// 完全一致的 WS 发送。openSession 绑定 (aiclawUid, roomId) → sessionKey；
 		// session 存到 thinkingSession 上，供超时/广播/destroy finalize 时 best-effort close。
+		// REQ-008 #77: 透传会话上下文给 driver。openclaw driver 忽略 chatContext（行为不变）；
+		// opencode driver 据此派生隔离 workspace 目录。私聊（roomType=2）的对端 = fromUid。
 		const agentSession = await this.driver.openSession({
 			aiclawUid: this.selfUid,
 			roomId,
-			chatContext: {},
+			chatContext: { roomType, roomId, counterpartUid: fromUid, isOwner },
 		});
 		session.agentSession = agentSession;
 

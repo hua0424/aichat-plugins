@@ -113,6 +113,13 @@ export interface ReceivedMessage {
 		 * 3=IMG / 4=FILE MediaMessageBody）。
 		 */
 		body: ReceivedMessageBody;
+		/**
+		 * REQ-008 #77: aiclaw 扩展信息，server 仅在推送给 aiclaw 用户时附加（私聊带；群聊缺省）。
+		 * `isOwner` = 发送者是否为本 aiclaw 的主人（server 算 senderUid==ownerUid）。
+		 */
+		aiclaw?: {
+			isOwner?: boolean;
+		};
 	};
 }
 
