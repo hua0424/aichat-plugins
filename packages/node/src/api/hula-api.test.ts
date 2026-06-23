@@ -71,3 +71,21 @@ describe('HulaApiClient.listSelfGroupConfigs (REQ #26)', () => {
 		await expect(client.listSelfGroupConfigs()).resolves.toEqual([]);
 	});
 });
+
+describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
+	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0 }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		await client.reportAgentType('opencode');
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/aiclaw/report-agent-type');
+		expect((init as RequestInit).method).toBe('POST');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(JSON.parse((init as RequestInit).body as string)).toEqual({ agentType: 'opencode' });
+	});
+});

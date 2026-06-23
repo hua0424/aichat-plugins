@@ -139,6 +139,14 @@ export class Supervisor {
 				this.markReconnected(cred.uid);
 				// REQ #26: 首连 + 每次重连主动预热全量群配置（fire-and-forget，内部已容错）。
 				ref.handler?.prewarmGroupConfigs().catch(() => {});
+				// REQ-009 #83: 连接成功后上报 agent 类型（fire-and-forget，不阻塞/不破坏连接）。
+				// 每次连接（含重连）都报，server upsert 幂等。
+				api.reportAgentType(entry.tool).catch((err) =>
+					console.error(
+						'[supervisor] reportAgentType failed:',
+						err instanceof Error ? err.message : String(err),
+					),
+				);
 			},
 			onDisconnected: () => {
 				// REQ-008 #76 P2: 掉线 → reconnecting（瞬态，HulaWSClient 自行重连）。

@@ -22,6 +22,9 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		destroyByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 		// REQ-008 #76 P2: capture the ws hooks per uid so tests can drive reconnect transitions
 		hooksByUid: new Map<number, { onConnected: () => void; onDisconnected: () => void }>(),
+		// REQ-009 #83: capture each api client's reportAgentType per uid so the test can assert
+		// onConnected reports the agent type.
+		reportAgentTypeByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -41,7 +44,11 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				openSession: vi.fn(),
 			} as unknown as AgentDriver;
 		}),
-		buildApiClient: vi.fn((): HulaApiClient => ({}) as unknown as HulaApiClient),
+		buildApiClient: vi.fn((cred: AichatCredentials): HulaApiClient => {
+			const reportAgentType = vi.fn().mockResolvedValue(undefined);
+			built.reportAgentTypeByUid.set(cred.uid, reportAgentType);
+			return { reportAgentType } as unknown as HulaApiClient;
+		}),
 		buildWs: vi.fn(
 			(cred: AichatCredentials, hooks: { onConnected: () => void; onDisconnected: () => void }): HulaWSClient => {
 				const connect = vi.fn();
@@ -332,6 +339,24 @@ describe('Supervisor reconnect status (REQ-008 #76 P2)', () => {
 		expect(agent2.status).toBe('offline');
 		hooks.onConnected();
 		expect(agent2.status).toBe('offline');
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('Supervisor reportAgentType on connect (REQ-009 #83)', () => {
+	it('firing onConnected reports the entry tool via api.reportAgentType', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		// uid=2 was built from entry { tool: 'openclaw', token: 'tok-2' }
+		const report = built.reportAgentTypeByUid.get(2)!;
+		expect(report).toBeTypeOf('function');
+
+		// drive the captured onConnected hook for uid=2
+		built.hooksByUid.get(2)!.onConnected();
+
+		expect(report).toHaveBeenCalledWith('openclaw');
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });
