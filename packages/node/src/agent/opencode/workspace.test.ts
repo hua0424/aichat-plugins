@@ -10,6 +10,39 @@ describe('deriveWorkspaceDir', () => {
 		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42 })).toBe(join(BASE, '5', 'group', '42'));
 	});
 
+	it('REQ-009 #85: group WITH account (groupkey) → <base>/<aiclawUid>/group/<account>', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, account: '888888' })).toBe(
+			join(BASE, '5', 'group', '888888'),
+		);
+	});
+
+	it('REQ-009 #85: group WITHOUT account → falls back to group/<roomId>', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, account: undefined })).toBe(
+			join(BASE, '5', 'group', '42'),
+		);
+	});
+
+	it('REQ-009 #85: workspaceDir set → returned verbatim (absolute override, NOT namespaced)', () => {
+		expect(
+			deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, account: '888888', workspaceDir: '/srv/proj' }),
+		).toBe('/srv/proj');
+	});
+
+	it('REQ-009 #85: empty/whitespace workspaceDir is ignored → derives the default', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, account: '888888', workspaceDir: '' })).toBe(
+			join(BASE, '5', 'group', '888888'),
+		);
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, account: '888888', workspaceDir: '  ' })).toBe(
+			join(BASE, '5', 'group', '888888'),
+		);
+	});
+
+	it('REQ-009 #85: unknown roomType prefers account over roomId', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 99, roomId: 5, account: '777' })).toBe(
+			join(BASE, '5', 'group', '777'),
+		);
+	});
+
 	it('owner dm (roomType=2, isOwner) → <base>/<aiclawUid>/owner', () => {
 		expect(
 			deriveWorkspaceDir(BASE, UID, { roomType: 2, roomId: 7, counterpartUid: 10937, isOwner: true }),

@@ -11,6 +11,16 @@ export interface OpencodeChatContext {
 	roomId: number;
 	counterpartUid?: number;
 	isOwner?: boolean;
+	/**
+	 * REQ-009 #85: owner-configured absolute host path. When set (non-empty), it is the absolute
+	 * override and wins for ANY context (in practice only groups carry it).
+	 */
+	workspaceDir?: string;
+	/**
+	 * REQ-009 #85: the group's human-readable group number ("groupkey"). Preferred over roomId as
+	 * the default group workspace segment so the owner can cd into a stable, human-readable path.
+	 */
+	account?: string | number;
 }
 
 /**
@@ -21,15 +31,23 @@ export interface OpencodeChatContext {
  * the layout had no per-identity segment, so e.g. two aiclaws both DMing their OWNER, or
  * both in the same group/roomId, would have shared one workspace dir.)
  *
- *  - owner DM (roomType===2 && isOwner) → <base>/<aiclawUid>/owner   (the aiclaw's owner gets a stable alias)
+ * REQ-009 #85: an owner-configured absolute `workspaceDir` overrides everything — when set it is
+ * returned verbatim (NOT namespaced), so the owner can pin a group to a fixed host path. Otherwise
+ * the default group segment prefers the human-readable groupkey (`account`) over `roomId`, so the
+ * owner cd's into `<base>/<aiclawUid>/group/<account>` on the machine.
+ *
+ *  - owner workspaceDir set            → <workspaceDir>                 (absolute override, any ctx)
+ *  - owner DM (roomType===2 && isOwner) → <base>/<aiclawUid>/owner      (the aiclaw's owner gets a stable alias)
  *  - friend DM (roomType===2)           → <base>/<aiclawUid>/dm/<counterpartUid>  (one dir per peer)
- *  - group (roomType===1)               → <base>/<aiclawUid>/group/<roomId>
- *  - unknown roomType                   → conservative group-by-roomId fallback
+ *  - group (roomType===1)               → <base>/<aiclawUid>/group/<account ?? roomId>
+ *  - unknown roomType                   → conservative group-by-(account ?? roomId) fallback
  *
  * owner vs friend is distinguished by `message.aiclaw.isOwner` on the inbound message
  * (server-computed senderUid==ownerUid; AiclawExt is present only on DM pushes).
  */
 export function deriveWorkspaceDir(base: string, aiclawUid: number, ctx: OpencodeChatContext): string {
+	// REQ-009 #85: owner's absolute override wins for any context (in practice only groups carry it).
+	if (ctx.workspaceDir && ctx.workspaceDir.trim() !== '') return ctx.workspaceDir;
 	// #77 fix: per-identity root segment — never let two aiclaws share a conversation dir.
 	const root = join(base, String(aiclawUid));
 	if (ctx.roomType === 2) {
@@ -42,9 +60,10 @@ export function deriveWorkspaceDir(base: string, aiclawUid: number, ctx: Opencod
 		return join(root, 'dm', String(peer));
 	}
 	if (ctx.roomType === 1) {
-		return join(root, 'group', String(ctx.roomId));
+		// REQ-009 #85: prefer the human-readable groupkey; fall back to roomId when account missing.
+		return join(root, 'group', String(ctx.account ?? ctx.roomId));
 	}
-	// ponytail: unknown roomType → conservative group-by-roomId fallback (no new abstraction,
-	// reuse the group layout) until a real new room type appears that needs its own handling.
-	return join(root, 'group', String(ctx.roomId));
+	// ponytail: unknown roomType → conservative group-by-(account ?? roomId) fallback (no new
+	// abstraction, reuse the group layout) until a real new room type appears that needs its own handling.
+	return join(root, 'group', String(ctx.account ?? ctx.roomId));
 }
