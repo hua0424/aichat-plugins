@@ -87,6 +87,57 @@ export class HulaApiClient {
 	}
 
 	/**
+	 * REQ-010 S4 #94 — 本 aiclaw（按 token 认证身份）已加入的群列表。
+	 * GET /api/im/room/group/list（无参数；身份取自 token）→ data[] 映射。
+	 * server 把大整数 groupId/roomId 序列化为字符串，这里统一 Number(...) 化。
+	 */
+	async listGroups(): Promise<
+		Array<{
+			groupId: number;
+			roomId: number;
+			groupName: string;
+			account?: string;
+			memberNum?: number;
+			onlineNum?: number;
+			roleId?: number;
+		}>
+	> {
+		const resp = await this.get('/api/im/room/group/list');
+		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
+		return list.map((item) => ({
+			groupId: Number(item.groupId),
+			roomId: Number(item.roomId),
+			groupName: item.groupName as string,
+			account: item.account as string | undefined,
+			memberNum: item.memberNum === undefined ? undefined : Number(item.memberNum),
+			onlineNum: item.onlineNum === undefined ? undefined : Number(item.onlineNum),
+			roleId: item.roleId === undefined ? undefined : Number(item.roleId),
+		}));
+	}
+
+	/**
+	 * REQ-010 S4 #94 — 查询某群成员（带在线状态）。
+	 * GET /api/im/room/group/aiclaw/members?roomId=<roomId>&online=<bool> → data[] 映射。
+	 * node 不判断房间类型：始终把 roomId 透传给 server，由 server 校验成员/类型。
+	 * 业务错误时 server 返回 R{ success:false, msg }（"当前不在群聊中" / "未加入该群聊，无法查询成员"），
+	 * parseResponse 会抛 `HuLa API failed: <msg>`，让调用方（capability）catch 后回传结构化错误给 agent。
+	 */
+	async listGroupMembers(
+		roomId: number,
+		online: boolean,
+	): Promise<Array<{ uid: number; name: string; account?: string; online: boolean; roleId?: number }>> {
+		const resp = await this.get(`/api/im/room/group/aiclaw/members?roomId=${roomId}&online=${online}`);
+		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
+		return list.map((item) => ({
+			uid: Number(item.uid),
+			name: item.name as string,
+			account: item.account as string | undefined,
+			online: item.online === true,
+			roleId: item.roleId === undefined ? undefined : Number(item.roleId),
+		}));
+	}
+
+	/**
 	 * 获取 aiclaw 群配置
 	 */
 	async getGroupConfig(aiclawUid: number, roomId: number): Promise<Record<string, unknown>> {
