@@ -13,7 +13,13 @@ import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
 import { Supervisor } from '../supervisor.js';
 import { getMachineCode } from '../auth/machine.js';
-import { CapabilityRegistry, sendMessageCapability } from '../capability/registry.js';
+import {
+	CapabilityRegistry,
+	sendMessageCapability,
+	memberInfoCapability,
+	listFriendsCapability,
+	findFriendCapability,
+} from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
 
@@ -104,6 +110,10 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// session; the first hit wins; then find that uid's SupervisedAgent for its per-identity api.
 	const registry$ = new CapabilityRegistry();
 	registry$.register('send-message', sendMessageCapability());
+	// REQ-010 S3: read-only query capabilities (token-scoped via the resolved per-identity apiClient)
+	registry$.register('member-info', memberInfoCapability());
+	registry$.register('list-friends', listFriendsCapability());
+	registry$.register('find-friend', findFriendCapability());
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => {

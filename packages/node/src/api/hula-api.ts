@@ -41,11 +41,49 @@ export class HulaApiClient {
 	}
 
 	/**
-	 * 搜索好友
+	 * REQ-010 S3 #93 — 查询单个成员的公开资料。
+	 * GET /api/im/user/getById/{uid} → data = 公开资料对象。
 	 */
-	async searchFriends(keyword: string): Promise<{ uid: number; name: string; avatar?: string }[]> {
-		const resp = await this.get(`/api/im/friend/search?key=${encodeURIComponent(keyword)}`);
-		return (resp.data as { uid: number; name: string; avatar?: string }[]) ?? [];
+	async getMemberInfo(uid: number): Promise<Record<string, unknown>> {
+		const resp = await this.get(`/api/im/user/getById/${uid}`);
+		return (resp.data as Record<string, unknown>) ?? {};
+	}
+
+	/**
+	 * REQ-010 S3 #93 — 拉取好友列表（单页，cursor 分页；agent 只取一页）。
+	 * GET /api/im/user/friend/page?pageSize=<n> → data.list[] 映射为 {uid,name,account,remark}。
+	 * server 把大整数 uid 序列化为字符串，这里统一 Number(...) 化。
+	 */
+	async listFriends(
+		pageSize = 100,
+	): Promise<Array<{ uid: number; name: string; account?: string; remark?: string }>> {
+		const resp = await this.get(`/api/im/user/friend/page?pageSize=${pageSize}`);
+		const data = resp.data as { list?: Array<Record<string, unknown>> } | undefined;
+		const list = data?.list ?? [];
+		return list.map((item) => ({
+			uid: Number(item.uid),
+			name: item.name as string,
+			account: item.account as string | undefined,
+			remark: item.remark as string | undefined,
+		}));
+	}
+
+	/**
+	 * REQ-010 S3 #93 — 按关键字搜索用户（参数名是 keyword，不是 key）。
+	 * GET /api/im/user/search?keyword=<kw> → data.list[] 映射为 {uid,name,account,userType}。
+	 */
+	async searchUsers(
+		keyword: string,
+	): Promise<Array<{ uid: number; name: string; account?: string; userType?: number }>> {
+		const resp = await this.get(`/api/im/user/search?keyword=${encodeURIComponent(keyword)}`);
+		const data = resp.data as { list?: Array<Record<string, unknown>> } | undefined;
+		const list = data?.list ?? [];
+		return list.map((item) => ({
+			uid: Number(item.uid),
+			name: item.name as string,
+			account: item.account as string | undefined,
+			userType: item.userType === undefined ? undefined : Number(item.userType),
+		}));
 	}
 
 	/**

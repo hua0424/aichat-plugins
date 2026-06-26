@@ -89,6 +89,102 @@ describe('HulaApiClient.listSelfGroupConfigs (REQ #26)', () => {
 	});
 });
 
+describe('HulaApiClient query methods (REQ-010 S3 #93)', () => {
+	it('getMemberInfo: GET /api/im/user/getById/{uid}, returns data profile object', async () => {
+		const profile = { uid: 555, name: 'Alice', account: 'alice01', avatar: 'a.png', sex: 1 };
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: profile }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		const out = await client.getMemberInfo(555);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/user/getById/555');
+		expect((init as RequestInit).method).toBe('GET');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(out).toEqual(profile);
+	});
+
+	it('getMemberInfo: missing data → {} ', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0 }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getMemberInfo(1)).resolves.toEqual({});
+	});
+
+	it('listFriends: GET /api/im/user/friend/page?pageSize=<n>, maps data.list to {uid,name,account,remark}', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: {
+					cursor: 'c1',
+					isLast: true,
+					list: [
+						{ uid: '111', name: 'Bob', account: 'bob', remark: 'pal', avatar: 'b.png', userType: 1 },
+						{ uid: '222', name: 'Cara', account: 'cara' },
+					],
+				},
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+
+		const out = await client.listFriends(100);
+
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/user/friend/page?pageSize=100');
+		expect((init as RequestInit).method).toBe('GET');
+		expect(out).toEqual([
+			{ uid: 111, name: 'Bob', account: 'bob', remark: 'pal' },
+			{ uid: 222, name: 'Cara', account: 'cara', remark: undefined },
+		]);
+		// uid coerced from server string to number
+		expect(typeof out[0].uid).toBe('number');
+	});
+
+	it('listFriends: defaults pageSize to 100; missing data.list → []', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: {} }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		const out = await client.listFriends();
+		const [url] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/user/friend/page?pageSize=100');
+		expect(out).toEqual([]);
+	});
+
+	it('searchUsers: GET /api/im/user/search?keyword=<kw> (param keyword, encoded), maps data.list', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: {
+					pageNo: 1,
+					pageSize: 10,
+					totalRecords: 1,
+					isLast: true,
+					list: [{ uid: '333', name: 'Dee', avatar: 'd.png', account: 'dee', userType: 2 }],
+				},
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+
+		const out = await client.searchUsers('hi there');
+
+		const [url] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/user/search?keyword=hi%20there');
+		expect(out).toEqual([{ uid: 333, name: 'Dee', account: 'dee', userType: 2 }]);
+		expect(typeof out[0].uid).toBe('number');
+	});
+
+	it('searchUsers: missing data.list → []', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0, data: {} }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.searchUsers('x')).resolves.toEqual([]);
+	});
+});
+
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
