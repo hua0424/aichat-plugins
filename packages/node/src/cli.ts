@@ -5,6 +5,8 @@ import { handleSendMessage } from './commands/send-message.js';
 import { handleMemberInfo } from './commands/member-info.js';
 import { handleListFriends } from './commands/list-friends.js';
 import { handleFindFriend } from './commands/find-friend.js';
+import { handleListGroups } from './commands/list-groups.js';
+import { handleListGroupMembers } from './commands/list-group-members.js';
 import { handleGroupConfig } from './commands/group-config.js';
 import { installSkill } from './capability/skill.js';
 
@@ -31,6 +33,13 @@ switch (command) {
 		break;
 	case 'find-friend':
 		await handleFindFriend(args.slice(1));
+		break;
+	// REQ-010 S4: group query subcommands
+	case 'list-groups':
+		await handleListGroups(args.slice(1));
+		break;
+	case 'list-group-members':
+		await handleListGroupMembers(args.slice(1));
 		break;
 	case 'group-config':
 		await handleGroupConfig(args.slice(1));
@@ -82,7 +91,12 @@ Commands:
                                                   from your agent session — never passed in)
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
-  find-friend <keyword>                          Search users by keyword
+  find-friend <keyword>                          Search users by keyword (substring match)
+  list-groups                                    List the groups this assistant has joined
+  list-group-members [--online] [--groupid <id>] List a group's members with online status
+                                                 (default: the current chat's group;
+                                                  --groupid targets a different joined group;
+                                                  --online shows only online members)
   install-skill                                  Install the aichat-reply opencode skill
   group-config --room <roomId>                   Query group config
   group-config --room <roomId> [options...]      Update group config
@@ -94,6 +108,9 @@ Examples:
   aichat member-info 12345
   aichat list-friends
   aichat find-friend "alice"
+  aichat list-groups
+  aichat list-group-members --online
+  aichat list-group-members --groupid 12345
   aichat install-skill
   aichat group-config --room 12345 --rate-limit 20 --respond-to-ai true
 `);

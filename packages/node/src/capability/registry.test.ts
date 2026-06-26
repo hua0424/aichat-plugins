@@ -5,6 +5,8 @@ import {
 	memberInfoCapability,
 	listFriendsCapability,
 	findFriendCapability,
+	listGroupsCapability,
+	listGroupMembersCapability,
 	type CapabilityContext,
 } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
@@ -121,6 +123,76 @@ describe('findFriendCapability (REQ-010 S3)', () => {
 		await expect(cap(ctx, { keyword: '   ' })).rejects.toThrow();
 		await expect(cap(ctx, { keyword: 123 })).rejects.toThrow();
 		expect(searchUsers).not.toHaveBeenCalled();
+	});
+});
+
+describe('listGroupsCapability (REQ-010 S4)', () => {
+	it('calls apiClient.listGroups() and returns { groups }', async () => {
+		const groups = [{ groupId: 1, roomId: 2, groupName: 'G' }];
+		const listGroups = vi.fn(async () => groups);
+		const apiClient = { listGroups } as unknown as HulaApiClient;
+		const ctx: CapabilityContext = { aiclawUid: 7, roomId: 42, apiClient };
+		const out = await listGroupsCapability()(ctx, {});
+		expect(listGroups).toHaveBeenCalledTimes(1);
+		expect(out).toEqual({ groups });
+	});
+});
+
+describe('listGroupMembersCapability (REQ-010 S4)', () => {
+	function ctxWith(listGroupMembers: ReturnType<typeof vi.fn>, roomId = 42) {
+		const apiClient = { listGroupMembers } as unknown as HulaApiClient;
+		return { aiclawUid: 7, roomId, apiClient } as CapabilityContext;
+	}
+
+	it('defaults to ctx.roomId, online=false, returns { roomId, online, members }', async () => {
+		const members = [{ uid: 1, name: 'A', online: true }];
+		const listGroupMembers = vi.fn(async () => members);
+		const ctx = ctxWith(listGroupMembers, 42);
+		const out = await listGroupMembersCapability()(ctx, {});
+		expect(listGroupMembers).toHaveBeenCalledWith(42, false);
+		expect(out).toEqual({ roomId: 42, online: false, members });
+	});
+
+	it('uses args.groupid when given (a DIFFERENT room than ctx.roomId)', async () => {
+		const listGroupMembers = vi.fn(async () => []);
+		const ctx = ctxWith(listGroupMembers, 42);
+		await listGroupMembersCapability()(ctx, { groupid: 999 });
+		expect(listGroupMembers).toHaveBeenCalledWith(999, false);
+	});
+
+	it('coerces a numeric-string groupid', async () => {
+		const listGroupMembers = vi.fn(async () => []);
+		const ctx = ctxWith(listGroupMembers, 42);
+		await listGroupMembersCapability()(ctx, { groupid: '999' });
+		expect(listGroupMembers).toHaveBeenCalledWith(999, false);
+	});
+
+	it('passes the online flag (true / "true")', async () => {
+		const listGroupMembers = vi.fn(async () => []);
+		const ctx = ctxWith(listGroupMembers, 42);
+		await listGroupMembersCapability()(ctx, { online: true });
+		expect(listGroupMembers).toHaveBeenLastCalledWith(42, true);
+		await listGroupMembersCapability()(ctx, { online: 'true' });
+		expect(listGroupMembers).toHaveBeenLastCalledWith(42, true);
+	});
+
+	it('throws on a non-numeric groupid', async () => {
+		const listGroupMembers = vi.fn(async () => []);
+		const ctx = ctxWith(listGroupMembers, 42);
+		const cap = listGroupMembersCapability();
+		await expect(cap(ctx, { groupid: 'abc' })).rejects.toThrow('invalid --groupid');
+		await expect(cap(ctx, { groupid: 0 })).rejects.toThrow('invalid --groupid');
+		await expect(cap(ctx, { groupid: -1 })).rejects.toThrow('invalid --groupid');
+		expect(listGroupMembers).not.toHaveBeenCalled();
+	});
+
+	it('returns { roomId, error } (NOT throw) when apiClient rejects with a business error', async () => {
+		const listGroupMembers = vi.fn(async () => {
+			throw new Error('HuLa API failed: 当前不在群聊中');
+		});
+		const ctx = ctxWith(listGroupMembers, 42);
+		const out = await listGroupMembersCapability()(ctx, {});
+		expect(out).toEqual({ roomId: 42, error: 'HuLa API failed: 当前不在群聊中' });
 	});
 });
 

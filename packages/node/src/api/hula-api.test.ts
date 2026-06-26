@@ -185,6 +185,111 @@ describe('HulaApiClient query methods (REQ-010 S3 #93)', () => {
 	});
 });
 
+describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
+	it('listGroups: GET /api/im/room/group/list (no params), maps data[] and Number-coerces ids', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: [
+					{
+						groupId: '100200300400500',
+						roomId: '987654321098765',
+						groupName: 'Team A',
+						avatar: 'g.png',
+						onlineNum: '3',
+						memberNum: '10',
+						roleId: '2',
+						account: 'hula_grpA',
+						remark: 'r',
+					},
+					{ groupId: '111', roomId: '222', groupName: 'Team B' },
+				],
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		const out = await client.listGroups();
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/room/group/list');
+		expect((init as RequestInit).method).toBe('GET');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(out).toEqual([
+			{
+				groupId: 100200300400500,
+				roomId: 987654321098765,
+				groupName: 'Team A',
+				account: 'hula_grpA',
+				memberNum: 10,
+				onlineNum: 3,
+				roleId: 2,
+			},
+			{
+				groupId: 111,
+				roomId: 222,
+				groupName: 'Team B',
+				account: undefined,
+				memberNum: undefined,
+				onlineNum: undefined,
+				roleId: undefined,
+			},
+		]);
+		expect(typeof out[0].groupId).toBe('number');
+		expect(typeof out[0].roomId).toBe('number');
+	});
+
+	it('listGroups: missing data → []', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0 }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.listGroups()).resolves.toEqual([]);
+	});
+
+	it('listGroupMembers: GET .../aiclaw/members?roomId=<id>&online=<bool>, maps data[] with online boolean', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: [
+					{ uid: '777', name: 'Eve', account: 'eve01', online: true, roleId: '1' },
+					{ uid: '888', name: 'Fox', online: false },
+				],
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+
+		const out = await client.listGroupMembers(555, true);
+
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/room/group/aiclaw/members?roomId=555&online=true');
+		expect((init as RequestInit).method).toBe('GET');
+		expect(out).toEqual([
+			{ uid: 777, name: 'Eve', account: 'eve01', online: true, roleId: 1 },
+			{ uid: 888, name: 'Fox', account: undefined, online: false, roleId: undefined },
+		]);
+		expect(typeof out[0].uid).toBe('number');
+	});
+
+	it('listGroupMembers: passes online=false in the query', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: [] }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await client.listGroupMembers(42, false);
+		const [url] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/room/group/aiclaw/members?roomId=42&online=false');
+	});
+
+	it('listGroupMembers: a success:false business error rejects with the server msg', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: false, code: 1, msg: '当前不在群聊中' }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.listGroupMembers(42, false)).rejects.toThrow('当前不在群聊中');
+	});
+});
+
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(

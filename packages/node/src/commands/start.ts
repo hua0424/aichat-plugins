@@ -19,6 +19,8 @@ import {
 	memberInfoCapability,
 	listFriendsCapability,
 	findFriendCapability,
+	listGroupsCapability,
+	listGroupMembersCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
@@ -114,6 +116,9 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	registry$.register('member-info', memberInfoCapability());
 	registry$.register('list-friends', listFriendsCapability());
 	registry$.register('find-friend', findFriendCapability());
+	// REQ-010 S4: group query capabilities (list-groups token-scoped; list-group-members server-validated)
+	registry$.register('list-groups', listGroupsCapability());
+	registry$.register('list-group-members', listGroupMembersCapability());
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => {

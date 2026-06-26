@@ -97,3 +97,50 @@ export function findFriendCapability(): Capability {
 		return { keyword, users };
 	};
 }
+
+/**
+ * REQ-010 S4 — group query capabilities (list-groups / list-group-members).
+ *
+ * ANTI-SPOOFING: identity/scope come ONLY from the resolved `ctx.apiClient` (the aiclaw's token,
+ * from the agent session key). `--groupid` below is a QUERY TARGET (a room the agent names), NOT an
+ * identity claim — the server enforces that the aiclaw actually joined it. node NEVER judges room
+ * type: it always passes the roomId through; the server is the authority and returns a structured
+ * business error ("当前不在群聊中" / "未加入该群聊，无法查询成员"), which we pass through to the agent
+ * as an `error` field (CLI exit 0) rather than a hard failure.
+ */
+
+/** list-groups: the groups this aiclaw has joined (no args; token-scoped). */
+export function listGroupsCapability(): Capability {
+	return async (ctx) => {
+		return { groups: await ctx.apiClient.listGroups() };
+	};
+}
+
+/**
+ * list-group-members: members (with online status) of a joined group.
+ * Default target is the current session's room (ctx.roomId); `args.groupid` overrides to a DIFFERENT
+ * joined group. `args.online` filters to online members only.
+ */
+export function listGroupMembersCapability(): Capability {
+	return async (ctx, args) => {
+		let roomId: number;
+		if (args.groupid != null) {
+			roomId = Number(args.groupid);
+			if (!Number.isInteger(roomId) || roomId <= 0) {
+				throw new Error('list-group-members: invalid --groupid');
+			}
+		} else {
+			roomId = ctx.roomId;
+		}
+		const online = args.online === true || args.online === 'true';
+		try {
+			const members = await ctx.apiClient.listGroupMembers(roomId, online);
+			return { roomId, online, members };
+		} catch (err) {
+			// node never judges room type; the server is the authority. Pass its structured business
+			// message ("当前不在群聊中" / "未加入该群聊，无法查询成员") through cleanly to the agent
+			// (CLI exit 0 with an `error` field) instead of surfacing it as a hard CLI failure.
+			return { roomId, error: err instanceof Error ? err.message : String(err) };
+		}
+	};
+}
