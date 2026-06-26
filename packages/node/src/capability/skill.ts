@@ -21,6 +21,8 @@ import { homedir } from 'node:os';
 
 const SKILL_NAME = 'aichat-reply';
 
+const QUERY_SKILL_NAME = 'aichat-query';
+
 const SKILL_MD = `---
 name: ${SKILL_NAME}
 description: Reply to the current HuLa chat conversation. Use ONLY when you actually want to send a reply to the user you are talking to.
@@ -50,6 +52,43 @@ aichat send-message --content "<your reply to the user>"
   nothing to add), simply do not run it — the turn ends and nothing is sent.
 `;
 
+const QUERY_SKILL_MD = `---
+name: ${QUERY_SKILL_NAME}
+description: Look up users and groups this assistant can see — member profiles, friends, user search, the assistant's groups, and a group's members with online status.
+license: MIT
+compatibility: opencode
+---
+
+## What I do
+
+I let you look up users and groups that this assistant can see — so you can decide who to talk to,
+who to add, and which group members are online.
+
+## Read capabilities
+
+- \`aichat member-info <uid>\` — look up any user's public profile.
+- \`aichat list-friends\` — list this assistant's friends.
+- \`aichat find-friend <keyword>\` — search users by keyword (to find people to add).
+- \`aichat list-groups\` — list the groups this assistant is in; each result has an \`id\`, a \`name\`,
+  and member/online counts.
+- \`aichat list-group-members [--online] [--groupid <id>]\` — list a group's members with online
+  status. Default = the current chat's group. To query a DIFFERENT group you've joined, pass
+  \`--groupid <id>\` using the **\`id\`** field from \`list-groups\` output (NOT the name or account).
+  \`--online\` keeps only online members.
+
+## Important
+
+- Your identity and the current room are bound AUTOMATICALLY from your session — never pass any
+  identity or room argument. The ONLY arguments are the query targets themselves: \`<uid>\`,
+  \`<keyword>\`, and \`--groupid <id>\`.
+`;
+
+/** The skills installSkill writes — each into every skill root. */
+const SKILLS: Array<{ name: string; md: string }> = [
+	{ name: SKILL_NAME, md: SKILL_MD },
+	{ name: QUERY_SKILL_NAME, md: QUERY_SKILL_MD },
+];
+
 /** Global skill roots opencode 1.17.9 discovers. */
 function skillRoots(): string[] {
 	const home = homedir();
@@ -61,20 +100,22 @@ function skillRoots(): string[] {
 }
 
 /**
- * Idempotently (overwrite) write the skill into every global skill root. Best-effort: a root that
- * can't be written is skipped (never crashes node). Returns the list of paths actually written.
+ * Idempotently (overwrite) write every skill into every global skill root. Best-effort: a write
+ * that throws is skipped (never crashes node). Returns the list of paths actually written.
  */
 export function installSkill(): string[] {
 	const written: string[] = [];
 	for (const root of skillRoots()) {
-		const dir = join(root, SKILL_NAME);
-		const file = join(dir, 'SKILL.md');
-		try {
-			mkdirSync(dir, { recursive: true });
-			writeFileSync(file, SKILL_MD, 'utf-8');
-			written.push(file);
-		} catch {
-			/* best-effort: skip a root we can't write */
+		for (const skill of SKILLS) {
+			const dir = join(root, skill.name);
+			const file = join(dir, 'SKILL.md');
+			try {
+				mkdirSync(dir, { recursive: true });
+				writeFileSync(file, skill.md, 'utf-8');
+				written.push(file);
+			} catch {
+				/* best-effort: skip a skill/root we can't write */
+			}
 		}
 	}
 	return written;

@@ -4,6 +4,7 @@ import { join, dirname } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
 import type { CapabilityRegistry, CapabilityContext } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
+import { parseSessionKey } from './session-key.js';
 
 /** The resolve() result: the bound identity+room + the per-identity api client. */
 type Resolved = { aiclawUid: number; roomId: number; apiClient: HulaApiClient };
@@ -71,6 +72,14 @@ export class CapabilityEndpoint {
 		const parsed = parseBody(req.body);
 		if (!parsed) {
 			return { status: 400, json: { ok: false, error: 'bad request: invalid body' } };
+		}
+
+		// REQ-010 S5: require a KNOWN agent-type prefix BEFORE resolve/idempotency/dispatch. An
+		// unprefixed/unknown key never identifies a driver, so reject it deterministically (400) rather
+		// than letting it fall through to resolve. (A valid prefix that simply has no live driver/session
+		// still returns the existing 404 'unknown session' via resolve → undefined.)
+		if (!parseSessionKey(parsed.sessionKey)) {
+			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
 		}
 
 		// Idempotency: a repeat of (sessionKey, idempotencyKey) returns the prior response verbatim,

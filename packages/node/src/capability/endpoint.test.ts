@@ -91,6 +91,24 @@ describe('CapabilityEndpoint.handle', () => {
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
+	it('sessionKey with no known prefix → 400, resolve + capability NOT invoked', async () => {
+		const { endpoint, sendMessage, resolve } = build({ resolveRoom: 42 });
+		const res = await endpoint.handle({ body: body({ sessionKey: 'ses_no_prefix' }) });
+		expect(res.status).toBe(400);
+		expect((res.json as { ok: boolean }).ok).toBe(false);
+		// the prefix gate rejects BEFORE resolve/idempotency/dispatch
+		expect(resolve).not.toHaveBeenCalled();
+		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('valid opencode:-prefixed key still flows to resolve as before', async () => {
+		const { endpoint, sendMessage, resolve } = build({ resolveRoom: 42 });
+		const res = await endpoint.handle({ body: body({ sessionKey: 'opencode:ses_ok' }) });
+		expect(res.status).toBe(200);
+		expect(resolve).toHaveBeenCalledWith('opencode:ses_ok');
+		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+
 	it('idempotency cache is FIFO-bounded: oldest key is evicted once the cap is exceeded', async () => {
 		// cap=3: after driving 4 distinct keys, the first ('k0') must have been evicted.
 		const { endpoint, sendMessage } = build({ resolveRoom: 42, idempotencyCap: 3 });

@@ -95,7 +95,8 @@ Commands:
   list-groups                                    List the groups this assistant has joined
   list-group-members [--online] [--groupid <id>] List a group's members with online status
                                                  (default: the current chat's group;
-                                                  --groupid targets a different joined group;
+                                                  --groupid <id> targets a different joined group,
+                                                  where <id> is the 'id' from list-groups output;
                                                   --online shows only online members)
   install-skill                                  Install the aichat-reply opencode skill
   group-config --room <roomId>                   Query group config
