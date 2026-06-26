@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { deriveWorkspaceDir } from './workspace.js';
 
 const BASE = '/tmp/ws';
@@ -67,6 +68,26 @@ describe('deriveWorkspaceDir', () => {
 
 	it('unknown roomType → conservative group-by-roomId fallback', () => {
 		expect(deriveWorkspaceDir(BASE, UID, { roomType: 99, roomId: 5 })).toBe(join(BASE, '5', 'group', '5'));
+	});
+
+	it('REQ-010 S3: workspaceDir override of ~/foo/bar expands the leading ~ to homedir', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, workspaceDir: '~/foo/bar' })).toBe(
+			join(homedir(), 'foo', 'bar'),
+		);
+	});
+
+	it('REQ-010 S3: a bare ~ override expands to homedir', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, workspaceDir: '~' })).toBe(homedir());
+	});
+
+	it('REQ-010 S3: an absolute workspaceDir (no leading ~) is unchanged', () => {
+		expect(deriveWorkspaceDir(BASE, UID, { roomType: 1, roomId: 42, workspaceDir: '/srv/proj' })).toBe('/srv/proj');
+	});
+
+	it('REQ-010 S3: a tilde-rooted base expands so no segment leaks an unexpanded ~', () => {
+		expect(deriveWorkspaceDir('~/.aichat/ws', UID, { roomType: 1, roomId: 42 })).toBe(
+			join(homedir(), '.aichat', 'ws', '5', 'group', '42'),
+		);
 	});
 
 	it('#77 fix: two aiclaw identities NEVER collide on the same owner/group/dm dir', () => {

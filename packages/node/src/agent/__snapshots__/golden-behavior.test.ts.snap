@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > a) send: deltas + terminal sent + done 1`] = `
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > a) thinking + done → complete 1`] = `
 [
   {
     "data": {
@@ -29,7 +29,7 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > a) send
 ]
 `;
 
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) explicit skip: terminal skipped (agent_skip_reply) + done 1`] = `
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) deltas + done only → complete, no skipReason 1`] = `
 [
   {
     "data": {
@@ -48,9 +48,8 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) expl
   },
   {
     "data": {
-      "content": "analysing",
+      "content": "just thinking",
       "durationMs": "<durationMs:number>",
-      "skipReason": "agent_skip_reply",
       "status": "complete",
       "thinkingId": undefined,
     },
@@ -59,7 +58,7 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) expl
 ]
 `;
 
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) no-terminal: deltas + done only → fallback agent_no_terminal_tool 1`] = `
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) error 1`] = `
 [
   {
     "data": {
@@ -78,10 +77,10 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) no-t
   },
   {
     "data": {
-      "content": "just thinking",
+      "content": "partial-work",
       "durationMs": "<durationMs:number>",
-      "skipReason": "agent_no_terminal_tool",
-      "status": "complete",
+      "error": "boom",
+      "status": "error",
       "thinkingId": undefined,
     },
     "type": "THINKING_END",
@@ -89,7 +88,7 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) no-t
 ]
 `;
 
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > d) error 1`] = `
+exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > d) two thinking deltas concatenated 1`] = `
 [
   {
     "data": {
@@ -103,65 +102,6 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > d) erro
       "fromUid": 999,
       "roomId": 1,
       "triggerMsgId": "4",
-    },
-    "type": "THINKING_START",
-  },
-  {
-    "data": {
-      "content": "partial-work",
-      "durationMs": "<durationMs:number>",
-      "error": "boom",
-      "status": "error",
-      "thinkingId": undefined,
-    },
-    "type": "THINKING_END",
-  },
-]
-`;
-
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > e) send-then-skip (send-wins) 1`] = `
-[
-  {
-    "data": {
-      "msgId": 5,
-      "timestamp": "<timestamp:number>",
-    },
-    "type": "ACK",
-  },
-  {
-    "data": {
-      "fromUid": 999,
-      "roomId": 1,
-      "triggerMsgId": "5",
-    },
-    "type": "THINKING_START",
-  },
-  {
-    "data": {
-      "content": "x",
-      "durationMs": "<durationMs:number>",
-      "status": "complete",
-      "thinkingId": undefined,
-    },
-    "type": "THINKING_END",
-  },
-]
-`;
-
-exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > f) two thinking deltas concatenated 1`] = `
-[
-  {
-    "data": {
-      "msgId": 6,
-      "timestamp": "<timestamp:number>",
-    },
-    "type": "ACK",
-  },
-  {
-    "data": {
-      "fromUid": 999,
-      "roomId": 1,
-      "triggerMsgId": "6",
     },
     "type": "THINKING_START",
   },

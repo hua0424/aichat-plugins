@@ -9,7 +9,6 @@
 export type AgentEvent =
 	| { type: 'thinking'; text: string }
 	| { type: 'tool'; name: string; phase: 'start' | 'end' }
-	| { type: 'terminal'; action: 'sent' | 'skipped'; reason?: string; content?: string }
 	| { type: 'done'; durationMs: number; usage?: Record<string, unknown> }
 	| { type: 'error'; message: string };
 
@@ -25,4 +24,12 @@ export interface AgentDriver {
 	connect(): Promise<void>;
 	openSession(o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }): Promise<AgentSession>;
 	disconnect(): Promise<void>;
+	/**
+	 * REQ-010 S1: resolve an agent-session-scoped key back to the bound HuLa identity+room.
+	 * Used by the loopback capability endpoint to look up where an `aichat send-message`
+	 * call (which carries only the agent's session id, never room/identity) should land.
+	 * Optional: drivers that don't back the capability path (e.g. OpenclawDriver) need not
+	 * implement it. Returns undefined when the key is unknown/unparseable.
+	 */
+	resolveSession?(sessionKey: string): { aiclawUid: number; roomId: number } | undefined;
 }

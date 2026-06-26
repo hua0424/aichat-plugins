@@ -3,6 +3,7 @@ import { activate } from './commands/activate.js';
 import { start } from './commands/start.js';
 import { handleSendMessage } from './commands/send-message.js';
 import { handleGroupConfig } from './commands/group-config.js';
+import { installSkill } from './capability/skill.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -21,6 +22,16 @@ switch (command) {
 	case 'group-config':
 		await handleGroupConfig(args.slice(1));
 		break;
+	case 'install-skill': {
+		const written = installSkill();
+		if (written.length > 0) {
+			console.log(`Installed aichat-reply skill:\n  ${written.join('\n  ')}`);
+		} else {
+			console.error('Failed to install aichat-reply skill (no writable skill directory).');
+			process.exit(1);
+		}
+		break;
+	}
 	default:
 		printHelp();
 		break;
@@ -53,15 +64,18 @@ aichat - HuLa AI Assistant Plugin
 Commands:
   activate --backend <backend> --token <token>   Activate with server token
   start                                          Connect and run
-  send-message --room <roomId> --content <text>  Send a message to a room
-  send-message --to <uid> --content <text>       Send a message to a friend
+  send-message --content <text>                  Reply to the current chat
+                                                 (room + identity are bound automatically
+                                                  from your agent session — never passed in)
+  install-skill                                  Install the aichat-reply opencode skill
   group-config --room <roomId>                   Query group config
   group-config --room <roomId> [options...]      Update group config
 
 Examples:
   aichat activate --backend openclaw --token eyJ...
   aichat start
-  aichat send-message --room 12345 --content "Hello"
+  aichat send-message --content "Hello"
+  aichat install-skill
   aichat group-config --room 12345 --rate-limit 20 --respond-to-ai true
 `);
 }

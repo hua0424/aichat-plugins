@@ -77,6 +77,11 @@ export interface SupervisedAgent {
 	driver: AgentDriver;
 	ws: HulaWSClient;
 	handler: MessageHandler;
+	/**
+	 * REQ-010 S1: the per-identity HulaApiClient. The capability endpoint's resolve() uses it to
+	 * send a reply to THIS identity's bound room — room/identity never come from the CLI args.
+	 */
+	api: HulaApiClient;
 }
 
 /**
@@ -162,7 +167,7 @@ export class Supervisor {
 
 		ws.connect();
 
-		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler });
+		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler, api });
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);
 	}
 

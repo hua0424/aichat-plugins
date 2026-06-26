@@ -13,6 +13,9 @@ import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
 import { Supervisor } from '../supervisor.js';
 import { getMachineCode } from '../auth/machine.js';
+import { CapabilityRegistry, sendMessageCapability } from '../capability/registry.js';
+import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
+import { installSkill } from '../capability/skill.js';
 
 /**
  * aichat start — 读取本地配置自动连接。
@@ -51,10 +54,13 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// REQ-008 #77: 单例 opencode server manager——「1 个 server 服务 N 个身份」。
 	// 在此构建一次并被所有 opencode 身份的 buildDriver 闭包共享；仅当注册表里真有
 	// opencode 身份、且该身份 connect() 时才惰性 ensureStarted（lazy）。
-	// REQ-008 #78: 注入已构建的 hula 插件绝对路径（dist/.../hula-plugin.js），spawned server
-	// 据此 config.plugin 加载它，使 agent 能调用 hula_send_message / hula_skip_reply。
-	const hulaPluginPath = fileURLToPath(new URL('../agent/opencode/hula-plugin.js', import.meta.url));
-	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [hulaPluginPath] });
+	// REQ-010 S1: opencode does NOT inject OPENCODE_SESSION_ID into the bash tool subprocess, so the
+	// agent's `aichat send-message` had no session to resolve its bound (aiclaw, room). Load the
+	// session-env plugin into the spawned server: its `shell.env` hook injects OPENCODE_SESSION_ID
+	// into every shell exec. Point at the BUILT plugin (dist/.../session-env-plugin.js), exactly like
+	// the retired hula-plugin shim was wired. This is binding plumbing, NOT a tool/capability.
+	const sessionEnvPluginPath = fileURLToPath(new URL('../agent/opencode/session-env-plugin.js', import.meta.url));
+	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [sessionEnvPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
 
 	const supervisor = new Supervisor({
@@ -91,11 +97,44 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 
 	await supervisor.start(registry);
 
+	// REQ-010 S1: node-local capability endpoint (Flow2). The agent replies by running
+	// `aichat send-message --content "..."`, which POSTs here over a loopback unix socket. resolve()
+	// maps the agent's session key → the bound identity/room/api — room/identity NEVER come from the
+	// CLI args (anti-spoofing). Strip the `opencode:` prefix, ask each driver that can resolve a
+	// session; the first hit wins; then find that uid's SupervisedAgent for its per-identity api.
+	const registry$ = new CapabilityRegistry();
+	registry$.register('send-message', sendMessageCapability());
+	const endpoint = new CapabilityEndpoint({
+		registry: registry$,
+		resolve: (sessionKey) => {
+			const opencodeId = sessionKey.startsWith('opencode:') ? sessionKey.slice('opencode:'.length) : sessionKey;
+			for (const agent of supervisor.agents) {
+				const resolved = agent.driver.resolveSession?.(opencodeId);
+				if (resolved) {
+					const owner = supervisor.agents.find((a) => a.uid === resolved.aiclawUid);
+					if (owner) return { aiclawUid: resolved.aiclawUid, roomId: resolved.roomId, apiClient: owner.api };
+				}
+			}
+			return undefined;
+		},
+	});
+	await endpoint.listen(capabilitySocketPath());
+	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
+
+	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
+	try {
+		const written = installSkill();
+		if (written.length > 0) console.log(`[start] Installed aichat-reply skill: ${written.join(', ')}`);
+	} catch {
+		/* best-effort */
+	}
+
 	const shutdown = async () => {
 		console.log('\n[start] Shutting down...');
 		// Stop per-identity supervision first, THEN close the shared opencode server. The
 		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
+		await endpoint.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		process.exit(0);

@@ -1,4 +1,20 @@
 import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+/**
+ * REQ-010 S3: expand a leading `~` to the host home dir. An owner-configured `workspaceDir` of the
+ * literal string `~/.aichat/...` was handed to opencode unexpanded, so opencode resolved it relative
+ * to its own cwd → a junk `/workspace/~/.aichat/...` session directory. The shell never expands `~`
+ * inside a program argument, so we expand it here, before the path leaves node.
+ *  - `~`        → <homedir>
+ *  - `~/foo`    → <homedir>/foo
+ * Any other path (already absolute, or relative without a leading `~`) is returned unchanged.
+ */
+function expandTilde(p: string): string {
+	if (p === '~') return homedir();
+	if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+	return p;
+}
 
 /**
  * REQ-008 #77 — the chat-context shape the opencode driver needs to isolate workspaces.
@@ -47,9 +63,12 @@ export interface OpencodeChatContext {
  */
 export function deriveWorkspaceDir(base: string, aiclawUid: number, ctx: OpencodeChatContext): string {
 	// REQ-009 #85: owner's absolute override wins for any context (in practice only groups carry it).
-	if (ctx.workspaceDir && ctx.workspaceDir.trim() !== '') return ctx.workspaceDir;
+	// REQ-010 S3: expand a leading `~` so a literal `~/.aichat/...` override resolves to the host home
+	// dir (not opencode's cwd) → a real absolute path, never `/workspace/~/...`.
+	if (ctx.workspaceDir && ctx.workspaceDir.trim() !== '') return expandTilde(ctx.workspaceDir.trim());
 	// #77 fix: per-identity root segment — never let two aiclaws share a conversation dir.
-	const root = join(base, String(aiclawUid));
+	// Expand `~` in the base too, so a tilde-rooted base never leaks an unexpanded `~` into any segment.
+	const root = join(expandTilde(base), String(aiclawUid));
 	if (ctx.roomType === 2) {
 		if (ctx.isOwner) {
 			return join(root, 'owner');

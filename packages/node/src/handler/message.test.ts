@@ -20,8 +20,6 @@ const THINKING_DELTA = WSReqType.THINKING_DELTA;
  */
 interface CallbacksShim {
 	onThinkingDelta(text: string): void;
-	// REQ-008 #78: terminal may carry `content` (opencode sent path) → handler sends a real reply.
-	onTerminalTool(info: { action: 'sent' | 'skipped'; tool?: string; reason?: string; content?: string }): void;
 	onThinkingEnd(durationMs: number): void;
 	onError(err: Error): void;
 }
@@ -74,13 +72,6 @@ function fakeAdapter() {
 
 					const callbacks: CallbacksShim = {
 						onThinkingDelta: (text) => push({ type: 'thinking', text }),
-						onTerminalTool: (info) =>
-							push({
-								type: 'terminal',
-								action: info.action,
-								reason: info.reason,
-								...(info.content !== undefined ? { content: info.content } : {}),
-							}),
 						onThinkingEnd: (durationMs) => {
 							push({ type: 'done', durationMs });
 							finish();
@@ -371,7 +362,11 @@ describe('MessageHandler per-room isolation', () => {
 		expect(calls.length).toBe(0);
 	});
 
-	it('terminal=sent → THINKING_END carries NO skipReason', async () => {
+	// REQ-010 S1: the terminal-event reply path is retired. A normal turn (thinking + done)
+	// finalizes THINKING_END as {status:'complete', content, durationMs} — NEVER a skipReason
+	// (reduceThinking no longer emits one). The agent's reply, if any, is sent out-of-band via
+	// the loopback capability endpoint, not from a terminal event in this stream.
+	it('normal turn (thinking + done) → THINKING_END complete, content, NO skipReason', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
@@ -381,7 +376,6 @@ describe('MessageHandler per-room isolation', () => {
 		const cb = calls[0].callbacks;
 
 		cb.onThinkingDelta('reasoning');
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
 		cb.onThinkingEnd(100);
 		await calls[0].flush();
 
@@ -392,109 +386,26 @@ describe('MessageHandler per-room isolation', () => {
 		expect(end.content).toBe('reasoning');
 	});
 
-	it('terminal=skipped with reason → THINKING_END carries that skipReason', async () => {
+	it('empty thinking turn → THINKING_END complete, empty content, NO skipReason', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
-		const cb = calls[0].callbacks;
-
-		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '纯客套' });
-		cb.onThinkingEnd(100);
-		await calls[0].flush();
-
-		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
-		expect(end.status).toBe('complete');
-		expect(end.skipReason).toBe('纯客套');
-	});
-
-	it('no terminal tool → onThinkingEnd auto-skips with agent_no_terminal_tool', async () => {
-		const { adapter, calls } = fakeAdapter();
-		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
-
-		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
-		await waitFor(() => calls.length >= 1);
-		// 不触发任何 onTerminalTool
 		calls[0].callbacks.onThinkingEnd(100);
 		await calls[0].flush();
 
 		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
 		expect(end.status).toBe('complete');
-		expect(end.skipReason).toBe('agent_no_terminal_tool');
-	});
-
-	it('send-wins: skipped THEN sent → effective sent, no skipReason', async () => {
-		const { adapter, calls } = fakeAdapter();
-		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
-
-		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
-		await waitFor(() => calls.length >= 1);
-		const cb = calls[0].callbacks;
-
-		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '早退' });
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
-		cb.onThinkingEnd(100);
-		await calls[0].flush();
-
-		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
-		expect(end.status).toBe('complete');
 		expect(end).not.toHaveProperty('skipReason');
+		expect(end.content).toBe('');
 	});
 
-	it('send-wins: sent THEN skipped → skip ignored, effective sent, no skipReason', async () => {
-		const { adapter, calls } = fakeAdapter();
-		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
-
-		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
-		await waitFor(() => calls.length >= 1);
-		const cb = calls[0].callbacks;
-
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
-		cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: '太晚了' });
-		cb.onThinkingEnd(100);
-		await calls[0].flush();
-
-		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
-		expect(end.status).toBe('complete');
-		expect(end).not.toHaveProperty('skipReason');
-	});
-
-	// REQ-008 #78 — opencode reply path: a terminal sent WITH content → handler sends a REAL reply
-	// via the per-identity apiClient to the BOUND roomId (no autoReply extra).
-	it('terminal sent WITH content → apiClient.sendMessage(roomId, content) (no autoReply)', async () => {
-		const { adapter, calls } = fakeAdapter();
-		const { ws, sent } = fakeWs();
-		const sendMessage = vi.fn(async () => ({ msgId: 1 }));
-		const apiClient = { sendMessage } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
-
-		// roomType=2 (private) → triggers; roomId = 7
-		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
-		await waitFor(() => calls.length >= 1);
-		const cb = calls[0].callbacks;
-
-		cb.onThinkingDelta('analysis');
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message', content: '你好，这是回复' });
-		cb.onThinkingEnd(100);
-		await calls[0].flush();
-
-		// real reply sent to the bound roomId with the event content, NO extra (autoReply absent)
-		expect(sendMessage).toHaveBeenCalledTimes(1);
-		expect(sendMessage).toHaveBeenCalledWith(7, '你好，这是回复');
-		expect(sendMessage.mock.calls[0].length).toBe(2); // no 3rd arg → no autoReply extra
-		// ledger still accounts terminal:sent → THINKING_END carries no skipReason (unchanged)
-		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
-		expect(end).not.toHaveProperty('skipReason');
-	});
-
-	// openclaw-style terminal: sent WITHOUT content → handler does NOT send (aichat-claw already
-	// sent inside the gateway). Behavior unchanged.
-	it('terminal sent WITHOUT content → apiClient.sendMessage NOT called (openclaw path unchanged)', async () => {
+	// The handler no longer sends a reply from the agent event stream — that path is retired.
+	// Even with an apiClient bound, a completed turn must NOT call apiClient.sendMessage (the
+	// reply, if any, comes through the loopback capability endpoint instead).
+	it('completed turn does NOT call apiClient.sendMessage (reply path retired)', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
 		const sendMessage = vi.fn(async () => ({ msgId: 1 }));
@@ -505,35 +416,11 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.length >= 1);
 		const cb = calls[0].callbacks;
 
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' }); // no content (openclaw)
+		cb.onThinkingDelta('analysis');
 		cb.onThinkingEnd(100);
 		await calls[0].flush();
 
 		expect(sendMessage).not.toHaveBeenCalled();
-	});
-
-	it('ignores a terminal event arriving AFTER finalize (out-of-order, no double-account)', async () => {
-		const { adapter, calls } = fakeAdapter();
-		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
-
-		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
-		await waitFor(() => calls.length >= 1);
-		const cb = calls[0].callbacks;
-
-		// 本轮无终结工具 → onThinkingEnd 兜底补记 auto-skip 并结算
-		cb.onThinkingEnd(100);
-		await calls[0].flush();
-		const endFrame = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
-		expect(endFrame.skipReason).toBe('agent_no_terminal_tool');
-
-		// finalize 之后到达的迟到 terminal 事件必须被忽略，不得改写已结算账本、不得再发帧
-		const endFramesBefore = sent.filter((f) => f.type === THINKING_END).length;
-		cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
-		await calls[0].flush();
-		expect(sent.filter((f) => f.type === THINKING_END).length).toBe(endFramesBefore);
-		// 已发出的 THINKING_END 仍是兜底 skip，未被迟到 sent 篡改
-		expect((sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>).skipReason).toBe('agent_no_terminal_tool');
 	});
 
 	it('S4: onThinkingDelta accumulates chunks but NEVER sends a THINKING_DELTA frame', async () => {

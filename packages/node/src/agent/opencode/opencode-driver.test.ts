@@ -19,6 +19,10 @@ function memStore(): SessionStore & { map: Map<string, StoredSession>; del: Retu
 			map.set(k, v);
 		},
 		delete: del,
+		findKeyBySessionID: (sid: string) => {
+			for (const [k, v] of map) if (v.sessionID === sid) return k;
+			return undefined;
+		},
 	};
 }
 
@@ -167,6 +171,25 @@ describe('OpencodeDriver.openSession', () => {
 		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
 
 		expect(create).toHaveBeenCalledOnce(); // second openSession reused, did NOT create again
+	});
+});
+
+describe('OpencodeDriver.resolveSession (REQ-010 S1)', () => {
+	it('after openSession, resolveSession(sessionID) → {aiclawUid, roomId}', async () => {
+		const { client } = mockClient({ sessionID: 'ses_xyz' });
+		const store = memStore();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: store });
+		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
+
+		expect(driver.resolveSession('ses_xyz')).toEqual({ aiclawUid: 5, roomId: 9 });
+	});
+
+	it('unknown sessionID → undefined', async () => {
+		const { client } = mockClient({ sessionID: 'ses_xyz' });
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
+
+		expect(driver.resolveSession('ses_nope')).toBeUndefined();
 	});
 });
 
@@ -322,44 +345,9 @@ describe('OpencodeSession.send', () => {
 		expect(spied.returnSpy).toHaveBeenCalled();
 	});
 
-	// REQ-008 #78 — terminal events pass through send() (NOT swallowed by the tool de-dup).
-	it('completed hula_send_message → exactly ONE terminal sent+content per call, passes through', async () => {
-		const { client, ctl } = mockClient();
-		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
-		const stream = session.send('m');
-		await new Promise((r) => setImmediate(r));
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'thinking' }, delta: 'thinking' } });
-		ctl.emit({
-			type: 'message.part.updated',
-			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_send_message', callID: 't1', state: { status: 'completed', input: { content: 'hi user' } } } },
-		});
-		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
-		const events = await drain(stream);
-		const terminals = events.filter((e) => e.type === 'terminal');
-		expect(terminals).toEqual([{ type: 'terminal', action: 'sent', content: 'hi user' }]);
-		// terminal sits between thinking and done; tool de-dup never swallowed it.
-		expect(events[0]).toEqual({ type: 'thinking', text: 'thinking' });
-		expect(events[events.length - 1].type).toBe('done');
-	});
-
-	it('completed hula_skip_reply → terminal skipped passes through send()', async () => {
-		const { client, ctl } = mockClient();
-		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
-		const stream = session.send('m');
-		await new Promise((r) => setImmediate(r));
-		ctl.emit({
-			type: 'message.part.updated',
-			properties: { part: { type: 'tool', sessionID: SID, tool: 'hula_skip_reply', callID: 's1', state: { status: 'completed', input: { reason: '客套' } } } },
-		});
-		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
-		const events = await drain(stream);
-		expect(events.filter((e) => e.type === 'terminal')).toEqual([{ type: 'terminal', action: 'skipped', reason: '客套' }]);
-	});
-
-	// REQ-008 #78 — REQ-004 role-instruction prefix is applied to the prompt body.
-	it('REQ-004 role prompt prefix is prepended to the prompt body (user message preserved)', async () => {
+	// REQ-010 S1 — the role-instruction prefix now points at the `aichat send-message` capability,
+	// NOT the retired hula_send_message tool.
+	it('role prompt prefix instructs `aichat send-message`, NOT hula_send_message (user message preserved)', async () => {
 		const { client, prompt } = mockClient();
 		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
 		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
@@ -368,8 +356,9 @@ describe('OpencodeSession.send', () => {
 		expect(prompt).toHaveBeenCalledOnce();
 		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body;
 		const text = body.parts[0].text;
-		expect(text).toContain('hula_send_message');
-		expect(text).toContain('hula_skip_reply');
+		expect(text).toContain('aichat send-message');
+		expect(text).not.toContain('hula_send_message');
+		expect(text).not.toContain('hula_skip_reply');
 		expect(text.endsWith('原始用户消息')).toBe(true);
 		// no [SYSTEM] markers (gateway security hardening)
 		expect(text).not.toContain('[SYSTEM]');
