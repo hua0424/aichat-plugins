@@ -7,8 +7,22 @@ import { request } from 'node:http';
  * socket and returns the status + parsed body. No business logic here — the endpoint is the tested
  * seam.
  */
-/** Default per-request timeout: a hung endpoint must never wedge the agent subprocess forever. */
-const DEFAULT_TIMEOUT_MS = 5000;
+/**
+ * Default per-request timeout: a hung endpoint must never wedge the agent subprocess forever.
+ *
+ * REQ-010 S1: the server's POST /api/im/chat/msg measures ~5.5s, so the old 5s default fired ~0.5s
+ * before the (successful) send returned. Raised to 30s (opencode's bash default is 120s, so 30s is
+ * safe headroom) and overridable via AICHAT_CAPABILITY_TIMEOUT_MS for slower environments.
+ */
+const FALLBACK_TIMEOUT_MS = 30000;
+
+/** Resolve the default timeout from env (AICHAT_CAPABILITY_TIMEOUT_MS), falling back when unset/NaN. */
+function defaultTimeoutMs(): number {
+	const raw = process.env.AICHAT_CAPABILITY_TIMEOUT_MS;
+	if (raw === undefined) return FALLBACK_TIMEOUT_MS;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isNaN(parsed) ? FALLBACK_TIMEOUT_MS : parsed;
+}
 
 export function postCapability(
 	socketPath: string,
@@ -16,7 +30,8 @@ export function postCapability(
 	opts?: { timeoutMs?: number },
 ): Promise<{ status: number; body: unknown }> {
 	const payload = JSON.stringify(body);
-	const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	// Injected opts.timeoutMs wins (tests, callers); otherwise env-or-30s default.
+	const timeoutMs = opts?.timeoutMs ?? defaultTimeoutMs();
 	return new Promise((resolve, reject) => {
 		const req = request(
 			{

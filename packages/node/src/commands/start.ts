@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
@@ -53,9 +54,13 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// REQ-008 #77: 单例 opencode server manager——「1 个 server 服务 N 个身份」。
 	// 在此构建一次并被所有 opencode 身份的 buildDriver 闭包共享；仅当注册表里真有
 	// opencode 身份、且该身份 connect() 时才惰性 ensureStarted（lazy）。
-	// REQ-010 S1: the hula plugin shim is retired — the agent replies out-of-band via the
-	// `aichat send-message` capability (loopback endpoint), so the spawned server loads NO plugins.
-	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [] });
+	// REQ-010 S1: opencode does NOT inject OPENCODE_SESSION_ID into the bash tool subprocess, so the
+	// agent's `aichat send-message` had no session to resolve its bound (aiclaw, room). Load the
+	// session-env plugin into the spawned server: its `shell.env` hook injects OPENCODE_SESSION_ID
+	// into every shell exec. Point at the BUILT plugin (dist/.../session-env-plugin.js), exactly like
+	// the retired hula-plugin shim was wired. This is binding plumbing, NOT a tool/capability.
+	const sessionEnvPluginPath = fileURLToPath(new URL('../agent/opencode/session-env-plugin.js', import.meta.url));
+	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [sessionEnvPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
 
 	const supervisor = new Supervisor({
