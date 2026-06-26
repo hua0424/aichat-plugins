@@ -59,6 +59,26 @@ export class OpencodeDriver implements AgentDriver {
 		await this.server.ensureStarted();
 	}
 
+	/**
+	 * REQ-010 S1: map an opencode session id (carried by the `aichat send-message` capability as
+	 * its sessionKey) back to the bound HuLa identity+room. Looks up the key this session id was
+	 * stored under (`aiclaw-{uid}-room-{roomId}`) and parses it. Returns undefined if the id is
+	 * unknown or the key is unparseable.
+	 *
+	 * ponytail: this scans THIS driver's in-memory sessionStore. Correct for the PoC's single
+	 * opencode identity. Multiple opencode identities share the sessions.json file on disk but
+	 * have SEPARATE in-memory maps, so a fresh session created by another identity after this
+	 * driver loaded won't resolve here until reload. Upgrade when N>1: a shared session index or a
+	 * per-call reload of the store.
+	 */
+	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+		const key = this.sessionStore.findKeyBySessionID(sessionKey);
+		if (!key) return undefined;
+		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
+		if (!m) return undefined;
+		return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+	}
+
 	async disconnect(): Promise<void> {
 		// No-op. The shared opencode server is NOT owned by any single driver — it is a
 		// singleton serving N opencode identities, so stopping it here would kill ALL of
@@ -221,18 +241,18 @@ class OpencodeSession implements AgentSession {
 			return false;
 		};
 
-		// REQ-008 #78 (mirrors openclaw.ts enrichedMessage, REQ-004 S3): prepend a role-instruction
-		// so the agent treats its text output as thinking/analysis (NOT shown to the user) and
-		// replies ONLY by calling hula_send_message (user-facing content in `content`), or calls
-		// hula_skip_reply when no reply is warranted. The session is already bound to the room — the
-		// agent must NOT pass any room/identity (anti-spoofing). Plain string prefix, no [SYSTEM]
-		// markers (those get filtered by gateway security hardening).
+		// REQ-010 S1: prepend a role-instruction so the agent treats its text output as
+		// thinking/analysis (NOT shown to the user) and replies ONLY by running the
+		// `aichat send-message --content "<reply>"` command in bash (per the aichat skill). The
+		// command is bound to THIS chat's room+identity automatically — the agent must NEVER pass
+		// any room/identity (anti-spoofing). If it does not run the command, no reply is sent and
+		// the turn simply ends. Plain string prefix, no [SYSTEM] markers (those get filtered by
+		// gateway security hardening).
 		const enrichedMessage =
 			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请调用 hula_send_message 工具，把给用户看的内容写进 content。' +
-			'当前会话已绑定房间与身份，hula_send_message 无需也不应再传 roomId 或任何身份信息。' +
-			'如果判断本轮无需回复（如纯客套、无实质内容、消息不需要回应），请调用 hula_skip_reply。' +
-			'send 至少一次或 skip 恰好一次，二者是本轮的合法终结动作。\n\n' +
+			'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
+			'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
+			'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
 			'--- 用户消息如下 ---\n' +
 			message;
 

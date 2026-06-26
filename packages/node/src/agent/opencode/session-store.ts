@@ -17,6 +17,12 @@ export interface SessionStore {
 	set(key: string, val: StoredSession): void;
 	/** REQ-008 #78 P2③: drop a stale binding so the next openSession recreates it lazily. */
 	delete(key: string): void;
+	/**
+	 * REQ-010 S1: reverse lookup — the key whose stored binding has this sessionID, or undefined.
+	 * Used by OpencodeDriver.resolveSession to map an opencode session id (which the loopback
+	 * capability carries) back to the `aiclaw-{uid}-room-{roomId}` key it was created under.
+	 */
+	findKeyBySessionID(sessionID: string): string | undefined;
 }
 
 /** Default location: persists under ~/.aichat/ (a persistent volume) so reuse survives restarts. */
@@ -61,6 +67,13 @@ export class FileSessionStore implements SessionStore {
 		if (!(key in this.map)) return;
 		delete this.map[key];
 		this.persist();
+	}
+
+	findKeyBySessionID(sessionID: string): string | undefined {
+		for (const [key, val] of Object.entries(this.map)) {
+			if (val?.sessionID === sessionID) return key;
+		}
+		return undefined;
 	}
 
 	private persist(): void {

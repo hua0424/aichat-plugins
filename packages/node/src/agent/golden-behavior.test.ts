@@ -24,7 +24,6 @@ const SELF_UID = 999;
 /** A normalized agent-turn event the script feeds into whichever seam is active. */
 type ScriptEvent =
 	| { kind: 'thinking'; text: string }
-	| { kind: 'terminal'; action: 'sent' | 'skipped'; tool: string; reason?: string }
 	| { kind: 'done'; durationMs: number }
 	| { kind: 'error'; message: string };
 
@@ -33,32 +32,25 @@ interface Script {
 	events: ScriptEvent[];
 }
 
+// REQ-010 S1: the terminal-event reply path is retired, so a turn's WS send sequence is now
+// driven purely by thinking text + done/error. THINKING_END carries NO skipReason ever.
 const SCRIPTS: Script[] = [
 	{
-		name: 'a) send: deltas + terminal sent + done',
+		name: 'a) thinking + done → complete',
 		events: [
 			{ kind: 'thinking', text: 'reason-1' },
-			{ kind: 'terminal', action: 'sent', tool: 'hula_send_message' },
 			{ kind: 'done', durationMs: 123 },
 		],
 	},
 	{
-		name: 'b) explicit skip: terminal skipped (agent_skip_reply) + done',
-		events: [
-			{ kind: 'thinking', text: 'analysing' },
-			{ kind: 'terminal', action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' },
-			{ kind: 'done', durationMs: 50 },
-		],
-	},
-	{
-		name: 'c) no-terminal: deltas + done only → fallback agent_no_terminal_tool',
+		name: 'b) deltas + done only → complete, no skipReason',
 		events: [
 			{ kind: 'thinking', text: 'just thinking' },
 			{ kind: 'done', durationMs: 77 },
 		],
 	},
 	{
-		name: 'd) error',
+		name: 'c) error',
 		events: [
 			{ kind: 'thinking', text: 'partial-' },
 			{ kind: 'thinking', text: 'work' },
@@ -66,20 +58,10 @@ const SCRIPTS: Script[] = [
 		],
 	},
 	{
-		name: 'e) send-then-skip (send-wins)',
-		events: [
-			{ kind: 'thinking', text: 'x' },
-			{ kind: 'terminal', action: 'sent', tool: 'hula_send_message' },
-			{ kind: 'terminal', action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' },
-			{ kind: 'done', durationMs: 200 },
-		],
-	},
-	{
-		name: 'f) two thinking deltas concatenated',
+		name: 'd) two thinking deltas concatenated',
 		events: [
 			{ kind: 'thinking', text: 'foo' },
 			{ kind: 'thinking', text: 'bar' },
-			{ kind: 'terminal', action: 'sent', tool: 'hula_send_message' },
 			{ kind: 'done', durationMs: 9 },
 		],
 	},
@@ -178,8 +160,6 @@ function toAgentEvent(ev: ScriptEvent): AgentEvent {
 	switch (ev.kind) {
 		case 'thinking':
 			return { type: 'thinking', text: ev.text };
-		case 'terminal':
-			return { type: 'terminal', action: ev.action, reason: ev.reason };
 		case 'done':
 			return { type: 'done', durationMs: ev.durationMs };
 		case 'error':

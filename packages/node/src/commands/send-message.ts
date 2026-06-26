@@ -1,66 +1,62 @@
 /**
- * REQ-004 M3: aichat-cli send-message 命令
+ * REQ-010 S1 — `aichat send-message` CLI.
+ *
+ * A THIN client run BY the agent inside its session. It accepts ONLY `--content`; the target
+ * room + identity are NEVER passed on the command line — node resolves them from the agent's
+ * session env var (anti-spoofing). The command POSTs to the node-local loopback capability
+ * socket, which looks up the bound room/identity and sends the reply.
  */
 
-import { loadConfig, loadCredentials, getServerUrl } from '../config.js';
-import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
+import { randomUUID } from 'node:crypto';
+import { capabilitySocketPath } from '../capability/endpoint.js';
+import { postCapability } from '../capability/client.js';
 
 export async function handleSendMessage(args: string[]): Promise<void> {
-	let roomId = 0;
-	let toUid = 0;
 	let content = '';
-
 	for (let i = 0; i < args.length; i++) {
-		if (args[i] === '--room' && args[i + 1]) roomId = Number(args[++i]);
-		if (args[i] === '--to' && args[i + 1]) toUid = Number(args[++i]);
 		if (args[i] === '--content' && args[i + 1]) content = args[++i];
 	}
 
-	if (!content?.trim()) {
-		console.error('Usage: aichat send-message --room <roomId> --content "<text>"');
-		console.error('       aichat send-message --to <uid> --content "<text>"');
+	if (!content.trim()) {
+		console.error('Usage: aichat send-message --content "<text>"');
+		console.error('       (room and identity are bound automatically from your agent session)');
 		process.exit(1);
 	}
 
-	const credentials = loadCredentials();
-	if (!credentials) {
-		console.error('Not activated. Run: aichat activate');
+	const sessionKey = resolveAgentSessionKey();
+	if (!sessionKey) {
+		console.error('Error: no agent session env (OPENCODE_SESSION_ID)');
 		process.exit(1);
 	}
 
-	const config = loadConfig();
-	const restBaseUrl = restBaseUrlFromWsUrl(getServerUrl(config));
-	const api = new HulaApiClient(restBaseUrl, credentials.connectionToken);
+	const res = await postCapability(capabilitySocketPath(), {
+		sessionKey,
+		command: 'send-message',
+		args: { content: content.trim() },
+		idempotencyKey: randomUUID(),
+	});
 
-	let targetRoomId = roomId;
-	if (!targetRoomId && toUid) {
-		// 通过好友 UID 解析 roomId（搜索好友后取私聊房间）
-		targetRoomId = await resolveRoomIdForUid(toUid, api);
+	const ok = res.status === 200 && (res.body as { ok?: boolean })?.ok === true;
+	if (ok) {
+		const result = (res.body as { result?: unknown }).result;
+		console.log(`Message sent: ${JSON.stringify(result)}`);
+		return;
 	}
 
-	if (!targetRoomId) {
-		console.error('Error: must specify --room or --to');
-		process.exit(1);
-	}
-
-	const result = await api.sendMessage(targetRoomId, content.trim());
-	console.log(`Message sent: msgId=${result.msgId} roomId=${targetRoomId}`);
+	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
+	console.error(`Error: send-message failed: ${error}`);
+	process.exit(1);
 }
 
 /**
- * 通过 UID 解析私聊房间 ID
- * 简化实现：搜索好友后，尝试通过 API 获取或创建会话
+ * REQ-010 S1 — resolve the agent's session key OUT-OF-BAND from its environment.
+ *
+ * For S1 only opencode is supported: `OPENCODE_SESSION_ID` → `opencode:<id>`. Extensible later
+ * for codex / cc / openclaw. Returns undefined when no recognized session env is set — the CLI
+ * never accepts a session id (or room/identity) as an argument.
  */
-async function resolveRoomIdForUid(uid: number, api: HulaApiClient): Promise<number> {
-	// 先搜索好友确认存在
-	const friends = await api.searchFriends(String(uid));
-	const friend = friends.find((f) => f.uid === uid);
-	if (!friend) {
-		throw new Error(`Friend not found: uid=${uid}`);
-	}
-
-	// TODO: 需要通过 server API 获取/创建私聊 roomId
-	// 当前简化：直接返回 uid 作为 roomId（仅用于测试，实际需调用会话创建 API）
-	console.warn(`[cli] resolveRoomIdForUid: returning uid=${uid} as roomId (simplified)`);
-	return uid;
+export function resolveAgentSessionKey(): string | undefined {
+	const opencode = process.env.OPENCODE_SESSION_ID;
+	if (opencode) return `opencode:${opencode}`;
+	return undefined;
 }

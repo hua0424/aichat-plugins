@@ -53,11 +53,14 @@ describe('OpenclawDriver', () => {
 		expect(calls[0].message).toBe('hi');
 	});
 
-	it('send: thinking deltas + terminal sent + done → mapped AgentEvent sequence', async () => {
+	// REQ-010 S1: the terminal AgentEvent is retired. onTerminalTool is NO LONGER bridged into the
+	// stream (the openclaw adapter still sends its reply internally inside the gateway). The stream
+	// now carries only thinking + done/error.
+	it('send: thinking deltas + done → mapped AgentEvent sequence (terminal NOT bridged)', async () => {
 		const { adapter } = fakeAdapter((cb) => {
 			cb.onThinkingDelta('foo');
 			cb.onThinkingDelta('bar');
-			cb.onTerminalTool!({ action: 'sent', tool: 'hula_send_message' });
+			// onTerminalTool is no longer provided by the driver → adapter never calls it (retired).
 			cb.onThinkingEnd(123);
 		});
 		const driver = new OpenclawDriver(adapter);
@@ -66,23 +69,19 @@ describe('OpenclawDriver', () => {
 		expect(events).toEqual([
 			{ type: 'thinking', text: 'foo' },
 			{ type: 'thinking', text: 'bar' },
-			{ type: 'terminal', action: 'sent', reason: undefined },
 			{ type: 'done', durationMs: 123 },
 		]);
 	});
 
-	it('skip: terminal skipped with reason → mapped + done; iterator ends', async () => {
+	it('skip: onTerminalTool not bridged; only done reaches the stream', async () => {
 		const { adapter } = fakeAdapter((cb) => {
-			cb.onTerminalTool!({ action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' });
+			// driver provides no onTerminalTool; a skip turn just ends with done.
 			cb.onThinkingEnd(50);
 		});
 		const driver = new OpenclawDriver(adapter);
 		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
 		const events = await drain(session.send('m'));
-		expect(events).toEqual([
-			{ type: 'terminal', action: 'skipped', reason: 'agent_skip_reply' },
-			{ type: 'done', durationMs: 50 },
-		]);
+		expect(events).toEqual([{ type: 'done', durationMs: 50 }]);
 	});
 
 	it('error: onError → error event then iterator ends', async () => {
@@ -105,7 +104,6 @@ describe('OpenclawDriver', () => {
 		const { adapter } = fakeAdapter((cb) => {
 			cb.onThinkingDelta('a');
 			cb.onThinkingDelta('b');
-			cb.onTerminalTool!({ action: 'sent', tool: 'message' });
 			cb.onThinkingEnd(7);
 		});
 		const driver = new OpenclawDriver(adapter);
@@ -117,7 +115,6 @@ describe('OpenclawDriver', () => {
 		expect(events).toEqual([
 			{ type: 'thinking', text: 'a' },
 			{ type: 'thinking', text: 'b' },
-			{ type: 'terminal', action: 'sent', reason: undefined },
 			{ type: 'done', durationMs: 7 },
 		]);
 	});
