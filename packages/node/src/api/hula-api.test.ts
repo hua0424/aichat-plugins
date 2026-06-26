@@ -218,26 +218,25 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
 		expect(out).toEqual([
 			{
-				groupId: 100200300400500,
-				roomId: 987654321098765,
-				groupName: 'Team A',
+				id: 987654321098765,
+				name: 'Team A',
 				account: 'hula_grpA',
 				memberNum: 10,
 				onlineNum: 3,
 				roleId: 2,
 			},
 			{
-				groupId: 111,
-				roomId: 222,
-				groupName: 'Team B',
+				id: 222,
+				name: 'Team B',
 				account: undefined,
 				memberNum: undefined,
 				onlineNum: undefined,
 				roleId: undefined,
 			},
 		]);
-		expect(typeof out[0].groupId).toBe('number');
-		expect(typeof out[0].roomId).toBe('number');
+		expect(typeof out[0].id).toBe('number');
+		expect(out[0]).not.toHaveProperty('groupId');
+		expect(out[0]).not.toHaveProperty('roomId');
 	});
 
 	it('listGroups: missing data → []', async () => {

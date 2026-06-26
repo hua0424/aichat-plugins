@@ -23,6 +23,7 @@ import {
 	listGroupMembersCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
+import { resolveBoundSession } from '../capability/session-key.js';
 import { installSkill } from '../capability/skill.js';
 
 /**
@@ -108,8 +109,9 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// REQ-010 S1: node-local capability endpoint (Flow2). The agent replies by running
 	// `aichat send-message --content "..."`, which POSTs here over a loopback unix socket. resolve()
 	// maps the agent's session key → the bound identity/room/api — room/identity NEVER come from the
-	// CLI args (anti-spoofing). Strip the `opencode:` prefix, ask each driver that can resolve a
-	// session; the first hit wins; then find that uid's SupervisedAgent for its per-identity api.
+	// CLI args (anti-spoofing). REQ-010 S5: require a KNOWN agent-type prefix and route ONLY to the
+	// driver of that type (no more try-every-driver); resolveBoundSession maps it to the bound
+	// identity/room + that owner uid's per-identity api.
 	const registry$ = new CapabilityRegistry();
 	registry$.register('send-message', sendMessageCapability());
 	// REQ-010 S3: read-only query capabilities (token-scoped via the resolved per-identity apiClient)
@@ -121,17 +123,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	registry$.register('list-group-members', listGroupMembersCapability());
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
-		resolve: (sessionKey) => {
-			const opencodeId = sessionKey.startsWith('opencode:') ? sessionKey.slice('opencode:'.length) : sessionKey;
-			for (const agent of supervisor.agents) {
-				const resolved = agent.driver.resolveSession?.(opencodeId);
-				if (resolved) {
-					const owner = supervisor.agents.find((a) => a.uid === resolved.aiclawUid);
-					if (owner) return { aiclawUid: resolved.aiclawUid, roomId: resolved.roomId, apiClient: owner.api };
-				}
-			}
-			return undefined;
-		},
+		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
 	});
 	await endpoint.listen(capabilitySocketPath());
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);

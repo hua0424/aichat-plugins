@@ -89,29 +89,29 @@ export class HulaApiClient {
 	/**
 	 * REQ-010 S4 #94 — 本 aiclaw（按 token 认证身份）已加入的群列表。
 	 * GET /api/im/room/group/list（无参数；身份取自 token）→ data[] 映射。
-	 * server 把大整数 groupId/roomId 序列化为字符串，这里统一 Number(...) 化。
+	 * 单一 canonical `id` = server 的 roomId（Number(...) 化）——这才是 member-list
+	 * 端点 / `--groupid` 接受的值；不再暴露独立的 groupId/roomId 二义键。
+	 * `account` 是人类可读的群号，仅供展示。
 	 */
 	async listGroups(): Promise<
 		Array<{
-			groupId: number;
-			roomId: number;
-			groupName: string;
-			account?: string;
+			id: number;
+			name: string;
 			memberNum?: number;
 			onlineNum?: number;
 			roleId?: number;
+			account?: string;
 		}>
 	> {
 		const resp = await this.get('/api/im/room/group/list');
 		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
 		return list.map((item) => ({
-			groupId: Number(item.groupId),
-			roomId: Number(item.roomId),
-			groupName: item.groupName as string,
-			account: item.account as string | undefined,
+			id: Number(item.roomId),
+			name: item.groupName as string,
 			memberNum: item.memberNum === undefined ? undefined : Number(item.memberNum),
 			onlineNum: item.onlineNum === undefined ? undefined : Number(item.onlineNum),
 			roleId: item.roleId === undefined ? undefined : Number(item.roleId),
+			account: item.account as string | undefined,
 		}));
 	}
 
