@@ -2,6 +2,9 @@
 import { activate } from './commands/activate.js';
 import { start } from './commands/start.js';
 import { handleSendMessage } from './commands/send-message.js';
+import { handleMemberInfo } from './commands/member-info.js';
+import { handleListFriends } from './commands/list-friends.js';
+import { handleFindFriend } from './commands/find-friend.js';
 import { handleGroupConfig } from './commands/group-config.js';
 import { installSkill } from './capability/skill.js';
 
@@ -18,6 +21,16 @@ switch (command) {
 	// REQ-004 M3: CLI 扩展
 	case 'send-message':
 		await handleSendMessage(args.slice(1));
+		break;
+	// REQ-010 S3: read-only query subcommands
+	case 'member-info':
+		await handleMemberInfo(args.slice(1));
+		break;
+	case 'list-friends':
+		await handleListFriends(args.slice(1));
+		break;
+	case 'find-friend':
+		await handleFindFriend(args.slice(1));
 		break;
 	case 'group-config':
 		await handleGroupConfig(args.slice(1));
@@ -67,6 +80,9 @@ Commands:
   send-message --content <text>                  Reply to the current chat
                                                  (room + identity are bound automatically
                                                   from your agent session — never passed in)
+  member-info <uid>                              Look up a user's public profile
+  list-friends                                   List this assistant's friends
+  find-friend <keyword>                          Search users by keyword
   install-skill                                  Install the aichat-reply opencode skill
   group-config --room <roomId>                   Query group config
   group-config --room <roomId> [options...]      Update group config
@@ -75,6 +91,9 @@ Examples:
   aichat activate --backend openclaw --token eyJ...
   aichat start
   aichat send-message --content "Hello"
+  aichat member-info 12345
+  aichat list-friends
+  aichat find-friend "alice"
   aichat install-skill
   aichat group-config --room 12345 --rate-limit 20 --respond-to-ai true
 `);

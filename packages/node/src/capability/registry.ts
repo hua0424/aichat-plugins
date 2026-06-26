@@ -53,3 +53,47 @@ export function sendMessageCapability(): Capability {
 		return { msgId, roomId: ctx.roomId };
 	};
 }
+
+/**
+ * REQ-010 S3 — read-only query capabilities (member-info / list-friends / find-friend).
+ *
+ * ANTI-SPOOFING: identity/scope come ONLY from the resolved `ctx.apiClient` (the aiclaw's token,
+ * derived from the agent session key) — they are NEVER read from args. The `uid` / `keyword` below
+ * are legitimate QUERY TARGETS (what to look up), not identity claims, so they correctly live in
+ * args. These caps intentionally IGNORE `ctx.roomId`: they are aiclaw-scoped queries (whoever this
+ * aiclaw's token can see), not room-scoped — the token, not the room, bounds what they return.
+ */
+
+/** member-info: look up one user's public profile by `args.uid`. */
+export function memberInfoCapability(): Capability {
+	return async (ctx, args) => {
+		const raw = args.uid;
+		const uid = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+		if (!Number.isInteger(uid) || uid <= 0) {
+			throw new Error('member-info: `uid` is required and must be a positive integer');
+		}
+		const profile = await ctx.apiClient.getMemberInfo(uid);
+		return { uid, profile };
+	};
+}
+
+/** list-friends: the aiclaw's own friend list (no args; token-scoped). */
+export function listFriendsCapability(): Capability {
+	return async (ctx) => {
+		const friends = await ctx.apiClient.listFriends();
+		return { friends };
+	};
+}
+
+/** find-friend: search users by `args.keyword` (non-empty, trimmed). */
+export function findFriendCapability(): Capability {
+	return async (ctx, args) => {
+		const raw = args.keyword;
+		if (typeof raw !== 'string' || raw.trim().length === 0) {
+			throw new Error('find-friend: `keyword` is required and must be a non-empty string');
+		}
+		const keyword = raw.trim();
+		const users = await ctx.apiClient.searchUsers(keyword);
+		return { keyword, users };
+	};
+}
