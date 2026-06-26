@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
@@ -109,5 +112,36 @@ describe('CapabilityEndpoint.handle', () => {
 		const res = await endpoint.handle({ body: body({ args: { content: '' } }) });
 		expect(res.status).toBe(500);
 		expect((res.json as { ok: boolean }).ok).toBe(false);
+	});
+});
+
+describe('CapabilityEndpoint.listen socket permissions', () => {
+	const dirs: string[] = [];
+	let endpoint: CapabilityEndpoint | null = null;
+
+	afterEach(async () => {
+		if (endpoint) {
+			await endpoint.close();
+			endpoint = null;
+		}
+		for (const d of dirs.splice(0)) {
+			rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	it('binds the socket 0600 inside a 0700 parent dir (anti-spoofing)', async () => {
+		const { endpoint: ep } = build({ resolveRoom: 42 });
+		endpoint = ep;
+		// nest a private subdir so the parent dir mode assertion is meaningful (mkdirSync creates it)
+		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
+		dirs.push(base);
+		const dir = join(base, 'priv');
+		const socketPath = join(dir, 'capability.sock');
+
+		await endpoint.listen(socketPath);
+
+		// On Linux the mode bits are honored; mask to the permission bits only.
+		expect(statSync(socketPath).mode & 0o777).toBe(0o600);
+		expect(statSync(dir).mode & 0o777).toBe(0o700);
 	});
 });

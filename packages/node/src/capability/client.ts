@@ -7,11 +7,16 @@ import { request } from 'node:http';
  * socket and returns the status + parsed body. No business logic here — the endpoint is the tested
  * seam.
  */
+/** Default per-request timeout: a hung endpoint must never wedge the agent subprocess forever. */
+const DEFAULT_TIMEOUT_MS = 5000;
+
 export function postCapability(
 	socketPath: string,
 	body: unknown,
+	opts?: { timeoutMs?: number },
 ): Promise<{ status: number; body: unknown }> {
 	const payload = JSON.stringify(body);
+	const timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	return new Promise((resolve, reject) => {
 		const req = request(
 			{
@@ -39,6 +44,11 @@ export function postCapability(
 			},
 		);
 		req.on('error', reject);
+		// A connected-but-silent endpoint must not hang the agent. Tear the socket down and reject.
+		req.setTimeout(timeoutMs, () => {
+			req.destroy();
+			reject(new Error('capability endpoint timeout'));
+		});
 		req.write(payload);
 		req.end();
 	});

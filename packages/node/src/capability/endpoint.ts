@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
-import { unlinkSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { unlinkSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
 import type { CapabilityRegistry, CapabilityContext } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
@@ -116,6 +116,13 @@ export class CapabilityEndpoint {
 
 	/** Wire node:http over a UNIX domain socket → handle(). Best-effort unlink a stale socket first. */
 	async listen(socketPath: string): Promise<void> {
+		// Anti-spoofing: keep the socket private. The PARENT dir must be 0700 so no other user can
+		// place/replace the socket; the explicit chmod defends against the process umask masking the
+		// mkdir mode bits. The socket itself is locked to 0600 after listen() below.
+		const dir = dirname(socketPath);
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		chmodSync(dir, 0o700);
+
 		if (existsSync(socketPath)) {
 			try {
 				unlinkSync(socketPath);
@@ -148,6 +155,9 @@ export class CapabilityEndpoint {
 			this.server!.once('error', onError);
 			this.server!.listen(socketPath, () => {
 				this.server!.off('error', onError);
+				// Lock the bound socket to owner-only rw. A world/group-writable unix socket on a shared
+				// host lets another user impersonate an aiclaw — required, not best-effort.
+				chmodSync(socketPath, 0o600);
 				resolve();
 			});
 		});
