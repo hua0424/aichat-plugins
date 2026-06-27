@@ -25,7 +25,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 
 	const sessionKey = resolveAgentSessionKey();
 	if (!sessionKey) {
-		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID)');
+		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID / OPENCLAW_BIND)');
 		process.exit(1);
 	}
 
@@ -53,6 +53,8 @@ export async function handleSendMessage(args: string[]): Promise<void> {
  *
  * opencode injects `OPENCODE_SESSION_ID` (via the session-env plugin) → `opencode:<id>`.
  * codex NATIVELY injects `CODEX_THREAD_ID` into its exec shell subprocess → `codex:<id>`.
+ * openclaw gets `OPENCLAW_BIND` injected by aichat-claw's `resolve_exec_env` hook (the bare
+ * `aiclaw-{uid}-room-{roomId}` binding) → `openclaw:<binding>` (REQ-010 S6 Phase-2).
  * The prefix routes the loopback capability to the owning driver (see capability/session-key.ts).
  * Returns undefined when no recognized session env is set — the CLI never accepts a session id
  * (or room/identity) as an argument (anti-spoofing).
@@ -62,5 +64,7 @@ export function resolveAgentSessionKey(): string | undefined {
 	if (opencode) return `opencode:${opencode}`;
 	const codex = process.env.CODEX_THREAD_ID;
 	if (codex) return `codex:${codex}`;
+	const openclaw = process.env.OPENCLAW_BIND;
+	if (openclaw) return `openclaw:${openclaw}`;
 	return undefined;
 }

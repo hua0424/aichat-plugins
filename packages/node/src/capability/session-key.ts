@@ -12,12 +12,14 @@ import type { HulaApiClient } from '../api/hula-api.js';
 
 /** Known session-key prefix → the AgentDriver.type that owns that key namespace.
  *
- * `codex:` is included now for forward-compat — the codex driver lands in the S5 body. Until then a
- * `codex:`-prefixed key passes the prefix gate but finds no codex driver and is simply unresolvable.
+ * `openclaw:` (REQ-010 S6 Phase-2) routes openclaw agent replies through the same unified CLI path
+ * as opencode/codex. Its id is the bare binding `aiclaw-{uid}-room-{roomId}` — OpenclawDriver.resolveSession
+ * parses it directly (no store: openclaw's binding IS the sessionKey).
  */
 export const KNOWN_PREFIXES: Record<string, string> = {
 	'opencode:': 'opencode',
 	'codex:': 'codex',
+	'openclaw:': 'openclaw',
 };
 
 /**

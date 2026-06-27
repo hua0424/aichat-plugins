@@ -12,6 +12,21 @@ export class OpenclawDriver implements AgentDriver {
 
 	constructor(private readonly adapter: ClawAdapter) {}
 
+	/**
+	 * REQ-010 S6 Phase-2 — resolve the openclaw capability session id back to its bound identity+room.
+	 *
+	 * Unlike opencode/codex (which keep a threadId→binding store), openclaw's binding IS the session
+	 * key: aichat-claw's resolve_exec_env hook injects the bare `aiclaw-{uid}-room-{roomId}` as
+	 * OPENCLAW_BIND, the CLI emits `openclaw:<binding>`, and resolveBoundSession strips the `openclaw:`
+	 * prefix before calling this. So this is a pure PARSE, not a lookup. Returns undefined on any
+	 * unparseable/garbage input (including a still-prefixed `openclaw:...`, which must never arrive here).
+	 */
+	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(sessionKey);
+		if (!m) return undefined;
+		return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+	}
+
 	async connect(): Promise<void> {
 		await this.adapter.connect();
 	}

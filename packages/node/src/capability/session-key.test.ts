@@ -35,8 +35,19 @@ describe('parseSessionKey', () => {
 		expect(parseSessionKey('opencode:')).toBeUndefined();
 	});
 
+	it('openclaw:<binding> → { agentType: openclaw, id: <binding> } (REQ-010 S6 Phase-2)', () => {
+		expect(parseSessionKey('openclaw:aiclaw-1-room-2')).toEqual({
+			agentType: 'openclaw',
+			id: 'aiclaw-1-room-2',
+		});
+	});
+
 	it('KNOWN_PREFIXES maps prefixes to AgentDriver.type', () => {
-		expect(KNOWN_PREFIXES).toEqual({ 'opencode:': 'opencode', 'codex:': 'codex' });
+		expect(KNOWN_PREFIXES).toEqual({
+			'opencode:': 'opencode',
+			'codex:': 'codex',
+			'openclaw:': 'openclaw',
+		});
 	});
 });
 
@@ -70,6 +81,23 @@ describe('resolveBoundSession', () => {
 	it('codex:<id> with no codex driver present → undefined', () => {
 		const opencode = agent({ type: 'opencode', uid: 7, resolve: () => ({ aiclawUid: 7, roomId: 42 }) });
 		expect(resolveBoundSession('codex:thr_y', [opencode])).toBeUndefined();
+	});
+
+	it('openclaw:<binding> routes to the openclaw driver with the prefix STRIPPED (id = bare binding)', () => {
+		// resolveBoundSession must hand the openclaw driver the prefix-stripped id (the bare binding),
+		// exactly like opencode/codex — assert it sees `aiclaw-3-room-8`, not `openclaw:aiclaw-3-room-8`.
+		let seenId: string | undefined;
+		const openclaw = agent({
+			type: 'openclaw',
+			uid: 3,
+			resolve: (id) => {
+				seenId = id;
+				return id === 'aiclaw-3-room-8' ? { aiclawUid: 3, roomId: 8 } : undefined;
+			},
+		});
+		const out = resolveBoundSession('openclaw:aiclaw-3-room-8', [openclaw]);
+		expect(seenId).toBe('aiclaw-3-room-8');
+		expect(out).toEqual({ aiclawUid: 3, roomId: 8, apiClient: openclaw.api });
 	});
 
 	it('unprefixed key → undefined', () => {
