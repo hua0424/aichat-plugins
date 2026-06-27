@@ -373,6 +373,15 @@ export class MessageHandler {
 	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
 	 */
 	private async triggerAgentLoop(roomId: number, message: string, skipGuard = false): Promise<void> {
+		// REQ-010 S7: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven by node — the
+		// owner drives the TUI by hand. Inbound messages are still ACK'd/deduped (in handleReceiveMessage,
+		// before this funnel), but node must NOT trigger an agent loop / THINKING_START for them. A cc
+		// identity's thinking comes ONLY from its side-channel broker (external-thinking). Drivers that
+		// leave drivesTurns undefined/true (openclaw/opencode/codex) are unaffected.
+		if (this.driver.drivesTurns === false) {
+			return;
+		}
+
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;

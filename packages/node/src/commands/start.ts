@@ -11,6 +11,10 @@ import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
 import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
+import { CcDriver, parseCcBinding } from '../agent/cc/cc-driver.js';
+import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
+import { buildCcSink } from '../agent/cc/sink.js';
+import { ccBindAdminHandler } from '../capability/cc-bind.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
@@ -106,6 +110,16 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
+			if (entry.tool === 'cc') {
+				// REQ-010 S7: claude-code is OWNER-DRIVEN. The CcDriver does NOT drive turns
+				// (drivesTurns=false) and has no server — connect()/disconnect() are no-ops. The owner
+				// launches `claude` by hand (via `aichat cc-bind`); CC replies through the capability CLI
+				// and mirrors thinking through the CcBroker (wired below after supervisor.start).
+				return new CcDriver({
+					workspaceBase: join(AICHAT_HOME, 'cc', 'workspace'),
+					brokerPort: ccBrokerPort(),
+				});
+			}
 			// 未知 tool 抛错使该身份降级，不影响其它身份。
 			throw new Error('unsupported agent tool: ' + entry.tool);
 		},
@@ -143,9 +157,35 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
+		// REQ-010 S7: cc-bind admin route (loopback-only setup op, NOT identity-resolved). Reads the
+		// LIVE supervisor.agents each call so a cc identity that came online late is still found.
+		adminHandlers: {
+			'cc-bind': (body) =>
+				ccBindAdminHandler(
+					supervisor.agents.map((a) => ({
+						uid: a.uid,
+						driver: a.driver as unknown as { type: string; bind?: CcDriver['bind'] },
+					})),
+				)(body),
+		},
 	});
 	await endpoint.listen(capabilitySocketPath());
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
+
+	// REQ-010 S7: if any cc identity is registered, start the CC side-channel broker so CC's hooks can
+	// mirror its turn into the room's thinking panel. resolve() = the shared parseCcBinding (same parse
+	// as CcDriver.resolveSession). sink dispatches begin/delta/end(roomId, uid) to the matching
+	// identity's MessageHandler (external-thinking). Only bound when a cc identity exists (don't bind
+	// 9100 otherwise). Closed on shutdown.
+	let ccBroker: CcBroker | null = null;
+	if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
+		ccBroker = new CcBroker({
+			resolve: parseCcBinding,
+			sink: buildCcSink(() => supervisor.agents),
+		});
+		await ccBroker.listen(ccBrokerPort());
+		console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
+	}
 
 	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
 	try {
@@ -161,6 +201,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
 		await endpoint.close().catch(() => {});
+		await ccBroker?.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		process.exit(0);

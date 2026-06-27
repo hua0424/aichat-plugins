@@ -13,12 +13,14 @@ describe('resolveAgentSessionKey', () => {
 		OPENCODE_SESSION_ID: process.env.OPENCODE_SESSION_ID,
 		CODEX_THREAD_ID: process.env.CODEX_THREAD_ID,
 		OPENCLAW_BIND: process.env.OPENCLAW_BIND,
+		AICHAT_BIND: process.env.AICHAT_BIND,
 	};
 
 	beforeEach(() => {
 		delete process.env.OPENCODE_SESSION_ID;
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
+		delete process.env.AICHAT_BIND;
 	});
 
 	afterEach(() => {
@@ -44,6 +46,17 @@ describe('resolveAgentSessionKey', () => {
 		process.env.CODEX_THREAD_ID = 'thr_y';
 		process.env.OPENCLAW_BIND = 'aiclaw-1-room-2';
 		expect(resolveAgentSessionKey()).toBe('codex:thr_y');
+	});
+
+	it('AICHAT_BIND set → cc:<binding> (REQ-010 S7)', () => {
+		process.env.AICHAT_BIND = 'aiclaw-3-room-4';
+		expect(resolveAgentSessionKey()).toBe('cc:aiclaw-3-room-4');
+	});
+
+	it('OPENCLAW_BIND wins over AICHAT_BIND (cc is last in precedence)', () => {
+		process.env.OPENCLAW_BIND = 'aiclaw-1-room-2';
+		process.env.AICHAT_BIND = 'aiclaw-3-room-4';
+		expect(resolveAgentSessionKey()).toBe('openclaw:aiclaw-1-room-2');
 	});
 
 	it('none set → undefined', () => {

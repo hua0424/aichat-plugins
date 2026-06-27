@@ -20,6 +20,9 @@ export const KNOWN_PREFIXES: Record<string, string> = {
 	'opencode:': 'opencode',
 	'codex:': 'codex',
 	'openclaw:': 'openclaw',
+	// REQ-010 S7: claude-code. Its id is the bare binding `aiclaw-{uid}-room-{roomId}` (read from the
+	// agent's `AICHAT_BIND` env) — CcDriver.resolveSession parses it directly (no store: like openclaw).
+	'cc:': 'cc',
 };
 
 /**

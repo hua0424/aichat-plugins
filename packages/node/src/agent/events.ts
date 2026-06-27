@@ -25,6 +25,16 @@ export interface AgentDriver {
 	openSession(o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }): Promise<AgentSession>;
 	disconnect(): Promise<void>;
 	/**
+	 * REQ-010 S7: whether NODE drives this identity's turns on inbound messages.
+	 *
+	 * Default semantics (undefined === true): the MessageHandler triggers the agent loop
+	 * (openSession().send()) on an inbound trigger-eligible message — the model for openclaw /
+	 * opencode / codex. The CC driver sets this `false`: claude-code has NO server, the OWNER drives
+	 * the TUI by hand, so node must NOT trigger a turn on inbound messages. A cc identity's thinking
+	 * comes ONLY from its side-channel broker (external-thinking), never from an inbound-triggered loop.
+	 */
+	readonly drivesTurns?: boolean;
+	/**
 	 * REQ-010 S1: resolve an agent-session-scoped key back to the bound HuLa identity+room.
 	 * Used by the loopback capability endpoint to look up where an `aichat send-message`
 	 * call (which carries only the agent's session id, never room/identity) should land.

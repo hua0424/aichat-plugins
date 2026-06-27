@@ -1564,3 +1564,50 @@ describe('MessageHandler S7: external thinking path (CC broker)', () => {
 		expect(starts.some((s) => s.startsWith('cc-ext-5-'))).toBe(true);
 	});
 });
+
+describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
+	/** A driver wrapper exposing drivesTurns; reuses fakeAdapter so openSession spy stays observable. */
+	function ownerDrivenAdapter() {
+		const { adapter, calls } = fakeAdapter();
+		(adapter as unknown as { drivesTurns: boolean }).drivesTurns = false;
+		return { adapter, calls };
+	}
+
+	it('does NOT trigger the agent loop on an inbound message (no openSession / no THINKING_START)', async () => {
+		const { adapter, calls } = ownerDrivenAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
+
+		// give the debouncer time to fire if it were going to
+		await new Promise((r) => setTimeout(r, 80));
+
+		// owner-driven: no openSession call, no THINKING_START frame
+		expect(calls.length).toBe(0);
+		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(0);
+
+		// but the inbound message is still ACK'd (dedupe/ACK behavior unchanged)
+		expect(sent.filter((f) => f.type === WSReqType.ACK).length).toBe(1);
+
+		// external-thinking (the broker path) still works for a cc identity
+		handler.beginExternalThinking(1, SELF_UID);
+		handler.externalThinkingDelta(1, SELF_UID, 'cc panel');
+		handler.endExternalThinking(1, SELF_UID);
+		const ends = sent.filter((f) => f.type === WSReqType.THINKING_END).map((f) => (f.data as Record<string, unknown>).content);
+		expect(ends).toContain('cc panel');
+	});
+
+	it('regression: a normal driver (drivesTurns undefined) still drives the agent loop', async () => {
+		const { adapter, calls } = fakeAdapter(); // drivesTurns undefined → default true semantics
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi normal', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(calls[0].message).toBe('hi normal');
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
+	});
+});
