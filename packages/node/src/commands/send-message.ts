@@ -25,7 +25,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 
 	const sessionKey = resolveAgentSessionKey();
 	if (!sessionKey) {
-		console.error('Error: no agent session env (OPENCODE_SESSION_ID)');
+		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID)');
 		process.exit(1);
 	}
 
@@ -49,14 +49,18 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 }
 
 /**
- * REQ-010 S1 — resolve the agent's session key OUT-OF-BAND from its environment.
+ * REQ-010 S1/S5 — resolve the agent's session key OUT-OF-BAND from its environment.
  *
- * For S1 only opencode is supported: `OPENCODE_SESSION_ID` → `opencode:<id>`. Extensible later
- * for codex / cc / openclaw. Returns undefined when no recognized session env is set — the CLI
- * never accepts a session id (or room/identity) as an argument.
+ * opencode injects `OPENCODE_SESSION_ID` (via the session-env plugin) → `opencode:<id>`.
+ * codex NATIVELY injects `CODEX_THREAD_ID` into its exec shell subprocess → `codex:<id>`.
+ * The prefix routes the loopback capability to the owning driver (see capability/session-key.ts).
+ * Returns undefined when no recognized session env is set — the CLI never accepts a session id
+ * (or room/identity) as an argument (anti-spoofing).
  */
 export function resolveAgentSessionKey(): string | undefined {
 	const opencode = process.env.OPENCODE_SESSION_ID;
 	if (opencode) return `opencode:${opencode}`;
+	const codex = process.env.CODEX_THREAD_ID;
+	if (codex) return `codex:${codex}`;
 	return undefined;
 }
