@@ -42,11 +42,19 @@ describe('parseSessionKey', () => {
 		});
 	});
 
+	it('cc:<binding> → { agentType: cc, id: <binding> } (REQ-010 S7)', () => {
+		expect(parseSessionKey('cc:aiclaw-3-room-4')).toEqual({
+			agentType: 'cc',
+			id: 'aiclaw-3-room-4',
+		});
+	});
+
 	it('KNOWN_PREFIXES maps prefixes to AgentDriver.type', () => {
 		expect(KNOWN_PREFIXES).toEqual({
 			'opencode:': 'opencode',
 			'codex:': 'codex',
 			'openclaw:': 'openclaw',
+			'cc:': 'cc',
 		});
 	});
 });
@@ -98,6 +106,22 @@ describe('resolveBoundSession', () => {
 		const out = resolveBoundSession('openclaw:aiclaw-3-room-8', [openclaw]);
 		expect(seenId).toBe('aiclaw-3-room-8');
 		expect(out).toEqual({ aiclawUid: 3, roomId: 8, apiClient: openclaw.api });
+	});
+
+	it('cc:<binding> routes to the cc driver with the prefix STRIPPED (id = bare binding)', () => {
+		// REQ-010 S7: same contract as openclaw — the cc driver must see the bare binding, not `cc:…`.
+		let seenId: string | undefined;
+		const cc = agent({
+			type: 'cc',
+			uid: 5,
+			resolve: (id) => {
+				seenId = id;
+				return id === 'aiclaw-5-room-9' ? { aiclawUid: 5, roomId: 9 } : undefined;
+			},
+		});
+		const out = resolveBoundSession('cc:aiclaw-5-room-9', [cc]);
+		expect(seenId).toBe('aiclaw-5-room-9');
+		expect(out).toEqual({ aiclawUid: 5, roomId: 9, apiClient: cc.api });
 	});
 
 	it('unprefixed key → undefined', () => {

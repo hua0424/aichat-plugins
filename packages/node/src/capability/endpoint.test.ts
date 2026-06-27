@@ -10,7 +10,11 @@ import type { HulaApiClient } from '../api/hula-api.js';
  * Build an endpoint wired to a real registry (send-message) + a controllable resolve. The fake
  * apiClient's sendMessage is the observable seam: we assert which roomId it received.
  */
-function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: number }) {
+function build(opts?: {
+	resolveRoom?: number | undefined;
+	idempotencyCap?: number;
+	adminHandlers?: Record<string, (b: Record<string, unknown>) => { status: number; json: unknown }>;
+}) {
 	const sendMessage = vi.fn(async () => ({ msgId: 1 }));
 	const apiClient = { sendMessage } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
@@ -19,7 +23,12 @@ function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: numbe
 		if (opts?.resolveRoom === undefined) return undefined;
 		return { aiclawUid: 7, roomId: opts.resolveRoom, apiClient };
 	});
-	const endpoint = new CapabilityEndpoint({ registry, resolve, idempotencyCap: opts?.idempotencyCap });
+	const endpoint = new CapabilityEndpoint({
+		registry,
+		resolve,
+		idempotencyCap: opts?.idempotencyCap,
+		adminHandlers: opts?.adminHandlers,
+	});
 	return { endpoint, sendMessage, resolve };
 }
 
@@ -130,6 +139,36 @@ describe('CapabilityEndpoint.handle', () => {
 		const res = await endpoint.handle({ body: body({ args: { content: '' } }) });
 		expect(res.status).toBe(500);
 		expect((res.json as { ok: boolean }).ok).toBe(false);
+	});
+});
+
+describe('CapabilityEndpoint admin routing (REQ-010 S7)', () => {
+	it('routes a { admin } body to the matching admin handler (NOT sessionKey-resolved)', async () => {
+		const ccBind = vi.fn((b: Record<string, unknown>) => ({
+			status: 200,
+			json: { ok: true, result: { roomId: b.roomId } },
+		}));
+		const { endpoint, resolve } = build({ resolveRoom: 42, adminHandlers: { 'cc-bind': ccBind } });
+		const res = await endpoint.handle({ body: { admin: 'cc-bind', roomId: 9 } });
+		expect(res).toEqual({ status: 200, json: { ok: true, result: { roomId: 9 } } });
+		expect(ccBind).toHaveBeenCalledWith({ admin: 'cc-bind', roomId: 9 });
+		// admin path must NOT touch the identity-resolved resolve()
+		expect(resolve).not.toHaveBeenCalled();
+	});
+
+	it('unknown admin name → 400', async () => {
+		const { endpoint } = build({ resolveRoom: 42, adminHandlers: {} });
+		const res = await endpoint.handle({ body: { admin: 'nope', roomId: 9 } });
+		expect(res.status).toBe(400);
+		expect((res.json as { ok: boolean }).ok).toBe(false);
+	});
+
+	it('admin path is still loopback-guarded (403 on non-local)', async () => {
+		const ccBind = vi.fn(() => ({ status: 200, json: { ok: true } }));
+		const { endpoint } = build({ resolveRoom: 42, adminHandlers: { 'cc-bind': ccBind } });
+		const res = await endpoint.handle({ body: { admin: 'cc-bind', roomId: 9 }, remoteAddress: '10.0.0.5' });
+		expect(res.status).toBe(403);
+		expect(ccBind).not.toHaveBeenCalled();
 	});
 });
 
