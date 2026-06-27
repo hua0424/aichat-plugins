@@ -18,4 +18,9 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Build before testing: aichat-claw's packaging.test.ts asserts the built dist/ entry
+      # (openclaw.plugin.json `entry` / package.json `main`) exists on disk. Without a prior
+      # build those assertions fail in CI (packages were green locally only because dist/ was
+      # already built). Building first also gives CI a tsc type-check.
+      - run: pnpm build
       - run: pnpm test:run
