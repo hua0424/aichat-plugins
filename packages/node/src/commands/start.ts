@@ -8,6 +8,9 @@ import { OpenclawDriver } from '../agent/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
 import { FileSessionStore } from '../agent/opencode/session-store.js';
+import { CodexDriver } from '../agent/codex/codex-driver.js';
+import { FileCodexSessionStore } from '../agent/codex/session-store.js';
+import { Codex } from '@openai/codex-sdk';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
@@ -72,6 +75,11 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [sessionEnvPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
 
+	// REQ-010 S5: codex needs NO shared server (the SDK spawns `codex exec` per turn) and NO
+	// env-injection plugin (codex natively injects CODEX_THREAD_ID into its exec shell). Its
+	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
+	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
+
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
@@ -84,6 +92,17 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
 					workspaceBase: opencodeWorkspaceBase,
 					sessionStore: new FileSessionStore(),
+					...(entry.model !== undefined ? { model: entry.model } : {}),
+				});
+			}
+			if (entry.tool === 'codex') {
+				// No shared-server singleton (unlike opencode): the codex SDK spawns `codex exec` per
+				// turn. `new Codex()` omits apiKey/baseUrl → uses the baked ~/.codex/config.toml provider
+				// + auth.json. resolveSession reverse-looks-up the bound (aiclaw, room) by CODEX_THREAD_ID.
+				return new CodexDriver({
+					codex: new Codex(),
+					workspaceBase: codexWorkspaceBase,
+					sessionStore: new FileCodexSessionStore(),
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
