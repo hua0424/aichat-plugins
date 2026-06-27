@@ -151,6 +151,14 @@ export class MessageHandler {
 	/** thinking session 超时时间（5 分钟） */
 	private readonly THINKING_SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 
+	/**
+	 * REQ-010 S7: 外部（owner 发起）thinking 的合成 triggerMsgId 计数器。
+	 * CC 轮无房间触发消息，故 triggerMsgId 由本地单调计数器派生（`cc-ext-<roomId>-<n>`），
+	 * 不用 Date/random（仓库约束）。server 对 THINKING_START 一视同仁，按 sessionKey+triggerMsgId
+	 * 回填 thinkingId（handleThinkingStartBroadcast），合成 id 同样流通无碍。
+	 */
+	private externalThinkingCounter = 0;
+
 	// REQ-004 M3: 防循环守卫 + 群配置缓存
 	private antiLoopGuard: AntiLoopGuard;
 	private groupConfigCache: GroupConfigCache;
@@ -748,6 +756,90 @@ export class MessageHandler {
 			channel.pendingMessages = [];
 		}
 		this.roomChannels.clear();
+	}
+
+	/**
+	 * REQ-010 S7: 启动一个**外部驱动**（CC broker / owner 发起）的 thinking 会话。
+	 *
+	 * 与 triggerAgentLoop 的房间触发路径不同：CC 轮没有房间触发消息，故 triggerMsgId 用本地
+	 * 单调计数器合成（`cc-ext-<roomId>-<n>`，非 Date/random）。复用既有 thinkingSessions map +
+	 * sessionKey 方案（`aiclaw-{fromUid}-room-{roomId}`），server 对 THINKING_START 一视同仁，
+	 * handleThinkingStartBroadcast 按 sessionKey+triggerMsgId 回填 thinkingId，合成 id 流通无碍。
+	 *
+	 * 双重 begin 守卫：同一 sessionKey 已有 active session 时直接 no-op（不重发 START）。
+	 *
+	 * 假设：一个 aiclaw-room 由 driver loop **或** CC broker 单独驱动，二者不并发（codex/opencode
+	 * aiclaw 不是 CC aiclaw）。共享同一 map + sessionKey 方案，是为了让 thinkingId 回填路径统一。
+	 */
+	beginExternalThinking(roomId: number, fromUid: number): void {
+		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
+		if (this.thinkingSessions.has(sessionKey)) {
+			// 已有 active session（driver loop 或上一次外部 begin）→ 守卫双重 begin。
+			return;
+		}
+		const triggerMsgId = `cc-ext-${roomId}-${this.externalThinkingCounter++}`;
+		const session: ThinkingSession = {
+			sessionKey,
+			thinkingId: '',
+			triggerMsgId,
+			startTime: Date.now(),
+			accumulatedContent: '',
+			finalized: false,
+			events: [],
+		};
+		// 复用与 triggerAgentLoop 一致的 5 分钟超时兜底（CC 轮卡死时也能收尾）。
+		session.timeoutId = setTimeout(() => {
+			if (session.finalized) return;
+			session.finalized = true;
+			console.error(`[thinking] external timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
+			this.ws.send(WSReqType.THINKING_END, {
+				thinkingId: session.thinkingId || undefined,
+				durationMs: Date.now() - session.startTime,
+				status: 'error',
+				error: 'thinking_session_timeout',
+				content: capUtf8Bytes(session.accumulatedContent),
+			});
+			this.thinkingSessions.delete(sessionKey);
+		}, this.THINKING_SESSION_TIMEOUT_MS);
+
+		this.thinkingSessions.set(sessionKey, session);
+		console.log(`[thinking] external start triggerMsgId=${triggerMsgId} sessionKey=${sessionKey}`);
+		this.ws.send(WSReqType.THINKING_START, {
+			fromUid,
+			roomId,
+			triggerMsgId,
+		});
+	}
+
+	/**
+	 * REQ-010 S7: 外部 thinking 增量。与既有 thinking 一致**仅本地累计**，不逐帧发 THINKING_DELTA
+	 * （内容随 THINKING_END 一次性整发）。无 active session 时安全 no-op。
+	 */
+	externalThinkingDelta(roomId: number, fromUid: number, text: string): void {
+		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
+		const session = this.thinkingSessions.get(sessionKey);
+		if (!session || session.finalized) return;
+		session.accumulatedContent += text;
+	}
+
+	/**
+	 * REQ-010 S7: 结束外部 thinking → 发 THINKING_END {status:'complete', content, durationMs}
+	 * （镜像 finalizeComplete 的帧形状），并清理会话。无 active session / 已 finalized 时安全 no-op。
+	 */
+	endExternalThinking(roomId: number, fromUid: number): void {
+		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
+		const session = this.thinkingSessions.get(sessionKey);
+		if (!session || session.finalized) return;
+		session.finalized = true;
+		if (session.timeoutId) clearTimeout(session.timeoutId);
+		this.ws.send(WSReqType.THINKING_END, {
+			thinkingId: session.thinkingId || undefined,
+			durationMs: Date.now() - session.startTime,
+			status: 'complete',
+			content: capUtf8Bytes(session.accumulatedContent),
+		});
+		console.log(`[thinking] external end session=${sessionKey} durationMs=${Date.now() - session.startTime}`);
+		this.thinkingSessions.delete(sessionKey);
 	}
 
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */

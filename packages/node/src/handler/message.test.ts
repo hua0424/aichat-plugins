@@ -1411,3 +1411,156 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		expect(getCachedConfig(handler, 10)).toBeUndefined();
 	});
 });
+
+/**
+ * REQ-010 S7: external (owner-initiated) thinking path for the CC broker.
+ * The CC driver has no room trigger message — the CcBroker drives a thinking session via
+ * beginExternalThinking / externalThinkingDelta / endExternalThinking. These mirror the
+ * existing ThinkingSession lifecycle (same thinkingSessions map + sessionKey scheme) but with a
+ * synthetic triggerMsgId, so handleThinkingStartBroadcast still backfills thinkingId cleanly.
+ */
+describe('MessageHandler S7: external thinking path (CC broker)', () => {
+	const ROOM = 5;
+	const sessionKey = `aiclaw-${SELF_UID}-room-${ROOM}`;
+
+	function startFrame(sent: Array<{ type: number; data: unknown }>) {
+		return sent.find((f) => f.type === WSReqType.THINKING_START)?.data as Record<string, unknown> | undefined;
+	}
+
+	it('beginExternalThinking sends THINKING_START with fromUid/roomId and a synthetic triggerMsgId', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.beginExternalThinking(ROOM, SELF_UID);
+
+		const start = startFrame(sent);
+		expect(start).toBeDefined();
+		expect(start!.fromUid).toBe(SELF_UID);
+		expect(start!.roomId).toBe(ROOM);
+		// synthetic id is a non-empty string scoped to the room; NOT Date/random based
+		expect(typeof start!.triggerMsgId).toBe('string');
+		expect(String(start!.triggerMsgId)).toContain(`cc-ext-${ROOM}-`);
+	});
+
+	it('synthetic triggerMsgId is monotonic across rooms (counter, not Date/random)', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.beginExternalThinking(5, SELF_UID);
+		handler.endExternalThinking(5, SELF_UID);
+		handler.beginExternalThinking(6, SELF_UID);
+
+		const starts = sent.filter((f) => f.type === WSReqType.THINKING_START).map((f) => (f.data as Record<string, unknown>).triggerMsgId as string);
+		expect(starts).toHaveLength(2);
+		const n0 = Number(starts[0].split('-').pop());
+		const n1 = Number(starts[1].split('-').pop());
+		expect(n1).toBe(n0 + 1);
+	});
+
+	it('double-begin is guarded — a second begin for the same room sends only one THINKING_START', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.beginExternalThinking(ROOM, SELF_UID);
+		handler.beginExternalThinking(ROOM, SELF_UID);
+
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START)).toHaveLength(1);
+	});
+
+	it('delta accumulates; end sends THINKING_END complete with full content', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.beginExternalThinking(ROOM, SELF_UID);
+		handler.externalThinkingDelta(ROOM, SELF_UID, '[工具] Bash ls\n');
+		handler.externalThinkingDelta(ROOM, SELF_UID, 'streaming reply');
+
+		// deltas must NOT emit per-delta frames (matches normal thinking: batched in THINKING_END)
+		expect(sent.some((f) => f.type === WSReqType.THINKING_DELTA)).toBe(false);
+
+		handler.endExternalThinking(ROOM, SELF_UID);
+
+		const end = sent.find((f) => f.type === WSReqType.THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('complete');
+		expect(end.content).toBe('[工具] Bash ls\nstreaming reply');
+		expect(typeof end.durationMs).toBe('number');
+		// session cleared
+		// @ts-expect-error 白盒断言
+		expect(handler.thinkingSessions.has(sessionKey)).toBe(false);
+	});
+
+	it('thinkingId still backfills via thinkingStart broadcast (synthetic triggerMsgId matches)', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.beginExternalThinking(ROOM, SELF_UID);
+		const start = startFrame(sent)!;
+		const triggerMsgId = String(start.triggerMsgId);
+
+		// server broadcasts thinkingStart carrying the synthetic triggerMsgId → thinkingId backfill
+		handler.handle({
+			type: 'thinkingStart',
+			data: { fromUid: SELF_UID, roomId: ROOM, triggerMsgId, thinkingId: 'tid-ext-1' },
+		} as never);
+
+		handler.externalThinkingDelta(ROOM, SELF_UID, 'x');
+		handler.endExternalThinking(ROOM, SELF_UID);
+
+		const end = sent.find((f) => f.type === WSReqType.THINKING_END)!.data as Record<string, unknown>;
+		expect(end.thinkingId).toBe('tid-ext-1');
+		expect(end.content).toBe('x');
+	});
+
+	it('delta/end before begin (or after end) are safe no-ops', () => {
+		const { adapter } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		// no session yet
+		expect(() => handler.externalThinkingDelta(ROOM, SELF_UID, 'x')).not.toThrow();
+		expect(() => handler.endExternalThinking(ROOM, SELF_UID)).not.toThrow();
+		expect(sent.length).toBe(0);
+
+		// after a full cycle, a second end is a no-op (single THINKING_END)
+		handler.beginExternalThinking(ROOM, SELF_UID);
+		handler.endExternalThinking(ROOM, SELF_UID);
+		handler.endExternalThinking(ROOM, SELF_UID);
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_END)).toHaveLength(1);
+	});
+
+	it('does NOT disturb a normal driver-driven thinking session for a DIFFERENT room', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		// normal driver turn in room 1
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// external CC turn in room 5 — independent
+		handler.beginExternalThinking(5, SELF_UID);
+		handler.externalThinkingDelta(5, SELF_UID, 'cc thinking');
+		handler.endExternalThinking(5, SELF_UID);
+
+		// finish the normal turn
+		calls[0].callbacks.onThinkingDelta('normal reasoning');
+		calls[0].callbacks.onThinkingEnd(100);
+		await calls[0].flush();
+
+		// two distinct THINKING_END frames, each with its own content
+		const ends = sent.filter((f) => f.type === WSReqType.THINKING_END).map((f) => f.data as Record<string, unknown>);
+		expect(ends.length).toBe(2);
+		const contents = ends.map((e) => e.content);
+		expect(contents).toContain('cc thinking');
+		expect(contents).toContain('normal reasoning');
+		// the external turn produced exactly one START with a synthetic id; the normal turn used the real msgId
+		const starts = sent.filter((f) => f.type === WSReqType.THINKING_START).map((f) => (f.data as Record<string, unknown>).triggerMsgId as string);
+		expect(starts).toContain('1');
+		expect(starts.some((s) => s.startsWith('cc-ext-5-'))).toBe(true);
+	});
+});
