@@ -178,3 +178,31 @@ describe('OpenclawDriver', () => {
 		expect(collected).toEqual([]);
 	});
 });
+
+describe('OpenclawDriver.resolveSession (REQ-010 S6 Phase-2)', () => {
+	// The OPENCLAW_BIND value IS the binding; resolveBoundSession strips the `openclaw:` prefix
+	// upstream, so resolveSession receives the bare `aiclaw-{uid}-room-{roomId}` and just parses it
+	// (no store — openclaw's binding IS the sessionKey).
+	function driver() {
+		const { adapter } = fakeAdapter(() => {});
+		return new OpenclawDriver(adapter);
+	}
+
+	it('valid bare binding → { aiclawUid, roomId }', () => {
+		expect(driver().resolveSession!('aiclaw-7-room-42')).toEqual({ aiclawUid: 7, roomId: 42 });
+	});
+
+	it('a `openclaw:`-prefixed input is NOT valid here (prefix is stripped upstream) → undefined', () => {
+		expect(driver().resolveSession!('openclaw:aiclaw-7-room-42')).toBeUndefined();
+	});
+
+	it('garbage / partial / non-numeric → undefined', () => {
+		const d = driver();
+		expect(d.resolveSession!('garbage')).toBeUndefined();
+		expect(d.resolveSession!('aiclaw-7-room-')).toBeUndefined();
+		expect(d.resolveSession!('aiclaw--room-42')).toBeUndefined();
+		expect(d.resolveSession!('aiclaw-abc-room-42')).toBeUndefined();
+		expect(d.resolveSession!('notaiclaw-7-room-42')).toBeUndefined();
+		expect(d.resolveSession!('')).toBeUndefined();
+	});
+});

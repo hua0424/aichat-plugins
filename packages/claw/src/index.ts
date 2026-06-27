@@ -2,6 +2,7 @@ import type { OpenClawPluginApi, ChannelPlugin } from './types.js';
 import { hulaChannel } from './channel/index.js';
 import { HulaApiClientPool } from './hula-api-pool.js';
 import { registerTools } from './tools/index.js';
+import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
 
 /**
  * 从多个可能的路径读取 hula 配置（兼容不同 openclaw 版本的 config 传递方式）
@@ -120,6 +121,31 @@ export default function register(api: OpenClawPluginApi) {
 		},
 	};
 	api.registerChannel({ plugin: channel });
+
+	// REQ-010 S6 Phase-2: route openclaw agent replies through the SAME unified `aichat send-message`
+	// CLI path as opencode/codex. The agent CAN run shell (exec tool), so we inject the room binding
+	// into its exec env via the `resolve_exec_env` hook. The CLI's resolveAgentSessionKey() reads
+	// OPENCLAW_BIND → emits `openclaw:<binding>` to the loopback capability endpoint.
+	//
+	// handler signature is (event, ctx) — sessionKey lives on the 2nd arg (ctx), real-machine-verified.
+	// We stay shape-tolerant (mirror the Phase-1 probe): prefer ctx.sessionKey, fall back to
+	// event.ctx.sessionKey / event.sessionKey. buildOpenclawExecEnv never throws and never injects a
+	// malformed binding (returns {} otherwise) — a safe no-op that keeps the legacy aichat-claw tools.
+	if (typeof api.on === 'function') {
+		api.on(
+			'resolve_exec_env',
+			(event, ctx) => {
+				const sessionKey = extractExecEnvSessionKey(event, ctx);
+				const env = buildOpenclawExecEnv(sessionKey);
+				if (env.OPENCLAW_BIND) {
+					api.logger.info(`aichat-claw resolve_exec_env: injecting OPENCLAW_BIND=${env.OPENCLAW_BIND}`);
+				}
+				return env;
+			},
+			{ priority: 100 },
+		);
+		api.logger.info('aichat-claw: registered resolve_exec_env hook (OPENCLAW_BIND injection)');
+	}
 
 	if (aiclawToken) {
 		// 向后兼容：全局 token 作为默认客户端
