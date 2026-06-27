@@ -182,6 +182,34 @@ describe('CodexDriver.resolveSession', () => {
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
 		expect(driver.resolveSession('thread_nope')).toBeUndefined();
 	});
+
+	// REQ-010 S5 TC-S5-04 (/clear rebind): node-driven codex has no user /clear (the driver manages
+	// thread lifecycle via startThread/resumeThread), so the rebind is exercised at the unit level —
+	// when a NEW CODEX_THREAD_ID arrives (a fresh thread replacing the prior binding for the same
+	// (uid,room)), the store must resume-or-create + UPDATE to the new id, and resolveSession reverse-
+	// lookup must follow the new id. AC-3.
+	it('new CODEX_THREAD_ID rebinds: store updates to the new threadId + resolveSession follows it', async () => {
+		const { codex, ctl, resumeThread } = mockCodex();
+		const store = memStore();
+		// prior binding for this (uid,room) → openSession RESUMES it
+		store.set('aiclaw-5-room-9', { threadId: 'thread_old' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
+		expect(resumeThread).toHaveBeenCalledWith('thread_old', expect.anything());
+
+		// the turn reports a DIFFERENT thread id (the /clear-equivalent: a fresh thread)
+		const stream = session.send('hi');
+		await new Promise((r) => setImmediate(r));
+		ctl.emit({ type: 'thread.started', thread_id: 'thread_new' });
+		ctl.emit({ type: 'turn.completed', usage: {} });
+		await drain(stream);
+
+		// store rebound to the new id (resume-or-create on the next turn now resumes thread_new)
+		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_new');
+		// resolveSession follows the new id back to the bound (aiclaw, room)
+		expect(driver.resolveSession('thread_new')).toEqual({ aiclawUid: 5, roomId: 9 });
+	});
 });
 
 describe('CodexSession.send', () => {
