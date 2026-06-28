@@ -1611,3 +1611,117 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
 });
+
+// ─── REQ-010 S9: ccBindRequest → CC_BIND_RESULT (node side of the server↔node bind RPC) ───
+
+const CC_BIND_RESULT = WSReqType.CC_BIND_RESULT;
+
+/**
+ * fake cc AgentDriver: `type:'cc'` + a spied `bind` returning canned CcBindInstructions.
+ * Mirrors CcDriver's surface (drivesTurns=false; openSession throws). `bind` is a spy so the
+ * tests can assert (uid, roomId, chatContext) it was called with.
+ */
+function fakeCcDriver() {
+	const bind = vi.fn((_uid: number, _roomId: number, _ctx: Record<string, unknown>) => ({
+		token: 'aiclaw-999-room-7',
+		launchCommand: 'cd /ws && AICHAT_BIND=aiclaw-999-room-7 claude --settings /ws/.claude/settings.json',
+		settingsPath: '/ws/.claude/settings.json',
+		workspaceDir: '/ws',
+	}));
+	const driver = {
+		type: 'cc',
+		drivesTurns: false,
+		connect: vi.fn().mockResolvedValue(undefined),
+		disconnect: vi.fn().mockResolvedValue(undefined),
+		openSession: vi.fn(async () => {
+			throw new Error('cc is owner-driven');
+		}),
+		bind,
+	} as unknown as AgentDriver & { bind: ReturnType<typeof vi.fn> };
+	return { driver, bind };
+}
+
+describe('MessageHandler S9: ccBindRequest → CC_BIND_RESULT', () => {
+	it('cc identity, group request → bind called with group context + CC_BIND_RESULT with launchCommand/workspaceDir (no error)', () => {
+		const { driver, bind } = fakeCcDriver();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, driver, SELF_UID);
+
+		handler.handle({
+			type: 'ccBindRequest',
+			data: { roomId: 7, roomType: 1, requestId: 'req-g1' },
+		} as never);
+
+		// bind called with (selfUid, roomId, group chatContext)
+		expect(bind).toHaveBeenCalledTimes(1);
+		expect(bind).toHaveBeenCalledWith(SELF_UID, 7, { roomType: 1, roomId: 7 });
+
+		const result = sent.find((f) => f.type === CC_BIND_RESULT);
+		expect(result).toBeDefined();
+		const data = result!.data as Record<string, unknown>;
+		expect(data.requestId).toBe('req-g1');
+		expect(data.launchCommand).toBe(
+			'cd /ws && AICHAT_BIND=aiclaw-999-room-7 claude --settings /ws/.claude/settings.json',
+		);
+		expect(data.workspaceDir).toBe('/ws');
+		expect('error' in data).toBe(false);
+	});
+
+	it('cc identity, dm request → bind called with dm context (counterpartUid)', () => {
+		const { driver, bind } = fakeCcDriver();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, driver, SELF_UID);
+
+		handler.handle({
+			type: 'ccBindRequest',
+			data: { roomId: 12, roomType: 2, counterpartUid: 555, requestId: 'req-d1' },
+		} as never);
+
+		expect(bind).toHaveBeenCalledWith(SELF_UID, 12, { roomType: 2, roomId: 12, counterpartUid: 555 });
+		const data = sent.find((f) => f.type === CC_BIND_RESULT)!.data as Record<string, unknown>;
+		expect(data.requestId).toBe('req-d1');
+		expect('error' in data).toBe(false);
+	});
+
+	it('non-cc identity → CC_BIND_RESULT with error, bind NOT called', () => {
+		const { adapter } = fakeAdapter(); // type:'fake', no bind
+		const bindProbe = vi.fn();
+		// attach a bind spy to ensure it is NEVER reached (defensive guard is type-based)
+		(adapter as unknown as { bind: unknown }).bind = bindProbe;
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID);
+
+		handler.handle({
+			type: 'ccBindRequest',
+			data: { roomId: 7, roomType: 1, requestId: 'req-nc' },
+		} as never);
+
+		expect(bindProbe).not.toHaveBeenCalled();
+		const data = sent.find((f) => f.type === CC_BIND_RESULT)!.data as Record<string, unknown>;
+		expect(data.requestId).toBe('req-nc');
+		expect(typeof data.error).toBe('string');
+		expect(data.error).toBeTruthy();
+		expect('launchCommand' in data).toBe(false);
+	});
+
+	it('bind throws → CC_BIND_RESULT with error and handle() does not throw', () => {
+		const { driver, bind } = fakeCcDriver();
+		bind.mockImplementation(() => {
+			throw new Error('boom from bind');
+		});
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, driver, SELF_UID);
+
+		expect(() =>
+			handler.handle({
+				type: 'ccBindRequest',
+				data: { roomId: 7, roomType: 1, requestId: 'req-throw' },
+			} as never),
+		).not.toThrow();
+
+		const data = sent.find((f) => f.type === CC_BIND_RESULT)!.data as Record<string, unknown>;
+		expect(data.requestId).toBe('req-throw');
+		expect(String(data.error)).toContain('boom from bind');
+		expect('launchCommand' in data).toBe(false);
+	});
+});
