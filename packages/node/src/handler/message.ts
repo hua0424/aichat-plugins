@@ -1,7 +1,9 @@
-import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
+import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO, CcBindRequestDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
+import type { CcDriver } from '../agent/cc/cc-driver.js';
+import type { OpencodeChatContext } from '../agent/opencode/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
@@ -232,6 +234,9 @@ export class MessageHandler {
 				break;
 			case 'thinkingEnd':
 				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
+				break;
+			case 'ccBindRequest':
+				this.handleCcBindRequest(msg.data as CcBindRequestDTO);
 				break;
 			case 'tokenExpired':
 				// REQ-008 #76: 有 onTokenExpired（多身份）→ 仅降级本身份，不退进程；
@@ -720,6 +725,52 @@ export class MessageHandler {
 			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(Number(roomId));
+		}
+	}
+
+	/**
+	 * REQ-010 S9: handle a server `ccBindRequest` → compute the CC owner-launch command via
+	 * `CcDriver.bind()` and reply `CC_BIND_RESULT` keyed by `requestId`. This is the node half of a
+	 * server↔node RPC over the aiclaw WS: the HuLa client surfaces the CC owner-launch command, the
+	 * server routes the request here (only to cc aiclaws), node generates the command and replies.
+	 *
+	 * Exactly one of `{launchCommand, workspaceDir}` (success) OR `{error}` (failure) is sent.
+	 * The handler is fully defensive: it NEVER throws out of `handle()`.
+	 *  - non-cc driver (or no `bind`) → error result (the server only routes to cc aiclaws, but guard).
+	 *  - bind throws → error result (`String(err)`).
+	 */
+	private handleCcBindRequest({ roomId, roomType, counterpartUid, requestId }: CcBindRequestDTO): void {
+		try {
+			// Defensive guard: only a cc driver exposing `bind` can answer (server routes only to cc
+			// aiclaws, but a misroute / non-cc identity must not crash or silently drop).
+			const driver = this.driver as Partial<CcDriver>;
+			if (driver.type !== 'cc' || typeof driver.bind !== 'function') {
+				this.ws.send(WSReqType.CC_BIND_RESULT, {
+					requestId,
+					error: 'identity is not a claude-code (cc) agent',
+				});
+				return;
+			}
+
+			// Build the chatContext exactly as CcDriver.bind/deriveWorkspaceDir expect:
+			//   group (roomType=1) → { roomType:1, roomId }
+			//   dm    (roomType=2) → { roomType:2, roomId, counterpartUid }  (counterpartUid only when present)
+			const chatContext: OpencodeChatContext =
+				roomType === 2
+					? { roomType: 2, roomId, ...(counterpartUid !== undefined ? { counterpartUid } : {}) }
+					: { roomType, roomId };
+
+			const b = (driver as CcDriver).bind(this.selfUid, roomId, chatContext);
+			this.ws.send(WSReqType.CC_BIND_RESULT, {
+				requestId,
+				launchCommand: b.launchCommand,
+				workspaceDir: b.workspaceDir,
+			});
+		} catch (err) {
+			this.ws.send(WSReqType.CC_BIND_RESULT, {
+				requestId,
+				error: String(err),
+			});
 		}
 	}
 
