@@ -110,7 +110,15 @@ export class CodexDriver implements AgentDriver {
 			? this.codex.resumeThread(stored.threadId, threadOpts)
 			: this.codex.startThread(threadOpts);
 
-		return new CodexSession(thread, key, o.aiclawUid, o.roomId, this.sessionStore);
+		return new CodexSession(
+			thread,
+			key,
+			o.aiclawUid,
+			o.roomId,
+			this.sessionStore,
+			this.codex,
+			threadOpts,
+		);
 	}
 }
 
@@ -130,6 +138,10 @@ class CodexSession implements AgentSession {
 		private readonly aiclawUid: number,
 		private readonly roomId: number,
 		private readonly sessionStore: CodexSessionStore,
+		// Fallback deps (REQ-010 #101 self-heal): when a resumed thread's rollout is gone, the session
+		// invalidates the stale store entry and starts a FRESH thread to retry the turn once.
+		private readonly codex: CodexClient,
+		private readonly threadOpts: ThreadOptions,
 	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
@@ -143,13 +155,31 @@ class CodexSession implements AgentSession {
 		const toolEnded = new Set<string>();
 
 		// Manual async-iterator handle on the events stream so close() can terminate a parked next().
+		// `streamIter` points at the CURRENTLY-active iterator; on a self-heal retry it is repointed at
+		// the fresh thread's iterator so close()/returnIter() always target the live stream. `iterClosed`
+		// guards against returning the SAME iterator twice, while still letting a new attempt's iterator
+		// be returned (it resets when a new iterator is installed).
 		let streamIter: AsyncIterator<unknown> | null = null;
-		let iterReturned = false;
+		let iterClosed = false;
+		const installIter = (iter: AsyncIterator<unknown>): boolean => {
+			// If close()/finish() already fired before this attempt got its iterator, terminate it now.
+			if (done) {
+				try {
+					void iter.return?.();
+				} catch {
+					/* best-effort */
+				}
+				return false;
+			}
+			streamIter = iter;
+			iterClosed = false;
+			return true;
+		};
 		const returnIter = () => {
-			if (iterReturned) return;
-			iterReturned = true;
+			if (iterClosed || !streamIter) return;
+			iterClosed = true;
 			try {
-				void streamIter?.return?.();
+				void streamIter.return?.();
 			} catch {
 				/* best-effort: terminate a parked iter.next() */
 			}
@@ -162,8 +192,12 @@ class CodexSession implements AgentSession {
 				r();
 			}
 		};
+		// `pushed` = at least one AgentEvent buffered. The resume failure surfaces BEFORE any event, so
+		// `!pushed` is the safe guard for triggering the self-heal retry (never double-emits).
+		let pushed = false;
 		const push = (ev: AgentEvent) => {
 			if (done) return;
+			pushed = true;
 			buffer.push(ev);
 			wake();
 		};
@@ -232,27 +266,43 @@ class CodexSession implements AgentSession {
 			'--- 用户消息如下 ---\n' +
 			message;
 
+		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
+		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.
+		const consume = async (thread: Thread): Promise<void> => {
+			const { events } = await thread.runStreamed(enrichedMessage);
+			const iter = (events as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+			if (!installIter(iter)) return; // already closed → installIter terminated the iter
+			while (true) {
+				const { value: raw, done: d } = await iter.next();
+				if (d) break;
+				if (done || this.closed) break;
+				const end = handleRaw(raw);
+				if (end) {
+					finish();
+					break;
+				}
+			}
+		};
+
+		const errOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 		void (async () => {
 			try {
-				const { events } = await this.thread.runStreamed(enrichedMessage);
-				const iter = (events as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-				streamIter = iter;
-				if (iterReturned) {
-					returnIter();
-				} else {
-					while (true) {
-						const { value: raw, done: d } = await iter.next();
-						if (d) break;
-						if (done || this.closed) break;
-						const end = handleRaw(raw);
-						if (end) {
-							finish();
-							break;
-						}
-					}
-				}
+				await consume(this.thread);
 			} catch (err) {
-				push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+				// Self-heal: a resumed thread whose rollout is gone rejects before any event. Invalidate the
+				// stale store entry and retry the turn ONCE on a FRESH thread; captureThreadStarted then
+				// stores the new id. Guarded by !pushed so we never retry mid-stream / double-emit.
+				if (isResumeFailure(err) && !pushed) {
+					this.sessionStore.delete(this.key);
+					try {
+						await consume(this.codex.startThread(this.threadOpts));
+					} catch (err2) {
+						push({ type: 'error', message: errOf(err2) });
+					}
+				} else {
+					push({ type: 'error', message: errOf(err) });
+				}
 			} finally {
 				finish();
 			}
@@ -279,6 +329,18 @@ class CodexSession implements AgentSession {
 		this.closed = true;
 		if (this.closeActive) this.closeActive();
 	}
+}
+
+/**
+ * True when a `runStreamed` rejection is a "resumed thread no longer exists" failure — i.e. the codex
+ * rollout for the stored threadId is gone (container recreate wiped runtime rollouts, or the thread
+ * expired/was cleaned). The real error text is e.g.:
+ *   `thread/resume failed: no rollout found for thread id <id> (code -32600)`
+ * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry.
+ */
+export function isResumeFailure(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return /no rollout found|thread\/resume failed|-32600/i.test(msg);
 }
 
 /** Pull the codex item id out of a raw item.* ThreadEvent, for tool start/end de-dup. */

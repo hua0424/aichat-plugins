@@ -102,6 +102,32 @@ function mockCodex(opts?: { stream?: AsyncGenerator<unknown>; rejectRun?: Error 
 	return { codex, startThread, resumeThread, thread, runStreamed, ctl };
 }
 
+/**
+ * Build a fake Codex client where the RESUMED thread and the freshly-STARTED (fallback) thread are
+ * DISTINCT, so a self-heal test can make resume's runStreamed reject while startThread's streams.
+ * `resumeRun` / `startRun` are async factories returning `{ events }` (or throwing). startThread also
+ * accepts a controllable stream so the test drives the fallback turn.
+ */
+function mockCodexSplit(opts: {
+	resumeRun: () => Promise<{ events: AsyncIterable<unknown> }>;
+	startStream?: AsyncGenerator<unknown>;
+	startRunReject?: Error;
+}) {
+	const startCtl = controllableStream();
+	const startEvents = opts.startStream ?? startCtl.stream;
+	const startRunStreamed = vi.fn(async () => {
+		if (opts.startRunReject) throw opts.startRunReject;
+		return { events: startEvents };
+	});
+	const resumeRunStreamed = vi.fn(opts.resumeRun);
+	const resumeThreadObj = { runStreamed: resumeRunStreamed, get id() { return null; } } as unknown as Thread;
+	const startThreadObj = { runStreamed: startRunStreamed, get id() { return null; } } as unknown as Thread;
+	const startThread = vi.fn((_o?: ThreadOptions) => startThreadObj);
+	const resumeThread = vi.fn((_id: string, _o?: ThreadOptions) => resumeThreadObj);
+	const codex: CodexClient = { startThread, resumeThread };
+	return { codex, startThread, resumeThread, startRunStreamed, resumeRunStreamed, startCtl };
+}
+
 async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 	const out: AgentEvent[] = [];
 	for await (const ev of stream) out.push(ev);
@@ -335,6 +361,77 @@ describe('CodexSession.send', () => {
 		});
 		await Promise.race([consumed, timeout]);
 		expect(spied.returnSpy).toHaveBeenCalled();
+	});
+});
+
+describe('CodexSession.send — resume-or-create resilience (REQ-010 #101)', () => {
+	const RESUME_FAIL = new Error(
+		'thread/resume: thread/resume failed: no rollout found for thread id 019f00.. (code -32600)',
+	);
+
+	it('self-heals: resume failure → invalidate stale entry, startThread fresh, retry succeeds, store rebound', async () => {
+		const { codex, startThread, startCtl } = mockCodexSplit({
+			resumeRun: () => Promise.reject(RESUME_FAIL),
+		});
+		const store = memStore();
+		store.set('aiclaw-5-room-9', { threadId: 'thread_dead' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
+		const stream = session.send('hi');
+		await new Promise((r) => setImmediate(r));
+
+		// fallback fresh thread streams a real turn
+		startCtl.emit({ type: 'thread.started', thread_id: 'thread_fresh' });
+		startCtl.emit({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'recovered' } });
+		startCtl.emit({ type: 'turn.completed', usage: {} });
+
+		const events = await drain(stream);
+
+		// stale entry invalidated then re-bound to the fresh thread
+		expect(store.del).toHaveBeenCalledWith('aiclaw-5-room-9');
+		expect(startThread).toHaveBeenCalledOnce();
+		// turn succeeds (no error event), and thinking + done came through
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events).toContainEqual({ type: 'thinking', text: 'recovered' });
+		expect(events[events.length - 1].type).toBe('done');
+		// captureThreadStarted stored the NEW id (resolveSession follows it)
+		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_fresh');
+		expect(driver.resolveSession('thread_fresh')).toEqual({ aiclawUid: 5, roomId: 9 });
+	});
+
+	it('non-resume error → NO fallback: single error event, startThread not called', async () => {
+		const { codex, startThread } = mockCodexSplit({
+			resumeRun: () => Promise.reject(new Error('codex exec failed')),
+		});
+		const store = memStore();
+		store.set('aiclaw-1-room-1', { threadId: 'thread_x' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+
+		const events = await drain(session.send('m'));
+
+		expect(startThread).not.toHaveBeenCalled();
+		expect(store.del).not.toHaveBeenCalled();
+		expect(events).toEqual([{ type: 'error', message: 'codex exec failed' }]);
+	});
+
+	it('resume fails AND fallback startThread turn also fails → one error event, no infinite loop', async () => {
+		const { codex, startThread, resumeThread } = mockCodexSplit({
+			resumeRun: () => Promise.reject(RESUME_FAIL),
+			startRunReject: new Error('fresh thread also exploded'),
+		});
+		const store = memStore();
+		store.set('aiclaw-1-room-1', { threadId: 'thread_dead' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+
+		const events = await drain(session.send('m'));
+
+		// fallback attempted exactly once
+		expect(resumeThread).toHaveBeenCalledOnce();
+		expect(startThread).toHaveBeenCalledOnce();
+		expect(events).toEqual([{ type: 'error', message: 'fresh thread also exploded' }]);
 	});
 });
 
