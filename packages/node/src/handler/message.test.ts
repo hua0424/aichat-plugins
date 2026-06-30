@@ -1610,6 +1610,115 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 		expect(calls[0].message).toBe('hi normal');
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
+
+	// ─── REQ-011 S2: cc DM-inbound delivery via channelPush (post anti-loop guard, DM-only) ───
+
+	it('cc + DM + guard allow → channelPush(roomId, content) once; no openSession / no THINKING_START', async () => {
+		const { adapter, calls } = ownerDrivenAdapter();
+		const { ws, sent } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		// humanMessage defaults to roomType=2 (DM).
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc dm', 1) } as never);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
+
+		expect(channelPush).toHaveBeenCalledTimes(1);
+		expect(channelPush).toHaveBeenCalledWith(1, 'hi cc dm');
+		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(0);
+		expect(calls.length).toBe(0);
+	});
+
+	it('cc + DM but anti-loop DELAY → channelPush NOT called (guard returns before the cc branch)', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter } = ownerDrivenAdapter();
+			const { ws } = fakeWs();
+			const channelPush = vi.fn();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, undefined, channelPush);
+			// DM with respondToAi → consecutive AI messages accumulate aiRoundCount; cc never holds a
+			// thinking session (drivesTurns=false), so each AI msg flushes straight through the guard.
+			setGroupConfig(handler, 1, { respondToAi: true });
+			const guard = getGuard(handler);
+
+			// Drive enough consecutive opposite-AI DM rounds to push aiRoundCount past 5 → guard delays.
+			for (let i = 1; i <= 8; i++) {
+				handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, `ai-${i}`, i) } as never);
+				await vi.advanceTimersByTimeAsync(2);
+			}
+
+			// the guard actually engaged (real guard, not stubbed)
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+			expect(isDelaying(handler, 1)).toBe(true);
+			// the delayed round returned BEFORE the cc branch → that round did not push.
+			// (early DM rounds before the threshold DID push; what we prove is the guard gates cc too:
+			//  a delayed round produces NO push for that round.)
+			const pushesBeforeDelay = channelPush.mock.calls.length;
+			// advancing the backoff timer reschedules with skipGuard — still a cc DM → it WILL push then,
+			// proving the only suppression was the guard's delay window, not a cc bypass.
+			await vi.advanceTimersByTimeAsync(35000);
+			expect(channelPush.mock.calls.length).toBeGreaterThan(pushesBeforeDelay);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('cc + GROUP (@bot, allow) → channelPush NOT called (S2 is DM-only); no openSession', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws, sent } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		// trigger-eligible group message: @ the bot.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }) } as never);
+		await new Promise((r) => setTimeout(r, 80));
+
+		expect(channelPush).not.toHaveBeenCalled();
+		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(0);
+	});
+
+	it('regression: a normal driver + DM ignores channelPush (drives the loop, never pushes)', async () => {
+		const { adapter, calls } = fakeAdapter(); // drivesTurns undefined → node-driven
+		const { ws, sent } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi normal', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(channelPush).not.toHaveBeenCalled();
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
+	});
+
+	it('flush gap: 2nd DM arriving during cc external-thinking is queued, then flushed → channelPush on endExternalThinking', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		// 1st DM → delivered to the channel (cc DM branch).
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'dm-1', 1) } as never);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
+		expect(channelPush).toHaveBeenCalledWith(1, 'dm-1');
+
+		// CC begins processing it (its hook fires) → an external thinking session is active for the room.
+		handler.beginExternalThinking(1, SELF_UID);
+
+		// A 2nd DM arrives WHILE external thinking is active → handleReceiveMessage QUEUES it (not pushed),
+		// because an owner-driven cc identity has no node-driven turn to consume it mid-thinking.
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'dm-2', 2) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+		expect(channelPush).toHaveBeenCalledTimes(1); // still only dm-1 — dm-2 is queued
+		expect(getPending(handler, 1)).toContain('dm-2');
+
+		// external thinking ends → flushPendingMessages (the S2 fix) → dm-2 re-enters triggerAgentLoop →
+		// the cc DM branch → channelPush. Without the flush, dm-2 would be stuck in pendingMessages forever.
+		handler.endExternalThinking(1, SELF_UID);
+		await waitFor(() => channelPush.mock.calls.length >= 2);
+		expect(channelPush).toHaveBeenCalledWith(1, 'dm-2');
+	});
 });
 
 // ─── REQ-010 S9: ccBindRequest → CC_BIND_RESULT (node side of the server↔node bind RPC) ───

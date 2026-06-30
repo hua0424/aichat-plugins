@@ -7,8 +7,12 @@ import {
 	buildCcSettings,
 	writeCcSettings,
 	buildCcLaunchCommand,
+	buildCcChannelMcpRegisterCommand,
 	CC_REPLY_CONTRACT,
 } from './launch.js';
+
+/** REQ-011 S2: the channels flag appended to every CC launch command. */
+const CHANNEL_FLAG = '--dangerously-load-development-channels server:aichat-channel';
 
 /** The events chunk-2 must wire (the broker dispatches by hook_event_name). */
 const EVENTS = ['UserPromptSubmit', 'PostToolUse', 'MessageDisplay', 'Stop', 'SessionStart'] as const;
@@ -131,7 +135,7 @@ describe('buildCcLaunchCommand', () => {
 		const quotedContract = `'${CC_REPLY_CONTRACT.replace(/'/g, "'\\''")}'`;
 		expect(cmd).toBe(
 			"cd '/home/u/.aichat/9/owner' && AICHAT_BIND='tok-abc_123-XY' claude --settings '/home/u/.aichat/9/owner/settings.json' " +
-				`--append-system-prompt ${quotedContract}`,
+				`--append-system-prompt ${quotedContract} ${CHANNEL_FLAG}`,
 		);
 	});
 
@@ -214,6 +218,46 @@ describe('buildCcLaunchCommand', () => {
 		});
 		expect(cmd).toContain("AICHAT_BIND='tok' '/opt/cc/claude' --settings");
 		expect(cmd).toContain('--append-system-prompt');
+	});
+
+	// REQ-011 S2 — the channels flag opts CC's launched session into the inbound-DM channel.
+	it('appends the channels flag (--dangerously-load-development-channels server:aichat-channel)', () => {
+		const cmd = buildCcLaunchCommand({ token: 'tok', workspaceDir: '/ws', settingsPath: '/ws/settings.json' });
+		expect(cmd).toContain(CHANNEL_FLAG);
+	});
+
+	it('without channelMcpBin: no register prefix, still a single `&&` (cd join) and one contract flag', () => {
+		const cmd = buildCcLaunchCommand({ token: 'tok', workspaceDir: '/ws', settingsPath: '/ws/settings.json' });
+		expect(cmd).not.toContain('claude mcp add');
+		expect(cmd.match(/ && /g)).toHaveLength(1);
+		expect(cmd.match(/--append-system-prompt/g)).toHaveLength(1);
+	});
+
+	it('with channelMcpBin: PREPENDS the register command before the cd launch', () => {
+		const cmd = buildCcLaunchCommand({
+			token: 'tok',
+			workspaceDir: '/ws',
+			settingsPath: '/ws/settings.json',
+			channelMcpBin: '/x/channel-mcp.js',
+		});
+		expect(cmd.startsWith(buildCcChannelMcpRegisterCommand('/x/channel-mcp.js'))).toBe(true);
+		expect(cmd).toContain(' && cd ');
+		expect(cmd).toContain(CHANNEL_FLAG);
+	});
+});
+
+describe('buildCcChannelMcpRegisterCommand (REQ-011 S2 — persistent channel MCP)', () => {
+	it('removes then adds the aichat-channel MCP at user scope (idempotent shape)', () => {
+		const cmd = buildCcChannelMcpRegisterCommand('/x/channel-mcp.js');
+		expect(cmd).toContain('claude mcp remove aichat-channel -s user');
+		expect(cmd).toContain('claude mcp add aichat-channel -s user -t stdio -- node');
+		// remove precedes add (idempotent: re-points / clears a stale entry first)
+		expect(cmd.indexOf('claude mcp remove')).toBeLessThan(cmd.indexOf('claude mcp add'));
+	});
+
+	it('shell-quotes the bin path', () => {
+		const cmd = buildCcChannelMcpRegisterCommand('/x/channel-mcp.js');
+		expect(cmd).toContain("node '/x/channel-mcp.js'");
 	});
 });
 

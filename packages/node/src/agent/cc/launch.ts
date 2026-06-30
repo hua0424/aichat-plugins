@@ -141,6 +141,20 @@ function shellQuote(value: string): string {
 }
 
 /**
+ * REQ-011 S2 — the persistent `aichat-channel` MCP registration command. CC's *channels* subsystem
+ * (the inbound-DM path) only wires user-scoped registered MCPs; a `--mcp-config` MCP is invisible to
+ * it. So we register `aichat-channel` persistently at user scope. `remove … 2>/dev/null` first makes
+ * it idempotent (swallows the "not found" on the first run / re-points a stale entry); AICHAT_BIND is
+ * read from the inherited launch env, so no `-e` is needed.
+ */
+export function buildCcChannelMcpRegisterCommand(channelMcpBin: string): string {
+	return (
+		`claude mcp remove aichat-channel -s user 2>/dev/null; ` +
+		`claude mcp add aichat-channel -s user -t stdio -- node ${shellQuote(channelMcpBin)}`
+	);
+}
+
+/**
  * (4) The owner copy-paste launch command. Returned by CCDriver.openSession as bindInstructions:
  *   cd <workspaceDir> && AICHAT_BIND=<token> <claudeBin|claude> --settings <settingsPath>
  * `AICHAT_BIND` puts the binding token in CC's env so the hooks' `$AICHAT_BIND` resolves at run time.
@@ -152,18 +166,25 @@ function shellQuote(value: string): string {
  * so it is present every turn, survives `/clear`, and is cwd-independent. It contains quotes/spaces/
  * `⚠️` so it MUST be `shellQuote`d — the contract is a single quoted arg and never breaks the `&&`
  * or the flags, keeping the launch command a single valid shell line.
+ *
+ * REQ-011 S2: `--dangerously-load-development-channels server:aichat-channel` opts the launched CC
+ * into the channels subsystem backed by the `aichat-channel` MCP (inbound DM delivery). When
+ * `channelMcpBin` is given, the persistent MCP register command is PREPENDED (`… ; … && cd …`) so the
+ * owner's single paste registers the MCP and launches CC in one shot.
  */
 export function buildCcLaunchCommand(opts: {
 	token: string;
 	workspaceDir: string;
 	settingsPath: string;
 	claudeBin?: string;
+	channelMcpBin?: string;
 }): string {
 	const bin = opts.claudeBin ? shellQuote(opts.claudeBin) : 'claude';
-	return (
+	const launch =
 		`cd ${shellQuote(opts.workspaceDir)} && ` +
 		`AICHAT_BIND=${shellQuote(opts.token)} ${bin} ` +
 		`--settings ${shellQuote(opts.settingsPath)} ` +
-		`--append-system-prompt ${shellQuote(CC_REPLY_CONTRACT)}`
-	);
+		`--append-system-prompt ${shellQuote(CC_REPLY_CONTRACT)} ` +
+		`--dangerously-load-development-channels server:aichat-channel`;
+	return opts.channelMcpBin ? `${buildCcChannelMcpRegisterCommand(opts.channelMcpBin)} && ${launch}` : launch;
 }

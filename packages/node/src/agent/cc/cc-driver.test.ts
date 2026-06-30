@@ -79,6 +79,10 @@ describe('CcDriver', () => {
 		expect(out.launchCommand).toContain(`--settings '${out.settingsPath}'`);
 		expect(out.launchCommand).toContain(`cd '${out.workspaceDir}'`);
 
+		// REQ-011 S2: the launch command also registers the persistent channels MCP and opts into channels.
+		expect(out.launchCommand).toContain('claude mcp add aichat-channel');
+		expect(out.launchCommand).toContain('--dangerously-load-development-channels server:aichat-channel');
+
 		// the written settings carry the broker port in the hooks + the aichat bash permission.
 		const settings = JSON.parse(readFileSync(out.settingsPath, 'utf-8'));
 		expect(JSON.stringify(settings)).toContain('127.0.0.1:9100');

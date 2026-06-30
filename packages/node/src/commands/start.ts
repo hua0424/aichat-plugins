@@ -14,6 +14,7 @@ import { Codex } from '@openai/codex-sdk';
 import { CcDriver, parseCcBinding } from '../agent/cc/cc-driver.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { buildCcSink } from '../agent/cc/sink.js';
+import { CcChannelEndpoint, ccChannelPort } from '../agent/cc/channel-endpoint.js';
 import { ccBindAdminHandler } from '../capability/cc-bind.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
@@ -84,6 +85,12 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 
+	// REQ-011 S2: late-bound CC channel endpoint. Declared before the supervisor so buildHandler's
+	// closure can capture it by reference; assigned after supervisor.start() (only if a cc identity
+	// exists). By the time any inbound message arrives, it is set (same lazy pattern as the broker sink
+	// reading supervisor.agents). Null until then → channelPush is a safe no-op.
+	let channelEndpoint: CcChannelEndpoint | null = null;
+
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
@@ -134,7 +141,11 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 				onDisconnected: hooks.onDisconnected,
 			}),
 		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
-			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
+			// REQ-011 S2: channelPush late-binds to the CC channel endpoint (null until a cc identity
+			// brings it online below); a non-cc identity simply never reaches the cc DM branch.
+			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, (roomId, content) =>
+				channelEndpoint?.push(roomId, content),
+			),
 	});
 
 	await supervisor.start(registry);
@@ -185,6 +196,14 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 		});
 		await ccBroker.listen(ccBrokerPort());
 		console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
+
+		// REQ-011 S2: the CC channel push endpoint — the channel MCP (loaded by CC) subscribes here with
+		// its binding; the handler's cc DM branch pushes inbound DMs. resolve() = the shared parseCcBinding
+		// (same parse as the broker / CcDriver.resolveSession). The buildHandler closure captured this
+		// `let` by reference, so assigning it now wires every cc handler's channelPush.
+		channelEndpoint = new CcChannelEndpoint({ resolve: parseCcBinding });
+		await channelEndpoint.listen(ccChannelPort());
+		console.log(`[start] CC channel endpoint listening on 127.0.0.1:${ccChannelPort()}`);
 	}
 
 	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
@@ -202,6 +221,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
 		await endpoint.close().catch(() => {});
 		await ccBroker?.close().catch(() => {});
+		await channelEndpoint?.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		process.exit(0);

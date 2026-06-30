@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import type { AgentDriver, AgentSession } from '../events.js';
 import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
 import { buildCcSettings, writeCcSettings, buildCcLaunchCommand } from './launch.js';
@@ -109,7 +110,10 @@ export class CcDriver implements AgentDriver {
 		const token = `aiclaw-${aiclawUid}-room-${roomId}`;
 		const workspaceDir = deriveWorkspaceDir(this.workspaceBase, aiclawUid, chatContext);
 		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
-		const launchCommand = buildCcLaunchCommand({ token, workspaceDir, settingsPath });
+		// REQ-011 S2: resolve the sibling `aichat-channel` MCP bin (dist/agent/cc/channel-mcp.js) so the
+		// launch command also registers the persistent channels MCP (single owner paste).
+		const channelMcpBin = fileURLToPath(new URL('./channel-mcp.js', import.meta.url));
+		const launchCommand = buildCcLaunchCommand({ token, workspaceDir, settingsPath, channelMcpBin });
 		return { token, launchCommand, settingsPath, workspaceDir };
 	}
 }

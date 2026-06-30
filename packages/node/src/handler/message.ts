@@ -177,6 +177,13 @@ export class MessageHandler {
 	 */
 	private readonly onTokenExpired?: () => void;
 
+	/**
+	 * REQ-011 S2: push an inbound DM to an owner-driven (CC) identity's channel endpoint. Optional —
+	 * a cc identity without a wired channel endpoint (or any non-cc identity) leaves this undefined and
+	 * the cc DM branch becomes a safe no-op (optional chaining).
+	 */
+	private readonly channelPush?: (roomId: number, content: string) => void;
+
 	constructor(
 		ws: HulaWSClient,
 		driver: AgentDriver,
@@ -184,6 +191,7 @@ export class MessageHandler {
 		apiClient?: HulaApiClient,
 		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
 		onTokenExpired?: () => void,
+		channelPush?: (roomId: number, content: string) => void,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -193,6 +201,7 @@ export class MessageHandler {
 		this.apiClient = apiClient || null;
 		this.debounceOptions = debounceOptions;
 		this.onTokenExpired = onTokenExpired;
+		this.channelPush = channelPush;
 	}
 
 	/**
@@ -378,15 +387,6 @@ export class MessageHandler {
 	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
 	 */
 	private async triggerAgentLoop(roomId: number, message: string, skipGuard = false): Promise<void> {
-		// REQ-010 S7: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven by node — the
-		// owner drives the TUI by hand. Inbound messages are still ACK'd/deduped (in handleReceiveMessage,
-		// before this funnel), but node must NOT trigger an agent loop / THINKING_START for them. A cc
-		// identity's thinking comes ONLY from its side-channel broker (external-thinking). Drivers that
-		// leave drivesTurns undefined/true (openclaw/opencode/codex) are unaffected.
-		if (this.driver.drivesTurns === false) {
-			return;
-		}
-
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
@@ -441,6 +441,19 @@ export class MessageHandler {
 				return;
 			}
 			// 'allow'：继续
+		}
+
+		// REQ-010 S7 / REQ-011 S2: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven
+		// by node — the owner drives the TUI by hand, and node must never open a thinking session for it
+		// (CC's hooks drive thinking via the broker). Placed HERE, AFTER the anti-loop guard block, so a
+		// cc identity is subject to the SAME anti-loop gate as a node-driven one — the guard already
+		// returned on block/delay, so by this point the turn is allowed (or skipGuard on a reschedule).
+		// This is the single correct placement (the early-return that used to sit before the guard would
+		// have let cc bypass anti-loop). S2 delivers DM (roomType===2) inbound to CC via its channel
+		// endpoint; group (roomType===1) is intentionally NOT pushed here (S3 adds group parity).
+		if (this.driver.drivesTurns === false) {
+			if (roomType === 2) this.channelPush?.(roomId, message);
+			return;
 		}
 
 		// 并发防护
@@ -885,6 +898,11 @@ export class MessageHandler {
 	/**
 	 * REQ-010 S7: 结束外部 thinking → 发 THINKING_END {status:'complete', content, durationMs}
 	 * （镜像 finalizeComplete 的帧形状），并清理会话。无 active session / 已 finalized 时安全 no-op。
+	 *
+	 * REQ-011 S2: 同 finalizeComplete 一样在收尾后 flushPendingMessages —— 外部 thinking 活跃期间
+	 * （session 已存在，handleReceiveMessage 会把后续消息入队而非直推）到达的消息（如 CC 处理首条
+	 * DM 期间来的第 2 条 DM）必须在此 flush，否则它们会卡在 pendingMessages 里：owner 驱动的 cc
+	 * 身份 node 永不主动驱动一轮去消费它们。flush 后这些消息重入 triggerAgentLoop → cc DM 分支 → channelPush。
 	 */
 	endExternalThinking(roomId: number, fromUid: number): void {
 		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
@@ -900,6 +918,7 @@ export class MessageHandler {
 		});
 		console.log(`[thinking] external end session=${sessionKey} durationMs=${Date.now() - session.startTime}`);
 		this.thinkingSessions.delete(sessionKey);
+		this.flushPendingMessages(roomId);
 	}
 
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
