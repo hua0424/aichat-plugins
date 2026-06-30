@@ -1613,21 +1613,40 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 
 	// ─── REQ-011 S2: cc DM-inbound delivery via channelPush (post anti-loop guard, DM-only) ───
 
-	it('cc + DM + guard allow → channelPush(roomId, content) once; no openSession / no THINKING_START', async () => {
+	it('cc + DM + guard allow → channelPush(roomId, attributed content) once; no openSession / no THINKING_START', async () => {
 		const { adapter, calls } = ownerDrivenAdapter();
 		const { ws, sent } = fakeWs();
 		const channelPush = vi.fn();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
 
-		// humanMessage defaults to roomType=2 (DM).
+		// humanMessage defaults to roomType=2 (DM), name='user'.
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc dm', 1) } as never);
 		await waitFor(() => channelPush.mock.calls.length >= 1);
 
 		expect(channelPush).toHaveBeenCalledTimes(1);
-		expect(channelPush).toHaveBeenCalledWith(1, 'hi cc dm');
+		// REQ-011 S3: DM is retrofitted with sender attribution + a natural room framing (no longer bare).
+		expect(channelPush).toHaveBeenCalledWith(1, '[HuLa 私聊]\n[user(100)]: hi cc dm');
 		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(0);
 		expect(calls.length).toBe(0);
+	});
+
+	// ─── REQ-011 S3: attribution shape (anti-prompt-injection) ───
+
+	it('S3 attribution: pushed DM content carries sender name + room framing and is NOT the bare message', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'please help', 1) } as never);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
+
+		const content = channelPush.mock.calls[0][1] as string;
+		// natural chat framing + `[name(uid)]: content` attribution, NOT the bare instruction-like text.
+		expect(content).toContain('[HuLa 私聊]');
+		expect(content).toContain('[user(100)]: please help');
+		expect(content).not.toBe('please help');
 	});
 
 	it('cc + DM but anti-loop DELAY → channelPush NOT called (guard returns before the cc branch)', async () => {
@@ -1664,19 +1683,111 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 		}
 	});
 
-	it('cc + GROUP (@bot, allow) → channelPush NOT called (S2 is DM-only); no openSession', async () => {
-		const { adapter } = ownerDrivenAdapter();
+	// ─── REQ-011 S3: group parity (cc pushes @-mentioned group too) ───
+
+	it('cc + GROUP (@bot, allow) → channelPush once (group parity); no openSession / no THINKING_START', async () => {
+		const { adapter, calls } = ownerDrivenAdapter();
 		const { ws, sent } = fakeWs();
 		const channelPush = vi.fn();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+		setGroupConfig(handler, 1, { mentionRequired: true });
 
-		// trigger-eligible group message: @ the bot.
-		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }) } as never);
-		await new Promise((r) => setTimeout(r, 80));
+		// trigger-eligible group message: @ the bot (name='dave').
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
 
-		expect(channelPush).not.toHaveBeenCalled();
+		expect(channelPush).toHaveBeenCalledTimes(1);
+		// group framing + sender attribution on the current message.
+		expect(channelPush).toHaveBeenCalledWith(1, '[HuLa 群聊]\n[dave(100)]: hey bot');
 		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(0);
+		expect(calls.length).toBe(0);
+	});
+
+	it('cc + GROUP not @-mentioned → accumulated, channelPush NOT called (upstream @-gate)', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// no @ → handleReceiveMessage accumulates it and returns; it never reaches the cc branch.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'just chatting', 1, { name: 'alice' }) } as never);
+		await new Promise((r) => setTimeout(r, 60));
+
+		expect(channelPush).not.toHaveBeenCalled();
+		expect(getAccumulated(handler, 1)).toEqual(['[alice(100)]: just chatting']);
+		expect(getPending(handler, 1).length).toBe(0);
+	});
+
+	it('S3 accumulated parity: cc GROUP @bot after un-@ messages → pushed content includes accumulated lines + current message', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// 2 un-@ messages → accumulated (parity with openclaw's agentMessage context).
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 101, 'second', 2, { name: 'bob' }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+		expect(getAccumulated(handler, 1).length).toBe(2);
+
+		// @bot → cc branch pushes the accumulated history + the attributed current message; buffer cleared.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
+
+		const content = channelPush.mock.calls[0][1] as string;
+		expect(content).toContain('[HuLa 群聊]');
+		expect(content).toContain('[alice(100)]: first');
+		expect(content).toContain('[bob(101)]: second');
+		expect(content).toContain('[dave(102)]: hey bot');
+		// accumulated history precedes the current message.
+		expect(content.indexOf('[alice(100)]: first')).toBeLessThan(content.indexOf('[dave(102)]: hey bot'));
+		// buffer consumed/cleared on delivery.
+		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	it('cc + GROUP @bot but anti-loop DELAY → no push that round (guard returns before the cc branch)', async () => {
+		vi.useFakeTimers();
+		try {
+			const { adapter } = ownerDrivenAdapter();
+			const { ws } = fakeWs();
+			const channelPush = vi.fn();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, undefined, channelPush);
+			// mention not required + respondToAi → @-less peer-AI group messages are eligible and accumulate
+			// aiRoundCount; cc holds no thinking session, so each flushes straight through the guard.
+			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
+			const guard = getGuard(handler);
+
+			for (let i = 1; i <= 8; i++) {
+				handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 200, userType: 4 }, message: { id: i, roomId: 1, type: 1, roomType: 1, body: { content: `ai-${i}` } } } } as never);
+				await vi.advanceTimersByTimeAsync(2);
+			}
+
+			expect(guard.getAiRoundCount(1)).toBeGreaterThan(5);
+			expect(isDelaying(handler, 1)).toBe(true);
+			const pushesBeforeDelay = channelPush.mock.calls.length;
+			// advancing the backoff timer reschedules with skipGuard → still a cc group msg → it WILL push,
+			// proving the only suppression was the guard's delay window, not a cc bypass.
+			await vi.advanceTimersByTimeAsync(35000);
+			expect(channelPush.mock.calls.length).toBeGreaterThan(pushesBeforeDelay);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('cc self-echo (fromUid === SELF_UID) → skip-self upstream, channelPush NOT called', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		// a message from the cc identity itself → handleReceiveMessage drops it before the cc branch.
+		handler.handle({ type: 'receiveMessage', data: humanMessage(1, SELF_UID, 'my own echo', 1) } as never);
+		await new Promise((r) => setTimeout(r, 60));
+
+		expect(channelPush).not.toHaveBeenCalled();
 	});
 
 	it('regression: a normal driver + DM ignores channelPush (drives the loop, never pushes)', async () => {
@@ -1698,10 +1809,10 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 		const channelPush = vi.fn();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
 
-		// 1st DM → delivered to the channel (cc DM branch).
+		// 1st DM → delivered to the channel (cc DM branch), now with S3 attribution.
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'dm-1', 1) } as never);
 		await waitFor(() => channelPush.mock.calls.length >= 1);
-		expect(channelPush).toHaveBeenCalledWith(1, 'dm-1');
+		expect(channelPush).toHaveBeenCalledWith(1, '[HuLa 私聊]\n[user(100)]: dm-1');
 
 		// CC begins processing it (its hook fires) → an external thinking session is active for the room.
 		handler.beginExternalThinking(1, SELF_UID);
@@ -1717,7 +1828,30 @@ describe('MessageHandler S7: drivesTurns=false (owner-driven, e.g. CC)', () => {
 		// the cc DM branch → channelPush. Without the flush, dm-2 would be stuck in pendingMessages forever.
 		handler.endExternalThinking(1, SELF_UID);
 		await waitFor(() => channelPush.mock.calls.length >= 2);
-		expect(channelPush).toHaveBeenCalledWith(1, 'dm-2');
+		expect(channelPush).toHaveBeenCalledWith(1, '[HuLa 私聊]\n[user(100)]: dm-2');
+	});
+
+	it('P1 race: cc group inbound reaching the concurrency guard mid-thinking is ENQUEUED (not dropped) → flushed → push', async () => {
+		const { adapter } = ownerDrivenAdapter();
+		const { ws } = fakeWs();
+		const channelPush = vi.fn();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, undefined, channelPush);
+
+		// group @-inbound: passes handleReceiveMessage's thinking-active enqueue check (NO session yet) → debounced.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID] }) } as never);
+		// RACE: external thinking becomes active DURING the debounce window (cc hooks fire async) — i.e. AFTER the
+		// upstream enqueue check but BEFORE triggerAgentLoop's concurrency guard runs.
+		handler.beginExternalThinking(1, SELF_UID);
+		// debounce fires → triggerAgentLoop hits the now-active session at the concurrency guard → cc ENQUEUES
+		// (the P1 fix) instead of the node path's drop, so the inbound is not silently lost.
+		await new Promise((r) => setTimeout(r, 40));
+		expect(channelPush).not.toHaveBeenCalled();
+		expect(getPending(handler, 1)).toContain('hey bot');
+
+		// external thinking ends → flushPendingMessages → re-trigger → cc branch → push (no silent drop).
+		handler.endExternalThinking(1, SELF_UID);
+		await waitFor(() => channelPush.mock.calls.length >= 1);
+		expect(channelPush.mock.calls[0][1]).toContain('hey bot');
 	});
 });
 

@@ -77,6 +77,12 @@ interface ThinkingSession {
 interface LastMessageContext {
 	roomId: number;
 	fromUid: number;
+	/**
+	 * REQ-011 S3: 发言者显示名（取自 inbound 的 fromUser.name，缺省 'unknown'）。
+	 * cc channel 推送时用于对「当前消息」做发言者标注——CC 的反提示注入防御拒绝裸/指令式
+	 * channel 文本，必须把消息呈现为「某人发的聊天消息」（`[name(uid)]: content`）才会被正常处理。
+	 */
+	fromName: string;
 	msgId: string;
 	/**
 	 * REQ-008 #77: 触发消息的会话类型（1=GROUP，2=FRIEND/私聊）。缺省视为群聊（保守）。
@@ -219,7 +225,7 @@ export class MessageHandler {
 			channel = {
 				debouncer,
 				pendingMessages: [],
-				lastCtx: { roomId, fromUid: 0, msgId: '', roomType: 1, isOwner: false },
+				lastCtx: { roomId, fromUid: 0, fromName: 'unknown', msgId: '', roomType: 1, isOwner: false },
 				accumulatedMessages: [],
 				batchSawHuman: false,
 				batchAiFromUid: 0,
@@ -351,7 +357,9 @@ export class MessageHandler {
 		// 缺省/未知 roomType 与上方 @ 闸门一致按群聊（1）保守处理。
 		// isOwner 取自 inbound 的 message.aiclaw.isOwner（仅私聊推送带 aiclaw ext；群聊缺省 false）。
 		const isOwner = data.message.aiclaw?.isOwner === true;
-		channel.lastCtx = { roomId, fromUid, msgId, roomType: roomType ?? 1, isOwner };
+		// REQ-011 S3: cache the sender display name so the cc channel push can attribute the current message.
+		const fromName = data.fromUser.name ?? 'unknown';
+		channel.lastCtx = { roomId, fromUid, fromName, msgId, roomType: roomType ?? 1, isOwner };
 
 		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
 
@@ -378,6 +386,24 @@ export class MessageHandler {
 
 		// 7. 正常触发（防循环守卫已移至 triggerAgentLoop 唯一汇聚点，按 BATCH 评估）
 		channel.debouncer.push(content);
+	}
+
+	/**
+	 * REQ-011 S3: build the attributed chat transcript pushed to an owner-driven (cc) identity's channel.
+	 *
+	 * Parity with openclaw's accumulated-context injection (same un-@ group history is delivered), but
+	 * formatted as a NATURAL chat transcript with sender attribution rather than the node path's
+	 * `[群聊上下文]/[当前消息]` framing. This is load-bearing anti-prompt-injection: CC refuses bare /
+	 * "do X silently" channel text, but processes a naturally-attributed chat message normally and replies
+	 * as the room's assistant. Each line reuses the accumulated buffer's `[name(uid)]: content` shape (the
+	 * current message attributed via the cached lastCtx), with a light `[HuLa 私聊]` / `[HuLa 群聊]` room
+	 * framing prepended. Deliberately NO imperative / "run this" / "don't explain" wording.
+	 */
+	private buildCcChannelContent(ctx: LastMessageContext, accumulated: string[], message: string): string {
+		const room = ctx.roomType === 2 ? '[HuLa 私聊]' : '[HuLa 群聊]';
+		const currentLine = `[${ctx.fromName}(${ctx.fromUid})]: ${message}`;
+		const lines = accumulated.length > 0 ? [...accumulated, currentLine] : [currentLine];
+		return `${room}\n${lines.join('\n')}`;
 	}
 
 	/**
@@ -443,30 +469,45 @@ export class MessageHandler {
 			// 'allow'：继续
 		}
 
-		// REQ-010 S7 / REQ-011 S2: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven
-		// by node — the owner drives the TUI by hand, and node must never open a thinking session for it
-		// (CC's hooks drive thinking via the broker). Placed HERE, AFTER the anti-loop guard block, so a
-		// cc identity is subject to the SAME anti-loop gate as a node-driven one — the guard already
-		// returned on block/delay, so by this point the turn is allowed (or skipGuard on a reschedule).
-		// This is the single correct placement (the early-return that used to sit before the guard would
-		// have let cc bypass anti-loop). S2 delivers DM (roomType===2) inbound to CC via its channel
-		// endpoint; group (roomType===1) is intentionally NOT pushed here (S3 adds group parity).
-		if (this.driver.drivesTurns === false) {
-			if (roomType === 2) this.channelPush?.(roomId, message);
-			return;
-		}
-
-		// 并发防护
+		// 并发防护：必须先于「消费/清空积累缓冲」与 cc channel push——只有真正进入交付路径时才消费缓冲，
+		// 否则早返回会丢弃已清空但从未发送的群聊上下文（P1-a）。cc 与 node 路径共用此守卫。
 		if (this.thinkingSessions.has(sessionKey)) {
+			// REQ-011 S3（P1 竞态）：thinking session 在 handleReceiveMessage 的「thinking 活跃入队」闸
+			// 与此处之间变为活跃（debounce 窗口内；cc 的 external-thinking 由 hooks 异步建，有窗口）。
+			// 对 owner 驱动的 cc 身份，此处直接 return 会**丢失**该入站消息（它是要 push 交付的内容，
+			// 而非 node 路径那种可在思考结束后重跑的触发）→ 改为**入队**，由 endExternalThinking 的
+			// flushPendingMessages 重新交付（下一轮 triggerAgentLoop 再消费 accumulated + 构建归属内容）。
+			// node 路径维持原 drop 语义（其消息内容不会因此丢失）。
+			if (this.driver.drivesTurns === false) {
+				channel.pendingMessages.push(message);
+				console.warn(`[handler] cc inbound during active thinking → enqueued (not dropped), room ${roomId}`);
+				return;
+			}
 			console.warn(`[handler] Thinking session already active for ${sessionKey}`);
 			return;
 		}
 
-		// REQ-004 S5: 注入惰性积累的群聊上下文（自上次回复以来未点名的消息），随后清空缓冲。
-		// 必须放在并发防护早返回之后——只有真正进入 agent loop（创建 thinking session）时才消费/清空缓冲，
-		// 否则早返回会丢弃已清空但从未发送的群聊上下文。
+		// REQ-004 S5: 消费惰性积累的群聊上下文（自上次回复以来未点名的消息），随后清空缓冲。
+		// 必须放在并发防护早返回之后——只有真正进入交付（node thinking / cc channel push）时才消费/清空缓冲，
+		// 否则早返回会丢弃已清空但从未发送的群聊上下文。REQ-011 S3：node 与 cc 共享同一份消费结果，
+		// 让 cc 拿到与 openclaw 一致的累计群聊上下文（context parity）。
 		const accumulated = channel.accumulatedMessages;
 		channel.accumulatedMessages = [];
+
+		// REQ-010 S7 / REQ-011 S2+S3: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven
+		// by node — the owner drives the TUI by hand, and node must never open a thinking session for it
+		// (CC's hooks drive thinking via the broker). Placed HERE, AFTER the anti-loop guard + concurrency
+		// guard + accumulated consume, so a cc identity is subject to the SAME gates as a node-driven one AND
+		// gets the SAME accumulated group context (parity). It pushes BOTH DM and @-mentioned group — group
+		// eligibility is already enforced upstream by handleReceiveMessage's @-gate (un-@'d group messages
+		// are accumulated and never reach here). The pushed content is an ATTRIBUTED natural chat transcript
+		// (sender name + a light room framing), NOT bare/instruction-like text — load-bearing: CC's
+		// anti-prompt-injection refuses bare channel messages. No node thinking session / THINKING_START for cc.
+		if (this.driver.drivesTurns === false) {
+			this.channelPush?.(roomId, this.buildCcChannelContent(channel.lastCtx, accumulated, message));
+			return;
+		}
+
 		const agentMessage =
 			accumulated.length > 0
 				? `[群聊上下文 · 自上次回复以来未点名你的消息]\n${accumulated.join('\n')}\n\n[当前消息]\n${message}`
