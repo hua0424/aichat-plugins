@@ -23,6 +23,27 @@ const BROKER_HOOK_PATH = '/hook';
 /** The aichat reply CLI permission rule — lets the agent run `aichat send-message` unattended. */
 const AICHAT_BASH_RULE = 'Bash(aichat:*)';
 
+/**
+ * REQ-010 #102 — the reply contract injected as a CC launch-level system prompt
+ * (`claude --append-system-prompt`). This is the CC analog of the per-turn role-prompt that
+ * node-driven agents (codex/opencode) get injected each turn: CC, being owner-driven in a TUI,
+ * gets NO per-turn role-prompt, so without this it relies on the `aichat-reply` skill alone and
+ * conflates "invoking the skill" with "sending" — the #102 bug (CC narrated "已发" but never ran
+ * `aichat send-message`, so the DB stayed empty).
+ *
+ * Injecting it as a launch FLAG (not a workspace CLAUDE.md) makes it: present on EVERY turn,
+ * immune to `/clear` (a launch flag is not part of conversation state), and cwd-independent (no
+ * dependence on the owner running CC inside a particular workspace). VERIFIED supported +
+ * functional on claude-code 2.1.195.
+ */
+export const CC_REPLY_CONTRACT =
+	'你是 HuLa 聊天会话里的 AI 助理。要把回复发送到当前聊天，你必须在 bash 中实际运行命令：' +
+	'aichat send-message --content "<你的回复>"。⚠️ 只有运行这条 bash 命令才会真正发送消息；' +
+	'仅仅调用 aichat-reply 技能、或在回答里声称"已发送/我发了"都不会发送任何消息。' +
+	'房间和身份由系统经 AICHAT_BIND 自动绑定——绝不要传 --room/--to/收件人/身份参数。' +
+	'本轮无需回复时不运行即可（本轮自然结束、不发送任何消息）。' +
+	'在你真正运行过该命令之前，绝不要声称已发送。';
+
 /** A single claude-code command-hook entry. */
 interface CcCommandHook {
 	type: 'command';
@@ -126,6 +147,11 @@ function shellQuote(value: string): string {
  * Paths and token are single-quoted (workspaceDir/settingsPath may contain spaces; token stays quoted
  * even though it's URL-safe base64). The command name (`claude` or override) is quoted too so an
  * override path with spaces still works; a bare `claude` quotes harmlessly to find it on PATH.
+ *
+ * REQ-010 #102: the reply contract (`CC_REPLY_CONTRACT`) is appended as `--append-system-prompt`
+ * so it is present every turn, survives `/clear`, and is cwd-independent. It contains quotes/spaces/
+ * `⚠️` so it MUST be `shellQuote`d — the contract is a single quoted arg and never breaks the `&&`
+ * or the flags, keeping the launch command a single valid shell line.
  */
 export function buildCcLaunchCommand(opts: {
 	token: string;
@@ -137,6 +163,7 @@ export function buildCcLaunchCommand(opts: {
 	return (
 		`cd ${shellQuote(opts.workspaceDir)} && ` +
 		`AICHAT_BIND=${shellQuote(opts.token)} ${bin} ` +
-		`--settings ${shellQuote(opts.settingsPath)}`
+		`--settings ${shellQuote(opts.settingsPath)} ` +
+		`--append-system-prompt ${shellQuote(CC_REPLY_CONTRACT)}`
 	);
 }

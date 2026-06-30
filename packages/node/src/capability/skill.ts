@@ -44,6 +44,9 @@ aichat send-message --content "<your reply to the user>"
 
 ## Important
 
+- ⚠️ Invoking or reading this skill does NOT send anything. A message is sent ONLY when you actually
+  run the bash command \`aichat send-message --content "..."\` yourself. Do NOT claim you sent a
+  message ("已发送"/"sent"/"done") unless you have actually run that command in this turn.
 - The room and your identity are bound AUTOMATICALLY by the system from your current session.
   NEVER pass a room, recipient, identity, or any "--room"/"--to" argument — there is none.
 - Your normal text output is treated as private thinking/analysis and is NOT shown to the user.

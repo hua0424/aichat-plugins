@@ -65,6 +65,18 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 		expect(reply!.content).toContain('aichat send-message --content');
 	});
 
+	// REQ-010 #102 — make "invoking the skill ≠ sent" unambiguous in the skill itself.
+	it('aichat-reply warns that invoking/reading the skill does NOT send', () => {
+		installSkill();
+		const reply = writes.find((w) => w.path.endsWith('aichat-reply/SKILL.md'));
+		expect(reply).toBeDefined();
+		const md = reply!.content;
+		expect(md).toContain('does NOT send anything');
+		expect(md).toContain('A message is sent ONLY when you actually');
+		expect(md).toContain('Do NOT claim you sent a');
+		expect(md).toContain('unless you have actually run that command');
+	});
+
 	it('best-effort: a root that throws is skipped, others still written, no throw', () => {
 		throwForPath = (p) => p.startsWith('/home/test/.claude/skills');
 		const result = installSkill();
