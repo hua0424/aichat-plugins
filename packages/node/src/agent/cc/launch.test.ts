@@ -7,6 +7,7 @@ import {
 	buildCcSettings,
 	writeCcSettings,
 	buildCcLaunchCommand,
+	CC_REPLY_CONTRACT,
 } from './launch.js';
 
 /** The events chunk-2 must wire (the broker dispatches by hook_event_name). */
@@ -121,14 +122,16 @@ describe('writeCcSettings', () => {
 });
 
 describe('buildCcLaunchCommand', () => {
-	it('produces the owner copy-paste command with binding env + --settings', () => {
+	it('produces the owner copy-paste command with binding env + --settings (+ contract flag)', () => {
 		const cmd = buildCcLaunchCommand({
 			token: 'tok-abc_123-XY',
 			workspaceDir: '/home/u/.aichat/9/owner',
 			settingsPath: '/home/u/.aichat/9/owner/settings.json',
 		});
+		const quotedContract = `'${CC_REPLY_CONTRACT.replace(/'/g, "'\\''")}'`;
 		expect(cmd).toBe(
-			"cd '/home/u/.aichat/9/owner' && AICHAT_BIND='tok-abc_123-XY' claude --settings '/home/u/.aichat/9/owner/settings.json'",
+			"cd '/home/u/.aichat/9/owner' && AICHAT_BIND='tok-abc_123-XY' claude --settings '/home/u/.aichat/9/owner/settings.json' " +
+				`--append-system-prompt ${quotedContract}`,
 		);
 	});
 
@@ -171,5 +174,65 @@ describe('buildCcLaunchCommand', () => {
 		expect(cmd).toContain('my-token');
 		expect(cmd).toContain('/ws');
 		expect(cmd).toContain('/ws/settings.json');
+	});
+
+	// REQ-010 #102 — the reply contract is injected as a launch-level system prompt so it is
+	// present every turn, survives /clear (it's a launch flag), and is cwd-independent.
+	it('appends --append-system-prompt with the shell-quoted reply contract after --settings', () => {
+		const cmd = buildCcLaunchCommand({
+			token: 'tok',
+			workspaceDir: '/ws',
+			settingsPath: '/ws/settings.json',
+		});
+		// POSIX single-quote the contract exactly the way shellQuote does.
+		const quoted = `'${CC_REPLY_CONTRACT.replace(/'/g, "'\\''")}'`;
+		expect(cmd).toContain(`--settings '/ws/settings.json' --append-system-prompt ${quoted}`);
+	});
+
+	it('keeps the command a single valid line — the contract is quoted, not breaking flags/&&', () => {
+		const cmd = buildCcLaunchCommand({
+			token: 'tok',
+			workspaceDir: '/ws',
+			settingsPath: '/ws/settings.json',
+		});
+		// exactly one ` && ` (the cd && AICHAT_BIND join) — the contract must not introduce another.
+		expect(cmd.match(/ && /g)).toHaveLength(1);
+		// exactly one --append-system-prompt flag.
+		expect(cmd.match(/--append-system-prompt/g)).toHaveLength(1);
+		// token, workspaceDir, settingsPath all still present + quoted.
+		expect(cmd).toContain("AICHAT_BIND='tok'");
+		expect(cmd).toContain("cd '/ws'");
+		expect(cmd).toContain("--settings '/ws/settings.json'");
+	});
+
+	it('still respects a claudeBin override with the appended contract', () => {
+		const cmd = buildCcLaunchCommand({
+			token: 'tok',
+			workspaceDir: '/ws',
+			settingsPath: '/ws/settings.json',
+			claudeBin: '/opt/cc/claude',
+		});
+		expect(cmd).toContain("AICHAT_BIND='tok' '/opt/cc/claude' --settings");
+		expect(cmd).toContain('--append-system-prompt');
+	});
+});
+
+describe('CC_REPLY_CONTRACT (REQ-010 #102 — skill≠sent enforcement)', () => {
+	it('mandates actually running the send-message bash command', () => {
+		expect(CC_REPLY_CONTRACT).toContain('aichat send-message');
+	});
+
+	it('warns that invoking the skill / claiming "已发送" does NOT send', () => {
+		expect(CC_REPLY_CONTRACT).toContain('aichat-reply');
+		expect(CC_REPLY_CONTRACT).toContain('不会发送');
+	});
+
+	it('forbids passing room/identity args (AICHAT_BIND auto-binds)', () => {
+		expect(CC_REPLY_CONTRACT).toContain('AICHAT_BIND');
+		expect(CC_REPLY_CONTRACT).toContain('绝不要传 --room');
+	});
+
+	it('forbids claiming sent before actually running the command', () => {
+		expect(CC_REPLY_CONTRACT).toContain('在你真正运行过该命令之前，绝不要声称已发送');
 	});
 });
