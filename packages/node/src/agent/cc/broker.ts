@@ -2,12 +2,17 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 /**
- * REQ-010 S7 — the claude-code (CC) side-channel broker.
+ * REQ-010 S7 / REQ-011 S2 — the claude-code (CC) hook broker.
  *
- * CC has no gateway/server: node mirrors a CC turn's activity into the room's thinking panel via
- * claude-code **hooks** that POST to this node-local HTTP broker. Each hook fires in CC's `-p` run,
- * reads `$AICHAT_BIND` (a node-minted binding token placed in CC's launch env), and POSTs to
- * `http://127.0.0.1:<port>/` with `Authorization: Bearer <AICHAT_BIND>` and a JSON hook body.
+ * CC has no gateway/server: node sources a CC turn's THINKING/tool activity from claude-code **hooks**
+ * that POST to this node-local HTTP broker. Each hook fires in CC's headless (`-p`) run, reads
+ * `$AICHAT_BIND` (the binding string placed in CC's launch env), and POSTs to `http://127.0.0.1:<port>/`
+ * with `Authorization: Bearer <AICHAT_BIND>` and a JSON hook body.
+ *
+ * REQ-011 S2: CC is now NODE-DRIVEN. The broker no longer drives an "external thinking" session; it
+ * routes each resolved hook into the active CcHeadlessSession's AgentEvent stream via the injected
+ * CcHookSink (a CcSessionRegistry bridge, src/agent/cc/sink.ts), so the handler's STANDARD path renders
+ * the panel — identical to codex/opencode.
  *
  * `handle()` is the pure-ish, unit-testable core (local-only guard → Bearer extract → resolve →
  * hook-event → sink mapping). `listen()`/`close()` are a thin node:http wrapper over a 127.0.0.1 TCP
@@ -17,14 +22,18 @@ import type { AddressInfo } from 'node:net';
  * only its CC session and the binding token; it can never name a room/identity it isn't bound to.
  */
 
-/** The destination for mirrored CC activity: drives an external (non-room-triggered) thinking session. */
-export interface ExternalThinkingSink {
-	/** Start/refresh an external thinking session for (roomId, aiclawUid). Idempotent per turn. */
-	begin(roomId: number, aiclawUid: number): void;
-	/** Accumulate a thinking chunk (tool activity or streaming assistant text). */
-	delta(roomId: number, aiclawUid: number, text: string): void;
-	/** Finalize the external thinking session (turn done). */
-	end(roomId: number, aiclawUid: number): void;
+/**
+ * The destination for resolved CC hooks: routes them into the active node-driven CcHeadlessSession's
+ * AgentEvent stream (via a CcSessionRegistry bridge). A hook for a room with no active session is a
+ * safe no-op drop inside the sink (never a throw).
+ */
+export interface CcHookSink {
+	/** PostToolUse → a `{tool}` AgentEvent for the room (name only; reduceThinking ignores tools). */
+	tool(roomId: number, aiclawUid: number, toolName: string): void;
+	/** MessageDisplay / assistant text → a `{thinking}` AgentEvent for the room (rendered in the panel). */
+	thinking(roomId: number, aiclawUid: number, text: string): void;
+	/** Stop → flush any final thinking; do NOT close — the session's `done` comes from stdout EOF. */
+	flush(roomId: number, aiclawUid: number): void;
 }
 
 /** resolve() result: the bound identity + room for a binding token. */
@@ -33,8 +42,8 @@ type Resolved = { aiclawUid: number; roomId: number };
 export interface CcBrokerDeps {
 	/** Map a CC binding token → bound identity/room, or undefined if unknown. */
 	resolve: (bindToken: string) => Resolved | undefined;
-	/** Where mirrored CC activity is routed (a MessageHandler adapter in production). */
-	sink: ExternalThinkingSink;
+	/** Where resolved CC hooks are routed (the per-room session-stream bridge in production). */
+	sink: CcHookSink;
 }
 
 /** The handle() result: an HTTP status + JSON payload. */
@@ -49,12 +58,9 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 /** Fixed default broker port — chunk 2's hooks config needs a known port. Env-overridable. */
 const DEFAULT_BROKER_PORT = 9100;
 
-/** Max chars of a tool_input JSON mirrored into thinking (keeps the panel readable). */
-const TOOL_INPUT_MAX = 200;
-
 export class CcBroker {
 	private readonly resolve: (bindToken: string) => Resolved | undefined;
-	private readonly sink: ExternalThinkingSink;
+	private readonly sink: CcHookSink;
 	private server: Server | null = null;
 
 	constructor(deps: CcBrokerDeps) {
@@ -87,26 +93,27 @@ export class CcBroker {
 		switch (hook.event) {
 			case 'UserPromptSubmit':
 			case 'SessionStart':
-				this.sink.begin(roomId, aiclawUid);
+				// Lifecycle only: ignore. The handler's STANDARD node-driven path already sends
+				// THINKING_START when it opens the CcHeadlessSession — no external begin needed.
 				break;
 			case 'PostToolUse': {
 				const toolName = typeof hook.body.tool_name === 'string' ? hook.body.tool_name : 'tool';
-				const inputJson = JSON.stringify(hook.body.tool_input ?? {}).slice(0, TOOL_INPUT_MAX);
-				this.sink.delta(roomId, aiclawUid, `[工具] ${toolName} ${inputJson}`);
+				this.sink.tool(roomId, aiclawUid, toolName);
 				break;
 			}
 			case 'MessageDisplay': {
 				const content = typeof hook.body.content === 'string' ? hook.body.content : '';
-				if (content) this.sink.delta(roomId, aiclawUid, content);
+				if (content) this.sink.thinking(roomId, aiclawUid, content);
 				break;
 			}
 			case 'Stop':
 				// last_assistant_message is the agent's thinking text, NOT the reply — the reply goes
-				// through the CLI capability path, not here. So Stop only finalizes the thinking session.
-				this.sink.end(roomId, aiclawUid);
+				// through the CLI capability path, not here. Stop flushes any final thinking; it does NOT
+				// close the session (the session's `done` comes from the driver's stdout EOF/`result`).
+				this.sink.flush(roomId, aiclawUid);
 				break;
 			default:
-				// A known-but-unmirrored event (or future event): accept it, mirror nothing.
+				// A known-but-unmirrored event (or future event): accept it, route nothing.
 				break;
 		}
 

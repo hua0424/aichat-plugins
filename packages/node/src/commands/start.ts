@@ -12,9 +12,10 @@ import { CodexDriver } from '../agent/codex/codex-driver.js';
 import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
 import { CcDriver, parseCcBinding } from '../agent/cc/cc-driver.js';
+import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
-import { buildCcSink } from '../agent/cc/sink.js';
-import { CcChannelEndpoint, ccChannelPort } from '../agent/cc/channel-endpoint.js';
+import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { ccBindAdminHandler } from '../capability/cc-bind.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
@@ -85,11 +86,12 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 
-	// REQ-011 S2: late-bound CC channel endpoint. Declared before the supervisor so buildHandler's
-	// closure can capture it by reference; assigned after supervisor.start() (only if a cc identity
-	// exists). By the time any inbound message arrives, it is set (same lazy pattern as the broker sink
-	// reading supervisor.agents). Null until then → channelPush is a safe no-op.
-	let channelEndpoint: CcChannelEndpoint | null = null;
+	// REQ-011 S2: claude-code is now NODE-DRIVEN headless (CcHeadlessDriver). One shared per-room bridge
+	// routes CC hooks (via the CcBroker) into the active CcHeadlessSession's AgentEvent stream, so cc goes
+	// through the STANDARD supervised path. Built once here and shared by every cc identity's driver + the
+	// broker sink (below). The session store persists (uid,room)→session_id for cross-turn/restart --resume.
+	const ccRegistry = new CcSessionRegistry();
+	const ccWorkspaceBase = join(AICHAT_HOME, 'cc', 'workspace');
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
@@ -118,13 +120,16 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 				});
 			}
 			if (entry.tool === 'cc') {
-				// REQ-010 S7: claude-code is OWNER-DRIVEN. The CcDriver does NOT drive turns
-				// (drivesTurns=false) and has no server — connect()/disconnect() are no-ops. The owner
-				// launches `claude` by hand (via `aichat cc-bind`); CC replies through the capability CLI
-				// and mirrors thinking through the CcBroker (wired below after supervisor.start).
-				return new CcDriver({
-					workspaceBase: join(AICHAT_HOME, 'cc', 'workspace'),
+				// REQ-011 S2: claude-code is NODE-DRIVEN headless. CcHeadlessDriver spawns `claude -p`
+				// (stream-json) per inbound turn (drivesTurns=true → standard supervised path). The reply
+				// still goes out-of-band via the `aichat send-message` CLI; thinking is sourced from CC's
+				// hooks (POSTing to the CcBroker) and bridged into the turn's AgentEvent stream via the
+				// shared per-room registry. session_id is persisted for cross-turn/restart --resume.
+				return new CcHeadlessDriver({
+					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
+					sessionStore: new FileCcHeadlessSessionStore(),
+					registry: ccRegistry,
 				});
 			}
 			// 未知 tool 抛错使该身份降级，不影响其它身份。
@@ -141,11 +146,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 				onDisconnected: hooks.onDisconnected,
 			}),
 		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
-			// REQ-011 S2: channelPush late-binds to the CC channel endpoint (null until a cc identity
-			// brings it online below); a non-cc identity simply never reaches the cc DM branch.
-			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, (roomId, content) =>
-				channelEndpoint?.push(roomId, content),
-			),
+			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
 	});
 
 	await supervisor.start(registry);
@@ -183,27 +184,19 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	await endpoint.listen(capabilitySocketPath());
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
 
-	// REQ-010 S7: if any cc identity is registered, start the CC side-channel broker so CC's hooks can
-	// mirror its turn into the room's thinking panel. resolve() = the shared parseCcBinding (same parse
-	// as CcDriver.resolveSession). sink dispatches begin/delta/end(roomId, uid) to the matching
-	// identity's MessageHandler (external-thinking). Only bound when a cc identity exists (don't bind
-	// 9100 otherwise). Closed on shutdown.
+	// REQ-011 S2: if any cc identity is registered, start the CC hook broker. CC's headless hooks POST
+	// here; the bridge sink routes each resolved hook into the active CcHeadlessSession's AgentEvent
+	// stream via the shared ccRegistry, so the standard node-driven path renders the panel. resolve() =
+	// the shared parseCcBinding (same parse as CcHeadlessDriver.resolveSession). Only bound when a cc
+	// identity exists (don't bind 9100 otherwise). Closed on shutdown.
 	let ccBroker: CcBroker | null = null;
 	if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
 		ccBroker = new CcBroker({
 			resolve: parseCcBinding,
-			sink: buildCcSink(() => supervisor.agents),
+			sink: buildCcBridgeSink(ccRegistry),
 		});
 		await ccBroker.listen(ccBrokerPort());
 		console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
-
-		// REQ-011 S2: the CC channel push endpoint — the channel MCP (loaded by CC) subscribes here with
-		// its binding; the handler's cc DM branch pushes inbound DMs. resolve() = the shared parseCcBinding
-		// (same parse as the broker / CcDriver.resolveSession). The buildHandler closure captured this
-		// `let` by reference, so assigning it now wires every cc handler's channelPush.
-		channelEndpoint = new CcChannelEndpoint({ resolve: parseCcBinding });
-		await channelEndpoint.listen(ccChannelPort());
-		console.log(`[start] CC channel endpoint listening on 127.0.0.1:${ccChannelPort()}`);
 	}
 
 	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
@@ -221,7 +214,6 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
 		await endpoint.close().catch(() => {});
 		await ccBroker?.close().catch(() => {});
-		await channelEndpoint?.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		process.exit(0);

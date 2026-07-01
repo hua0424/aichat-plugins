@@ -183,13 +183,6 @@ export class MessageHandler {
 	 */
 	private readonly onTokenExpired?: () => void;
 
-	/**
-	 * REQ-011 S2: push an inbound DM to an owner-driven (CC) identity's channel endpoint. Optional —
-	 * a cc identity without a wired channel endpoint (or any non-cc identity) leaves this undefined and
-	 * the cc DM branch becomes a safe no-op (optional chaining).
-	 */
-	private readonly channelPush?: (roomId: number, content: string) => void;
-
 	constructor(
 		ws: HulaWSClient,
 		driver: AgentDriver,
@@ -197,7 +190,6 @@ export class MessageHandler {
 		apiClient?: HulaApiClient,
 		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
 		onTokenExpired?: () => void,
-		channelPush?: (roomId: number, content: string) => void,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -207,7 +199,6 @@ export class MessageHandler {
 		this.apiClient = apiClient || null;
 		this.debounceOptions = debounceOptions;
 		this.onTokenExpired = onTokenExpired;
-		this.channelPush = channelPush;
 	}
 
 	/**
@@ -389,24 +380,6 @@ export class MessageHandler {
 	}
 
 	/**
-	 * REQ-011 S3: build the attributed chat transcript pushed to an owner-driven (cc) identity's channel.
-	 *
-	 * Parity with openclaw's accumulated-context injection (same un-@ group history is delivered), but
-	 * formatted as a NATURAL chat transcript with sender attribution rather than the node path's
-	 * `[群聊上下文]/[当前消息]` framing. This is load-bearing anti-prompt-injection: CC refuses bare /
-	 * "do X silently" channel text, but processes a naturally-attributed chat message normally and replies
-	 * as the room's assistant. Each line reuses the accumulated buffer's `[name(uid)]: content` shape (the
-	 * current message attributed via the cached lastCtx), with a light `[HuLa 私聊]` / `[HuLa 群聊]` room
-	 * framing prepended. Deliberately NO imperative / "run this" / "don't explain" wording.
-	 */
-	private buildCcChannelContent(ctx: LastMessageContext, accumulated: string[], message: string): string {
-		const room = ctx.roomType === 2 ? '[HuLa 私聊]' : '[HuLa 群聊]';
-		const currentLine = `[${ctx.fromName}(${ctx.fromUid})]: ${message}`;
-		const lines = accumulated.length > 0 ? [...accumulated, currentLine] : [currentLine];
-		return `${room}\n${lines.join('\n')}`;
-	}
-
-	/**
 	 * REQ-004 Agent Loop 触发汇聚点。
 	 * 所有触发路径（直达 debounce / pendingMessages flush / 退避 reschedule）都经此进入，
 	 * 因此防循环守卫在此处按本轮 BATCH 统一评估，杜绝排队消息绕过守卫（issue #22）。
@@ -469,44 +442,19 @@ export class MessageHandler {
 			// 'allow'：继续
 		}
 
-		// 并发防护：必须先于「消费/清空积累缓冲」与 cc channel push——只有真正进入交付路径时才消费缓冲，
-		// 否则早返回会丢弃已清空但从未发送的群聊上下文（P1-a）。cc 与 node 路径共用此守卫。
+		// 并发防护：必须先于「消费/清空积累缓冲」——只有真正进入交付路径时才消费缓冲，否则早返回会丢弃
+		// 已清空但从未发送的群聊上下文（P1-a）。REQ-011 S2：cc 现为 node-driven（drivesTurns=true），
+		// 与 openclaw/opencode/codex 共用此标准守卫与 drop 语义（其消息内容不会因此丢失）。
 		if (this.thinkingSessions.has(sessionKey)) {
-			// REQ-011 S3（P1 竞态）：thinking session 在 handleReceiveMessage 的「thinking 活跃入队」闸
-			// 与此处之间变为活跃（debounce 窗口内；cc 的 external-thinking 由 hooks 异步建，有窗口）。
-			// 对 owner 驱动的 cc 身份，此处直接 return 会**丢失**该入站消息（它是要 push 交付的内容，
-			// 而非 node 路径那种可在思考结束后重跑的触发）→ 改为**入队**，由 endExternalThinking 的
-			// flushPendingMessages 重新交付（下一轮 triggerAgentLoop 再消费 accumulated + 构建归属内容）。
-			// node 路径维持原 drop 语义（其消息内容不会因此丢失）。
-			if (this.driver.drivesTurns === false) {
-				channel.pendingMessages.push(message);
-				console.warn(`[handler] cc inbound during active thinking → enqueued (not dropped), room ${roomId}`);
-				return;
-			}
 			console.warn(`[handler] Thinking session already active for ${sessionKey}`);
 			return;
 		}
 
 		// REQ-004 S5: 消费惰性积累的群聊上下文（自上次回复以来未点名的消息），随后清空缓冲。
-		// 必须放在并发防护早返回之后——只有真正进入交付（node thinking / cc channel push）时才消费/清空缓冲，
-		// 否则早返回会丢弃已清空但从未发送的群聊上下文。REQ-011 S3：node 与 cc 共享同一份消费结果，
-		// 让 cc 拿到与 openclaw 一致的累计群聊上下文（context parity）。
+		// 必须放在并发防护早返回之后——只有真正进入交付（thinking session）时才消费/清空缓冲，
+		// 否则早返回会丢弃已清空但从未发送的群聊上下文。
 		const accumulated = channel.accumulatedMessages;
 		channel.accumulatedMessages = [];
-
-		// REQ-010 S7 / REQ-011 S2+S3: an owner-driven driver (CC: drivesTurns===false) is NOT turn-driven
-		// by node — the owner drives the TUI by hand, and node must never open a thinking session for it
-		// (CC's hooks drive thinking via the broker). Placed HERE, AFTER the anti-loop guard + concurrency
-		// guard + accumulated consume, so a cc identity is subject to the SAME gates as a node-driven one AND
-		// gets the SAME accumulated group context (parity). It pushes BOTH DM and @-mentioned group — group
-		// eligibility is already enforced upstream by handleReceiveMessage's @-gate (un-@'d group messages
-		// are accumulated and never reach here). The pushed content is an ATTRIBUTED natural chat transcript
-		// (sender name + a light room framing), NOT bare/instruction-like text — load-bearing: CC's
-		// anti-prompt-injection refuses bare channel messages. No node thinking session / THINKING_START for cc.
-		if (this.driver.drivesTurns === false) {
-			this.channelPush?.(roomId, this.buildCcChannelContent(channel.lastCtx, accumulated, message));
-			return;
-		}
 
 		const agentMessage =
 			accumulated.length > 0
@@ -939,11 +887,10 @@ export class MessageHandler {
 	/**
 	 * REQ-010 S7: 结束外部 thinking → 发 THINKING_END {status:'complete', content, durationMs}
 	 * （镜像 finalizeComplete 的帧形状），并清理会话。无 active session / 已 finalized 时安全 no-op。
+	 * 收尾后 flushPendingMessages，让外部 thinking 活跃期间入队的消息得以重新交付。
 	 *
-	 * REQ-011 S2: 同 finalizeComplete 一样在收尾后 flushPendingMessages —— 外部 thinking 活跃期间
-	 * （session 已存在，handleReceiveMessage 会把后续消息入队而非直推）到达的消息（如 CC 处理首条
-	 * DM 期间来的第 2 条 DM）必须在此 flush，否则它们会卡在 pendingMessages 里：owner 驱动的 cc
-	 * 身份 node 永不主动驱动一轮去消费它们。flush 后这些消息重入 triggerAgentLoop → cc DM 分支 → channelPush。
+	 * REQ-011 S2: cc 已改为 node-driven（CcHeadlessDriver），thinking 经 CcBroker→CcSessionRegistry
+	 * 桥接进 driver 的 AgentEvent 流，走标准路径。以下 external-thinking 方法保留（无害）但生产不再调用。
 	 */
 	endExternalThinking(roomId: number, fromUid: number): void {
 		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
