@@ -271,6 +271,15 @@ class CcHeadlessSession implements AgentSession {
 	/** REQ-011 S3: the session_id this turn runs under (stored on resume, updated on system/init), for transcript records. */
 	private sessionId: string | undefined;
 
+	// REQ-011 S5 (#112): --resume self-heal bookkeeping.
+	/** Per-attempt token: every async handler early-returns unless it still matches, so a killed
+	 * resume-child's late events cannot disturb the fresh retry attempt (stale-child guard). */
+	private attemptSeq = 0;
+	/** Whether THIS attempt spawned with `--resume` (a stored session_id existed at spawn time). */
+	private attemptUsedResume = false;
+	/** One-shot: a dead-`--resume` failure self-heals ONCE (clear id + fresh retry); a second failure is real. */
+	private retriedFresh = false;
+
 	constructor(deps: CcHeadlessSessionDeps) {
 		this.d = deps;
 	}
@@ -468,6 +477,7 @@ class CcHeadlessSession implements AgentSession {
 		this.sessionId = this.d.sessionStore.get(this.key)?.sessionId;
 		const attributed = this.enrich(message);
 		// AC9: the INBOUND record — the attributed message the owner's CC actually received this turn.
+		// Appended ONCE per turn (not per attempt): a self-heal retry is the SAME inbound message.
 		this.d.transcript.append(this.d.binding, {
 			ts: this.turnStart,
 			session_id: this.sessionId,
@@ -478,6 +488,31 @@ class CcHeadlessSession implements AgentSession {
 		// Register the room bridge BEFORE spawning, so a hook that fires early still routes here.
 		this.d.registry.register(this.d.roomId, (ev) => this.push(ev));
 
+		this.spawnAttempt(attributed);
+		return this.iterable();
+	}
+
+	/**
+	 * REQ-011 S5 (#112): one spawn attempt of the turn. Extracted from send() so the turn can retry FRESH
+	 * (self-heal) after a dead `--resume`. Builds argv, spawns, installs the first-event watchdog + the
+	 * stale-child-guarded stdout/stderr/error/exit handlers, and writes the stdin envelope. Per-attempt
+	 * state (firstEventSeen, buffers, watchdog) is reset here; turn-spanning state (queue, turnStart,
+	 * turnComplete, ended) is preserved so a retry continues the SAME turn.
+	 */
+	private spawnAttempt(attributed: string): void {
+		// Stale-child guard token: bumped each attempt so a killed resume-child's late events are dropped.
+		const myAttempt = ++this.attemptSeq;
+		// Reset per-attempt state (the turn-spanning queue/turnStart/turnComplete/ended are left as-is).
+		this.firstEventSeen = false;
+		this.stdoutBuf = '';
+		this.stderrBuf = '';
+		if (this.firstEventTimer) clearTimeout(this.firstEventTimer);
+		this.firstEventTimer = null;
+
+		// buildArgv() appends `--resume` iff a session_id is stored; capture whether THIS attempt used it,
+		// so a failure with `--resume` self-heals (clear + fresh retry) while a fresh failure is real.
+		this.attemptUsedResume = !!this.d.sessionStore.get(this.key)?.sessionId;
+
 		let child: CcChild;
 		try {
 			child = this.d.spawn(this.d.claudeBin, this.buildArgv(), {
@@ -487,35 +522,49 @@ class CcHeadlessSession implements AgentSession {
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
 		} catch (err) {
-			this.fail(err instanceof Error ? err.message : String(err));
-			return this.iterable();
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
+			return;
 		}
 		this.child = child;
 
-		// First-event (stdout) watchdog.
+		// First-event (stdout) watchdog. A hung attempt kills its group and self-heals (may be a dead resume).
 		this.firstEventTimer = setTimeout(() => {
+			if (myAttempt !== this.attemptSeq) return;
 			if (this.ended || this.firstEventSeen) return;
-			this.push({ type: 'error', message: 'first-event timeout' });
 			this.killChild();
-			this.finish();
+			this.onAttemptFailure('first-event timeout', attributed);
 		}, this.d.firstEventTimeoutMs);
 		if (typeof this.firstEventTimer === 'object' && 'unref' in this.firstEventTimer) this.firstEventTimer.unref();
 
-		child.stdout?.on('data', (c) => this.handleStdoutChunk(c));
+		child.stdout?.on('data', (c) => {
+			if (myAttempt !== this.attemptSeq) return;
+			this.handleStdoutChunk(c);
+		});
 		// EOF backstop: if the turn never emitted a `result`, EOF still completes it.
-		child.stdout?.on('end', () => this.complete());
-		child.stdout?.on('close', () => this.complete());
+		child.stdout?.on('end', () => {
+			if (myAttempt !== this.attemptSeq) return;
+			this.complete();
+		});
+		child.stdout?.on('close', () => {
+			if (myAttempt !== this.attemptSeq) return;
+			this.complete();
+		});
 		child.stderr?.on('data', (c) => {
+			if (myAttempt !== this.attemptSeq) return;
 			this.stderrBuf += typeof c === 'string' ? c : c.toString('utf-8');
 		});
-		child.on('error', (err) => this.fail(err instanceof Error ? err.message : String(err)));
+		child.on('error', (err) => {
+			if (myAttempt !== this.attemptSeq) return;
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
+		});
 		child.on('exit', (code) => {
+			if (myAttempt !== this.attemptSeq) return;
 			if (this.ended || this.turnComplete) return;
 			if (code === 0) {
 				this.complete(); // clean exit without a parsed `result` → treat as complete
 			} else {
 				const tail = this.stderrBuf.trim().slice(-500);
-				this.fail(`claude exited ${code}${tail ? `: ${tail}` : ''}`);
+				this.onAttemptFailure(`claude exited ${code}${tail ? `: ${tail}` : ''}`, attributed);
 			}
 		});
 
@@ -528,10 +577,31 @@ class CcHeadlessSession implements AgentSession {
 			child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			child.stdin?.end();
 		} catch (err) {
-			this.fail(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
 		}
+	}
 
-		return this.iterable();
+	/**
+	 * REQ-011 S5 (#112): route EVERY per-attempt failure (spawn throw, child `error`, non-zero exit,
+	 * first-event timeout) here. If this attempt used `--resume` and we have not yet retried, the stored
+	 * session_id is probably DEAD (e.g. `~/.claude` reverted after a container redeploy) → clear it and
+	 * retry the SAME turn ONCE with a fresh session (buildArgv now omits `--resume`). A fresh attempt (or
+	 * an already-retried turn) that fails is a genuine error — emit it (no further retry → no infinite loop).
+	 * Per #112 we do NOT distinguish "session-not-found" from a transient error: a false-positive clear
+	 * costs at most this one turn's context (the fresh retry), which is acceptable.
+	 */
+	private onAttemptFailure(message: string, attributed: string): void {
+		if (this.ended || this.turnComplete) return;
+		if (this.attemptUsedResume && !this.retriedFresh) {
+			this.retriedFresh = true;
+			this.d.sessionStore.delete(this.key); // clear the dead session_id → fresh retry
+			this.sessionId = undefined;
+			this.killChild(); // reap the failed resume-child's process group
+			this.child = null;
+			this.spawnAttempt(attributed); // buildArgv now omits --resume → fresh retry (same turn)
+			return;
+		}
+		this.fail(message); // fresh attempt (or already retried) failed → real error
 	}
 
 	private iterable(): AsyncIterable<AgentEvent> {

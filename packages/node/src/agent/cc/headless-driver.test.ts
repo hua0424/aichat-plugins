@@ -97,6 +97,77 @@ function fakeSpawn(pid = 4242) {
 	};
 }
 
+/**
+ * A spawn fn that returns a FRESH fake child on EACH call and records per-call handles, so a single
+ * turn that self-heals (spawns twice: dead `--resume` → fresh retry) can be driven per-attempt.
+ */
+function fakeMultiSpawn(basePid = 4242) {
+	const calls: Array<{
+		command: string;
+		args: readonly string[];
+		options: Record<string, unknown>;
+		pid: number;
+		child: CcChild;
+		stdinWrites: string[];
+		stdinEnd: ReturnType<typeof vi.fn>;
+		kill: ReturnType<typeof vi.fn>;
+		emitStdout: (s: string) => void;
+		emitStderr: (s: string) => void;
+		endStdout: () => void;
+		emitExit: (code: number | null) => void;
+		emitError: (e: Error) => void;
+	}> = [];
+
+	const spawn: CcSpawnFn = (command, args, options) => {
+		const pid = basePid + calls.length;
+		const dataCbs: Array<(c: Buffer | string) => void> = [];
+		const endCbs: Array<() => void> = [];
+		const stderrCbs: Array<(c: Buffer | string) => void> = [];
+		const errorCbs: Array<(e: Error) => void> = [];
+		const exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
+		const stdinWrites: string[] = [];
+		const stdinEnd = vi.fn();
+		const kill = vi.fn(() => true);
+		const child: CcChild = {
+			pid,
+			stdin: { write: (c: string) => void stdinWrites.push(c), end: () => stdinEnd() },
+			stdout: {
+				on: (event: string, listener: (...a: never[]) => void) => {
+					if (event === 'data') dataCbs.push(listener as (c: Buffer | string) => void);
+					if (event === 'end' || event === 'close') endCbs.push(listener as () => void);
+				},
+			} as CcChild['stdout'],
+			stderr: {
+				on: (event: string, listener: (...a: never[]) => void) => {
+					if (event === 'data') stderrCbs.push(listener as (c: Buffer | string) => void);
+				},
+			} as CcChild['stderr'],
+			on: (event: string, listener: (...a: never[]) => void) => {
+				if (event === 'error') errorCbs.push(listener as (e: Error) => void);
+				if (event === 'exit' || event === 'close') exitCbs.push(listener as (c: number | null, s: string | null) => void);
+			},
+			kill,
+		};
+		calls.push({
+			command,
+			args,
+			options: options as unknown as Record<string, unknown>,
+			pid,
+			child,
+			stdinWrites,
+			stdinEnd,
+			kill,
+			emitStdout: (s) => dataCbs.forEach((cb) => cb(s)),
+			emitStderr: (s) => stderrCbs.forEach((cb) => cb(s)),
+			endStdout: () => endCbs.forEach((cb) => cb()),
+			emitExit: (code) => exitCbs.forEach((cb) => cb(code, null)),
+			emitError: (e) => errorCbs.forEach((cb) => cb(e)),
+		});
+		return child;
+	};
+	return { spawn, calls };
+}
+
 async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 	const out: AgentEvent[] = [];
 	for await (const ev of stream) out.push(ev);
@@ -545,5 +616,182 @@ describe('CcHeadlessDriver — REQ-011 S3 resetSession', () => {
 		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
 		session.send('hi');
 		expect(fs.spawnCall!.args).not.toContain('--resume');
+	});
+});
+
+// ─── REQ-011 S5 (#112): --resume self-heal (dead session_id after a container redeploy) ───
+
+describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
+	it('dead-resume (non-zero exit) self-heals: clears the stored id, retries fresh, succeeds', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store, kill } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-dead' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		// attempt 1 resumed the (now dead) session and then failed non-zero
+		expect(fms.calls.length).toBe(1);
+		expect(fms.calls[0].args).toContain('--resume');
+		expect(fms.calls[0].args[fms.calls[0].args.indexOf('--resume') + 1]).toBe('sid-dead');
+		fms.calls[0].emitStderr('No conversation found with session ID sid-dead');
+		fms.calls[0].emitExit(1);
+
+		// self-heal: exactly ONE retry, FRESH (no --resume), and the dead id was cleared before it
+		expect(fms.calls.length).toBe(2);
+		expect(fms.calls[1].args).not.toContain('--resume');
+		// the resume-child's process group was reaped
+		expect(kill).toHaveBeenCalledWith(-fms.calls[0].pid, 'SIGTERM');
+
+		// drive the fresh attempt to success
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-new' })}\n`);
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events[events.length - 1].type).toBe('done');
+		expect(store.map.get(KEY)?.sessionId).toBe('sid-new'); // fresh attempt re-populated the store
+		expect(fms.calls.length).toBe(2); // no third spawn
+	});
+
+	it('dead-resume (first-event timeout) self-heals: kills the resume-child group, retries fresh', async () => {
+		vi.useFakeTimers();
+		try {
+			const fms = fakeMultiSpawn();
+			const { driver, store, kill } = makeDriver({ spawn: fms.spawn, firstEventTimeoutMs: 20, drainMs: 10 });
+			store.set(KEY, { sessionId: 'sid-dead' });
+			const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+			const stream = session.send('hi');
+
+			// attempt 1 resumed but emits NO stdout within the watchdog window
+			expect(fms.calls.length).toBe(1);
+			expect(fms.calls[0].args).toContain('--resume');
+			await vi.advanceTimersByTimeAsync(20); // first-event timeout fires → self-heal
+
+			expect(fms.calls.length).toBe(2);
+			expect(fms.calls[1].args).not.toContain('--resume');
+			expect(store.map.has(KEY)).toBe(false); // dead id cleared before the retry
+			expect(kill).toHaveBeenCalledWith(-fms.calls[0].pid, 'SIGTERM'); // resume-child group reaped
+
+			// fresh attempt succeeds
+			fms.calls[1].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-new' })}\n`);
+			fms.calls[1].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+			await vi.advanceTimersByTimeAsync(10); // drain window
+			const events = await drain(stream);
+
+			expect(events.some((e) => e.type === 'error')).toBe(false);
+			expect(events[events.length - 1].type).toBe('done');
+			expect(store.map.get(KEY)?.sessionId).toBe('sid-new');
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('dead-resume (spawn `error` event) self-heals: retries fresh', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-dead' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		expect(fms.calls[0].args).toContain('--resume');
+		fms.calls[0].emitError(new Error('spawn hiccup'));
+
+		expect(fms.calls.length).toBe(2);
+		expect(fms.calls[1].args).not.toContain('--resume');
+		expect(store.map.has(KEY)).toBe(false);
+
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-new' })}\n`);
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events[events.length - 1].type).toBe('done');
+	});
+
+	it('valid-resume is UNAFFECTED: a resuming attempt that succeeds does NOT clear or re-spawn', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-live' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		expect(fms.calls.length).toBe(1);
+		expect(fms.calls[0].args).toContain('--resume');
+		expect(fms.calls[0].args[fms.calls[0].args.indexOf('--resume') + 1]).toBe('sid-live');
+
+		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-live2' })}\n`);
+		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+
+		expect(fms.calls.length).toBe(1); // no self-heal retry
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events[events.length - 1].type).toBe('done');
+		expect(store.map.get(KEY)?.sessionId).toBe('sid-live2'); // store follows the resumed turn's new id
+	});
+
+	it('fresh attempt failure does NOT retry (no stored session → single spawn → {error})', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		// no stored session_id
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		expect(fms.calls[0].args).not.toContain('--resume');
+		fms.calls[0].emitStderr('genuine failure');
+		fms.calls[0].emitExit(1);
+		const events = await drain(stream);
+
+		expect(fms.calls.length).toBe(1); // fresh failure is not retried
+		expect(events).toHaveLength(1);
+		expect(events[0].type).toBe('error');
+		expect((events[0] as { message: string }).message).toContain('claude exited 1');
+		expect(store.map.has(KEY)).toBe(false);
+	});
+
+	it('dead-resume then fresh retry ALSO fails → exactly TWO spawns then {error} (no third)', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-dead' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		// attempt 1 (resume) fails → self-heal
+		fms.calls[0].emitExit(1);
+		expect(fms.calls.length).toBe(2);
+		expect(fms.calls[1].args).not.toContain('--resume');
+		// attempt 2 (fresh) ALSO fails → genuine error, no third attempt
+		fms.calls[1].emitStderr('still broken');
+		fms.calls[1].emitExit(1);
+		const events = await drain(stream);
+
+		expect(fms.calls.length).toBe(2);
+		expect(events).toHaveLength(1);
+		expect(events[0].type).toBe('error');
+		expect((events[0] as { message: string }).message).toContain('claude exited 1');
+	});
+
+	it('a stale (killed) resume-child late event is IGNORED: no spurious {error}/{done}, fresh attempt undisturbed', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-dead' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		// attempt 1 (resume) fails → self-heal to a fresh attempt 2
+		fms.calls[0].emitExit(1);
+		expect(fms.calls.length).toBe(2);
+
+		// the OLD resume-child now emits late events (e.g. from the kill) — they must be dropped
+		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		fms.calls[0].emitExit(137);
+		fms.calls[0].endStdout();
+
+		// the fresh attempt proceeds normally and is the ONLY thing that drives the stream
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-new' })}\n`);
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events.filter((e) => e.type === 'done')).toHaveLength(1); // exactly one done, from the fresh attempt
+		expect(store.map.get(KEY)?.sessionId).toBe('sid-new');
 	});
 });
