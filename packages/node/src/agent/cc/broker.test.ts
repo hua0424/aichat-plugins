@@ -1,17 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CcBroker, ccBrokerPort, type ExternalThinkingSink } from './broker.js';
+import { CcBroker, ccBrokerPort, type CcHookSink } from './broker.js';
 
-/** A spy sink recording (roomId, aiclawUid[, text]) per call. */
+/** A spy sink recording (roomId, aiclawUid[, name/text]) per call. */
 function fakeSink() {
-	const begins: Array<{ roomId: number; aiclawUid: number }> = [];
-	const deltas: Array<{ roomId: number; aiclawUid: number; text: string }> = [];
-	const ends: Array<{ roomId: number; aiclawUid: number }> = [];
-	const sink: ExternalThinkingSink = {
-		begin: vi.fn((roomId, aiclawUid) => begins.push({ roomId, aiclawUid })),
-		delta: vi.fn((roomId, aiclawUid, text) => deltas.push({ roomId, aiclawUid, text })),
-		end: vi.fn((roomId, aiclawUid) => ends.push({ roomId, aiclawUid })),
+	const tools: Array<{ roomId: number; aiclawUid: number; toolName: string }> = [];
+	const thinkings: Array<{ roomId: number; aiclawUid: number; text: string }> = [];
+	const flushes: Array<{ roomId: number; aiclawUid: number }> = [];
+	const sink: CcHookSink = {
+		tool: vi.fn((roomId, aiclawUid, toolName) => tools.push({ roomId, aiclawUid, toolName })),
+		thinking: vi.fn((roomId, aiclawUid, text) => thinkings.push({ roomId, aiclawUid, text })),
+		flush: vi.fn((roomId, aiclawUid) => flushes.push({ roomId, aiclawUid })),
 	};
-	return { sink, begins, deltas, ends };
+	return { sink, tools, thinkings, flushes };
 }
 
 /** A resolve() that maps one known token → a fixed binding; everything else undefined. */
@@ -36,7 +36,7 @@ describe('CcBroker.handle — guards', () => {
 
 		expect(out.status).toBe(403);
 		expect(resolve).not.toHaveBeenCalled();
-		expect(sink.begin).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
 	});
 
 	it('allows a loopback remoteAddress (127.0.0.1)', async () => {
@@ -44,23 +44,23 @@ describe('CcBroker.handle — guards', () => {
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
 		const out = await broker.handle({
-			body: { hook_event_name: 'UserPromptSubmit' },
+			body: { hook_event_name: 'MessageDisplay', content: 'hi' },
 			remoteAddress: '127.0.0.1',
 			authToken: BIND,
 		});
 
 		expect(out.status).toBe(200);
-		expect(sink.begin).toHaveBeenCalledWith(7, 999);
+		expect(sink.thinking).toHaveBeenCalledWith(7, 999, 'hi');
 	});
 
 	it('allows an undefined remoteAddress', async () => {
 		const { sink } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
-		const out = await broker.handle({ body: { hook_event_name: 'SessionStart' }, authToken: BIND });
+		const out = await broker.handle({ body: { hook_event_name: 'Stop' }, authToken: BIND });
 
 		expect(out.status).toBe(200);
-		expect(sink.begin).toHaveBeenCalledWith(7, 999);
+		expect(sink.flush).toHaveBeenCalledWith(7, 999);
 	});
 });
 
@@ -70,7 +70,7 @@ describe('CcBroker.handle — binding resolution', () => {
 		const resolve = fakeResolver(BIND, BINDING);
 		const broker = new CcBroker({ resolve, sink });
 
-		await broker.handle({ body: { hook_event_name: 'SessionStart' }, authToken: BIND });
+		await broker.handle({ body: { hook_event_name: 'Stop' }, authToken: BIND });
 
 		expect(resolve).toHaveBeenCalledWith(BIND);
 	});
@@ -80,27 +80,27 @@ describe('CcBroker.handle — binding resolution', () => {
 		const resolve = fakeResolver(BIND, BINDING);
 		const broker = new CcBroker({ resolve, sink });
 
-		const out = await broker.handle({ body: { hook_event_name: 'UserPromptSubmit' }, authToken: 'wrong' });
+		const out = await broker.handle({ body: { hook_event_name: 'MessageDisplay', content: 'x' }, authToken: 'wrong' });
 
 		expect([401, 404]).toContain(out.status);
-		expect(sink.begin).not.toHaveBeenCalled();
-		expect(sink.delta).not.toHaveBeenCalled();
-		expect(sink.end).not.toHaveBeenCalled();
+		expect(sink.tool).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
+		expect(sink.flush).not.toHaveBeenCalled();
 	});
 
 	it('missing token → 401/404 and sink NOT called', async () => {
 		const { sink } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
-		const out = await broker.handle({ body: { hook_event_name: 'UserPromptSubmit' } });
+		const out = await broker.handle({ body: { hook_event_name: 'MessageDisplay', content: 'x' } });
 
 		expect([401, 404]).toContain(out.status);
-		expect(sink.begin).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
 	});
 });
 
 describe('CcBroker.handle — hook event → sink mapping', () => {
-	it('UserPromptSubmit → sink.begin(roomId, aiclawUid)', async () => {
+	it('UserPromptSubmit → lifecycle ignored (no sink call), 200 ok', async () => {
 		const { sink } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
@@ -108,20 +108,23 @@ describe('CcBroker.handle — hook event → sink mapping', () => {
 
 		expect(out.status).toBe(200);
 		expect(out.json).toEqual({ ok: true });
-		expect(sink.begin).toHaveBeenCalledWith(7, 999);
+		expect(sink.tool).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
+		expect(sink.flush).not.toHaveBeenCalled();
 	});
 
-	it('SessionStart → sink.begin(roomId, aiclawUid)', async () => {
+	it('SessionStart → lifecycle ignored (no sink call)', async () => {
 		const { sink } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
 		await broker.handle({ body: { hook_event_name: 'SessionStart', source: 'startup' }, authToken: BIND });
 
-		expect(sink.begin).toHaveBeenCalledWith(7, 999);
+		expect(sink.thinking).not.toHaveBeenCalled();
+		expect(sink.tool).not.toHaveBeenCalled();
 	});
 
-	it('PostToolUse → sink.delta with "[工具] " + tool_name + truncated tool_input JSON', async () => {
-		const { sink, deltas } = fakeSink();
+	it('PostToolUse → sink.tool(roomId, aiclawUid, tool_name)', async () => {
+		const { sink, tools } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
 		await broker.handle({
@@ -134,40 +137,39 @@ describe('CcBroker.handle — hook event → sink mapping', () => {
 			authToken: BIND,
 		});
 
-		expect(sink.delta).toHaveBeenCalledTimes(1);
-		expect(deltas[0].roomId).toBe(7);
-		expect(deltas[0].aiclawUid).toBe(999);
-		expect(deltas[0].text).toContain('[工具] Bash');
-		expect(deltas[0].text).toContain('ls -la');
+		expect(sink.tool).toHaveBeenCalledTimes(1);
+		expect(tools[0]).toEqual({ roomId: 7, aiclawUid: 999, toolName: 'Bash' });
 	});
 
-	it('PostToolUse → tool_input JSON is sliced to 200 chars', async () => {
-		const { sink, deltas } = fakeSink();
+	it('PostToolUse with no tool_name → falls back to "tool"', async () => {
+		const { sink, tools } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
-		const longCmd = 'x'.repeat(500);
-		await broker.handle({
-			body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { command: longCmd } },
-			authToken: BIND,
-		});
+		await broker.handle({ body: { hook_event_name: 'PostToolUse' }, authToken: BIND });
 
-		const text = deltas[0].text;
-		// "[工具] Bash " prefix + at most 200 chars of JSON
-		const jsonPart = text.slice('[工具] Bash '.length);
-		expect(jsonPart.length).toBeLessThanOrEqual(200);
+		expect(tools[0].toolName).toBe('tool');
 	});
 
-	it('MessageDisplay → sink.delta(content)', async () => {
-		const { sink, deltas } = fakeSink();
+	it('MessageDisplay → sink.thinking(content)', async () => {
+		const { sink, thinkings } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
 		await broker.handle({ body: { hook_event_name: 'MessageDisplay', content: 'streaming text' }, authToken: BIND });
 
-		expect(sink.delta).toHaveBeenCalledTimes(1);
-		expect(deltas[0].text).toBe('streaming text');
+		expect(sink.thinking).toHaveBeenCalledTimes(1);
+		expect(thinkings[0].text).toBe('streaming text');
 	});
 
-	it('Stop → sink.end(roomId, aiclawUid)', async () => {
+	it('MessageDisplay with empty content → no sink call', async () => {
+		const { sink } = fakeSink();
+		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
+
+		await broker.handle({ body: { hook_event_name: 'MessageDisplay', content: '' }, authToken: BIND });
+
+		expect(sink.thinking).not.toHaveBeenCalled();
+	});
+
+	it('Stop → sink.flush(roomId, aiclawUid) (does NOT close the session)', async () => {
 		const { sink } = fakeSink();
 		const broker = new CcBroker({ resolve: fakeResolver(BIND, BINDING), sink });
 
@@ -176,7 +178,7 @@ describe('CcBroker.handle — hook event → sink mapping', () => {
 			authToken: BIND,
 		});
 
-		expect(sink.end).toHaveBeenCalledWith(7, 999);
+		expect(sink.flush).toHaveBeenCalledWith(7, 999);
 	});
 
 	it('an unknown hook_event_name → 200 ok but no sink call', async () => {
@@ -186,9 +188,9 @@ describe('CcBroker.handle — hook event → sink mapping', () => {
 		const out = await broker.handle({ body: { hook_event_name: 'WeirdEvent' }, authToken: BIND });
 
 		expect(out.status).toBe(200);
-		expect(sink.begin).not.toHaveBeenCalled();
-		expect(sink.delta).not.toHaveBeenCalled();
-		expect(sink.end).not.toHaveBeenCalled();
+		expect(sink.tool).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
+		expect(sink.flush).not.toHaveBeenCalled();
 	});
 
 	it('a malformed body (no hook_event_name) → 400, no sink call, but only after resolve', async () => {
@@ -198,7 +200,7 @@ describe('CcBroker.handle — hook event → sink mapping', () => {
 		const out = await broker.handle({ body: { not_a_hook: true }, authToken: BIND });
 
 		expect(out.status).toBe(400);
-		expect(sink.begin).not.toHaveBeenCalled();
+		expect(sink.thinking).not.toHaveBeenCalled();
 	});
 });
 
@@ -218,7 +220,7 @@ describe('CcBroker.listen / close — real TCP loopback', () => {
 			});
 			expect(res.status).toBe(200);
 			await res.json();
-			expect(sink.end).toHaveBeenCalledWith(7, 999);
+			expect(sink.flush).toHaveBeenCalledWith(7, 999);
 		} finally {
 			await broker.close();
 		}
@@ -236,7 +238,7 @@ describe('CcBroker.listen / close — real TCP loopback', () => {
 				body: JSON.stringify({ hook_event_name: 'Stop' }),
 			});
 			expect([401, 404]).toContain(res.status);
-			expect(sink.end).not.toHaveBeenCalled();
+			expect(sink.flush).not.toHaveBeenCalled();
 		} finally {
 			await broker.close();
 		}
