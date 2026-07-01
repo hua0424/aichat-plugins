@@ -6,6 +6,31 @@ import { parseCcBinding } from './cc-driver.js';
 import { buildCcSettings, writeCcSettings, CC_REPLY_CONTRACT } from './launch.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
+import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
+
+/**
+ * REQ-011 S3 — build the cc stdin channel content with per-sender attribution (anti-prompt-injection).
+ *
+ * VERBATIM the format resurrected from commit 645fec2 (do NOT re-invent): a NATURAL chat transcript,
+ * NOT bare/imperative text. CC's anti-prompt-injection is stronger than the other three drivers (they
+ * tolerate a bare current message; CC refuses bare / "do X silently" channel text but processes a
+ * naturally-attributed chat message and replies as the room's assistant), so attribution is cc-specific
+ * and lives here in the driver — never a handler behaviour branch.
+ *   DM    (roomType===2) → `[HuLa 私聊]\n[fromName(fromUid)]: <message>`
+ *   group (else)         → `[HuLa 群聊]\n<accumulated lines>\n[fromName(fromUid)]: <current>`
+ */
+export function buildCcChannelContent(o: {
+	roomType: number;
+	fromName: string;
+	fromUid: number;
+	accumulated: string[];
+	message: string;
+}): string {
+	const room = o.roomType === 2 ? '[HuLa 私聊]' : '[HuLa 群聊]';
+	const currentLine = `[${o.fromName}(${o.fromUid})]: ${o.message}`;
+	const lines = o.accumulated.length > 0 ? [...o.accumulated, currentLine] : [currentLine];
+	return `${room}\n${lines.join('\n')}`;
+}
 
 /**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
@@ -72,6 +97,11 @@ export interface CcHeadlessDriverDeps {
 	sessionStore: CcHeadlessSessionStore;
 	/** Per-room bridge: hooks routed by the broker land in the active session's stream via this. */
 	registry: CcSessionRegistry;
+	/**
+	 * REQ-011 S3 (AC5/AC9): per-room append-only transcript sink (inbound + teed CC output). Injectable
+	 * for tests; defaults to the file-backed writer under ~/.aichat/cc/transcripts.
+	 */
+	transcript?: CcTranscriptWriter;
 	/** Spawn fn (injectable for tests). Default node:child_process.spawn. */
 	spawn?: CcSpawnFn;
 	/** Kill fn (injectable for tests). Default process.kill. */
@@ -101,6 +131,7 @@ export class CcHeadlessDriver implements AgentDriver {
 	private readonly brokerPort: number;
 	private readonly sessionStore: CcHeadlessSessionStore;
 	private readonly registry: CcSessionRegistry;
+	private readonly transcript: CcTranscriptWriter;
 	private readonly spawn: CcSpawnFn;
 	private readonly kill: CcKillFn;
 	private readonly firstEventTimeoutMs: number;
@@ -116,6 +147,7 @@ export class CcHeadlessDriver implements AgentDriver {
 		this.brokerPort = deps.brokerPort;
 		this.sessionStore = deps.sessionStore;
 		this.registry = deps.registry;
+		this.transcript = deps.transcript ?? new FileCcTranscriptWriter();
 		this.spawn = deps.spawn ?? (nodeSpawn as unknown as CcSpawnFn);
 		this.kill = deps.kill ?? ((pid, signal) => void process.kill(pid, signal));
 		this.firstEventTimeoutMs = deps.firstEventTimeoutMs ?? DEFAULT_FIRST_EVENT_TIMEOUT_MS;
@@ -139,6 +171,16 @@ export class CcHeadlessDriver implements AgentDriver {
 		return parseCcBinding(sessionKey);
 	}
 
+	/**
+	 * REQ-011 S3 (§3) — reset the CC session for a room: drop the stored `session_id` so the NEXT turn
+	 * spawns FRESH (no `--resume`, no prior conversation context). A first-trigger (no stored id) already
+	 * spawns fresh, so this simply returns a room to that state. Minimal v1 entry point (a method; no
+	 * client UX) — an `aichat` CLI subcommand can wrap it later if needed.
+	 */
+	resetSession(aiclawUid: number, roomId: number): void {
+		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+	}
+
 	async openSession(o: {
 		aiclawUid: number;
 		roomId: number;
@@ -153,11 +195,19 @@ export class CcHeadlessDriver implements AgentDriver {
 		const session = new CcHeadlessSession({
 			binding,
 			roomId: o.roomId,
+			// REQ-011 S3: per-turn attribution — the current sender + un-@ group-context lines, used to
+			// build the per-sender-attributed stdin envelope (buildCcChannelContent). counterpartUid IS
+			// the current message's fromUid (handler sets it). Defaults keep a bare ctx safe.
+			roomType: typeof ctx.roomType === 'number' ? ctx.roomType : 1,
+			fromName: ctx.fromName ?? 'unknown',
+			fromUid: ctx.counterpartUid ?? 0,
+			accumulated: ctx.accumulated ?? [],
 			workspaceDir,
 			settingsPath,
 			claudeBin: this.claudeBin,
 			sessionStore: this.sessionStore,
 			registry: this.registry,
+			transcript: this.transcript,
 			spawn: this.spawn,
 			kill: this.kill,
 			firstEventTimeoutMs: this.firstEventTimeoutMs,
@@ -173,11 +223,17 @@ export class CcHeadlessDriver implements AgentDriver {
 interface CcHeadlessSessionDeps {
 	binding: string;
 	roomId: number;
+	/** REQ-011 S3: attribution context for this turn's stdin envelope. */
+	roomType: number;
+	fromName: string;
+	fromUid: number;
+	accumulated: string[];
 	workspaceDir: string;
 	settingsPath: string;
 	claudeBin: string;
 	sessionStore: CcHeadlessSessionStore;
 	registry: CcSessionRegistry;
+	transcript: CcTranscriptWriter;
 	spawn: CcSpawnFn;
 	kill: CcKillFn;
 	firstEventTimeoutMs: number;
@@ -212,6 +268,8 @@ class CcHeadlessSession implements AgentSession {
 	private killTimer: ReturnType<typeof setTimeout> | null = null;
 	private stdoutBuf = '';
 	private stderrBuf = '';
+	/** REQ-011 S3: the session_id this turn runs under (stored on resume, updated on system/init), for transcript records. */
+	private sessionId: string | undefined;
 
 	constructor(deps: CcHeadlessSessionDeps) {
 		this.d = deps;
@@ -311,6 +369,7 @@ class CcHeadlessSession implements AgentSession {
 		this.onFirstEvent();
 		const type = obj.type;
 		if (type === 'system' && obj.subtype === 'init' && typeof obj.session_id === 'string' && obj.session_id) {
+			this.sessionId = obj.session_id;
 			this.d.sessionStore.set(this.key, { sessionId: obj.session_id });
 			return;
 		}
@@ -318,7 +377,36 @@ class CcHeadlessSession implements AgentSession {
 			this.complete();
 			return;
 		}
-		// Every other stdout event is control-plane noise for our purposes → ignore.
+		// REQ-011 S3 (AC9): RAW TEE of CC's output to the per-room transcript so the owner sees the full
+		// session. This is NOT control-plane parsing (the panel/reply still come from hooks/the CLI) — it
+		// is a passive tee for the owner, never fed back into the reply/thinking path.
+		this.teeOutput(obj);
+	}
+
+	/**
+	 * REQ-011 S3 (AC9): tee an `assistant` stdout event's content blocks to the transcript — assistant
+	 * text / thinking as `text`, tool_use as a `tool` name. Best-effort: any shape it doesn't recognise is
+	 * ignored, and it never throws (a transcript hiccup must not break the turn).
+	 */
+	private teeOutput(obj: Record<string, unknown>): void {
+		try {
+			if (obj.type !== 'assistant') return;
+			const message = (obj as { message?: { content?: unknown } }).message;
+			const content = message?.content;
+			if (!Array.isArray(content)) return;
+			for (const block of content as Array<Record<string, unknown>>) {
+				const ts = Date.now();
+				if (block.type === 'text' && typeof block.text === 'string') {
+					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'assistant', text: block.text });
+				} else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'thinking', text: block.thinking });
+				} else if (block.type === 'tool_use' && typeof block.name === 'string') {
+					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'tool_use', tool: block.name });
+				}
+			}
+		} catch {
+			/* best-effort tee — never break the turn */
+		}
 	}
 
 	private handleStdoutChunk(chunk: Buffer | string): void {
@@ -358,14 +446,34 @@ class CcHeadlessSession implements AgentSession {
 	}
 
 	private enrich(message: string): string {
-		// The #102 reply contract is delivered once per turn via `--append-system-prompt` (see buildArgv),
-		// so the stdin envelope carries ONLY the raw user message — no per-message prefix.
-		return message;
+		// REQ-011 S3: the #102 reply contract is delivered once per turn via `--append-system-prompt`
+		// (see buildArgv), so the stdin envelope carries no per-message contract prefix — but it DOES carry
+		// per-sender attribution (buildCcChannelContent), which is load-bearing for CC's anti-prompt-
+		// injection defence: CC refuses bare/imperative channel text but processes a naturally-attributed
+		// chat message. DM → `[HuLa 私聊]\n[name(uid)]: msg`; group → `[HuLa 群聊]\n<accumulated>\n[name(uid)]: cur`.
+		return buildCcChannelContent({
+			roomType: this.d.roomType,
+			fromName: this.d.fromName,
+			fromUid: this.d.fromUid,
+			accumulated: this.d.accumulated,
+			message,
+		});
 	}
 
 	send(message: string): AsyncIterable<AgentEvent> {
 		this.buffer = [];
 		this.turnStart = Date.now();
+		// REQ-011 S3: seed the session_id from the store (resume turns know it up front; a fresh turn
+		// updates it when system/init arrives) so transcript records carry it.
+		this.sessionId = this.d.sessionStore.get(this.key)?.sessionId;
+		const attributed = this.enrich(message);
+		// AC9: the INBOUND record — the attributed message the owner's CC actually received this turn.
+		this.d.transcript.append(this.d.binding, {
+			ts: this.turnStart,
+			session_id: this.sessionId,
+			kind: 'inbound',
+			text: attributed,
+		});
 
 		// Register the room bridge BEFORE spawning, so a hook that fires early still routes here.
 		this.d.registry.register(this.d.roomId, (ev) => this.push(ev));
@@ -415,7 +523,7 @@ class CcHeadlessSession implements AgentSession {
 		try {
 			const envelope = {
 				type: 'user',
-				message: { role: 'user', content: [{ type: 'text', text: this.enrich(message) }] },
+				message: { role: 'user', content: [{ type: 'text', text: attributed }] },
 			};
 			child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			child.stdin?.end();

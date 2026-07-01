@@ -2,7 +2,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from './headless-driver.js';
+import { CcHeadlessDriver, buildCcChannelContent, type CcChild, type CcSpawnFn } from './headless-driver.js';
+import type { CcTranscriptRecord } from './transcript.js';
 import { CC_REPLY_CONTRACT } from './launch.js';
 import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
 import { CcBroker } from './broker.js';
@@ -105,17 +106,30 @@ async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 const BASE_CTX = { roomType: 1, roomId: 9 };
 const KEY = 'aiclaw-5-room-9';
 
+/** A fake CcTranscriptWriter that records every appended (key, record) pair. */
+function fakeTranscript() {
+	const records: Array<{ key: string; record: CcTranscriptRecord }> = [];
+	return {
+		records,
+		append(key: string, record: CcTranscriptRecord) {
+			records.push({ key, record });
+		},
+	};
+}
+
 function makeDriver(overrides: Partial<Parameters<typeof CcHeadlessDriver.prototype.constructor>[0]> = {}) {
 	const fs = fakeSpawn();
 	const registry = new CcSessionRegistry();
 	const store = memStore();
 	const kill = vi.fn();
+	const transcript = fakeTranscript();
 	const driver = new CcHeadlessDriver({
 		claudeBin: '/opt/claude',
 		workspaceBase: freshBase(),
 		brokerPort: 9100,
 		sessionStore: store,
 		registry,
+		transcript,
 		spawn: fs.spawn,
 		kill,
 		firstEventTimeoutMs: 1000,
@@ -123,7 +137,12 @@ function makeDriver(overrides: Partial<Parameters<typeof CcHeadlessDriver.protot
 		killGraceMs: 50,
 		...overrides,
 	});
-	return { driver, fs, registry, store, kill };
+	return { driver, fs, registry, store, kill, transcript };
+}
+
+/** Read the text of the stdin user envelope this fake spawn received. */
+function stdinText(fs: ReturnType<typeof fakeSpawn>): string {
+	return JSON.parse(fs.stdinWrites[0].trim()).message.content[0].text as string;
 }
 
 describe('CcHeadlessDriver — shape', () => {
@@ -150,9 +169,13 @@ describe('CcHeadlessDriver — shape', () => {
 });
 
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
-	it('spawns claude with the exact headless argv, cc env, and writes the enriched stdin envelope', async () => {
+	it('spawns claude with the exact headless argv, cc env, and writes the attributed stdin envelope', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({
+			aiclawUid: 5,
+			roomId: 9,
+			chatContext: { roomType: 2, roomId: 9, fromName: '小明', counterpartUid: 100 },
+		});
 		session.send('原始用户消息');
 
 		const call = fs.spawnCall!;
@@ -184,13 +207,14 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 		expect(call.options.detached).toBe(true);
 		expect(call.options.stdio).toEqual(['pipe', 'pipe', 'pipe']);
 
-		// stdin envelope: ONE stream-json user message = the RAW user text only (the contract lives in
-		// --append-system-prompt, not prepended here — no per-message content pollution), then EOF.
+		// stdin envelope: ONE stream-json user message = the ATTRIBUTED chat transcript (the #102 contract
+		// lives in --append-system-prompt, not prepended here — no per-message content pollution). REQ-011
+		// S3: cc anti-injection needs the current message attributed per-sender → DM = `[HuLa 私聊]\n[name(uid)]: msg`.
 		expect(fs.stdinWrites.length).toBe(1);
 		const env2 = JSON.parse(fs.stdinWrites[0].trim());
 		expect(env2.type).toBe('user');
 		const text = env2.message.content[0].text as string;
-		expect(text).toBe('原始用户消息');
+		expect(text).toBe('[HuLa 私聊]\n[小明(100)]: 原始用户消息');
 		expect(text).not.toContain('aichat send-message'); // contract is NOT in the user message
 		expect(fs.stdinEnd).toHaveBeenCalledOnce();
 	});
@@ -384,5 +408,142 @@ describe('CcHeadlessSession/Driver — cleanup (AC8: no orphaned process groups)
 		expect(kill).not.toHaveBeenCalled();
 		await driver.disconnect(); // nothing left to reap
 		expect(kill).not.toHaveBeenCalled();
+	});
+});
+
+// ─── REQ-011 S3: sender attribution (Option A, cc-specific, in the driver) ───
+
+describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', () => {
+	it('DM → `[HuLa 私聊]\\n[name(uid)]: <msg>` (roomType 2, no accumulated)', async () => {
+		const { driver, fs } = makeDriver();
+		const session = await driver.openSession({
+			aiclawUid: 5,
+			roomId: 9,
+			chatContext: { roomType: 2, roomId: 9, fromName: '阿强', counterpartUid: 100 },
+		});
+		session.send('你好');
+		expect(stdinText(fs)).toBe('[HuLa 私聊]\n[阿强(100)]: 你好');
+	});
+
+	it('group @ with accumulated → `[HuLa 群聊]\\n<accumulated lines>\\n[name(uid)]: <current>`', async () => {
+		const { driver, fs } = makeDriver();
+		const accumulated = ['[alice(100)]: first', '[bob(101)]: second'];
+		const session = await driver.openSession({
+			aiclawUid: 5,
+			roomId: 9,
+			chatContext: { roomType: 1, roomId: 9, fromName: 'dave', counterpartUid: 102, accumulated },
+		});
+		session.send('hey bot');
+		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
+	});
+
+	it('the envelope text matches buildCcChannelContent VERBATIM (single source of the format)', async () => {
+		const { driver, fs } = makeDriver();
+		const accumulated = ['[x(1)]: a'];
+		const session = await driver.openSession({
+			aiclawUid: 5,
+			roomId: 9,
+			chatContext: { roomType: 1, roomId: 9, fromName: 'y', counterpartUid: 2, accumulated },
+		});
+		session.send('cur');
+		expect(stdinText(fs)).toBe(
+			buildCcChannelContent({ roomType: 1, fromName: 'y', fromUid: 2, accumulated, message: 'cur' }),
+		);
+	});
+
+	it('a bare chatContext (no fromName/counterpartUid) degrades to `[unknown(0)]` — never throws', async () => {
+		const { driver, fs } = makeDriver();
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		session.send('m');
+		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[unknown(0)]: m');
+	});
+});
+
+// ─── REQ-011 S3 (AC9): per-room transcript — inbound + teed CC output ───
+
+describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching the terminal)', () => {
+	it('a turn appends the INBOUND (attributed) record + the CC OUTPUT events (assistant/tool/thinking) with ts+session_id', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const session = await driver.openSession({
+			aiclawUid: 5,
+			roomId: 9,
+			chatContext: { roomType: 2, roomId: 9, fromName: '阿强', counterpartUid: 100 },
+		});
+		const stream = session.send('你好');
+
+		fs.emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-abc' })}\n`);
+		// an assistant event carrying text + thinking + tool_use content blocks → three output records
+		fs.emitStdout(
+			`${JSON.stringify({
+				type: 'assistant',
+				message: {
+					content: [
+						{ type: 'thinking', thinking: 'let me think' },
+						{ type: 'text', text: 'hello there' },
+						{ type: 'tool_use', name: 'Bash', input: { cmd: 'ls' } },
+					],
+				},
+			})}\n`,
+		);
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		await drain(stream);
+
+		const recs = transcript.records.filter((r) => r.key === KEY).map((r) => r.record);
+		// inbound first, carrying the attributed text
+		expect(recs[0].kind).toBe('inbound');
+		expect(recs[0].text).toBe('[HuLa 私聊]\n[阿强(100)]: 你好');
+		// then the teed CC output (assistant text / thinking / tool_use), each with the captured session_id
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'thinking', text: 'let me think', session_id: 'sid-abc' }));
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'assistant', text: 'hello there', session_id: 'sid-abc' }));
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'tool_use', tool: 'Bash', session_id: 'sid-abc' }));
+		// every record carries a numeric ts
+		expect(recs.every((r) => typeof r.ts === 'number')).toBe(true);
+		// the tee does NOT leak CC output into the reply/thinking AgentEvent stream from stdout (control-plane only)
+	});
+
+	it('appends (never overwrites) across turns — a second send() adds more records', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const ctx = { roomType: 2, roomId: 9, fromName: 'u', counterpartUid: 100 };
+
+		const s1 = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: ctx });
+		const st1 = s1.send('turn-1');
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		await drain(st1);
+		const afterTurn1 = transcript.records.filter((r) => r.key === KEY).length;
+
+		const s2 = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: ctx });
+		s2.send('turn-2');
+		const afterTurn2 = transcript.records.filter((r) => r.key === KEY).length;
+
+		expect(afterTurn1).toBeGreaterThanOrEqual(1);
+		expect(afterTurn2).toBeGreaterThan(afterTurn1); // appended, not reset
+		const inbound = transcript.records.filter((r) => r.record.kind === 'inbound').map((r) => r.record.text);
+		expect(inbound.some((t) => t?.includes('turn-1'))).toBe(true);
+		expect(inbound.some((t) => t?.includes('turn-2'))).toBe(true);
+	});
+});
+
+// ─── REQ-011 S3 (§3): session reset → next turn spawns fresh (no --resume) ───
+
+describe('CcHeadlessDriver — REQ-011 S3 resetSession', () => {
+	it('resetSession deletes the stored session_id → the next send() argv has NO --resume', async () => {
+		const { driver, fs, store } = makeDriver();
+		store.set(KEY, { sessionId: 'sid-prev' });
+
+		// sanity: without reset a turn WOULD resume
+		driver.resetSession(5, 9);
+		expect(store.map.has(KEY)).toBe(false);
+
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		session.send('hi');
+		expect(fs.spawnCall!.args).not.toContain('--resume');
+	});
+
+	it('first-trigger (no stored session_id) still spawns fresh — reset changes nothing there', async () => {
+		const { driver, fs } = makeDriver();
+		driver.resetSession(5, 9); // no-op on an empty store
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		session.send('hi');
+		expect(fs.spawnCall!.args).not.toContain('--resume');
 	});
 });

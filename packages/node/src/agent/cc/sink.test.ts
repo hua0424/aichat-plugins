@@ -1,8 +1,28 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { CcBroker } from './broker.js';
 import { parseCcBinding } from './cc-driver.js';
 import { CcSessionRegistry, buildCcBridgeSink, type CcEventPush } from './sink.js';
 import type { AgentEvent } from '../events.js';
+
+// REQ-011 S3 (§5): the channel push path is DEAD in the runtime (S2 removed it). The channel-endpoint /
+// channel-mcp files stay (kept in git, unwired). Guard: no live `channelPush` reference in the runtime
+// message/registry path, so an accidental re-wire is caught.
+describe('REQ-011 S3 — channel dead-path stays unwired (no live channelPush)', () => {
+	const runtimeFiles = [
+		'../../handler/message.ts',
+		'./sink.ts',
+		'./headless-driver.ts',
+		'../../commands/start.ts',
+	];
+	for (const rel of runtimeFiles) {
+		it(`${rel} has no live channelPush reference`, () => {
+			const src = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf-8');
+			expect(src).not.toContain('channelPush');
+		});
+	}
+});
 
 describe('CcSessionRegistry', () => {
 	it('register + push routes to the room push; deregister makes it a no-op', () => {
