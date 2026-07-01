@@ -279,6 +279,9 @@ class CcHeadlessSession implements AgentSession {
 	private attemptUsedResume = false;
 	/** One-shot: a dead-`--resume` failure self-heals ONCE (clear id + fresh retry); a second failure is real. */
 	private retriedFresh = false;
+	/** The attributed stdin envelope for THIS turn — set once in send() before any handler can fire, so
+	 * a failure detected in handleStdoutLine (which has no `attributed` in scope) can self-heal/re-spawn. */
+	private attributed = '';
 
 	constructor(deps: CcHeadlessSessionDeps) {
 		this.d = deps;
@@ -383,6 +386,17 @@ class CcHeadlessSession implements AgentSession {
 			return;
 		}
 		if (type === 'result') {
+			// A dead `--resume` (session gone after `~/.claude` was wiped) does NOT just exit non-zero —
+			// real `claude` FIRST emits an ERROR `result` on stdout, then exits 1. Routing ANY result to
+			// complete() would set turnComplete → the later non-zero exit bails on its guard → self-heal
+			// never fires. So an error result routes to the FAILURE path (self-heal on --resume, {error}
+			// on a fresh attempt); only a normal success result completes.
+			if (obj.is_error === true || obj.subtype === 'error_during_execution') {
+				const errs = obj.errors;
+				const detail = Array.isArray(errs) && errs.length > 0 ? errs.join('; ') : (typeof obj.subtype === 'string' ? obj.subtype : 'unknown');
+				this.onAttemptFailure(`claude result error: ${detail}`);
+				return;
+			}
 			this.complete();
 			return;
 		}
@@ -476,6 +490,9 @@ class CcHeadlessSession implements AgentSession {
 		// updates it when system/init arrives) so transcript records carry it.
 		this.sessionId = this.d.sessionStore.get(this.key)?.sessionId;
 		const attributed = this.enrich(message);
+		// Set BEFORE spawning so any handler (incl. handleStdoutLine, which has no `attributed` in scope)
+		// can self-heal/re-spawn via onAttemptFailure(). One value per turn (a self-heal retry re-sends it).
+		this.attributed = attributed;
 		// AC9: the INBOUND record — the attributed message the owner's CC actually received this turn.
 		// Appended ONCE per turn (not per attempt): a self-heal retry is the SAME inbound message.
 		this.d.transcript.append(this.d.binding, {
@@ -522,7 +539,7 @@ class CcHeadlessSession implements AgentSession {
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
 			return;
 		}
 		this.child = child;
@@ -532,7 +549,7 @@ class CcHeadlessSession implements AgentSession {
 			if (myAttempt !== this.attemptSeq) return;
 			if (this.ended || this.firstEventSeen) return;
 			this.killChild();
-			this.onAttemptFailure('first-event timeout', attributed);
+			this.onAttemptFailure('first-event timeout');
 		}, this.d.firstEventTimeoutMs);
 		if (typeof this.firstEventTimer === 'object' && 'unref' in this.firstEventTimer) this.firstEventTimer.unref();
 
@@ -555,7 +572,7 @@ class CcHeadlessSession implements AgentSession {
 		});
 		child.on('error', (err) => {
 			if (myAttempt !== this.attemptSeq) return;
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
 		});
 		child.on('exit', (code) => {
 			if (myAttempt !== this.attemptSeq) return;
@@ -564,7 +581,7 @@ class CcHeadlessSession implements AgentSession {
 				this.complete(); // clean exit without a parsed `result` → treat as complete
 			} else {
 				const tail = this.stderrBuf.trim().slice(-500);
-				this.onAttemptFailure(`claude exited ${code}${tail ? `: ${tail}` : ''}`, attributed);
+				this.onAttemptFailure(`claude exited ${code}${tail ? `: ${tail}` : ''}`);
 			}
 		});
 
@@ -577,7 +594,7 @@ class CcHeadlessSession implements AgentSession {
 			child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			child.stdin?.end();
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err), attributed);
+			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -590,7 +607,7 @@ class CcHeadlessSession implements AgentSession {
 	 * Per #112 we do NOT distinguish "session-not-found" from a transient error: a false-positive clear
 	 * costs at most this one turn's context (the fresh retry), which is acceptable.
 	 */
-	private onAttemptFailure(message: string, attributed: string): void {
+	private onAttemptFailure(message: string): void {
 		if (this.ended || this.turnComplete) return;
 		if (this.attemptUsedResume && !this.retriedFresh) {
 			this.retriedFresh = true;
@@ -598,7 +615,7 @@ class CcHeadlessSession implements AgentSession {
 			this.sessionId = undefined;
 			this.killChild(); // reap the failed resume-child's process group
 			this.child = null;
-			this.spawnAttempt(attributed); // buildArgv now omits --resume → fresh retry (same turn)
+			this.spawnAttempt(this.attributed); // buildArgv now omits --resume → fresh retry (same turn)
 			return;
 		}
 		this.fail(message); // fresh attempt (or already retried) failed → real error

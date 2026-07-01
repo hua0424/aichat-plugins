@@ -794,4 +794,94 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		expect(events.filter((e) => e.type === 'done')).toHaveLength(1); // exactly one done, from the fresh attempt
 		expect(store.map.get(KEY)?.sessionId).toBe('sid-new');
 	});
+
+	// ── the real-machine bug (#112 follow-up): a dead `--resume` emits an ERROR `result` on stdout
+	// FIRST (then exits 1). The old `result` branch called complete() for ANY result → turnComplete
+	// pre-empted the non-zero exit → self-heal never fired. An error result must route to the failure
+	// path, not complete(). ──
+
+	it('dead-resume via ERROR RESULT self-heals: clears the stored id, retries fresh, succeeds', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		store.set(KEY, { sessionId: 'sid-dead' });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		// attempt 1 resumed the (now dead) session
+		expect(fms.calls.length).toBe(1);
+		expect(fms.calls[0].args).toContain('--resume');
+		expect(fms.calls[0].args[fms.calls[0].args.indexOf('--resume') + 1]).toBe('sid-dead');
+
+		// real `claude` emits an error `result` on stdout FIRST (then exit 1)
+		fms.calls[0].emitStdout(
+			`${JSON.stringify({
+				type: 'result',
+				subtype: 'error_during_execution',
+				is_error: true,
+				num_turns: 0,
+				session_id: 'sid-dead',
+				errors: ['No conversation found with session ID: sid-dead'],
+			})}\n`,
+		);
+
+		// self-heal: dead id CLEARED, exactly ONE retry, FRESH (no --resume)
+		expect(store.map.has(KEY)).toBe(false);
+		expect(fms.calls.length).toBe(2);
+		expect(fms.calls[1].args).not.toContain('--resume');
+
+		// drive the fresh attempt to success
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-new' })}\n`);
+		fms.calls[1].emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+
+		// the OLD resume-child's late exit(1) after the error result must be dropped by the stale guard
+		fms.calls[0].emitExit(1);
+
+		const events = await drain(stream);
+
+		expect(events.some((e) => e.type === 'error')).toBe(false); // no {error}: it self-healed
+		expect(events.filter((e) => e.type === 'done')).toHaveLength(1); // exactly one done, from the fresh attempt
+		expect(store.map.get(KEY)?.sessionId).toBe('sid-new'); // fresh attempt re-populated the store
+		expect(fms.calls.length).toBe(2); // no third spawn
+	});
+
+	it('error-result on a FRESH attempt surfaces {error} (no stored session → no retry)', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		// no stored session_id → fresh attempt
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		expect(fms.calls[0].args).not.toContain('--resume');
+		fms.calls[0].emitStdout(
+			`${JSON.stringify({
+				type: 'result',
+				subtype: 'error_during_execution',
+				is_error: true,
+				session_id: 'sid-x',
+				errors: ['No conversation found with session ID: sid-x'],
+			})}\n`,
+		);
+		const events = await drain(stream);
+
+		expect(fms.calls.length).toBe(1); // fresh error is not retried
+		expect(events).toHaveLength(1);
+		expect(events[0].type).toBe('error');
+		expect((events[0] as { message: string }).message).toContain('No conversation found');
+	});
+
+	it('success result STILL completes (regression): a normal `result` (no is_error) → {done}, single spawn', async () => {
+		const fms = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: fms.spawn });
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-ok' })}\n`);
+		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'sid-ok' })}\n`);
+		const events = await drain(stream);
+
+		expect(fms.calls.length).toBe(1); // no retry on success
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events.filter((e) => e.type === 'done')).toHaveLength(1);
+		expect(store.map.get(KEY)?.sessionId).toBe('sid-ok');
+	});
 });
