@@ -16,6 +16,7 @@ import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
 import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
+import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
 import { ccBindAdminHandler } from '../capability/cc-bind.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
@@ -92,6 +93,9 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// broker sink (below). The session store persists (uid,room)→session_id for cross-turn/restart --resume.
 	const ccRegistry = new CcSessionRegistry();
 	const ccWorkspaceBase = join(AICHAT_HOME, 'cc', 'workspace');
+	// REQ-011 S3 (AC5/AC9): one shared per-room transcript writer (inbound + teed CC output), so the owner
+	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
+	const ccTranscript = new FileCcTranscriptWriter();
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
@@ -130,6 +134,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 					brokerPort: ccBrokerPort(),
 					sessionStore: new FileCcHeadlessSessionStore(),
 					registry: ccRegistry,
+					transcript: ccTranscript,
 				});
 			}
 			// 未知 tool 抛错使该身份降级，不影响其它身份。

@@ -1,10 +1,17 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MessageHandler } from './message.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
+import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
+import { CcSessionRegistry } from '../agent/cc/sink.js';
+import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
+import type { CcTranscriptRecord } from '../agent/cc/transcript.js';
 
 const THINKING_END = WSReqType.THINKING_END;
 const THINKING_DELTA = WSReqType.THINKING_DELTA;
@@ -270,6 +277,23 @@ function getThinkingSession(handler: MessageHandler, sessionKey: string): { agen
 }
 
 const SELF_UID = 999;
+
+/** REQ-011 S3 e2e: temp workspace bases for the real CcHeadlessDriver, cleaned up after each test. */
+const ccTmpDirs: string[] = [];
+function ccTmpBase(): string {
+	const d = mkdtempSync(join(tmpdir(), 'msg-cc-e2e-'));
+	ccTmpDirs.push(d);
+	return d;
+}
+afterEach(() => {
+	for (const d of ccTmpDirs.splice(0)) {
+		try {
+			rmSync(d, { recursive: true, force: true });
+		} catch {
+			/* best-effort */
+		}
+	}
+});
 
 describe('MessageHandler per-room isolation', () => {
 	it('routes two rooms to their own sessionKey + roomId (no cross-room merge)', async () => {
@@ -1607,6 +1631,169 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 		expect(end).toBeDefined();
 		expect((end!.data as Record<string, unknown>).content).toBe('cc reasoning');
 		expect((end!.data as Record<string, unknown>).status).toBe('complete');
+	});
+});
+
+// ─── REQ-011 S3: sender attribution wiring + data-routing + group @-parity ───
+
+describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + group @-parity', () => {
+	/** A cc-typed fake adapter (drivesTurns=true) — the STANDARD path applies, like CcHeadlessDriver. */
+	function ccAdapter() {
+		const { adapter, calls } = fakeAdapter();
+		(adapter as unknown as { type: string }).type = 'cc';
+		(adapter as unknown as { drivesTurns: boolean }).drivesTurns = true;
+		return { adapter, calls };
+	}
+	const openSessionOf = (adapter: unknown) => (adapter as { openSession: ReturnType<typeof vi.fn> }).openSession;
+
+	it('populates chatContext.fromName + accumulated, and DATA-ROUTES the RAW current message to a cc driver', async () => {
+		const { adapter, calls } = ccAdapter();
+		const openSession = openSessionOf(adapter);
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// two un-@ messages accumulate (un-@ group context)
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 101, 'second', 2, { name: 'bob' }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+		// then an @-message triggers
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// cc data-routing: the driver receives the RAW current message (attribution happens IN the driver),
+		// NOT the pre-merged `[群聊上下文]/[当前消息]` agentMessage.
+		expect(calls[0].message).toBe('hey bot');
+		expect(calls[0].message).not.toContain('群聊上下文');
+		// chatContext carries the generic attribution fields the cc driver reads.
+		const ctx = openSession.mock.calls[0][0].chatContext as { fromName?: string; accumulated?: string[] };
+		expect(ctx.fromName).toBe('dave');
+		expect(ctx.accumulated).toEqual(['[alice(100)]: first', '[bob(101)]: second']);
+	});
+
+	it('regression: a NON-cc driver still gets the pre-merged agentMessage (data-routing is cc-only)', async () => {
+		const { adapter, calls } = fakeAdapter(); // type 'fake' (not cc)
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// non-cc: unchanged pre-merged form (regression guard for the other three drivers).
+		expect(calls[0].message).toContain('[群聊上下文 · 自上次回复以来未点名你的消息]');
+		expect(calls[0].message).toContain('[alice(100)]: first');
+		expect(calls[0].message).toContain('[当前消息]');
+		expect(calls[0].message).toContain('hey bot');
+	});
+
+	it('parity: a cc un-@ group message is accumulated and does NOT trigger (guard inherited, no bypass)', async () => {
+		const { adapter, calls } = ccAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'just chatting', 1, { name: 'alice' }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1)).toEqual(['[alice(100)]: just chatting']);
+		expect(getPending(handler, 1).length).toBe(0);
+	});
+
+	it('parity: a cc @-group message triggers openSession/send (same @-gate as the other drivers)', async () => {
+		const { adapter, calls } = ccAdapter();
+		const openSession = openSessionOf(adapter);
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(openSession).toHaveBeenCalled();
+		expect(calls[0].message).toBe('hey bot');
+		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
+	});
+
+	it('parity: cc skip-self is inherited (own message neither triggers nor accumulates)', async () => {
+		const { adapter, calls } = ccAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// a message FROM self (uid === SELF_UID) — dropped at step 3 before any @-gate / accumulate.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, SELF_UID, 'echo of myself', 1, { atUidList: [SELF_UID] }) } as never);
+		await new Promise((r) => setTimeout(r, 40));
+
+		expect(calls.length).toBe(0);
+		expect(getAccumulated(handler, 1).length).toBe(0);
+	});
+
+	// e2e through the REAL CcHeadlessDriver: the attributed transcript is assembled IN the driver from the
+	// handler's raw message + chatContext.fromName/accumulated → the spawned stdin envelope proves the wiring.
+	function ccE2eSpawn() {
+		const stdinWrites: string[] = [];
+		let spawnCall: { command: string; args: readonly string[] } | null = null;
+		const endCbs: Array<() => void> = [];
+		const child: CcChild = {
+			pid: 5252,
+			stdin: { write: (c: string) => void stdinWrites.push(c), end: () => {} },
+			stdout: {
+				on: (event: string, listener: (...a: never[]) => void) => {
+					if (event === 'end' || event === 'close') endCbs.push(listener as () => void);
+				},
+			} as CcChild['stdout'],
+			stderr: { on: () => {} } as CcChild['stderr'],
+			on: () => {},
+			kill: () => true,
+		};
+		const spawn: CcSpawnFn = (command, args) => {
+			spawnCall = { command, args };
+			return child;
+		};
+		return { spawn, stdinWrites, endStdout: () => endCbs.forEach((cb) => cb()), get spawnCall() { return spawnCall; } };
+	}
+	function memCcStore(): CcHeadlessSessionStore {
+		const map = new Map<string, StoredCcHeadlessSession>();
+		return { get: (k) => map.get(k), set: (k, v) => void map.set(k, v), delete: (k) => void map.delete(k) };
+	}
+
+	it('e2e: cc group @ through the REAL CcHeadlessDriver → spawned stdin envelope is the attributed [HuLa 群聊] transcript', async () => {
+		const fs = ccE2eSpawn();
+		const transcriptRecords: CcTranscriptRecord[] = [];
+		const driver = new CcHeadlessDriver({
+			workspaceBase: ccTmpBase(),
+			brokerPort: 9100,
+			sessionStore: memCcStore(),
+			registry: new CcSessionRegistry(),
+			transcript: { append: (_k, r) => void transcriptRecords.push(r) },
+			spawn: fs.spawn,
+			firstEventTimeoutMs: 1000,
+			drainMs: 5,
+			killGraceMs: 20,
+		});
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 5, maxWaitMs: 30 });
+		setGroupConfig(handler, 1, { mentionRequired: true });
+
+		// one un-@ accumulates, then an @-message triggers the real spawn.
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
+		await new Promise((r) => setTimeout(r, 20));
+		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
+		await waitFor(() => fs.spawnCall !== null && fs.stdinWrites.length > 0);
+
+		const text = JSON.parse(fs.stdinWrites[0].trim()).message.content[0].text as string;
+		expect(text).toBe('[HuLa 群聊]\n[alice(100)]: first\n[dave(102)]: hey bot');
+		// the inbound transcript record carries the same attributed text
+		expect(transcriptRecords.find((r) => r.kind === 'inbound')?.text).toBe(text);
+
+		// finish the turn (EOF backstop) so no timer/session dangles.
+		fs.endStdout();
+		await waitFor(() => getThinkingSession(handler, `aiclaw-${SELF_UID}-room-1`) === undefined);
+		handler.destroy();
 	});
 });
 

@@ -520,6 +520,10 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
+				// REQ-011 S3: generic per-turn attribution fields. Only the cc driver reads them (to build a
+				// per-sender-attributed stdin envelope); openclaw/opencode/codex ignore them (unchanged).
+				fromName: channel.lastCtx.fromName,
+				accumulated,
 			},
 		});
 		session.agentSession = agentSession;
@@ -561,8 +565,13 @@ export class MessageHandler {
 			this.flushPendingMessages(roomId);
 		};
 
+		// REQ-011 S3: pure DATA ROUTING (not a behaviour branch): cc anti-injection needs the raw current
+		// message to attribute it per-sender in the driver (via chatContext.fromName/accumulated); the
+		// other drivers get the pre-merged `[群聊上下文]/[当前消息]` agentMessage exactly as before.
+		const messageForDriver = this.driver.type === 'cc' ? message : agentMessage;
+
 		try {
-			for await (const ev of agentSession.send(agentMessage)) {
+			for await (const ev of agentSession.send(messageForDriver)) {
 				// 超时/广播 finalize 抢先：停止映射后续事件。session 的收尾交给 finally 统一 close。
 				if (session.finalized) {
 					break;

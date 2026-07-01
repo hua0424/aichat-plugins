@@ -22,6 +22,12 @@ export interface AgentSession {
 export interface AgentDriver {
 	readonly type: string;
 	connect(): Promise<void>;
+	/**
+	 * `chatContext` is a generic per-turn bag (a driver reads only the keys it cares about). Beyond the
+	 * REQ-008/#85 workspace keys it also carries REQ-011 S3's `fromName` + `accumulated` (the current
+	 * sender's name + the un-@ group-context lines) — read ONLY by the cc driver for per-sender
+	 * attribution; other drivers ignore them (behaviour unchanged).
+	 */
 	openSession(o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }): Promise<AgentSession>;
 	disconnect(): Promise<void>;
 	/**
