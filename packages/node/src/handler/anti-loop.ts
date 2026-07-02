@@ -8,9 +8,10 @@
  */
 
 export interface GuardCheckInput {
-	roomId: number;
-	fromUid: number;
-	selfUid: number;
+	// REQ-029 (#29): roomId/fromUid/selfUid 一律**不透明字符串**（防 >2^53 精度丢失/碰撞）。
+	roomId: string;
+	fromUid: string;
+	selfUid: string;
 	content: string;
 	isFromAi: boolean;
 }
@@ -26,8 +27,8 @@ interface RoomState {
 	aiRoundCount: number;
 	/** 最后一条消息是否来自 AI */
 	lastMessageFromAi: boolean;
-	/** 最后一条消息的 fromUid */
-	lastFromUid: number;
+	/** 最后一条消息的 fromUid（REQ-029: 字符串；'' = 尚无） */
+	lastFromUid: string;
 	/** 更新时间 */
 	lastUpdateTime: number;
 }
@@ -41,7 +42,7 @@ export class AntiLoopGuard {
 
 	check(input: GuardCheckInput): GuardCheckResult {
 		const { roomId, fromUid, selfUid, isFromAi } = input;
-		const roomKey = String(roomId);
+		const roomKey = roomId;
 
 		// 清理过期状态
 		this.cleanupExpiredStates();
@@ -52,7 +53,7 @@ export class AntiLoopGuard {
 			state = {
 				aiRoundCount: 0,
 				lastMessageFromAi: false,
-				lastFromUid: 0,
+				lastFromUid: '',
 				lastUpdateTime: Date.now(),
 			};
 			this.roomStates.set(roomKey, state);
@@ -84,8 +85,8 @@ export class AntiLoopGuard {
 	}
 
 	/** 获取指定房间的 AI-to-AI 轮数（仅用于日志/debug） */
-	getAiRoundCount(roomId: number): number {
-		return this.roomStates.get(String(roomId))?.aiRoundCount ?? 0;
+	getAiRoundCount(roomId: string): number {
+		return this.roomStates.get(roomId)?.aiRoundCount ?? 0;
 	}
 
 	private calculateBackoffDelay(aiRoundCount: number): number {

@@ -181,7 +181,7 @@ describe('OpencodeDriver.resolveSession (REQ-010 S1)', () => {
 		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: store });
 		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
 
-		expect(driver.resolveSession('ses_xyz')).toEqual({ aiclawUid: 5, roomId: 9 });
+		expect(driver.resolveSession('ses_xyz')).toEqual({ aiclawUid: '5', roomId: '9' });
 	});
 
 	it('unknown sessionID → undefined', async () => {

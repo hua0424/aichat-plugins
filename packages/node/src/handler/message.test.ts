@@ -182,40 +182,42 @@ function groupMessage(
 	} as unknown as ReceivedMessage;
 }
 
+// REQ-029 (#29): internals are keyed by opaque string roomId; helpers coerce numeric-literal args with String().
 /** 读取指定房间的积累缓冲（白盒断言用） */
-function getAccumulated(handler: MessageHandler, roomId: number): string[] {
+function getAccumulated(handler: MessageHandler, roomId: number | string): string[] {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.roomChannels.get(roomId)?.accumulatedMessages ?? [];
+	return handler.roomChannels.get(String(roomId))?.accumulatedMessages ?? [];
 }
 
 /** 读取指定房间的 pendingMessages（白盒断言用） */
-function getPending(handler: MessageHandler, roomId: number): string[] {
+function getPending(handler: MessageHandler, roomId: number | string): string[] {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.roomChannels.get(roomId)?.pendingMessages ?? [];
+	return handler.roomChannels.get(String(roomId))?.pendingMessages ?? [];
 }
 
-/** 读取内嵌 AntiLoopGuard（白盒断言用） */
-function getGuard(handler: MessageHandler): { getAiRoundCount: (roomId: number) => number } {
+/** 读取内嵌 AntiLoopGuard（白盒断言用；getAiRoundCount 接受 number|string 并 String() 归一） */
+function getGuard(handler: MessageHandler): { getAiRoundCount: (roomId: number | string) => number } {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.antiLoopGuard;
+	const guard = handler.antiLoopGuard as { getAiRoundCount: (roomId: string) => number };
+	return { getAiRoundCount: (roomId) => guard.getAiRoundCount(String(roomId)) };
 }
 
 /** 读取指定房间的 antiLoopDelaying 标志（白盒断言用） */
-function isDelaying(handler: MessageHandler, roomId: number): boolean {
+function isDelaying(handler: MessageHandler, roomId: number | string): boolean {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.roomChannels.get(roomId)?.antiLoopDelaying === true;
+	return handler.roomChannels.get(String(roomId))?.antiLoopDelaying === true;
 }
 
-/** 读取指定房间本批的 batchAiFromUid（白盒断言用；0=本批无对端 AI 触发消息） */
-function getBatchAiFromUid(handler: MessageHandler, roomId: number): number {
+/** 读取指定房间本批的 batchAiFromUid（白盒断言用；''=本批无对端 AI 触发消息） */
+function getBatchAiFromUid(handler: MessageHandler, roomId: number | string): string {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.roomChannels.get(roomId)?.batchAiFromUid ?? 0;
+	return handler.roomChannels.get(String(roomId))?.batchAiFromUid ?? '';
 }
 
 /** 读取内嵌 GroupConfigCache 中某房间的配置（白盒断言用） */
 function getCachedConfig(
 	handler: MessageHandler,
-	roomId: number,
+	roomId: number | string,
 ):
 	| {
 			mentionRequired: boolean;
@@ -227,7 +229,7 @@ function getCachedConfig(
 	  }
 	| undefined {
 	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.groupConfigCache.get(SELF_UID, roomId);
+	return handler.groupConfigCache.get(SELF_UID, String(roomId));
 }
 
 /** 向 handler 注入一条群配置（mentionRequired 等） */
@@ -276,7 +278,8 @@ function getThinkingSession(handler: MessageHandler, sessionKey: string): { agen
 	return handler.thinkingSessions.get(sessionKey);
 }
 
-const SELF_UID = 999;
+// REQ-029 (#29): selfUid/roomId/uid are opaque strings end-to-end.
+const SELF_UID = '999';
 
 /** REQ-011 S3 e2e: temp workspace bases for the real CcHeadlessDriver, cleaned up after each test. */
 const ccTmpDirs: string[] = [];
@@ -308,10 +311,10 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.length >= 2);
 
 		const byRoom = new Map(calls.map((c) => [c.context?.roomId, c]));
-		expect(byRoom.get(1)?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-1`);
-		expect(byRoom.get(1)?.message).toBe('msg-room-1');
-		expect(byRoom.get(2)?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-2`);
-		expect(byRoom.get(2)?.message).toBe('msg-room-2');
+		expect(byRoom.get('1')?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-1`);
+		expect(byRoom.get('1')?.message).toBe('msg-room-1');
+		expect(byRoom.get('2')?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-2`);
+		expect(byRoom.get('2')?.message).toBe('msg-room-2');
 		// 没有把两房消息合并
 		expect(calls.every((c) => !c.message.includes('\n'))).toBe(true);
 	});
@@ -324,29 +327,29 @@ describe('MessageHandler per-room isolation', () => {
 		// room 1 第一条 → 触发 thinking（adapter.chat 不结束，session 保持 active）
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'A1', 1) } as never);
 		await waitFor(() => calls.length >= 1);
-		expect(calls[0].context?.roomId).toBe(1);
+		expect(calls[0].context?.roomId).toBe('1');
 
 		// room 1 thinking 进行中，再来一条 room 1 消息 → 进入 room1 pending（不触发新 chat）
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'A2', 2) } as never);
 
 		// room 2 来消息 → 应独立触发自己的 chat，不被 room1 的 active thinking 阻塞
 		handler.handle({ type: 'receiveMessage', data: humanMessage(2, 200, 'B1', 3) } as never);
-		await waitFor(() => calls.some((c) => c.context?.roomId === 2));
+		await waitFor(() => calls.some((c) => c.context?.roomId === '2'));
 
-		const room2Call = calls.find((c) => c.context?.roomId === 2)!;
+		const room2Call = calls.find((c) => c.context?.roomId === '2')!;
 		expect(room2Call.message).toBe('B1');
 		// room1 的 pending（A2）不能混进 room2
 		expect(room2Call.message).not.toContain('A2');
 
 		// 结束 room1 的 thinking → 只 flush room1 的 pending（A2），不触碰 room2
-		const room1Call = calls.find((c) => c.context?.roomId === 1)!;
+		const room1Call = calls.find((c) => c.context?.roomId === '1')!;
 		room1Call.callbacks.onThinkingEnd(100);
-		await waitFor(() => calls.filter((c) => c.context?.roomId === 1).length >= 2);
+		await waitFor(() => calls.filter((c) => c.context?.roomId === '1').length >= 2);
 
-		const room1Calls = calls.filter((c) => c.context?.roomId === 1);
+		const room1Calls = calls.filter((c) => c.context?.roomId === '1');
 		expect(room1Calls[1].message).toBe('A2');
 		// room2 仍然只有一次调用，没有被 room1 的 flush 误触发
-		expect(calls.filter((c) => c.context?.roomId === 2).length).toBe(1);
+		expect(calls.filter((c) => c.context?.roomId === '2').length).toBe(1);
 	});
 
 	it('ignores own messages and non-text messages', async () => {
@@ -646,7 +649,7 @@ describe('MessageHandler per-room isolation', () => {
 		await new Promise((r) => setTimeout(r, 20));
 
 		// @ts-expect-error 访问私有字段做白盒断言
-		expect(handler.roomChannels.has(7)).toBe(false);
+		expect(handler.roomChannels.has('7')).toBe(false);
 	});
 });
 
@@ -663,7 +666,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		} as never);
 
 		await waitFor(() => calls.length >= 1);
-		expect(calls[0].context?.roomId).toBe(1);
+		expect(calls[0].context?.roomId).toBe('1');
 		expect(calls[0].message).toBe('hey bot');
 		expect(getAccumulated(handler, 1).length).toBe(0);
 	});
@@ -1122,7 +1125,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		expect(getAccumulated(handler, 1)).toEqual(['[peer-ai(200)]: ai chatter, no @']);
 		expect(getPending(handler, 1).length).toBe(0);
 		// 关键：未点名 AI 消息既不设 batchAiFromUid，也不喂防循环计数
-		expect(getBatchAiFromUid(handler, 1)).toBe(0);
+		expect(getBatchAiFromUid(handler, 1)).toBe('');
 		expect(guard.getAiRoundCount(1)).toBe(0);
 	});
 
@@ -1444,7 +1447,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
  * synthetic triggerMsgId, so handleThinkingStartBroadcast still backfills thinkingId cleanly.
  */
 describe('MessageHandler S7: external thinking path (CC broker)', () => {
-	const ROOM = 5;
+	const ROOM = '5';
 	const sessionKey = `aiclaw-${SELF_UID}-room-${ROOM}`;
 
 	function startFrame(sent: Array<{ type: number; data: unknown }>) {
@@ -1472,9 +1475,9 @@ describe('MessageHandler S7: external thinking path (CC broker)', () => {
 		const { ws, sent } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID);
 
-		handler.beginExternalThinking(5, SELF_UID);
-		handler.endExternalThinking(5, SELF_UID);
-		handler.beginExternalThinking(6, SELF_UID);
+		handler.beginExternalThinking('5', SELF_UID);
+		handler.endExternalThinking('5', SELF_UID);
+		handler.beginExternalThinking('6', SELF_UID);
 
 		const starts = sent.filter((f) => f.type === WSReqType.THINKING_START).map((f) => (f.data as Record<string, unknown>).triggerMsgId as string);
 		expect(starts).toHaveLength(2);
@@ -1567,9 +1570,9 @@ describe('MessageHandler S7: external thinking path (CC broker)', () => {
 		await waitFor(() => calls.length >= 1);
 
 		// external CC turn in room 5 — independent
-		handler.beginExternalThinking(5, SELF_UID);
-		handler.externalThinkingDelta(5, SELF_UID, 'cc thinking');
-		handler.endExternalThinking(5, SELF_UID);
+		handler.beginExternalThinking('5', SELF_UID);
+		handler.externalThinkingDelta('5', SELF_UID, 'cc thinking');
+		handler.endExternalThinking('5', SELF_UID);
 
 		// finish the normal turn
 		calls[0].callbacks.onThinkingDelta('normal reasoning');
@@ -1839,7 +1842,7 @@ describe('MessageHandler S9: ccBindRequest → CC_BIND_RESULT', () => {
 
 		// bind called with (selfUid, roomId, group chatContext)
 		expect(bind).toHaveBeenCalledTimes(1);
-		expect(bind).toHaveBeenCalledWith(SELF_UID, 7, { roomType: 1, roomId: 7 });
+		expect(bind).toHaveBeenCalledWith(SELF_UID, '7', { roomType: 1, roomId: '7' });
 
 		const result = sent.find((f) => f.type === CC_BIND_RESULT);
 		expect(result).toBeDefined();
@@ -1862,7 +1865,7 @@ describe('MessageHandler S9: ccBindRequest → CC_BIND_RESULT', () => {
 			data: { roomId: 12, roomType: 2, counterpartUid: 555, requestId: 'req-d1' },
 		} as never);
 
-		expect(bind).toHaveBeenCalledWith(SELF_UID, 12, { roomType: 2, roomId: 12, counterpartUid: 555 });
+		expect(bind).toHaveBeenCalledWith(SELF_UID, '12', { roomType: 2, roomId: '12', counterpartUid: '555' });
 		const data = sent.find((f) => f.type === CC_BIND_RESULT)!.data as Record<string, unknown>;
 		expect(data.requestId).toBe('req-d1');
 		expect('error' in data).toBe(false);
@@ -1908,5 +1911,30 @@ describe('MessageHandler S9: ccBindRequest → CC_BIND_RESULT', () => {
 		expect(data.requestId).toBe('req-throw');
 		expect(String(data.error)).toContain('boom from bind');
 		expect('launchCommand' in data).toBe(false);
+	});
+});
+
+// ─── REQ-029 (#29): roomId > 2^53 stays an EXACT opaque string end-to-end (inbound → outbound) ───
+
+describe('MessageHandler REQ-029 (#29): >2^53 roomId precision', () => {
+	it('inbound roomId > 2^53 → THINKING_START carries the EXACT string (untruncated, not Number()d)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		// Number('9007199254740993') === 9007199254740992 — a Number()d roomId would corrupt routing.
+		const bigRoom = '9007199254740993';
+		// private (roomType=2) → always triggers
+		handler.handle({ type: 'receiveMessage', data: humanMessage(bigRoom, '100', 'hi', '77') } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// outbound routing preserved: the driver session is bound to the EXACT room string.
+		expect(calls[0].context?.roomId).toBe(bigRoom);
+		expect(calls[0].sessionKey).toBe(`aiclaw-${SELF_UID}-room-${bigRoom}`);
+
+		// the outbound THINKING_START payload carries the exact string, never the corrupted number.
+		const start = sent.find((f) => f.type === WSReqType.THINKING_START)!.data as Record<string, unknown>;
+		expect(start.roomId).toBe(bigRoom);
+		expect(start.roomId).not.toBe(9007199254740992);
 	});
 });

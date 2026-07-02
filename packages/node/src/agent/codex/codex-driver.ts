@@ -73,17 +73,18 @@ export class CodexDriver implements AgentDriver {
 	 * back to the bound HuLa identity+room. Reverse-looks-up the `aiclaw-{uid}-room-{roomId}` key the
 	 * thread id was stored under and parses it. Returns undefined when the id is unknown/unparseable.
 	 */
-	resolveSession(threadId: string): { aiclawUid: number; roomId: number } | undefined {
+	resolveSession(threadId: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyByThreadId(threadId);
 		if (!key) return undefined;
 		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
 		if (!m) return undefined;
-		return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
+		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
 	async openSession(o: {
-		aiclawUid: number;
-		roomId: number;
+		aiclawUid: string;
+		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const ctx = o.chatContext as unknown as OpencodeChatContext;
@@ -135,8 +136,8 @@ class CodexSession implements AgentSession {
 	constructor(
 		private readonly thread: Thread,
 		private readonly key: string,
-		private readonly aiclawUid: number,
-		private readonly roomId: number,
+		private readonly aiclawUid: string,
+		private readonly roomId: string,
 		private readonly sessionStore: CodexSessionStore,
 		// Fallback deps (REQ-010 #101 self-heal): when a resumed thread's rollout is gone, the session
 		// invalidates the stale store entry and starts a FRESH thread to retry the turn once.

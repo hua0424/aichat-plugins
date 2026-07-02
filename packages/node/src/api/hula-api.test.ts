@@ -54,8 +54,10 @@ describe('HulaApiClient.listSelfGroupConfigs (REQ #26)', () => {
 
 		expect(list).toHaveLength(1);
 		const entry = list[0];
-		expect(typeof entry.roomId).toBe('number');
-		expect(entry.roomId).toBe(987654321098765432);
+		// REQ-029 (#29): roomId is an opaque string (never Number() — >2^53 corrupts). Other numeric
+		// config fields (mentionRequired/respondToAi/…) are NOT ids and stay numbers.
+		expect(typeof entry.roomId).toBe('string');
+		expect(entry.roomId).toBe('987654321098765432');
 		expect(entry.mentionRequired).toBe(0);
 		expect(entry.respondToAi).toBe(1);
 		expect(entry.rateLimitPerMinute).toBe(5);
@@ -86,6 +88,17 @@ describe('HulaApiClient.listSelfGroupConfigs (REQ #26)', () => {
 		const client = new HulaApiClient('http://host:8080', 'tok');
 
 		await expect(client.listSelfGroupConfigs()).resolves.toEqual([]);
+	});
+
+	it('REQ-029 (#29): a >2^53 roomId maps to the EXACT string (Number() would corrupt it)', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: [{ roomId: '9007199254740993' }] }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		const list = await client.listSelfGroupConfigs();
+		expect(list[0].roomId).toBe('9007199254740993');
+		// the corrupted Number() value must never surface.
+		expect(list[0].roomId).not.toBe('9007199254740992');
 	});
 });
 
@@ -136,11 +149,11 @@ describe('HulaApiClient query methods (REQ-010 S3 #93)', () => {
 		expect(url).toBe('http://host:8080/api/im/user/friend/page?pageSize=100');
 		expect((init as RequestInit).method).toBe('GET');
 		expect(out).toEqual([
-			{ uid: 111, name: 'Bob', account: 'bob', remark: 'pal' },
-			{ uid: 222, name: 'Cara', account: 'cara', remark: undefined },
+			{ uid: '111', name: 'Bob', account: 'bob', remark: 'pal' },
+			{ uid: '222', name: 'Cara', account: 'cara', remark: undefined },
 		]);
-		// uid coerced from server string to number
-		expect(typeof out[0].uid).toBe('number');
+		// REQ-029 (#29): uid kept as an opaque string (never Number() — >2^53 corrupts).
+		expect(typeof out[0].uid).toBe('string');
 	});
 
 	it('listFriends: defaults pageSize to 100; missing data.list → []', async () => {
@@ -174,8 +187,8 @@ describe('HulaApiClient query methods (REQ-010 S3 #93)', () => {
 
 		const [url] = fetchSpy.mock.calls[0];
 		expect(url).toBe('http://host:8080/api/im/user/search?keyword=hi%20there');
-		expect(out).toEqual([{ uid: 333, name: 'Dee', account: 'dee', userType: 2 }]);
-		expect(typeof out[0].uid).toBe('number');
+		expect(out).toEqual([{ uid: '333', name: 'Dee', account: 'dee', userType: 2 }]);
+		expect(typeof out[0].uid).toBe('string');
 	});
 
 	it('searchUsers: missing data.list → []', async () => {
@@ -218,7 +231,7 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
 		expect(out).toEqual([
 			{
-				id: 987654321098765,
+				id: '987654321098765',
 				name: 'Team A',
 				account: 'hula_grpA',
 				memberNum: 10,
@@ -226,7 +239,7 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 				roleId: 2,
 			},
 			{
-				id: 222,
+				id: '222',
 				name: 'Team B',
 				account: undefined,
 				memberNum: undefined,
@@ -234,7 +247,8 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 				roleId: undefined,
 			},
 		]);
-		expect(typeof out[0].id).toBe('number');
+		// REQ-029 (#29): canonical `id` (= server roomId) kept as an opaque string.
+		expect(typeof out[0].id).toBe('string');
 		expect(out[0]).not.toHaveProperty('groupId');
 		expect(out[0]).not.toHaveProperty('roomId');
 	});
@@ -264,10 +278,20 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 		expect(url).toBe('http://host:8080/api/im/room/group/aiclaw/members?roomId=555&online=true');
 		expect((init as RequestInit).method).toBe('GET');
 		expect(out).toEqual([
-			{ uid: 777, name: 'Eve', account: 'eve01', online: true, roleId: 1 },
-			{ uid: 888, name: 'Fox', account: undefined, online: false, roleId: undefined },
+			{ uid: '777', name: 'Eve', account: 'eve01', online: true, roleId: 1 },
+			{ uid: '888', name: 'Fox', account: undefined, online: false, roleId: undefined },
 		]);
-		expect(typeof out[0].uid).toBe('number');
+		expect(typeof out[0].uid).toBe('string');
+	});
+
+	it('REQ-029 (#29): a >2^53 member uid maps to the EXACT string (Number() would corrupt it)', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: [{ uid: '9007199254740993', name: 'Big', online: true }] }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		const out = await client.listGroupMembers('9007199254740993', true);
+		expect(out[0].uid).toBe('9007199254740993');
+		expect(out[0].uid).not.toBe('9007199254740992');
 	});
 
 	it('listGroupMembers: passes online=false in the query', async () => {

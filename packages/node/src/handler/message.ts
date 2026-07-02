@@ -75,8 +75,9 @@ interface ThinkingSession {
  * 最近一次收到的用户消息上下文
  */
 interface LastMessageContext {
-	roomId: number;
-	fromUid: number;
+	// REQ-029 (#29): roomId/fromUid are opaque strings (>2^53-safe).
+	roomId: string;
+	fromUid: string;
 	/**
 	 * REQ-011 S3: 发言者显示名（取自 inbound 的 fromUser.name，缺省 'unknown'）。
 	 * cc channel 推送时用于对「当前消息」做发言者标注——CC 的反提示注入防御拒绝裸/指令式
@@ -117,11 +118,12 @@ interface RoomChannel {
 	 * 思考期间排队的消息经 flushPendingMessages 直推 debouncer 时也必经守卫。
 	 * 每条 trigger-eligible 消息（无论是否随即入队）都更新这两个标志：
 	 *   - batchSawHuman：本批是否出现过人类消息（出现则本轮按人类轮处理，计数归零）
-	 *   - batchAiFromUid：本批最近一条对端 AI 消息的 fromUid（0=本批无对端 AI 消息）
+	 *   - batchAiFromUid：本批最近一条对端 AI 消息的 fromUid（''=本批无对端 AI 消息）
 	 * 守卫在 triggerAgentLoop 评估完本批后清零这两个标志（非 skipGuard 路径）。
+	 * REQ-029 (#29): fromUid 为不透明字符串，无 AI 哨兵值改用 ''（原为 0）。
 	 */
 	batchSawHuman: boolean;
-	batchAiFromUid: number;
+	batchAiFromUid: string;
 	/**
 	 * REQ-004 S8-7: 指数退避窗口标志。
 	 * 守卫判定 delay 时置 true，rescheduled 触发落地时置 false。
@@ -141,13 +143,14 @@ const ACCUMULATED_MESSAGES_CAP = 50;
 export class MessageHandler {
 	private ws: HulaWSClient;
 	private driver: AgentDriver;
-	private selfUid: number;
+	// REQ-029 (#29): selfUid is an opaque string end-to-end.
+	private selfUid: string;
 
 	// REQ-004: 替换 streaming boolean 为 thinkingSessions Map
 	private thinkingSessions = new Map<string, ThinkingSession>();
 
-	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）
-	private roomChannels = new Map<number, RoomChannel>();
+	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）；REQ-029: key 为字符串 roomId
+	private roomChannels = new Map<string, RoomChannel>();
 
 	/**
 	 * 已处理的 msgId 集合（防重复推送）。
@@ -186,7 +189,7 @@ export class MessageHandler {
 	constructor(
 		ws: HulaWSClient,
 		driver: AgentDriver,
-		selfUid: number,
+		selfUid: string,
 		apiClient?: HulaApiClient,
 		debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
 		onTokenExpired?: () => void,
@@ -205,7 +208,7 @@ export class MessageHandler {
 	 * REQ-004 S2: 获取/创建指定房间的处理通道。
 	 * 每个房间有独立的 debouncer，flush 时只触发该房间的 agent loop。
 	 */
-	private getRoomChannel(roomId: number): RoomChannel {
+	private getRoomChannel(roomId: string): RoomChannel {
 		let channel = this.roomChannels.get(roomId);
 		if (!channel) {
 			const debouncer = new MessageDebouncer((merged) => {
@@ -216,10 +219,10 @@ export class MessageHandler {
 			channel = {
 				debouncer,
 				pendingMessages: [],
-				lastCtx: { roomId, fromUid: 0, fromName: 'unknown', msgId: '', roomType: 1, isOwner: false },
+				lastCtx: { roomId, fromUid: '', fromName: 'unknown', msgId: '', roomType: 1, isOwner: false },
 				accumulatedMessages: [],
 				batchSawHuman: false,
-				batchAiFromUid: 0,
+				batchAiFromUid: '',
 				antiLoopDelaying: false,
 			};
 			this.roomChannels.set(roomId, channel);
@@ -266,9 +269,9 @@ export class MessageHandler {
 	private handleReceiveMessage(data: ReceivedMessage): void {
 		const msgId = String(data.message.id);
 
-		// 1. 发送 ACK
+		// 1. 发送 ACK（REQ-029 #29: msgId 作为不透明字符串发送，绝不 Number()——>2^53 会精度丢失）
 		this.ws.send(WSReqType.ACK, {
-			msgId: Number(msgId),
+			msgId,
 			timestamp: Date.now(),
 		});
 
@@ -288,8 +291,9 @@ export class MessageHandler {
 		const content = buildAgentInjection(data.message);
 		if (!content?.trim()) return;
 
-		const roomId = Number(data.message.roomId);
-		const fromUid = Number(data.fromUser.uid);
+		// REQ-029 (#29): normalize inbound ids with String(...) (NOT Number()) — opaque strings end-to-end.
+		const roomId = String(data.message.roomId);
+		const fromUid = String(data.fromUser.uid);
 		const isFromAi = data.fromUser.userType === 4; // 4 = AICLAW
 
 		// 4. 【M3】跳过 autoReply 消息
@@ -385,7 +389,7 @@ export class MessageHandler {
 	 * 因此防循环守卫在此处按本轮 BATCH 统一评估，杜绝排队消息绕过守卫（issue #22）。
 	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
 	 */
-	private async triggerAgentLoop(roomId: number, message: string, skipGuard = false): Promise<void> {
+	private async triggerAgentLoop(roomId: string, message: string, skipGuard = false): Promise<void> {
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
@@ -404,7 +408,7 @@ export class MessageHandler {
 		//   - skipGuard=true（退避 reschedule 落地）跳过：本轮已评估过，不重复评估。
 		//   - 本批仅当「无人类消息 且 出现过对端 AI 消息」才算一轮 AI-to-AI（反影子化：人类消息一票否决）。
 		if (!skipGuard) {
-			const isFromAi = !channel.batchSawHuman && channel.batchAiFromUid !== 0;
+			const isFromAi = !channel.batchSawHuman && channel.batchAiFromUid !== '';
 			const fromUid = channel.batchAiFromUid;
 			const guardResult = this.antiLoopGuard.check({
 				roomId,
@@ -415,7 +419,7 @@ export class MessageHandler {
 			});
 			// 评估完即清零本批标志（下一批重新积累）
 			channel.batchSawHuman = false;
-			channel.batchAiFromUid = 0;
+			channel.batchAiFromUid = '';
 
 			if (guardResult.action === 'block') {
 				console.log(`[anti-loop] block roomId=${roomId} reason=${guardResult.reason}`);
@@ -606,9 +610,10 @@ export class MessageHandler {
 		const { fromUid, roomId, triggerMsgId } = data;
 
 		// 只处理自己发起的 thinking（server 广播给全员，通过 fromUid 过滤）
-		if (String(fromUid) !== String(this.selfUid)) return;
+		if (String(fromUid) !== this.selfUid) return;
 
-		const sessionKey = `aiclaw-${this.selfUid}-room-${Number(roomId)}`;
+		// REQ-029 (#29): String(roomId) (drop Number()) — inbound roomId may be a >2^53 numeric string.
+		const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
 		const session = this.thinkingSessions.get(sessionKey);
 		if (!session) {
 			console.warn(`[thinking] received thinkingStart broadcast but no active session for ${sessionKey}`);
@@ -657,9 +662,10 @@ export class MessageHandler {
 
 	/** M3: 群配置变更通知处理 */
 	private handleGroupConfigChange(data: GroupConfigChangeDTO): void {
-		if (data.aiclawUid !== this.selfUid) return;
+		// REQ-029 (#29): compare/store ids as opaque strings (inbound may be numeric string or number).
+		if (String(data.aiclawUid) !== this.selfUid) return;
 		// REQ-009 #85: workspaceDir rides inside config; account rides on the outer message.
-		this.groupConfigCache.set(this.selfUid, data.roomId, {
+		this.groupConfigCache.set(this.selfUid, String(data.roomId), {
 			...data.config,
 			workspaceDir: data.config.workspaceDir,
 			account: data.account,
@@ -676,7 +682,7 @@ export class MessageHandler {
 			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 session
 			if (status === 'error' && (error === 'rate_limit_exceeded' || error === 'daily_limit_exceeded')) {
 				if (String(data.fromUid) === String(this.selfUid)) {
-					const sessionKey = `aiclaw-${this.selfUid}-room-${Number(roomId)}`;
+					const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
 					const session = this.thinkingSessions.get(sessionKey);
 					if (session) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
@@ -684,11 +690,11 @@ export class MessageHandler {
 							? '发言频率限制，已自动跳过本次响应'
 							: '今日发言上限已达，已自动跳过本次响应';
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
-						this.sendAutoReply(Number(roomId), reason);
+						this.sendAutoReply(String(roomId), reason);
 						// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
 						void session.agentSession?.close();
 						this.thinkingSessions.delete(sessionKey);
-						this.flushPendingMessages(Number(roomId));
+						this.flushPendingMessages(String(roomId));
 					}
 				}
 			}
@@ -711,7 +717,7 @@ export class MessageHandler {
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
 			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(Number(roomId));
+			this.flushPendingMessages(String(roomId));
 			return;
 		}
 
@@ -719,11 +725,11 @@ export class MessageHandler {
 			switch (error) {
 				case 'rate_limit_exceeded':
 					console.log(`[thinking] server rejected: rate_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(Number(roomId), '发言频率限制，已自动跳过本次响应');
+					this.sendAutoReply(String(roomId), '发言频率限制，已自动跳过本次响应');
 					break;
 				case 'daily_limit_exceeded':
 					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(Number(roomId), '今日发言上限已达，已自动跳过本次响应');
+					this.sendAutoReply(String(roomId), '今日发言上限已达，已自动跳过本次响应');
 					break;
 				default:
 					console.log(`[thinking] server error: ${error} (no autoReply)`);
@@ -735,7 +741,7 @@ export class MessageHandler {
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
 			void session.agentSession?.close();
 			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(Number(roomId));
+			this.flushPendingMessages(String(roomId));
 		}
 	}
 
@@ -750,8 +756,11 @@ export class MessageHandler {
 	 *  - non-cc driver (or no `bind`) → error result (the server only routes to cc aiclaws, but guard).
 	 *  - bind throws → error result (`String(err)`).
 	 */
-	private handleCcBindRequest({ roomId, roomType, counterpartUid, requestId }: CcBindRequestDTO): void {
+	private handleCcBindRequest({ roomId: rawRoomId, roomType, counterpartUid: rawCounterpartUid, requestId }: CcBindRequestDTO): void {
 		try {
+			// REQ-029 (#29): normalize inbound ids to opaque strings (never Number()).
+			const roomId = String(rawRoomId);
+			const counterpartUid = rawCounterpartUid === undefined ? undefined : String(rawCounterpartUid);
 			// Defensive guard: only a cc driver exposing `bind` can answer (server routes only to cc
 			// aiclaws, but a misroute / non-cc identity must not crash or silently drop).
 			const driver = this.driver as Partial<CcDriver>;
@@ -786,7 +795,7 @@ export class MessageHandler {
 	}
 
 	/** M3: 发送 autoReply（限流/退避触发时调用） */
-	private sendAutoReply(roomId: number, reason: string): void {
+	private sendAutoReply(roomId: string, reason: string): void {
 		if (!this.apiClient) {
 			console.warn('[anti-loop] autoReply skipped: no internal API client available');
 			return;
@@ -842,7 +851,7 @@ export class MessageHandler {
 	 * 假设：一个 aiclaw-room 由 driver loop **或** CC broker 单独驱动，二者不并发（codex/opencode
 	 * aiclaw 不是 CC aiclaw）。共享同一 map + sessionKey 方案，是为了让 thinkingId 回填路径统一。
 	 */
-	beginExternalThinking(roomId: number, fromUid: number): void {
+	beginExternalThinking(roomId: string, fromUid: string): void {
 		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
 		if (this.thinkingSessions.has(sessionKey)) {
 			// 已有 active session（driver loop 或上一次外部 begin）→ 守卫双重 begin。
@@ -886,7 +895,7 @@ export class MessageHandler {
 	 * REQ-010 S7: 外部 thinking 增量。与既有 thinking 一致**仅本地累计**，不逐帧发 THINKING_DELTA
 	 * （内容随 THINKING_END 一次性整发）。无 active session 时安全 no-op。
 	 */
-	externalThinkingDelta(roomId: number, fromUid: number, text: string): void {
+	externalThinkingDelta(roomId: string, fromUid: string, text: string): void {
 		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
 		const session = this.thinkingSessions.get(sessionKey);
 		if (!session || session.finalized) return;
@@ -901,7 +910,7 @@ export class MessageHandler {
 	 * REQ-011 S2: cc 已改为 node-driven（CcHeadlessDriver），thinking 经 CcBroker→CcSessionRegistry
 	 * 桥接进 driver 的 AgentEvent 流，走标准路径。以下 external-thinking 方法保留（无害）但生产不再调用。
 	 */
-	endExternalThinking(roomId: number, fromUid: number): void {
+	endExternalThinking(roomId: string, fromUid: string): void {
 		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
 		const session = this.thinkingSessions.get(sessionKey);
 		if (!session || session.finalized) return;
@@ -919,7 +928,7 @@ export class MessageHandler {
 	}
 
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
-	private flushPendingMessages(roomId: number): void {
+	private flushPendingMessages(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
 		if (!channel || channel.pendingMessages.length === 0) {
 			this.maybeEvictRoom(roomId);
@@ -938,7 +947,7 @@ export class MessageHandler {
 	 * 仅当无待处理消息、无缓冲 debounce、无活跃 thinking 会话时回收；
 	 * 下一条消息会按需重建通道（lastCtx 每次收信都会重设）。
 	 */
-	private maybeEvictRoom(roomId: number): void {
+	private maybeEvictRoom(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
 		if (!channel) return;
 		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;

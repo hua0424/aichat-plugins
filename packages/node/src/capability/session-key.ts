@@ -46,14 +46,15 @@ export function parseSessionKey(sessionKey: string): { agentType: string; id: st
 /** A supervised agent, narrowed to what session routing needs: its driver, uid, and per-identity api. */
 export interface BindableAgent {
 	driver: AgentDriver;
-	uid: number;
+	// REQ-029 (#29): uid is an opaque string end-to-end.
+	uid: string;
 	api: HulaApiClient;
 }
 
 /** The resolved binding: the bound identity+room + the per-identity api client to reply through. */
 export interface BoundSession {
-	aiclawUid: number;
-	roomId: number;
+	aiclawUid: string;
+	roomId: string;
 	apiClient: HulaApiClient;
 }
 

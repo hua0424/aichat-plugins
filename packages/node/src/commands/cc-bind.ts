@@ -19,8 +19,8 @@ export async function handleCcBind(args: string[]): Promise<void> {
 		else if (args[i] === '--uid' && args[i + 1]) uid = args[++i];
 	}
 
-	const roomId = Number(room);
-	if (!Number.isInteger(roomId) || roomId <= 0) {
+	// REQ-029 (#29): keep roomId/uid as opaque numeric strings (never Number() — >2^53 corrupts).
+	if (!/^\d+$/.test(room) || room === '0') {
 		console.error('Usage: aichat cc-bind --room <roomId> [--uid <ccUid>]');
 		console.error('       (asks the running node for the CC launch command bound to <roomId>)');
 		process.exit(1);
@@ -28,8 +28,8 @@ export async function handleCcBind(args: string[]): Promise<void> {
 
 	const res = await postCapability(capabilitySocketPath(), {
 		admin: 'cc-bind',
-		roomId,
-		...(uid ? { uid: Number(uid) } : {}),
+		roomId: room,
+		...(uid ? { uid } : {}),
 	});
 
 	const ok = res.status === 200 && (res.body as { ok?: boolean })?.ok === true;
@@ -40,7 +40,7 @@ export async function handleCcBind(args: string[]): Promise<void> {
 	}
 
 	const result = (res.body as { result?: { launchCommand?: string; workspaceDir?: string } }).result ?? {};
-	console.log(`Run this to start CC bound to room ${roomId}:`);
+	console.log(`Run this to start CC bound to room ${room}:`);
 	console.log('');
 	console.log(`  ${result.launchCommand}`);
 	console.log('');

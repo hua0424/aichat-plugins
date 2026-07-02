@@ -25,11 +25,11 @@ export class GroupConfigCache {
 	/** key = `${aiclawUid}:${roomId}` */
 	private cache = new Map<string, GroupConfig>();
 
-	get(aiclawUid: number, roomId: number): GroupConfig | undefined {
+	get(aiclawUid: string, roomId: string): GroupConfig | undefined {
 		return this.cache.get(`${aiclawUid}:${roomId}`);
 	}
 
-	set(aiclawUid: number, roomId: number, config: GroupConfig): void {
+	set(aiclawUid: string, roomId: string, config: GroupConfig): void {
 		// CR-S8: normalize boolean fields — server sends 0/1, enforce boolean
 		const normalized: GroupConfig = {
 			...config,
@@ -42,7 +42,7 @@ export class GroupConfigCache {
 		this.cache.set(`${aiclawUid}:${roomId}`, normalized);
 	}
 
-	delete(aiclawUid: number, roomId: number): void {
+	delete(aiclawUid: string, roomId: string): void {
 		this.cache.delete(`${aiclawUid}:${roomId}`);
 	}
 

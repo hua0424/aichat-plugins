@@ -6,11 +6,12 @@ import { loadConfig, loadCredentials, getServerUrl } from '../config.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
 export async function handleGroupConfig(args: string[]): Promise<void> {
-	let roomId = 0;
+	// REQ-029 (#29): roomId is an opaque string (never Number() — >2^53 corrupts).
+	let roomId = '';
 	const updates: Record<string, unknown> = {};
 
 	for (let i = 0; i < args.length; i++) {
-		if (args[i] === '--room' && args[i + 1]) roomId = Number(args[++i]);
+		if (args[i] === '--room' && args[i + 1]) roomId = args[++i];
 		if (args[i] === '--rate-limit' && args[i + 1]) updates.rateLimitPerMinute = Number(args[++i]);
 		if (args[i] === '--daily-limit' && args[i + 1]) updates.dailyLimit = Number(args[++i]);
 		if (args[i] === '--respond-to-ai' && args[i + 1]) updates.respondToAi = args[++i] === 'true' ? 1 : 0;

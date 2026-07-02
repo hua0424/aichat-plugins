@@ -3,9 +3,11 @@ import { ccBindAdminHandler, type CcBindableAgent } from './cc-bind.js';
 import type { CcDriver, CcBindInstructions } from '../agent/cc/cc-driver.js';
 
 /** A fake cc identity: a driver of type 'cc' with a spy bind() returning canned instructions. */
-function ccAgent(uid: number): CcBindableAgent & { bind: ReturnType<typeof vi.fn> } {
+function ccAgent(uidNum: number): CcBindableAgent & { bind: ReturnType<typeof vi.fn> } {
+	// REQ-029 (#29): uid is an opaque string end-to-end.
+	const uid = String(uidNum);
 	const bind = vi.fn(
-		(ccUid: number, roomId: number): CcBindInstructions => ({
+		(ccUid: string, roomId: string): CcBindInstructions => ({
 			token: `aiclaw-${ccUid}-room-${roomId}`,
 			launchCommand: `cd '/ws/${ccUid}/group/${roomId}' && AICHAT_BIND='aiclaw-${ccUid}-room-${roomId}' claude --settings '/ws/${ccUid}/group/${roomId}/settings.json'`,
 			settingsPath: `/ws/${ccUid}/group/${roomId}/settings.json`,
@@ -26,7 +28,7 @@ describe('ccBindAdminHandler', () => {
 		const handler = ccBindAdminHandler([otherAgent(7), cc]);
 		const res = await handler({ admin: 'cc-bind', roomId: 42 });
 
-		expect(cc.bind).toHaveBeenCalledWith(5, 42, expect.objectContaining({ roomId: 42 }));
+		expect(cc.bind).toHaveBeenCalledWith('5', '42', expect.objectContaining({ roomId: '42' }));
 		expect(res.status).toBe(200);
 		expect(res.json).toMatchObject({
 			ok: true,
@@ -57,7 +59,7 @@ describe('ccBindAdminHandler', () => {
 		const handler = ccBindAdminHandler([cc5, cc6]);
 		const res = await handler({ admin: 'cc-bind', roomId: 42, uid: 6 });
 		expect(res.status).toBe(200);
-		expect(cc6.bind).toHaveBeenCalledWith(6, 42, expect.objectContaining({ roomId: 42 }));
+		expect(cc6.bind).toHaveBeenCalledWith('6', '42', expect.objectContaining({ roomId: '42' }));
 		expect(cc5.bind).not.toHaveBeenCalled();
 	});
 

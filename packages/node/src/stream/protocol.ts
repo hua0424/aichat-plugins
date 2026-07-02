@@ -174,8 +174,9 @@ export interface ThinkingEndDTO {
 
 /** server → client/plugin: 群配置变更通知 */
 export interface GroupConfigChangeDTO {
-	aiclawUid: number;
-	roomId: number;
+	// REQ-029 (#29): server serializes Long as string; handler String()-normalizes at ingress.
+	aiclawUid: string | number;
+	roomId: string | number;
 	/** REQ-009 #85: the group's human-readable group number ("groupkey"), carried on the outer message. */
 	account?: string;
 	config: {
@@ -195,9 +196,10 @@ export interface GroupConfigChangeDTO {
  * roomType: 1=GROUP, 2=FRIEND/DM; counterpartUid present for DMs (the other party).
  */
 export interface CcBindRequestDTO {
-	roomId: number;
+	// REQ-029 (#29): server serializes Long as string; handler String()-normalizes at ingress.
+	roomId: string | number;
 	roomType: number;
-	counterpartUid?: number;
+	counterpartUid?: string | number;
 	requestId: string;
 }
 

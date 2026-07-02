@@ -200,7 +200,7 @@ describe('CodexDriver.resolveSession', () => {
 
 		// stored BOTH directions
 		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe(TID);
-		expect(driver.resolveSession(TID)).toEqual({ aiclawUid: 5, roomId: 9 });
+		expect(driver.resolveSession(TID)).toEqual({ aiclawUid: '5', roomId: '9' });
 	});
 
 	it('unknown threadId → undefined', () => {
@@ -234,7 +234,7 @@ describe('CodexDriver.resolveSession', () => {
 		// store rebound to the new id (resume-or-create on the next turn now resumes thread_new)
 		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_new');
 		// resolveSession follows the new id back to the bound (aiclaw, room)
-		expect(driver.resolveSession('thread_new')).toEqual({ aiclawUid: 5, roomId: 9 });
+		expect(driver.resolveSession('thread_new')).toEqual({ aiclawUid: '5', roomId: '9' });
 	});
 });
 
@@ -397,7 +397,7 @@ describe('CodexSession.send — resume-or-create resilience (REQ-010 #101)', () 
 		expect(events[events.length - 1].type).toBe('done');
 		// captureThreadStarted stored the NEW id (resolveSession follows it)
 		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_fresh');
-		expect(driver.resolveSession('thread_fresh')).toEqual({ aiclawUid: 5, roomId: 9 });
+		expect(driver.resolveSession('thread_fresh')).toEqual({ aiclawUid: '5', roomId: '9' });
 	});
 
 	it('non-resume error → NO fallback: single error event, startThread not called', async () => {

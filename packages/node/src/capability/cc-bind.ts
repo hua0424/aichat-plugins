@@ -21,14 +21,15 @@ import type { OpencodeChatContext } from '../agent/opencode/workspace.js';
 
 /** A cc-bindable agent: a CcDriver-bearing identity. */
 export interface CcBindableAgent {
-	uid: number;
+	// REQ-029 (#29): uid is an opaque string.
+	uid: string;
 	driver: { type: string; bind?: CcDriver['bind'] };
 }
 
 /** Find the target cc identity: the sole cc driver, or the one matching `uid` when several exist. */
 function findCcAgent(
 	agents: ReadonlyArray<CcBindableAgent>,
-	uid: number | undefined,
+	uid: string | undefined,
 ): { agent: CcBindableAgent } | { error: string } {
 	const ccAgents = agents.filter((a) => a.driver.type === 'cc' && typeof a.driver.bind === 'function');
 	if (ccAgents.length === 0) {
@@ -50,11 +51,12 @@ function findCcAgent(
 
 export function ccBindAdminHandler(agents: ReadonlyArray<CcBindableAgent>): AdminHandler {
 	return (body: Record<string, unknown>): CapabilityResponse => {
-		const roomId = Number(body.roomId);
-		if (!Number.isInteger(roomId) || roomId <= 0) {
+		// REQ-029 (#29): keep roomId/uid as opaque numeric strings (never Number() — >2^53 corrupts).
+		const roomId = body.roomId == null ? '' : String(body.roomId);
+		if (!/^\d+$/.test(roomId) || roomId === '0') {
 			return { status: 400, json: { ok: false, error: 'cc-bind requires a positive integer roomId' } };
 		}
-		const uid = body.uid === undefined ? undefined : Number(body.uid);
+		const uid = body.uid === undefined ? undefined : String(body.uid);
 
 		const found = findCcAgent(agents, uid);
 		if ('error' in found) {

@@ -22,7 +22,7 @@ import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js
 export function buildCcChannelContent(o: {
 	roomType: number;
 	fromName: string;
-	fromUid: number;
+	fromUid: string;
 	accumulated: string[];
 	message: string;
 }): string {
@@ -167,7 +167,7 @@ export class CcHeadlessDriver implements AgentDriver {
 	}
 
 	/** Pure parse of the AICHAT_BIND binding back to (aiclawUid, roomId). Same contract as codex/opencode. */
-	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		return parseCcBinding(sessionKey);
 	}
 
@@ -177,13 +177,13 @@ export class CcHeadlessDriver implements AgentDriver {
 	 * spawns fresh, so this simply returns a room to that state. Minimal v1 entry point (a method; no
 	 * client UX) — an `aichat` CLI subcommand can wrap it later if needed.
 	 */
-	resetSession(aiclawUid: number, roomId: number): void {
+	resetSession(aiclawUid: string, roomId: string): void {
 		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
 	}
 
 	async openSession(o: {
-		aiclawUid: number;
-		roomId: number;
+		aiclawUid: string;
+		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const ctx = o.chatContext as unknown as OpencodeChatContext;
@@ -200,7 +200,7 @@ export class CcHeadlessDriver implements AgentDriver {
 			// the current message's fromUid (handler sets it). Defaults keep a bare ctx safe.
 			roomType: typeof ctx.roomType === 'number' ? ctx.roomType : 1,
 			fromName: ctx.fromName ?? 'unknown',
-			fromUid: ctx.counterpartUid ?? 0,
+			fromUid: ctx.counterpartUid ?? '',
 			accumulated: ctx.accumulated ?? [],
 			workspaceDir,
 			settingsPath,
@@ -222,11 +222,11 @@ export class CcHeadlessDriver implements AgentDriver {
 
 interface CcHeadlessSessionDeps {
 	binding: string;
-	roomId: number;
+	roomId: string;
 	/** REQ-011 S3: attribution context for this turn's stdin envelope. */
 	roomType: number;
 	fromName: string;
-	fromUid: number;
+	fromUid: string;
 	accumulated: string[];
 	workspaceDir: string;
 	settingsPath: string;
