@@ -71,12 +71,13 @@ export class OpencodeDriver implements AgentDriver {
 	 * driver loaded won't resolve here until reload. Upgrade when N>1: a shared session index or a
 	 * per-call reload of the store.
 	 */
-	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyBySessionID(sessionKey);
 		if (!key) return undefined;
 		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
 		if (!m) return undefined;
-		return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
+		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
 	async disconnect(): Promise<void> {
@@ -93,8 +94,8 @@ export class OpencodeDriver implements AgentDriver {
 	// crashed server and lazily rebuild the session on the next openSession/send. Not done
 	// now: no crash detection / retry here.
 	async openSession(o: {
-		aiclawUid: number;
-		roomId: number;
+		aiclawUid: string;
+		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const ctx = o.chatContext as unknown as OpencodeChatContext;

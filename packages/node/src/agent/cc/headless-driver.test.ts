@@ -174,7 +174,7 @@ async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 	return out;
 }
 
-const BASE_CTX = { roomType: 1, roomId: 9 };
+const BASE_CTX = { roomType: 1, roomId: '9' };
 const KEY = 'aiclaw-5-room-9';
 
 /** A fake CcTranscriptWriter that records every appended (key, record) pair. */
@@ -225,7 +225,7 @@ describe('CcHeadlessDriver — shape', () => {
 
 	it('resolveSession mirrors parseCcBinding', () => {
 		const { driver } = makeDriver();
-		expect(driver.resolveSession('aiclaw-7-room-8')).toEqual({ aiclawUid: 7, roomId: 8 });
+		expect(driver.resolveSession('aiclaw-7-room-8')).toEqual({ aiclawUid: '7', roomId: '8' });
 		expect(driver.resolveSession('garbage')).toBeUndefined();
 		expect(parseCcBinding('aiclaw-7-room-8')).toEqual(driver.resolveSession('aiclaw-7-room-8'));
 	});
@@ -233,7 +233,7 @@ describe('CcHeadlessDriver — shape', () => {
 	it('connect/disconnect resolve; openSession returns a session', async () => {
 		const { driver } = makeDriver();
 		await expect(driver.connect()).resolves.toBeUndefined();
-		const s = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const s = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		expect(typeof s.send).toBe('function');
 		await expect(driver.disconnect()).resolves.toBeUndefined();
 	});
@@ -243,9 +243,9 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 	it('spawns claude with the exact headless argv, cc env, and writes the attributed stdin envelope', async () => {
 		const { driver, fs } = makeDriver();
 		const session = await driver.openSession({
-			aiclawUid: 5,
-			roomId: 9,
-			chatContext: { roomType: 2, roomId: 9, fromName: '小明', counterpartUid: 100 },
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 2, roomId: '9', fromName: '小明', counterpartUid: '100' },
 		});
 		session.send('原始用户消息');
 
@@ -294,7 +294,7 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 describe('CcHeadlessSession.send — stdout control-plane', () => {
 	it('system:init → session_id stored; result → {done}; NO thinking/text yielded from stdout', async () => {
 		const { driver, fs, store } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		fs.emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-abc' })}\n`);
@@ -310,7 +310,7 @@ describe('CcHeadlessSession.send — stdout control-plane', () => {
 
 	it('EOF (stdout end) with no `result` still finishes as a backstop', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-x' })}\n`);
 		fs.endStdout();
@@ -320,7 +320,7 @@ describe('CcHeadlessSession.send — stdout control-plane', () => {
 
 	it('tolerates a `data:` SSE-style prefix on stdout lines', async () => {
 		const { driver, fs, store } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStdout(`data: ${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-sse' })}\n`);
 		fs.emitStdout(`data: ${JSON.stringify({ type: 'result' })}\n`);
@@ -333,7 +333,7 @@ describe('CcHeadlessSession.send — resume', () => {
 	it('a stored session_id for (uid,room) → argv has --resume <sid>; a new init rebinds the store', async () => {
 		const { driver, fs, store } = makeDriver();
 		store.set(KEY, { sessionId: 'sid-prev' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		expect(fs.spawnCall!.args).toContain('--resume');
@@ -350,7 +350,7 @@ describe('CcHeadlessSession.send — resume', () => {
 describe('CcHeadlessSession.send — timeout & errors', () => {
 	it('no stdout event within firstEventTimeoutMs → {error} + kills the process group', async () => {
 		const { driver, fs, kill } = makeDriver({ firstEventTimeoutMs: 20, drainMs: 10 });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const events = await drain(session.send('hi'));
 		expect(events).toEqual([{ type: 'error', message: 'first-event timeout' }]);
 		// killed the GROUP (negative pid), SIGTERM
@@ -359,7 +359,7 @@ describe('CcHeadlessSession.send — timeout & errors', () => {
 
 	it('nonzero exit before completion → {error} with the exit code', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStderr('boom on stderr');
 		fs.emitExit(1);
@@ -372,7 +372,7 @@ describe('CcHeadlessSession.send — timeout & errors', () => {
 
 	it('spawn error event → {error}', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitError(new Error('ENOENT claude'));
 		const events = await drain(stream);
@@ -384,7 +384,7 @@ describe('CcHeadlessSession.send — timeout & errors', () => {
 			throw new Error('spawn EACCES');
 		};
 		const { driver } = makeDriver({ spawn: throwingSpawn });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const events = await drain(session.send('hi'));
 		expect(events).toEqual([{ type: 'error', message: 'spawn EACCES' }]);
 	});
@@ -399,7 +399,7 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 	it('MessageDisplay/PostToolUse hooks → {thinking}/{tool} appear in send()`s stream', async () => {
 		const { driver, fs, registry } = makeDriver();
 		const broker = brokerFor(registry);
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'thinking A' } });
@@ -415,7 +415,7 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 	it('ORDER boundary: a Stop-hook thinking racing AFTER stdout-complete still flushes BEFORE done', async () => {
 		const { driver, fs, registry } = makeDriver({ drainMs: 40 });
 		const broker = brokerFor(registry);
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// stdout says the turn is complete FIRST (starts the drain window)...
@@ -434,7 +434,7 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 	it('a hook for a room with NO active session (turn already finished) is a safe no-op (no throw)', async () => {
 		const { driver, fs, registry } = makeDriver();
 		const broker = brokerFor(registry);
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream); // session finished → deregistered from the room
@@ -447,7 +447,7 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 describe('CcHeadlessSession/Driver — cleanup (AC8: no orphaned process groups)', () => {
 	it('close() kills the child process group (kill(-pid, SIGTERM)) and finishes the stream', async () => {
 		const { driver, fs, kill } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const collected: AgentEvent[] = [];
 		const consumed = (async () => {
 			for await (const ev of session.send('hi')) collected.push(ev);
@@ -462,7 +462,7 @@ describe('CcHeadlessSession/Driver — cleanup (AC8: no orphaned process groups)
 
 	it('driver.disconnect() reaps every active child (node teardown handler)', async () => {
 		const { driver, fs, kill } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		void session.send('hi'); // spawns the child, registers as active
 
 		await driver.disconnect();
@@ -471,7 +471,7 @@ describe('CcHeadlessSession/Driver — cleanup (AC8: no orphaned process groups)
 
 	it('a normally-completed turn removes itself from the active set (disconnect does not re-kill it)', async () => {
 		const { driver, fs, kill } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream); // finish() → onClosed → removed from active; normal exit does NOT kill
@@ -488,9 +488,9 @@ describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', 
 	it('DM → `[HuLa 私聊]\\n[name(uid)]: <msg>` (roomType 2, no accumulated)', async () => {
 		const { driver, fs } = makeDriver();
 		const session = await driver.openSession({
-			aiclawUid: 5,
-			roomId: 9,
-			chatContext: { roomType: 2, roomId: 9, fromName: '阿强', counterpartUid: 100 },
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 2, roomId: '9', fromName: '阿强', counterpartUid: '100' },
 		});
 		session.send('你好');
 		expect(stdinText(fs)).toBe('[HuLa 私聊]\n[阿强(100)]: 你好');
@@ -500,9 +500,9 @@ describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', 
 		const { driver, fs } = makeDriver();
 		const accumulated = ['[alice(100)]: first', '[bob(101)]: second'];
 		const session = await driver.openSession({
-			aiclawUid: 5,
-			roomId: 9,
-			chatContext: { roomType: 1, roomId: 9, fromName: 'dave', counterpartUid: 102, accumulated },
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', fromName: 'dave', counterpartUid: '102', accumulated },
 		});
 		session.send('hey bot');
 		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
@@ -512,9 +512,9 @@ describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', 
 		const { driver, fs } = makeDriver();
 		const accumulated = ['[x(1)]: a'];
 		const session = await driver.openSession({
-			aiclawUid: 5,
-			roomId: 9,
-			chatContext: { roomType: 1, roomId: 9, fromName: 'y', counterpartUid: 2, accumulated },
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', fromName: 'y', counterpartUid: '2', accumulated },
 		});
 		session.send('cur');
 		expect(stdinText(fs)).toBe(
@@ -522,11 +522,11 @@ describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', 
 		);
 	});
 
-	it('a bare chatContext (no fromName/counterpartUid) degrades to `[unknown(0)]` — never throws', async () => {
+	it('a bare chatContext (no fromName/counterpartUid) degrades to `[unknown()]` — never throws', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		session.send('m');
-		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[unknown(0)]: m');
+		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[unknown()]: m');
 	});
 });
 
@@ -536,9 +536,9 @@ describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching th
 	it('a turn appends the INBOUND (attributed) record + the CC OUTPUT events (assistant/tool/thinking) with ts+session_id', async () => {
 		const { driver, fs, transcript } = makeDriver();
 		const session = await driver.openSession({
-			aiclawUid: 5,
-			roomId: 9,
-			chatContext: { roomType: 2, roomId: 9, fromName: '阿强', counterpartUid: 100 },
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 2, roomId: '9', fromName: '阿强', counterpartUid: '100' },
 		});
 		const stream = session.send('你好');
 
@@ -574,15 +574,15 @@ describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching th
 
 	it('appends (never overwrites) across turns — a second send() adds more records', async () => {
 		const { driver, fs, transcript } = makeDriver();
-		const ctx = { roomType: 2, roomId: 9, fromName: 'u', counterpartUid: 100 };
+		const ctx = { roomType: 2, roomId: '9', fromName: 'u', counterpartUid: '100' };
 
-		const s1 = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: ctx });
+		const s1 = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: ctx });
 		const st1 = s1.send('turn-1');
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(st1);
 		const afterTurn1 = transcript.records.filter((r) => r.key === KEY).length;
 
-		const s2 = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: ctx });
+		const s2 = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: ctx });
 		s2.send('turn-2');
 		const afterTurn2 = transcript.records.filter((r) => r.key === KEY).length;
 
@@ -605,7 +605,7 @@ describe('CcHeadlessDriver — REQ-011 S3 resetSession', () => {
 		driver.resetSession(5, 9);
 		expect(store.map.has(KEY)).toBe(false);
 
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		session.send('hi');
 		expect(fs.spawnCall!.args).not.toContain('--resume');
 	});
@@ -613,7 +613,7 @@ describe('CcHeadlessDriver — REQ-011 S3 resetSession', () => {
 	it('first-trigger (no stored session_id) still spawns fresh — reset changes nothing there', async () => {
 		const { driver, fs } = makeDriver();
 		driver.resetSession(5, 9); // no-op on an empty store
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		session.send('hi');
 		expect(fs.spawnCall!.args).not.toContain('--resume');
 	});
@@ -626,7 +626,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store, kill } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-dead' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// attempt 1 resumed the (now dead) session and then failed non-zero
@@ -659,7 +659,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 			const fms = fakeMultiSpawn();
 			const { driver, store, kill } = makeDriver({ spawn: fms.spawn, firstEventTimeoutMs: 20, drainMs: 10 });
 			store.set(KEY, { sessionId: 'sid-dead' });
-			const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+			const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 			const stream = session.send('hi');
 
 			// attempt 1 resumed but emits NO stdout within the watchdog window
@@ -690,7 +690,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-dead' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		expect(fms.calls[0].args).toContain('--resume');
@@ -711,7 +711,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-live' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		expect(fms.calls.length).toBe(1);
@@ -732,7 +732,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		// no stored session_id
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		expect(fms.calls[0].args).not.toContain('--resume');
@@ -751,7 +751,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-dead' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// attempt 1 (resume) fails → self-heal
@@ -773,7 +773,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-dead' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// attempt 1 (resume) fails → self-heal to a fresh attempt 2
@@ -804,7 +804,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		store.set(KEY, { sessionId: 'sid-dead' });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// attempt 1 resumed the (now dead) session
@@ -848,7 +848,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
 		// no stored session_id → fresh attempt
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		expect(fms.calls[0].args).not.toContain('--resume');
@@ -872,7 +872,7 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 	it('success result STILL completes (regression): a normal `result` (no is_error) → {done}, single spawn', async () => {
 		const fms = fakeMultiSpawn();
 		const { driver, store } = makeDriver({ spawn: fms.spawn });
-		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: BASE_CTX });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		fms.calls[0].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-ok' })}\n`);

@@ -84,8 +84,9 @@ describe('buildCcBridgeSink', () => {
 describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () => {
 	function harness() {
 		const reg = new CcSessionRegistry();
-		const got = new Map<number, AgentEvent[]>();
-		const register = (roomId: number): CcEventPush => {
+		// REQ-029 (#29): roomId keys are opaque strings (the broker resolves them from the binding).
+		const got = new Map<string, AgentEvent[]>();
+		const register = (roomId: string): CcEventPush => {
 			const arr: AgentEvent[] = [];
 			got.set(roomId, arr);
 			const push: CcEventPush = (ev) => arr.push(ev);
@@ -98,12 +99,12 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 
 	it('MessageDisplay → {thinking}; PostToolUse → {tool}; on the binding-owner room only', async () => {
 		const h = harness();
-		h.register(42); // active session for room 42 (uid 5)
+		h.register('42'); // active session for room 42 (uid 5)
 
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'MessageDisplay', content: 'streaming' } });
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 
-		expect(h.got.get(42)).toEqual([
+		expect(h.got.get('42')).toEqual([
 			{ type: 'thinking', text: 'streaming' },
 			{ type: 'tool', name: 'Bash', phase: 'end' },
 		]);
@@ -111,25 +112,25 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 
 	it('SessionStart / UserPromptSubmit lifecycle → nothing pushed (handler does THINKING_START)', async () => {
 		const h = harness();
-		h.register(42);
+		h.register('42');
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'SessionStart' } });
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'UserPromptSubmit' } });
-		expect(h.got.get(42)).toEqual([]);
+		expect(h.got.get('42')).toEqual([]);
 	});
 
 	it('Stop → 200 ok, nothing pushed, no throw (done comes from stdout EOF, not the hook)', async () => {
 		const h = harness();
-		h.register(42);
+		h.register('42');
 		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'Stop', last_assistant_message: 'x' } });
 		expect(res.status).toBe(200);
-		expect(h.got.get(42)).toEqual([]);
+		expect(h.got.get('42')).toEqual([]);
 	});
 
 	it('late/racing hook with NO active session for the room → 200 ok, safe no-op drop (no throw)', async () => {
 		const h = harness(); // no register() → no active session
 		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'MessageDisplay', content: 'orphan' } });
 		expect(res.status).toBe(200);
-		expect(h.got.get(42)).toBeUndefined();
+		expect(h.got.get('42')).toBeUndefined();
 	});
 
 	it('unparseable binding → 401, nothing routed', async () => {

@@ -15,8 +15,8 @@ import type { AddressInfo } from 'node:net';
  * guard (mirrors CcBroker's) rejects any non-local connection: this socket is node-local by design.
  */
 
-/** resolve() result: the bound identity + room for a binding token. */
-type Resolved = { aiclawUid: number; roomId: number };
+/** resolve() result: the bound identity + room for a binding token (REQ-029: opaque strings). */
+type Resolved = { aiclawUid: string; roomId: string };
 
 export interface CcChannelEndpointDeps {
 	/** Map a CC binding token → bound identity/room, or undefined if unknown. */
@@ -41,15 +41,15 @@ export function isLoopback(addr?: string): boolean {
 export class CcChannelEndpoint {
 	private readonly resolve: (bindToken: string) => Resolved | undefined;
 	private wss: WebSocketServer | null = null;
-	/** roomId → the set of subscribed sockets for that room. */
-	private rooms = new Map<number, Set<WebSocket>>();
+	/** roomId → the set of subscribed sockets for that room (REQ-029: opaque string key). */
+	private rooms = new Map<string, Set<WebSocket>>();
 
 	constructor(deps: CcChannelEndpointDeps) {
 		this.resolve = deps.resolve;
 	}
 
 	/** Push a message to every socket subscribed for `roomId`. No subscriber → safe no-op. */
-	push(roomId: number, content: string, meta?: object): void {
+	push(roomId: string, content: string, meta?: object): void {
 		const set = this.rooms.get(roomId);
 		if (!set) return;
 		const frame = JSON.stringify({ type: 'message', content, ...(meta ? { meta } : {}) });
@@ -100,7 +100,7 @@ export class CcChannelEndpoint {
 	}
 
 	/** Register a socket under a room set (created on first subscriber). */
-	private register(roomId: number, sock: WebSocket): void {
+	private register(roomId: string, sock: WebSocket): void {
 		let set = this.rooms.get(roomId);
 		if (!set) {
 			set = new Set();

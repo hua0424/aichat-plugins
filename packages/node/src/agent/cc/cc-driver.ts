@@ -56,10 +56,11 @@ export interface CcDriverDeps {
  * paths can never diverge. A still-prefixed `cc:aiclaw-…` must never arrive here (the endpoint strips
  * `cc:` first) and is rejected by the strict `^…$` anchors.
  */
-export function parseCcBinding(binding: string): { aiclawUid: number; roomId: number } | undefined {
+export function parseCcBinding(binding: string): { aiclawUid: string; roomId: string } | undefined {
 	const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(binding);
 	if (!m) return undefined;
-	return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+	// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
+	return { aiclawUid: m[1], roomId: m[2] };
 }
 
 export class CcDriver implements AgentDriver {
@@ -89,7 +90,7 @@ export class CcDriver implements AgentDriver {
 	 * the `cc:` prefix before calling this (same contract as opencode/codex/openclaw). Returns
 	 * undefined on any unparseable/garbage input (incl. a still-prefixed `cc:…`).
 	 */
-	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		return parseCcBinding(sessionKey);
 	}
 
@@ -106,7 +107,7 @@ export class CcDriver implements AgentDriver {
 	 * Compose the binding, derive the workspace dir, write CC's settings.json, and build the owner
 	 * copy-paste launch command. Called by the `cc-bind` admin route (setup op), NOT by the handler.
 	 */
-	bind(aiclawUid: number, roomId: number, chatContext: OpencodeChatContext): CcBindInstructions {
+	bind(aiclawUid: string, roomId: string, chatContext: OpencodeChatContext): CcBindInstructions {
 		const token = `aiclaw-${aiclawUid}-room-${roomId}`;
 		const workspaceDir = deriveWorkspaceDir(this.workspaceBase, aiclawUid, chatContext);
 		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));

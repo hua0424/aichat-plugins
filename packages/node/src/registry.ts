@@ -81,7 +81,7 @@ interface ActivateResponse {
 	success: boolean;
 	/**
 	 * SERVER CONTRACT：server 把 Java `Long` uid 序列化为 **字符串**（如 "163589881742848"）。
-	 * 这里如实标注 `number | string`，调用方负责 `Number()` 收敛为数字后再落盘/使用。
+	 * REQ-029 (#29)：调用方一律 `String()` 化为不透明字符串（防 >2^53 精度丢失），绝不 Number() 收敛。
 	 */
 	data?: { uid: number | string; connectionToken: string };
 	msg?: string;
@@ -103,14 +103,20 @@ function readCachedCredential(path: string): AichatCredentials | null {
 	try {
 		const raw = readFileSync(path, 'utf-8');
 		const json = raw.replace(/^\s*\/\/.*$/gm, '');
-		const parsed = JSON.parse(json) as Partial<AichatCredentials>;
-		// SERVER CONTRACT：旧版/server 写的缓存里 uid 可能是字符串（Java Long 序列化为 string）。
-		// 容忍并收敛为数字，既修新写入也恢复已写入的「字符串 uid」缓存（否则二次启动校验失败 → 重激活 → 砖）。
-		const uid = typeof parsed.uid === 'string' ? Number(parsed.uid) : parsed.uid;
+		const parsed = JSON.parse(json) as { uid?: unknown; connectionToken?: unknown; machineCode?: unknown; activatedAt?: unknown };
+		// REQ-029 (#29)：uid 一律**不透明字符串**。缓存文件可能是字符串 uid（新写入）或旧版数字 uid
+		// （backward-compat：早期 Number() 收敛落盘）——两者都 String() 归一，绝不 Number() 化
+		// （>2^53 会精度丢失）。校验为非空纯数字串且非 '0'。
+		const uid =
+			typeof parsed.uid === 'number'
+				? String(parsed.uid)
+				: typeof parsed.uid === 'string'
+					? parsed.uid
+					: undefined;
 		if (
-			typeof uid === 'number' &&
-			Number.isFinite(uid) &&
-			uid > 0 &&
+			typeof uid === 'string' &&
+			/^\d+$/.test(uid) &&
+			uid !== '0' &&
 			typeof parsed.connectionToken === 'string' &&
 			parsed.connectionToken !== '' &&
 			typeof parsed.machineCode === 'string' &&
@@ -179,10 +185,9 @@ export async function resolveAgentCredential(
 
 	const credential: AichatCredentials = {
 		// SERVER CONTRACT：server 把 Long uid 序列化为字符串（如 "163589881742848"）。
-		// 必须 Number() 收敛——否则落盘的 uid 是字符串，下次启动 readCachedCredential 校验失败 →
-		// 缓存永远读不回 → 重激活 → server 抛「已激活」→ 身份不可恢复（砖）。
-		// Number("163589881742848") 远小于 2^53，安全整数。
-		uid: Number(result.data.uid),
+		// REQ-029 (#29)：一律 String() 归一为**不透明字符串**落盘，绝不 Number() 化
+		// （>2^53 精度丢失会让 Map key 碰撞、路由错乱）；readCachedCredential 同样按字符串校验/回读。
+		uid: String(result.data.uid),
 		connectionToken: result.data.connectionToken,
 		machineCode: opts.machineCode,
 		activatedAt: new Date().toISOString(),

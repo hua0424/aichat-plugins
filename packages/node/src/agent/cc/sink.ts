@@ -26,18 +26,19 @@ export type CcEventPush = (ev: AgentEvent) => void;
  * start / finish; `push` is called by the bridge sink as hooks arrive.
  */
 export class CcSessionRegistry {
-	private readonly byRoom = new Map<number, CcEventPush>();
+	// REQ-029 (#29): roomId key is an opaque string (>2^53-safe).
+	private readonly byRoom = new Map<string, CcEventPush>();
 
-	register(roomId: number, push: CcEventPush): void {
+	register(roomId: string, push: CcEventPush): void {
 		this.byRoom.set(roomId, push);
 	}
 
-	deregister(roomId: number): void {
+	deregister(roomId: string): void {
 		this.byRoom.delete(roomId);
 	}
 
 	/** Route an AgentEvent to the room's active session, or a safe no-op if none is registered. */
-	push(roomId: number, ev: AgentEvent): void {
+	push(roomId: string, ev: AgentEvent): void {
 		this.byRoom.get(roomId)?.(ev);
 	}
 }

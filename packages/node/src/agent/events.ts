@@ -28,7 +28,7 @@ export interface AgentDriver {
 	 * sender's name + the un-@ group-context lines) — read ONLY by the cc driver for per-sender
 	 * attribution; other drivers ignore them (behaviour unchanged).
 	 */
-	openSession(o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }): Promise<AgentSession>;
+	openSession(o: { aiclawUid: string; roomId: string; chatContext: Record<string, unknown> }): Promise<AgentSession>;
 	disconnect(): Promise<void>;
 	/**
 	 * REQ-010 S7: whether NODE drives this identity's turns on inbound messages.
@@ -47,5 +47,5 @@ export interface AgentDriver {
 	 * Optional: drivers that don't back the capability path (e.g. OpenclawDriver) need not
 	 * implement it. Returns undefined when the key is unknown/unparseable.
 	 */
-	resolveSession?(sessionKey: string): { aiclawUid: number; roomId: number } | undefined;
+	resolveSession?(sessionKey: string): { aiclawUid: string; roomId: string } | undefined;
 }

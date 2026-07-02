@@ -43,7 +43,11 @@ export interface AichatConfig {
  * 凭证（~/.aichat/credentials.jsonc，activate 后自动生成）
  */
 export interface AichatCredentials {
-	uid: number;
+	/**
+	 * REQ-029 (#29): server 把 Java `Long` uid 序列化为字符串，插件内部一律按**不透明字符串**处理，
+	 * 绝不 Number() 化（>2^53 会精度丢失、Map key 碰撞、路由错乱）。
+	 */
+	uid: string;
 	connectionToken: string;
 	machineCode: string;
 	activatedAt: string;

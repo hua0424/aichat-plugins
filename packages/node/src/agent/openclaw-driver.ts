@@ -21,10 +21,11 @@ export class OpenclawDriver implements AgentDriver {
 	 * prefix before calling this. So this is a pure PARSE, not a lookup. Returns undefined on any
 	 * unparseable/garbage input (including a still-prefixed `openclaw:...`, which must never arrive here).
 	 */
-	resolveSession(sessionKey: string): { aiclawUid: number; roomId: number } | undefined {
+	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(sessionKey);
 		if (!m) return undefined;
-		return { aiclawUid: Number(m[1]), roomId: Number(m[2]) };
+		// REQ-029 (#29): return the captured groups as opaque strings (never Number() — >2^53 corrupts).
+		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
 	async connect(): Promise<void> {
@@ -36,8 +37,8 @@ export class OpenclawDriver implements AgentDriver {
 	}
 
 	async openSession(o: {
-		aiclawUid: number;
-		roomId: number;
+		aiclawUid: string;
+		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
 		const sessionKey = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
@@ -65,7 +66,7 @@ class OpenclawSession implements AgentSession {
 	constructor(
 		private readonly adapter: ClawAdapter,
 		private readonly sessionKey: string,
-		private readonly roomId: number,
+		private readonly roomId: string,
 	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {

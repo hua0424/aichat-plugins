@@ -23,7 +23,14 @@ afterEach(() => {
 
 describe('parseCcBinding', () => {
 	it('valid binding → uids', () => {
-		expect(parseCcBinding('aiclaw-12-room-34')).toEqual({ aiclawUid: 12, roomId: 34 });
+		expect(parseCcBinding('aiclaw-12-room-34')).toEqual({ aiclawUid: '12', roomId: '34' });
+	});
+
+	it('REQ-029 (#29): a >2^53 binding parses to EXACT strings (Number() would corrupt)', () => {
+		expect(parseCcBinding('aiclaw-9007199254740993-room-9007199254740994')).toEqual({
+			aiclawUid: '9007199254740993',
+			roomId: '9007199254740994',
+		});
 	});
 
 	it('garbage → undefined', () => {
@@ -47,7 +54,7 @@ describe('CcDriver', () => {
 
 	it('resolveSession mirrors parseCcBinding (valid → uids, garbage/prefixed → undefined)', () => {
 		const d = new CcDriver({ workspaceBase: freshBase(), brokerPort: 9100 });
-		expect(d.resolveSession('aiclaw-7-room-8')).toEqual({ aiclawUid: 7, roomId: 8 });
+		expect(d.resolveSession('aiclaw-7-room-8')).toEqual({ aiclawUid: '7', roomId: '8' });
 		expect(d.resolveSession('nope')).toBeUndefined();
 		expect(d.resolveSession('cc:aiclaw-7-room-8')).toBeUndefined();
 	});

@@ -62,15 +62,16 @@ describe('memberInfoCapability (REQ-010 S3)', () => {
 		const getMemberInfo = vi.fn(async () => profile);
 		const ctx = ctxWith(getMemberInfo);
 		const out = await memberInfoCapability()(ctx, { uid: 555 });
-		expect(getMemberInfo).toHaveBeenCalledWith(555);
-		expect(out).toEqual({ uid: 555, profile });
+		// REQ-029 (#29): uid kept as an opaque numeric string end-to-end.
+		expect(getMemberInfo).toHaveBeenCalledWith('555');
+		expect(out).toEqual({ uid: '555', profile });
 	});
 
 	it('coerces a numeric-string uid to a positive integer', async () => {
 		const getMemberInfo = vi.fn(async () => ({}));
 		const ctx = ctxWith(getMemberInfo);
 		await memberInfoCapability()(ctx, { uid: '555' });
-		expect(getMemberInfo).toHaveBeenCalledWith(555);
+		expect(getMemberInfo).toHaveBeenCalledWith('555');
 	});
 
 	it('rejects missing / invalid / non-positive uid', async () => {
@@ -157,14 +158,14 @@ describe('listGroupMembersCapability (REQ-010 S4)', () => {
 		const listGroupMembers = vi.fn(async () => []);
 		const ctx = ctxWith(listGroupMembers, 42);
 		await listGroupMembersCapability()(ctx, { groupid: 999 });
-		expect(listGroupMembers).toHaveBeenCalledWith(999, false);
+		expect(listGroupMembers).toHaveBeenCalledWith('999', false);
 	});
 
 	it('coerces a numeric-string groupid', async () => {
 		const listGroupMembers = vi.fn(async () => []);
 		const ctx = ctxWith(listGroupMembers, 42);
 		await listGroupMembersCapability()(ctx, { groupid: '999' });
-		expect(listGroupMembers).toHaveBeenCalledWith(999, false);
+		expect(listGroupMembers).toHaveBeenCalledWith('999', false);
 	});
 
 	it('passes the online flag (true / "true")', async () => {

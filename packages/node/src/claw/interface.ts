@@ -46,7 +46,7 @@ export interface ThinkingCallbacks {
 	onTerminalTool?: (info: { action: 'sent' | 'skipped'; tool: string; reason?: string }) => void;
 }
 
-/** Agent 调用上下文，传递 roomId 等信息供 tool 调用使用 */
+/** Agent 调用上下文，传递 roomId 等信息供 tool 调用使用（REQ-029: roomId 为不透明字符串） */
 export interface ChatContext {
-	roomId: number;
+	roomId: string;
 }

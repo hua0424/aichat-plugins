@@ -46,10 +46,10 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingEnd(10);
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 999, roomId: 7, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '999', roomId: '7', chatContext: {} });
 		await drain(session.send('hi'));
 		expect(calls[0].sessionKey).toBe('aiclaw-999-room-7');
-		expect(calls[0].context).toEqual({ roomId: 7 });
+		expect(calls[0].context).toEqual({ roomId: '7' });
 		expect(calls[0].message).toBe('hi');
 	});
 
@@ -64,7 +64,7 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingEnd(123);
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([
 			{ type: 'thinking', text: 'foo' },
@@ -79,7 +79,7 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingEnd(50);
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([{ type: 'done', durationMs: 50 }]);
 	});
@@ -90,7 +90,7 @@ describe('OpenclawDriver', () => {
 			cb.onError(new Error('boom'));
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([
 			{ type: 'thinking', text: 'partial' },
@@ -107,7 +107,7 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingEnd(7);
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 		// Yield a macrotask so chat() has fully run and buffered everything first.
 		await new Promise((r) => setImmediate(r));
@@ -129,7 +129,7 @@ describe('OpenclawDriver', () => {
 			return new Promise<void>(() => {}); // chat stays pending
 		});
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 		const collected: AgentEvent[] = [];
 		const consumer = (async () => {
@@ -152,7 +152,7 @@ describe('OpenclawDriver', () => {
 		// for-await completes (done) rather than hanging forever.
 		const { adapter } = fakeAdapter(() => new Promise<void>(() => {})); // never resolves, no callbacks
 		const driver = new OpenclawDriver(adapter);
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: {} });
+		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 
 		// Consume with NO events buffered → iterator parks on the await.
@@ -189,7 +189,12 @@ describe('OpenclawDriver.resolveSession (REQ-010 S6 Phase-2)', () => {
 	}
 
 	it('valid bare binding → { aiclawUid, roomId }', () => {
-		expect(driver().resolveSession!('aiclaw-7-room-42')).toEqual({ aiclawUid: 7, roomId: 42 });
+		// REQ-029 (#29): a >2^53 binding must survive as an EXACT string (Number() would corrupt it).
+		expect(driver().resolveSession!('aiclaw-7-room-42')).toEqual({ aiclawUid: '7', roomId: '42' });
+		expect(driver().resolveSession!('aiclaw-9007199254740993-room-9007199254740994')).toEqual({
+			aiclawUid: '9007199254740993',
+			roomId: '9007199254740994',
+		});
 	});
 
 	it('a `openclaw:`-prefixed input is NOT valid here (prefix is stripped upstream) → undefined', () => {

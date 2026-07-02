@@ -9,8 +9,9 @@ import type { HulaApiClient } from '../api/hula-api.js';
  * this is the anti-spoofing seam.
  */
 export interface CapabilityContext {
-	aiclawUid: number;
-	roomId: number;
+	// REQ-029 (#29): aiclawUid/roomId are opaque strings (resolved from the agent session).
+	aiclawUid: string;
+	roomId: string;
 	apiClient: HulaApiClient;
 }
 
@@ -68,8 +69,10 @@ export function sendMessageCapability(): Capability {
 export function memberInfoCapability(): Capability {
 	return async (ctx, args) => {
 		const raw = args.uid;
-		const uid = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
-		if (!Number.isInteger(uid) || uid <= 0) {
+		// REQ-029 (#29): keep uid as an opaque numeric string (never Number() — >2^53 corrupts). The uid
+		// is a QUERY TARGET, validated as a non-empty positive-integer string.
+		const uid = typeof raw === 'number' || typeof raw === 'string' ? String(raw) : '';
+		if (!/^\d+$/.test(uid) || uid === '0') {
 			throw new Error('member-info: `uid` is required and must be a positive integer');
 		}
 		const profile = await ctx.apiClient.getMemberInfo(uid);
@@ -123,10 +126,11 @@ export function listGroupsCapability(): Capability {
  */
 export function listGroupMembersCapability(): Capability {
 	return async (ctx, args) => {
-		let roomId: number;
+		let roomId: string;
 		if (args.groupid != null) {
-			roomId = Number(args.groupid);
-			if (!Number.isInteger(roomId) || roomId <= 0) {
+			// REQ-029 (#29): keep as an opaque numeric string (never Number() — >2^53 corrupts routing).
+			roomId = String(args.groupid);
+			if (!/^\d+$/.test(roomId) || roomId === '0') {
 				throw new Error('list-group-members: invalid --groupid');
 			}
 		} else {

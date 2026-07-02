@@ -24,8 +24,9 @@ function expandTilde(p: string): string {
  */
 export interface OpencodeChatContext {
 	roomType: number;
-	roomId: number;
-	counterpartUid?: number;
+	// REQ-029 (#29): roomId/counterpartUid 为不透明字符串（防 >2^53 精度丢失）。
+	roomId: string;
+	counterpartUid?: string;
 	isOwner?: boolean;
 	/**
 	 * REQ-009 #85: owner-configured absolute host path. When set (non-empty), it is the absolute
@@ -73,7 +74,7 @@ export interface OpencodeChatContext {
  * owner vs friend is distinguished by `message.aiclaw.isOwner` on the inbound message
  * (server-computed senderUid==ownerUid; AiclawExt is present only on DM pushes).
  */
-export function deriveWorkspaceDir(base: string, aiclawUid: number, ctx: OpencodeChatContext): string {
+export function deriveWorkspaceDir(base: string, aiclawUid: string, ctx: OpencodeChatContext): string {
 	// REQ-009 #85: owner's absolute override wins for any context (in practice only groups carry it).
 	// REQ-010 S3: expand a leading `~` so a literal `~/.aichat/...` override resolves to the host home
 	// dir (not opencode's cwd) → a real absolute path, never `/workspace/~/...`.

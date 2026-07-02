@@ -18,8 +18,9 @@ export async function handleMemberInfo(args: string[]): Promise<void> {
 		else if (!args[i].startsWith('--') && !uidArg) uidArg = args[i];
 	}
 
-	const uid = Number(uidArg);
-	if (!uidArg || !Number.isInteger(uid) || uid <= 0) {
+	// REQ-029 (#29): keep uid as an opaque numeric string (never Number() — >2^53 corrupts).
+	const uid = uidArg;
+	if (!/^\d+$/.test(uid) || uid === '0') {
 		console.error('Usage: aichat member-info <uid>');
 		process.exit(1);
 	}

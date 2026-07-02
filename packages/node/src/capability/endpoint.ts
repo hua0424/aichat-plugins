@@ -6,8 +6,8 @@ import type { CapabilityRegistry, CapabilityContext } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
 
-/** The resolve() result: the bound identity+room + the per-identity api client. */
-type Resolved = { aiclawUid: number; roomId: number; apiClient: HulaApiClient };
+/** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
+type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
 
 /**
  * REQ-010 S7 — an ADMIN handler: a loopback-only setup op that is NOT identity-resolved by a

@@ -29,15 +29,15 @@ import type { AddressInfo } from 'node:net';
  */
 export interface CcHookSink {
 	/** PostToolUse → a `{tool}` AgentEvent for the room (name only; reduceThinking ignores tools). */
-	tool(roomId: number, aiclawUid: number, toolName: string): void;
+	tool(roomId: string, aiclawUid: string, toolName: string): void;
 	/** MessageDisplay / assistant text → a `{thinking}` AgentEvent for the room (rendered in the panel). */
-	thinking(roomId: number, aiclawUid: number, text: string): void;
+	thinking(roomId: string, aiclawUid: string, text: string): void;
 	/** Stop → flush any final thinking; do NOT close — the session's `done` comes from stdout EOF. */
-	flush(roomId: number, aiclawUid: number): void;
+	flush(roomId: string, aiclawUid: string): void;
 }
 
-/** resolve() result: the bound identity + room for a binding token. */
-type Resolved = { aiclawUid: number; roomId: number };
+/** resolve() result: the bound identity + room for a binding token (REQ-029: opaque strings). */
+type Resolved = { aiclawUid: string; roomId: string };
 
 export interface CcBrokerDeps {
 	/** Map a CC binding token → bound identity/room, or undefined if unknown. */

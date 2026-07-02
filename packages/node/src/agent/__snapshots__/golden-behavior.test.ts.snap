@@ -4,15 +4,15 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > a) thin
 [
   {
     "data": {
-      "msgId": 1,
+      "msgId": "1",
       "timestamp": "<timestamp:number>",
     },
     "type": "ACK",
   },
   {
     "data": {
-      "fromUid": 999,
-      "roomId": 1,
+      "fromUid": "999",
+      "roomId": "1",
       "triggerMsgId": "1",
     },
     "type": "THINKING_START",
@@ -33,15 +33,15 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > b) delt
 [
   {
     "data": {
-      "msgId": 2,
+      "msgId": "2",
       "timestamp": "<timestamp:number>",
     },
     "type": "ACK",
   },
   {
     "data": {
-      "fromUid": 999,
-      "roomId": 1,
+      "fromUid": "999",
+      "roomId": "1",
       "triggerMsgId": "2",
     },
     "type": "THINKING_START",
@@ -62,15 +62,15 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > c) erro
 [
   {
     "data": {
-      "msgId": 3,
+      "msgId": "3",
       "timestamp": "<timestamp:number>",
     },
     "type": "ACK",
   },
   {
     "data": {
-      "fromUid": 999,
-      "roomId": 1,
+      "fromUid": "999",
+      "roomId": "1",
       "triggerMsgId": "3",
     },
     "type": "THINKING_START",
@@ -92,15 +92,15 @@ exports[`REQ-008 #75 golden behavior (MessageHandler WS send sequence) > d) two 
 [
   {
     "data": {
-      "msgId": 4,
+      "msgId": "4",
       "timestamp": "<timestamp:number>",
     },
     "type": "ACK",
   },
   {
     "data": {
-      "fromUid": 999,
-      "roomId": 1,
+      "fromUid": "999",
+      "roomId": "1",
       "triggerMsgId": "4",
     },
     "type": "THINKING_START",

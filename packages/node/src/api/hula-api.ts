@@ -23,10 +23,10 @@ export class HulaApiClient {
 	 * @param extra 额外字段（如 { autoReply: true }），server 侧不入库
 	 */
 	async sendMessage(
-		roomId: number,
+		roomId: string,
 		content: string,
 		extra?: Record<string, unknown>
-	): Promise<{ msgId: number }> {
+	): Promise<{ msgId: string }> {
 		const body: Record<string, unknown> = {
 			roomId,
 			msgType: 1, // 文本消息
@@ -36,15 +36,16 @@ export class HulaApiClient {
 			body.extra = extra;
 		}
 		const resp = await this.post('/api/im/chat/msg', body);
-		const data = resp.data as { message?: { id?: number } } | undefined;
-		return { msgId: data?.message?.id ?? 0 };
+		// REQ-029 (#29): msgId 为不透明字符串（server Long 序列化为 string；>2^53 不能 Number()）。
+		const data = resp.data as { message?: { id?: string | number } } | undefined;
+		return { msgId: data?.message?.id == null ? '' : String(data.message.id) };
 	}
 
 	/**
 	 * REQ-010 S3 #93 — 查询单个成员的公开资料。
 	 * GET /api/im/user/getById/{uid} → data = 公开资料对象。
 	 */
-	async getMemberInfo(uid: number): Promise<Record<string, unknown>> {
+	async getMemberInfo(uid: string): Promise<Record<string, unknown>> {
 		const resp = await this.get(`/api/im/user/getById/${uid}`);
 		return (resp.data as Record<string, unknown>) ?? {};
 	}
@@ -52,16 +53,16 @@ export class HulaApiClient {
 	/**
 	 * REQ-010 S3 #93 — 拉取好友列表（单页，cursor 分页；agent 只取一页）。
 	 * GET /api/im/user/friend/page?pageSize=<n> → data.list[] 映射为 {uid,name,account,remark}。
-	 * server 把大整数 uid 序列化为字符串，这里统一 Number(...) 化。
+	 * server 把大整数 uid 序列化为字符串，这里统一 String(...) 化（防 >2^53 精度丢失，issue #29）。
 	 */
 	async listFriends(
 		pageSize = 100,
-	): Promise<Array<{ uid: number; name: string; account?: string; remark?: string }>> {
+	): Promise<Array<{ uid: string; name: string; account?: string; remark?: string }>> {
 		const resp = await this.get(`/api/im/user/friend/page?pageSize=${pageSize}`);
 		const data = resp.data as { list?: Array<Record<string, unknown>> } | undefined;
 		const list = data?.list ?? [];
 		return list.map((item) => ({
-			uid: Number(item.uid),
+			uid: String(item.uid),
 			name: item.name as string,
 			account: item.account as string | undefined,
 			remark: item.remark as string | undefined,
@@ -74,12 +75,12 @@ export class HulaApiClient {
 	 */
 	async searchUsers(
 		keyword: string,
-	): Promise<Array<{ uid: number; name: string; account?: string; userType?: number }>> {
+	): Promise<Array<{ uid: string; name: string; account?: string; userType?: number }>> {
 		const resp = await this.get(`/api/im/user/search?keyword=${encodeURIComponent(keyword)}`);
 		const data = resp.data as { list?: Array<Record<string, unknown>> } | undefined;
 		const list = data?.list ?? [];
 		return list.map((item) => ({
-			uid: Number(item.uid),
+			uid: String(item.uid),
 			name: item.name as string,
 			account: item.account as string | undefined,
 			userType: item.userType === undefined ? undefined : Number(item.userType),
@@ -89,13 +90,13 @@ export class HulaApiClient {
 	/**
 	 * REQ-010 S4 #94 — 本 aiclaw（按 token 认证身份）已加入的群列表。
 	 * GET /api/im/room/group/list（无参数；身份取自 token）→ data[] 映射。
-	 * 单一 canonical `id` = server 的 roomId（Number(...) 化）——这才是 member-list
-	 * 端点 / `--groupid` 接受的值；不再暴露独立的 groupId/roomId 二义键。
+	 * 单一 canonical `id` = server 的 roomId（String(...) 化，防 >2^53 精度丢失，issue #29）——这才是
+	 * member-list 端点 / `--groupid` 接受的值；不再暴露独立的 groupId/roomId 二义键。
 	 * `account` 是人类可读的群号，仅供展示。
 	 */
 	async listGroups(): Promise<
 		Array<{
-			id: number;
+			id: string;
 			name: string;
 			memberNum?: number;
 			onlineNum?: number;
@@ -106,7 +107,7 @@ export class HulaApiClient {
 		const resp = await this.get('/api/im/room/group/list');
 		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
 		return list.map((item) => ({
-			id: Number(item.roomId),
+			id: String(item.roomId),
 			name: item.groupName as string,
 			memberNum: item.memberNum === undefined ? undefined : Number(item.memberNum),
 			onlineNum: item.onlineNum === undefined ? undefined : Number(item.onlineNum),
@@ -123,13 +124,13 @@ export class HulaApiClient {
 	 * parseResponse 会抛 `HuLa API failed: <msg>`，让调用方（capability）catch 后回传结构化错误给 agent。
 	 */
 	async listGroupMembers(
-		roomId: number,
+		roomId: string,
 		online: boolean,
-	): Promise<Array<{ uid: number; name: string; account?: string; online: boolean; roleId?: number }>> {
+	): Promise<Array<{ uid: string; name: string; account?: string; online: boolean; roleId?: number }>> {
 		const resp = await this.get(`/api/im/room/group/aiclaw/members?roomId=${roomId}&online=${online}`);
 		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
 		return list.map((item) => ({
-			uid: Number(item.uid),
+			uid: String(item.uid),
 			name: item.name as string,
 			account: item.account as string | undefined,
 			online: item.online === true,
@@ -140,18 +141,18 @@ export class HulaApiClient {
 	/**
 	 * 获取 aiclaw 群配置
 	 */
-	async getGroupConfig(aiclawUid: number, roomId: number): Promise<Record<string, unknown>> {
+	async getGroupConfig(aiclawUid: string, roomId: string): Promise<Record<string, unknown>> {
 		const resp = await this.get(`/api/im/aiclaw/group/config?aiclawUid=${aiclawUid}&roomId=${roomId}`);
 		return (resp.data as Record<string, unknown>) ?? {};
 	}
 
 	/**
 	 * REQ #26: 拉取本 aiclaw（按 token 认证身份）的全部群配置，用于启动/重连预热。
-	 * 无 query 参数；server 把大整数 roomId 序列化为字符串，这里统一 Number(...) 化。
+	 * 无 query 参数；server 把大整数 roomId 序列化为字符串，这里统一 String(...) 化（防 >2^53 精度丢失，issue #29）。
 	 */
 	async listSelfGroupConfigs(): Promise<
 		Array<{
-			roomId: number;
+			roomId: string;
 			mentionRequired?: number;
 			respondToAi?: number;
 			rateLimitPerMinute?: number;
@@ -165,7 +166,7 @@ export class HulaApiClient {
 		const resp = await this.get('/api/im/aiclaw/group/config/list');
 		const list = (resp.data as Array<Record<string, unknown>>) ?? [];
 		return list.map((item) => ({
-			roomId: Number(item.roomId),
+			roomId: String(item.roomId),
 			mentionRequired: item.mentionRequired === undefined ? undefined : Number(item.mentionRequired),
 			respondToAi: item.respondToAi === undefined ? undefined : Number(item.respondToAi),
 			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
@@ -183,8 +184,8 @@ export class HulaApiClient {
 	 * 更新 aiclaw 群配置
 	 */
 	async updateGroupConfig(
-		aiclawUid: number,
-		roomId: number,
+		aiclawUid: string,
+		roomId: string,
 		config: Record<string, unknown>
 	): Promise<void> {
 		await this.put('/api/im/aiclaw/group/config', { aiclawUid, roomId, ...config });

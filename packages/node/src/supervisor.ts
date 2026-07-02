@@ -21,7 +21,7 @@ export interface SupervisorDeps {
 	buildHandler: (
 		ws: HulaWSClient,
 		driver: AgentDriver,
-		uid: number,
+		uid: string,
 		api: HulaApiClient,
 		onTokenExpired: () => void,
 	) => MessageHandler;
@@ -72,7 +72,8 @@ export type AgentStatus = 'online' | 'reconnecting' | 'offline';
 /** 一条已拉起（或曾拉起）的身份链路。 */
 export interface SupervisedAgent {
 	entry: AgentEntry;
-	uid: number;
+	// REQ-029 (#29): uid is an opaque string end-to-end.
+	uid: string;
 	status: AgentStatus;
 	driver: AgentDriver;
 	ws: HulaWSClient;
@@ -217,7 +218,7 @@ export class Supervisor {
 	 * 降级单条身份：置 offline、关 ws、断 driver。已 offline 则 no-op。
 	 * **绝不 process.exit、绝不触碰其它身份。**
 	 */
-	private degrade(uid: number, reason: string): void {
+	private degrade(uid: string, reason: string): void {
 		const agent = this.supervised.find((a) => a.uid === uid);
 		if (!agent || agent.status === 'offline') return;
 		agent.status = 'offline';
@@ -236,7 +237,7 @@ export class Supervisor {
 	 * REQ-008 #76 P2: WS 掉线 → 置 reconnecting（瞬态）。
 	 * **offline 是 terminal**：已降级身份保持 offline，不进入 reconnecting。
 	 */
-	private markReconnecting(uid: number): void {
+	private markReconnecting(uid: string): void {
 		const agent = this.supervised.find((a) => a.uid === uid);
 		if (!agent || agent.status === 'offline') return;
 		agent.status = 'reconnecting';
@@ -246,7 +247,7 @@ export class Supervisor {
 	 * REQ-008 #76 P2: WS 重连成功 → 回到 online。
 	 * **offline 是 terminal**：迟到的重连回调不得把已降级身份翻回 online。
 	 */
-	private markReconnected(uid: number): void {
+	private markReconnected(uid: string): void {
 		const agent = this.supervised.find((a) => a.uid === uid);
 		if (!agent || agent.status === 'offline') return;
 		agent.status = 'online';

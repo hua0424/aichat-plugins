@@ -19,7 +19,8 @@ import type { ReceivedMessage } from '../stream/protocol.js';
  * separately (typeof === 'number') so timing has tolerance.
  */
 
-const SELF_UID = 999;
+// REQ-029 (#29): selfUid/roomId/msgId are opaque strings; the golden snapshot reflects that.
+const SELF_UID = '999';
 
 /** A normalized agent-turn event the script feeds into whichever seam is active. */
 type ScriptEvent =
