@@ -1561,6 +1561,25 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		expect(calls[0].message).toBe('[HuLa 私聊]\n[小明(100)]: 你好');
 	});
 
+	it('AC5: logs a single `envelope→driver` line with the assembled envelope (newlines escaped)', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+			handler.handle({ type: 'receiveMessage', data: dmMessage(9, 100, '你好', 1, { name: '小明' }) } as never);
+			await waitFor(() => logSpy.mock.calls.some((c) => String(c[0]).includes('envelope→driver')));
+
+			const line = logSpy.mock.calls.map((c) => String(c[0])).find((s) => s.includes('envelope→driver'))!;
+			// structural evidence (AC5): sender name(uid) + the room header + attribution line, newlines escaped to one line.
+			expect(line).toContain('from=小明(100)');
+			expect(line).toContain('[HuLa 私聊]\\n[小明(100)]: 你好');
+			expect(line).not.toContain('\n'); // the envelope's newline must be escaped, keeping it grep-able
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it('parity: a cc un-@ group message is accumulated and does NOT trigger (guard inherited, no bypass)', async () => {
 		const { adapter, calls } = ccAdapter();
 		const { ws } = fakeWs();
