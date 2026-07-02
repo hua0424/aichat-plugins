@@ -8,6 +8,7 @@ import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { buildAgentInjection } from './media-inject.js';
+import { buildAgentEnvelope } from './envelope.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -447,10 +448,16 @@ export class MessageHandler {
 		const accumulated = channel.accumulatedMessages;
 		channel.accumulatedMessages = [];
 
-		const agentMessage =
-			accumulated.length > 0
-				? `[群聊上下文 · 自上次回复以来未点名你的消息]\n${accumulated.join('\n')}\n\n[当前消息]\n${message}`
-				: message;
+		// REQ-013 S1: build the ONE unified inbound-attribution envelope for ALL FOUR drivers at this
+		// common layer (see ./envelope.ts). openclaw/opencode/codex/cc all now receive the identical
+		// `[HuLa 群聊]/[HuLa 私聊]\n[name(uid)]: ...` transcript instead of each inventing its own format.
+		const agentEnvelope = buildAgentEnvelope({
+			roomType,
+			fromName: channel.lastCtx.fromName,
+			fromUid,
+			accumulated,
+			message,
+		});
 
 		// 创建 thinking session（thinkingId 初始为空，等 server 广播回填）
 		const session: ThinkingSession = {
@@ -511,10 +518,6 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
-				// REQ-011 S3: generic per-turn attribution fields. Only the cc driver reads them (to build a
-				// per-sender-attributed stdin envelope); openclaw/opencode/codex ignore them (unchanged).
-				fromName: channel.lastCtx.fromName,
-				accumulated,
 			},
 		});
 		session.agentSession = agentSession;
@@ -556,13 +559,8 @@ export class MessageHandler {
 			this.flushPendingMessages(roomId);
 		};
 
-		// REQ-011 S3: pure DATA ROUTING (not a behaviour branch): cc anti-injection needs the raw current
-		// message to attribute it per-sender in the driver (via chatContext.fromName/accumulated); the
-		// other drivers get the pre-merged `[群聊上下文]/[当前消息]` agentMessage exactly as before.
-		const messageForDriver = this.driver.type === 'cc' ? message : agentMessage;
-
 		try {
-			for await (const ev of agentSession.send(messageForDriver)) {
+			for await (const ev of agentSession.send(agentEnvelope)) {
 				// 超时/广播 finalize 抢先：停止映射后续事件。session 的收尾交给 finally 统一 close。
 				if (session.finalized) {
 					break;

@@ -8,30 +8,6 @@ import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
 
 /**
- * REQ-011 S3 — build the cc stdin channel content with per-sender attribution (anti-prompt-injection).
- *
- * VERBATIM the format resurrected from commit 645fec2 (do NOT re-invent): a NATURAL chat transcript,
- * NOT bare/imperative text. CC's anti-prompt-injection is stronger than the other three drivers (they
- * tolerate a bare current message; CC refuses bare / "do X silently" channel text but processes a
- * naturally-attributed chat message and replies as the room's assistant), so attribution is cc-specific
- * and lives here in the driver — never a handler behaviour branch.
- *   DM    (roomType===2) → `[HuLa 私聊]\n[fromName(fromUid)]: <message>`
- *   group (else)         → `[HuLa 群聊]\n<accumulated lines>\n[fromName(fromUid)]: <current>`
- */
-export function buildCcChannelContent(o: {
-	roomType: number;
-	fromName: string;
-	fromUid: string;
-	accumulated: string[];
-	message: string;
-}): string {
-	const room = o.roomType === 2 ? '[HuLa 私聊]' : '[HuLa 群聊]';
-	const currentLine = `[${o.fromName}(${o.fromUid})]: ${o.message}`;
-	const lines = o.accumulated.length > 0 ? [...o.accumulated, currentLine] : [currentLine];
-	return `${room}\n${lines.join('\n')}`;
-}
-
-/**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
  * opencode, codex). The channel approach was abandoned; CC now runs HEADLESS, spawned per inbound turn.
  *
@@ -209,13 +185,6 @@ export class CcHeadlessDriver implements AgentDriver {
 		const session = new CcHeadlessSession({
 			binding,
 			roomId: o.roomId,
-			// REQ-011 S3: per-turn attribution — the current sender + un-@ group-context lines, used to
-			// build the per-sender-attributed stdin envelope (buildCcChannelContent). counterpartUid IS
-			// the current message's fromUid (handler sets it). Defaults keep a bare ctx safe.
-			roomType: typeof ctx.roomType === 'number' ? ctx.roomType : 1,
-			fromName: ctx.fromName ?? 'unknown',
-			fromUid: ctx.counterpartUid ?? '',
-			accumulated: ctx.accumulated ?? [],
 			workspaceDir,
 			settingsPath,
 			claudeBin: this.claudeBin,
@@ -237,11 +206,6 @@ export class CcHeadlessDriver implements AgentDriver {
 interface CcHeadlessSessionDeps {
 	binding: string;
 	roomId: string;
-	/** REQ-011 S3: attribution context for this turn's stdin envelope. */
-	roomType: number;
-	fromName: string;
-	fromUid: string;
-	accumulated: string[];
 	workspaceDir: string;
 	settingsPath: string;
 	claudeBin: string;
@@ -257,8 +221,9 @@ interface CcHeadlessSessionDeps {
 }
 
 /**
- * One node-driven CC turn. `send()` spawns `claude` headless, writes the enriched user envelope to
- * stdin, and merges TWO async sources into one AgentEvent stream:
+ * One node-driven CC turn. `send()` spawns `claude` headless, writes the given user envelope (already
+ * the unified attribution transcript, built at the handler common layer) to stdin, and merges TWO async
+ * sources into one AgentEvent stream:
  *   1. stdout control-plane → captures session_id, emits `done` on `result`/EOF (after a brief drain),
  *      or `error` on failure/timeout.
  *   2. hooks (via the registry) → `thinking`/`tool` events, pushed as they arrive.
@@ -498,28 +463,16 @@ class CcHeadlessSession implements AgentSession {
 		return argv;
 	}
 
-	private enrich(message: string): string {
-		// REQ-011 S3: the #102 reply contract is delivered once per turn via `--append-system-prompt`
-		// (see buildArgv), so the stdin envelope carries no per-message contract prefix — but it DOES carry
-		// per-sender attribution (buildCcChannelContent), which is load-bearing for CC's anti-prompt-
-		// injection defence: CC refuses bare/imperative channel text but processes a naturally-attributed
-		// chat message. DM → `[HuLa 私聊]\n[name(uid)]: msg`; group → `[HuLa 群聊]\n<accumulated>\n[name(uid)]: cur`.
-		return buildCcChannelContent({
-			roomType: this.d.roomType,
-			fromName: this.d.fromName,
-			fromUid: this.d.fromUid,
-			accumulated: this.d.accumulated,
-			message,
-		});
-	}
-
 	send(message: string): AsyncIterable<AgentEvent> {
 		this.buffer = [];
 		this.turnStart = Date.now();
 		// REQ-011 S3: seed the session_id from the store (resume turns know it up front; a fresh turn
 		// updates it when system/init arrives) so transcript records carry it.
 		this.sessionId = this.d.sessionStore.get(this.key)?.sessionId;
-		const attributed = this.enrich(message);
+		// REQ-013 S1: the message is already the full unified attribution envelope (built at the handler's
+		// common layer, see handler/envelope.ts) — the driver forwards it verbatim into the stdin envelope,
+		// the transcript `inbound` record, and any self-heal re-send.
+		const attributed = message;
 		// Set BEFORE spawning so any handler (incl. handleStdoutLine, which has no `attributed` in scope)
 		// can self-heal/re-spawn via onAttemptFailure(). One value per turn (a self-heal retry re-sends it).
 		this.attributed = attributed;

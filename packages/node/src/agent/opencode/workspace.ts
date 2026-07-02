@@ -38,18 +38,6 @@ export interface OpencodeChatContext {
 	 * the default group workspace segment so the owner can cd into a stable, human-readable path.
 	 */
 	account?: string | number;
-	/**
-	 * REQ-011 S3: display name of the current triggering message's sender. GENERIC per-turn field —
-	 * only the cc driver reads it (to attribute the current message per-sender in its stdin envelope,
-	 * its anti-prompt-injection defence). opencode/codex/openclaw ignore it (behaviour unchanged).
-	 */
-	fromName?: string;
-	/**
-	 * REQ-011 S3: the just-consumed un-@ group-context lines (already `[name(uid)]: content` formatted).
-	 * GENERIC per-turn field — only the cc driver reads it (to reproduce the group transcript, per-sender
-	 * attributed, in its stdin envelope). Other drivers ignore it (they get the pre-merged agentMessage).
-	 */
-	accumulated?: string[];
 }
 
 /**

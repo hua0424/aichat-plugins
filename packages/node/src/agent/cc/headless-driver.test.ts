@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CcHeadlessDriver, buildCcChannelContent, parseCcBinding, type CcChild, type CcSpawnFn } from './headless-driver.js';
+import { CcHeadlessDriver, parseCcBinding, type CcChild, type CcSpawnFn } from './headless-driver.js';
 import type { CcTranscriptRecord } from './transcript.js';
 import { CC_REPLY_CONTRACT } from './launch.js';
 import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
@@ -239,14 +239,12 @@ describe('CcHeadlessDriver — shape', () => {
 });
 
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
-	it('spawns claude with the exact headless argv, cc env, and writes the attributed stdin envelope', async () => {
+	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({
-			aiclawUid: '5',
-			roomId: '9',
-			chatContext: { roomType: 2, roomId: '9', fromName: '小明', counterpartUid: '100' },
-		});
-		session.send('原始用户消息');
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: { roomType: 2, roomId: '9' } });
+		// REQ-013 S1: the message arriving at send() is ALREADY the unified attribution envelope (built at
+		// the handler common layer). The driver forwards it verbatim — no per-driver envelope building.
+		session.send('[HuLa 私聊]\n[小明(100)]: 原始用户消息');
 
 		const call = fs.spawnCall!;
 		expect(call.command).toBe('/opt/claude');
@@ -481,51 +479,24 @@ describe('CcHeadlessSession/Driver — cleanup (AC8: no orphaned process groups)
 	});
 });
 
-// ─── REQ-011 S3: sender attribution (Option A, cc-specific, in the driver) ───
+// ─── REQ-013 S1: the driver forwards the unified envelope (built upstream) verbatim ───
+// The envelope FORMAT itself is covered by handler/envelope.test.ts; here we only prove the driver
+// writes whatever envelope it is given, unchanged, into the stdin user message.
 
-describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', () => {
-	it('DM → `[HuLa 私聊]\\n[name(uid)]: <msg>` (roomType 2, no accumulated)', async () => {
+describe('CcHeadlessDriver — REQ-013 S1 forwards the given envelope verbatim', () => {
+	it('a DM-style envelope passed to send() appears verbatim in the stdin user message', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({
-			aiclawUid: '5',
-			roomId: '9',
-			chatContext: { roomType: 2, roomId: '9', fromName: '阿强', counterpartUid: '100' },
-		});
-		session.send('你好');
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: { roomType: 2, roomId: '9' } });
+		session.send('[HuLa 私聊]\n[阿强(100)]: 你好');
 		expect(stdinText(fs)).toBe('[HuLa 私聊]\n[阿强(100)]: 你好');
 	});
 
-	it('group @ with accumulated → `[HuLa 群聊]\\n<accumulated lines>\\n[name(uid)]: <current>`', async () => {
+	it('a group envelope with accumulated lines passed to send() appears verbatim in the stdin user message', async () => {
 		const { driver, fs } = makeDriver();
-		const accumulated = ['[alice(100)]: first', '[bob(101)]: second'];
-		const session = await driver.openSession({
-			aiclawUid: '5',
-			roomId: '9',
-			chatContext: { roomType: 1, roomId: '9', fromName: 'dave', counterpartUid: '102', accumulated },
-		});
-		session.send('hey bot');
-		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
-	});
-
-	it('the envelope text matches buildCcChannelContent VERBATIM (single source of the format)', async () => {
-		const { driver, fs } = makeDriver();
-		const accumulated = ['[x(1)]: a'];
-		const session = await driver.openSession({
-			aiclawUid: '5',
-			roomId: '9',
-			chatContext: { roomType: 1, roomId: '9', fromName: 'y', counterpartUid: '2', accumulated },
-		});
-		session.send('cur');
-		expect(stdinText(fs)).toBe(
-			buildCcChannelContent({ roomType: 1, fromName: 'y', fromUid: 2, accumulated, message: 'cur' }),
-		);
-	});
-
-	it('a bare chatContext (no fromName/counterpartUid) degrades to `[unknown()]` — never throws', async () => {
-		const { driver, fs } = makeDriver();
+		const envelope = '[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot';
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
-		session.send('m');
-		expect(stdinText(fs)).toBe('[HuLa 群聊]\n[unknown()]: m');
+		session.send(envelope);
+		expect(stdinText(fs)).toBe(envelope);
 	});
 });
 
@@ -534,12 +505,9 @@ describe('CcHeadlessDriver — REQ-011 S3 sender attribution (stdin envelope)', 
 describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching the terminal)', () => {
 	it('a turn appends the INBOUND (attributed) record + the CC OUTPUT events (assistant/tool/thinking) with ts+session_id', async () => {
 		const { driver, fs, transcript } = makeDriver();
-		const session = await driver.openSession({
-			aiclawUid: '5',
-			roomId: '9',
-			chatContext: { roomType: 2, roomId: '9', fromName: '阿强', counterpartUid: '100' },
-		});
-		const stream = session.send('你好');
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: { roomType: 2, roomId: '9' } });
+		// REQ-013 S1: the inbound record is the given envelope verbatim (built upstream), not re-derived here.
+		const stream = session.send('[HuLa 私聊]\n[阿强(100)]: 你好');
 
 		fs.emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-abc' })}\n`);
 		// an assistant event carrying text + thinking + tool_use content blocks → three output records
