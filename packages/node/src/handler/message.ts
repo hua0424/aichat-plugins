@@ -459,6 +459,14 @@ export class MessageHandler {
 			message,
 		});
 
+		// REQ-013 S1 / AC5: single observability point for the assembled envelope (BL-018-aligned). Log the
+		// EXACT text handed to the driver — room header + `[name(uid)]` attribution — with newlines escaped
+		// so it stays one grep-able line; capped at 300 chars to bound log volume. This is the only place the
+		// four-driver envelope is emitted, so a log grep here is the structural evidence for AC1/AC5.
+		console.log(
+			`[handler] envelope→driver(${this.driver.type}) room=${roomId} from=${channel.lastCtx.fromName}(${fromUid}) roomType=${roomType}: ${agentEnvelope.slice(0, 300).replace(/\n/g, '\\n')}`,
+		);
+
 		// 创建 thinking session（thinkingId 初始为空，等 server 广播回填）
 		const session: ThinkingSession = {
 			sessionKey,
