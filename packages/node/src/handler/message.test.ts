@@ -182,6 +182,20 @@ function groupMessage(
 	} as unknown as ReceivedMessage;
 }
 
+/** 构造一条私聊文本消息（roomType=2），可选 name。 */
+function dmMessage(
+	roomId: number,
+	fromUid: number,
+	content: string,
+	msgId: number,
+	opts?: { name?: string },
+): ReceivedMessage {
+	return {
+		fromUser: { uid: fromUid, name: opts?.name ?? 'user', userType: 1 },
+		message: { id: msgId, roomId, type: 1, roomType: 2, body: { content } },
+	} as unknown as ReceivedMessage;
+}
+
 // REQ-029 (#29): internals are keyed by opaque string roomId; helpers coerce numeric-literal args with String().
 /** 读取指定房间的积累缓冲（白盒断言用） */
 function getAccumulated(handler: MessageHandler, roomId: number | string): string[] {
@@ -312,11 +326,12 @@ describe('MessageHandler per-room isolation', () => {
 
 		const byRoom = new Map(calls.map((c) => [c.context?.roomId, c]));
 		expect(byRoom.get('1')?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-1`);
-		expect(byRoom.get('1')?.message).toBe('msg-room-1');
+		expect(byRoom.get('1')?.message).toBe('[HuLa 私聊]\n[user(100)]: msg-room-1');
 		expect(byRoom.get('2')?.sessionKey).toBe(`aiclaw-${SELF_UID}-room-2`);
-		expect(byRoom.get('2')?.message).toBe('msg-room-2');
-		// 没有把两房消息合并
-		expect(calls.every((c) => !c.message.includes('\n'))).toBe(true);
+		expect(byRoom.get('2')?.message).toBe('[HuLa 私聊]\n[user(200)]: msg-room-2');
+		// 没有把两房消息合并（各自 envelope 只含本房发送者与内容）
+		expect(byRoom.get('1')?.message).not.toContain('msg-room-2');
+		expect(byRoom.get('2')?.message).not.toContain('msg-room-1');
 	});
 
 	it('does not let room A pending queue leak into room B', async () => {
@@ -337,7 +352,7 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.some((c) => c.context?.roomId === '2'));
 
 		const room2Call = calls.find((c) => c.context?.roomId === '2')!;
-		expect(room2Call.message).toBe('B1');
+		expect(room2Call.message).toBe('[HuLa 私聊]\n[user(200)]: B1');
 		// room1 的 pending（A2）不能混进 room2
 		expect(room2Call.message).not.toContain('A2');
 
@@ -347,7 +362,7 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.filter((c) => c.context?.roomId === '1').length >= 2);
 
 		const room1Calls = calls.filter((c) => c.context?.roomId === '1');
-		expect(room1Calls[1].message).toBe('A2');
+		expect(room1Calls[1].message).toBe('[HuLa 私聊]\n[user(100)]: A2');
 		// room2 仍然只有一次调用，没有被 room1 的 flush 误触发
 		expect(calls.filter((c) => c.context?.roomId === '2').length).toBe(1);
 	});
@@ -667,7 +682,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 
 		await waitFor(() => calls.length >= 1);
 		expect(calls[0].context?.roomId).toBe('1');
-		expect(calls[0].message).toBe('hey bot');
+		expect(calls[0].message).toBe('[HuLa 群聊]\n[user(100)]: hey bot');
 		expect(getAccumulated(handler, 1).length).toBe(0);
 	});
 
@@ -755,7 +770,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		} as never);
 
 		await waitFor(() => calls.length >= 1);
-		expect(calls[0].message).toBe('dm hi');
+		expect(calls[0].message).toBe('[HuLa 私聊]\n[u(100)]: dm hi');
 		expect(getAccumulated(handler, 3).length).toBe(0);
 	});
 
@@ -771,7 +786,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		} as never);
 
 		await waitFor(() => calls.length >= 1);
-		expect(calls[0].message).toBe('no mention needed');
+		expect(calls[0].message).toBe('[HuLa 群聊]\n[user(100)]: no mention needed');
 		expect(getAccumulated(handler, 1).length).toBe(0);
 	});
 
@@ -810,12 +825,10 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
 		await waitFor(() => calls.length >= 1);
 
+		// REQ-013 S1: the unified inbound-attribution envelope (same for all four drivers). Group header +
+		// accumulated un-@ lines + the trigger message's own attributed line, in order.
 		const sent = calls[0].message;
-		expect(sent).toContain('[群聊上下文 · 自上次回复以来未点名你的消息]');
-		expect(sent).toContain('[alice(100)]: first');
-		expect(sent).toContain('[bob(101)]: second');
-		expect(sent).toContain('[当前消息]');
-		expect(sent).toContain('hey bot');
+		expect(sent).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
 		// 历史在当前消息之前
 		expect(sent.indexOf('[alice(100)]: first')).toBeLessThan(sent.indexOf('hey bot'));
 		// 注入后缓冲清空
@@ -1091,7 +1104,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 
 			// 立即进入一次 chat，无退避
 			expect(calls.length).toBe(1);
-			expect(calls[0].message).toBe('ai-1');
+			expect(calls[0].message).toBe('[HuLa 私聊]\n[unknown(200)]: ai-1');
 			expect(isDelaying(handler, 1)).toBe(false);
 		} finally {
 			vi.useRealTimers();
@@ -1459,7 +1472,7 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
 
-		expect(calls[0].message).toBe('hi cc');
+		expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hi cc');
 		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).toHaveBeenCalled();
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
@@ -1496,7 +1509,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 	}
 	const openSessionOf = (adapter: unknown) => (adapter as { openSession: ReturnType<typeof vi.fn> }).openSession;
 
-	it('populates chatContext.fromName + accumulated, and DATA-ROUTES the RAW current message to a cc driver', async () => {
+	it('AC5: a cc driver gets the UNIFIED envelope containing the trigger sender`s [name(uid)] line', async () => {
 		const { adapter, calls } = ccAdapter();
 		const openSession = openSessionOf(adapter);
 		const { ws } = fakeWs();
@@ -1511,17 +1524,16 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
 		await waitFor(() => calls.length >= 1);
 
-		// cc data-routing: the driver receives the RAW current message (attribution happens IN the driver),
-		// NOT the pre-merged `[群聊上下文]/[当前消息]` agentMessage.
-		expect(calls[0].message).toBe('hey bot');
-		expect(calls[0].message).not.toContain('群聊上下文');
-		// chatContext carries the generic attribution fields the cc driver reads.
+		// REQ-013 S1: the driver receives the UNIFIED attribution envelope (built at the handler common
+		// layer), NOT a raw message — the same envelope every driver now gets.
+		expect(calls[0].message).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
+		// the generic per-turn attribution fields are no longer forwarded via chatContext (envelope is built upstream).
 		const ctx = openSession.mock.calls[0][0].chatContext as { fromName?: string; accumulated?: string[] };
-		expect(ctx.fromName).toBe('dave');
-		expect(ctx.accumulated).toEqual(['[alice(100)]: first', '[bob(101)]: second']);
+		expect(ctx.fromName).toBeUndefined();
+		expect(ctx.accumulated).toBeUndefined();
 	});
 
-	it('regression: a NON-cc driver still gets the pre-merged agentMessage (data-routing is cc-only)', async () => {
+	it('AC2: a NON-cc driver gets the SAME unified envelope (no cc-vs-others ternary anymore)', async () => {
 		const { adapter, calls } = fakeAdapter(); // type 'fake' (not cc)
 		const { ws } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
@@ -1532,11 +1544,21 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 102, 'hey bot', 3, { atUidList: [SELF_UID], name: 'dave' }) } as never);
 		await waitFor(() => calls.length >= 1);
 
-		// non-cc: unchanged pre-merged form (regression guard for the other three drivers).
-		expect(calls[0].message).toContain('[群聊上下文 · 自上次回复以来未点名你的消息]');
-		expect(calls[0].message).toContain('[alice(100)]: first');
-		expect(calls[0].message).toContain('[当前消息]');
-		expect(calls[0].message).toContain('hey bot');
+		// REQ-013 S1: unified — identical to what the cc driver gets; the old `[群聊上下文]/[当前消息]` form is gone.
+		expect(calls[0].message).toBe('[HuLa 群聊]\n[alice(100)]: first\n[dave(102)]: hey bot');
+		expect(calls[0].message).not.toContain('群聊上下文');
+	});
+
+	it('AC5: DM → the unified `[HuLa 私聊]` envelope carries the sender`s [name(uid)] line', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+
+		// a direct message (roomType=2) always triggers, no @ needed.
+		handler.handle({ type: 'receiveMessage', data: dmMessage(9, 100, '你好', 1, { name: '小明' }) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(calls[0].message).toBe('[HuLa 私聊]\n[小明(100)]: 你好');
 	});
 
 	it('parity: a cc un-@ group message is accumulated and does NOT trigger (guard inherited, no bypass)', async () => {
@@ -1564,7 +1586,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		await waitFor(() => calls.length >= 1);
 
 		expect(openSession).toHaveBeenCalled();
-		expect(calls[0].message).toBe('hey bot');
+		expect(calls[0].message).toBe('[HuLa 群聊]\n[dave(100)]: hey bot');
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
 
