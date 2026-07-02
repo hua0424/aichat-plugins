@@ -2,12 +2,11 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CcHeadlessDriver, buildCcChannelContent, type CcChild, type CcSpawnFn } from './headless-driver.js';
+import { CcHeadlessDriver, buildCcChannelContent, parseCcBinding, type CcChild, type CcSpawnFn } from './headless-driver.js';
 import type { CcTranscriptRecord } from './transcript.js';
 import { CC_REPLY_CONTRACT } from './launch.js';
 import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
 import { CcBroker } from './broker.js';
-import { parseCcBinding } from './cc-driver.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from './headless-session-store.js';
 import type { AgentEvent } from '../events.js';
 
@@ -592,6 +591,54 @@ describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching th
 		expect(inbound.some((t) => t?.includes('turn-1'))).toBe(true);
 		expect(inbound.some((t) => t?.includes('turn-2'))).toBe(true);
 	});
+
+	it('a tool_use block captures the FULL input as tool_input = JSON.stringify(input)', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		const input = { cmd: 'ls -la', dir: '/tmp', flags: ['a', 'b'] };
+		fs.emitStdout(
+			`${JSON.stringify({
+				type: 'assistant',
+				message: { content: [{ type: 'tool_use', name: 'Bash', input }] },
+			})}\n`,
+		);
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		await drain(stream);
+
+		const rec = transcript.records.filter((r) => r.key === KEY).map((r) => r.record).find((r) => r.kind === 'tool_use');
+		expect(rec).toBeDefined();
+		expect(rec!.tool).toBe('Bash');
+		expect(rec!.tool_input).toBe(JSON.stringify(input));
+	});
+
+	it('an oversized tool_use input is truncated to the cap with a truncation marker', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		// a huge input → stringified length far exceeds the 2000-char cap
+		const input = { blob: 'x'.repeat(10_000) };
+		const fullLen = JSON.stringify(input).length;
+		fs.emitStdout(
+			`${JSON.stringify({
+				type: 'assistant',
+				message: { content: [{ type: 'tool_use', name: 'Bash', input }] },
+			})}\n`,
+		);
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		await drain(stream);
+
+		const rec = transcript.records.filter((r) => r.key === KEY).map((r) => r.record).find((r) => r.kind === 'tool_use');
+		expect(rec).toBeDefined();
+		expect(rec!.tool_input).toBeDefined();
+		// bounded: the marker adds a small suffix, so length stays close to (but above) the 2000 cap and
+		// well under the full serialized length.
+		expect(rec!.tool_input!.length).toBeLessThan(fullLen);
+		expect(rec!.tool_input!.length).toBeLessThanOrEqual(2000 + 40);
+		expect(rec!.tool_input).toContain('[truncated');
+	});
 });
 
 // ─── REQ-011 S3 (§3): session reset → next turn spawns fresh (no --resume) ───
@@ -883,5 +930,29 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		expect(events.some((e) => e.type === 'error')).toBe(false);
 		expect(events.filter((e) => e.type === 'done')).toHaveLength(1);
 		expect(store.map.get(KEY)?.sessionId).toBe('sid-ok');
+	});
+});
+
+describe('parseCcBinding', () => {
+	it('valid binding → uids', () => {
+		expect(parseCcBinding('aiclaw-12-room-34')).toEqual({ aiclawUid: '12', roomId: '34' });
+	});
+
+	it('REQ-029 (#29): a >2^53 binding parses to EXACT strings (Number() would corrupt)', () => {
+		expect(parseCcBinding('aiclaw-9007199254740993-room-9007199254740994')).toEqual({
+			aiclawUid: '9007199254740993',
+			roomId: '9007199254740994',
+		});
+	});
+
+	it('garbage → undefined', () => {
+		expect(parseCcBinding('garbage')).toBeUndefined();
+		expect(parseCcBinding('')).toBeUndefined();
+		expect(parseCcBinding('aiclaw-1-room-')).toBeUndefined();
+		expect(parseCcBinding('aiclaw--room-2')).toBeUndefined();
+	});
+
+	it('still-prefixed cc:… → undefined (the endpoint must strip cc: first)', () => {
+		expect(parseCcBinding('cc:aiclaw-1-room-2')).toBeUndefined();
 	});
 });

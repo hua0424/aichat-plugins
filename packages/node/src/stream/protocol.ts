@@ -12,8 +12,6 @@ export enum WSReqType {
 	THINKING_START = 20,
 	THINKING_DELTA = 21, // 21: S4 起废弃，不再发送、不复用
 	THINKING_END = 22,
-	// REQ-010 S9: CC owner-launch bind RPC result (node → server, replies to a server `ccBindRequest`).
-	CC_BIND_RESULT = 23,
 }
 
 /**
@@ -32,9 +30,7 @@ export type WSRespType =
 	// REQ-004: THINKING 协议 + 群配置更新
 	| 'thinkingStart'
 	| 'thinkingEnd'
-	| 'groupConfigChange'
-	// REQ-010 S9: server asks node to compute the CC owner-launch command for a (room, identity).
-	| 'ccBindRequest';
+	| 'groupConfigChange';
 
 /**
  * WS 请求消息格式
@@ -187,20 +183,6 @@ export interface GroupConfigChangeDTO {
 		/** REQ-009 #85: owner-configured absolute host workspace path (empty/absent → derive default). */
 		workspaceDir?: string;
 	};
-}
-
-/**
- * REQ-010 S9: server → node `ccBindRequest` body. The server routes a CC owner-launch request
- * (surfaced from the HuLa client) only to cc aiclaws; node generates the launch command via
- * `CcDriver.bind()` and replies `CC_BIND_RESULT` keyed by `requestId`.
- * roomType: 1=GROUP, 2=FRIEND/DM; counterpartUid present for DMs (the other party).
- */
-export interface CcBindRequestDTO {
-	// REQ-029 (#29): server serializes Long as string; handler String()-normalizes at ingress.
-	roomId: string | number;
-	roomType: number;
-	counterpartUid?: string | number;
-	requestId: string;
 }
 
 /**

@@ -2,7 +2,6 @@ import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
-import { parseCcBinding } from './cc-driver.js';
 import { buildCcSettings, writeCcSettings, CC_REPLY_CONTRACT } from './launch.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
@@ -120,6 +119,21 @@ export interface CcHeadlessDriverDeps {
 const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 90_000;
 const DEFAULT_DRAIN_MS = 250;
 const DEFAULT_KILL_GRACE_MS = 2_000;
+/** Cap on the serialized tool_use input captured into the transcript (truncated past this). */
+const MAX_TOOL_INPUT_CHARS = 2000;
+
+/**
+ * Parse a CC binding string `aiclaw-{uid}-room-{roomId}` → `{ aiclawUid, roomId }`, or undefined on
+ * any garbage/prefixed input. Shared by `CcHeadlessDriver.resolveSession` AND `CcBroker.resolve` so the
+ * two paths can never diverge. A still-prefixed `cc:aiclaw-…` must never arrive here (the endpoint strips
+ * `cc:` first) and is rejected by the strict `^…$` anchors.
+ */
+export function parseCcBinding(binding: string): { aiclawUid: string; roomId: string } | undefined {
+	const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(binding);
+	if (!m) return undefined;
+	// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
+	return { aiclawUid: m[1], roomId: m[2] };
+}
 
 export class CcHeadlessDriver implements AgentDriver {
 	readonly type = 'cc';
@@ -424,7 +438,23 @@ class CcHeadlessSession implements AgentSession {
 				} else if (block.type === 'thinking' && typeof block.thinking === 'string') {
 					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'thinking', text: block.thinking });
 				} else if (block.type === 'tool_use' && typeof block.name === 'string') {
-					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'tool_use', tool: block.name });
+					// Capture the FULL tool input as JSON (truncated past the cap) so the transcript shows what
+					// the tool was actually called with, not just its name. Only when an input is present.
+					let toolInput: string | undefined;
+					if (block.input !== undefined) {
+						const json = JSON.stringify(block.input);
+						toolInput =
+							json.length > MAX_TOOL_INPUT_CHARS
+								? `${json.slice(0, MAX_TOOL_INPUT_CHARS)}…[truncated ${json.length - MAX_TOOL_INPUT_CHARS} chars]`
+								: json;
+					}
+					this.d.transcript.append(this.d.binding, {
+						ts,
+						session_id: this.sessionId,
+						kind: 'tool_use',
+						tool: block.name,
+						...(toolInput !== undefined ? { tool_input: toolInput } : {}),
+					});
 				}
 			}
 		} catch {

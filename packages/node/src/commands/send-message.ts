@@ -55,9 +55,9 @@ export async function handleSendMessage(args: string[]): Promise<void> {
  * codex NATIVELY injects `CODEX_THREAD_ID` into its exec shell subprocess → `codex:<id>`.
  * openclaw gets `OPENCLAW_BIND` injected by aichat-claw's `resolve_exec_env` hook (the bare
  * `aiclaw-{uid}-room-{roomId}` binding) → `openclaw:<binding>` (REQ-010 S6 Phase-2).
- * claude-code (CC) reads `AICHAT_BIND` (the same bare `aiclaw-{uid}-room-{roomId}` binding, placed in
- * CC's launch env by `aichat cc-bind`) → `cc:<binding>` (REQ-010 S7). CC has no server: the owner
- * runs `claude` by hand, and CC's bash runs `aichat send-message` to reply.
+ * claude-code (CC) reads `AICHAT_BIND` (the same bare `aiclaw-{uid}-room-{roomId}` binding, set in
+ * CC's env by the node-driven CcHeadlessDriver when it spawns `claude -p` per turn) → `cc:<binding>`
+ * (REQ-011 S2). CC's bash runs `aichat send-message` to reply, out-of-band from the headless turn.
  * The prefix routes the loopback capability to the owning driver (see capability/session-key.ts).
  * Precedence opencode > codex > openclaw > cc (cc last). Returns undefined when no recognized session
  * env is set — the CLI never accepts a session id (or room/identity) as an argument (anti-spoofing).

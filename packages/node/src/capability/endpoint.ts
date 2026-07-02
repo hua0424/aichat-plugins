@@ -9,25 +9,12 @@ import { parseSessionKey } from './session-key.js';
 /** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
 type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
 
-/**
- * REQ-010 S7 — an ADMIN handler: a loopback-only setup op that is NOT identity-resolved by a
- * sessionKey. The `cc-bind` CLI uses one to ask the running node for a CC launch command (only the
- * node knows the resolved cc aiclaw uid). It receives the raw request body and returns a response.
- */
-export type AdminHandler = (body: Record<string, unknown>) => Promise<CapabilityResponse> | CapabilityResponse;
-
 export interface CapabilityEndpointDeps {
 	registry: CapabilityRegistry;
 	/** Map an agent session key → bound identity/room/api, or undefined if unknown. */
 	resolve: (sessionKey: string) => Resolved | undefined;
 	/** Max idempotency cache entries before FIFO-evicting the oldest (default 1000). */
 	idempotencyCap?: number;
-	/**
-	 * REQ-010 S7: admin (setup) handlers keyed by name. A request carrying `{ admin: "<name>" }` is
-	 * routed here (loopback-guarded, NOT sessionKey-resolved, NOT idempotency-cached), distinct from
-	 * the identity-resolved capability path. Used by `aichat cc-bind`.
-	 */
-	adminHandlers?: Record<string, AdminHandler>;
 }
 
 /** Default cap on the idempotency cache; evict oldest (FIFO) past this in a long-lived daemon. */
@@ -67,7 +54,6 @@ export class CapabilityEndpoint {
 	private readonly idempotency = new Map<string, CapabilityResponse>();
 	/** FIFO cap on `idempotency`: every call uses a fresh idempotencyKey, so the Map would leak forever. */
 	private readonly idempotencyCap: number;
-	private readonly adminHandlers: Record<string, AdminHandler>;
 	private server: Server | null = null;
 	private socketPath: string | null = null;
 
@@ -75,26 +61,12 @@ export class CapabilityEndpoint {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
 		this.idempotencyCap = deps.idempotencyCap ?? DEFAULT_IDEMPOTENCY_CAP;
-		this.adminHandlers = deps.adminHandlers ?? {};
 	}
 
 	async handle(req: { body: unknown; remoteAddress?: string }): Promise<CapabilityResponse> {
 		// Non-local guard (defense-in-depth; a unix socket reports remoteAddress undefined → allowed).
 		if (req.remoteAddress !== undefined && !LOOPBACK.has(req.remoteAddress)) {
 			return { status: 403, json: { ok: false, error: 'forbidden: non-local connection' } };
-		}
-
-		// REQ-010 S7: admin (setup) requests carry `{ admin: "<name>" }` and are routed BEFORE the
-		// sessionKey-resolved capability path — they are loopback-only setup ops (e.g. cc-bind), not
-		// identity-resolved and not idempotency-cached. An unknown admin name is a deterministic 400.
-		if (req.body && typeof req.body === 'object' && typeof (req.body as Record<string, unknown>).admin === 'string') {
-			const b = req.body as Record<string, unknown>;
-			const adminName = b.admin as string;
-			const adminHandler = this.adminHandlers[adminName];
-			if (!adminHandler) {
-				return { status: 400, json: { ok: false, error: `unknown admin command: ${adminName}` } };
-			}
-			return adminHandler(b);
 		}
 
 		const parsed = parseBody(req.body);
