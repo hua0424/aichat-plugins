@@ -39,7 +39,8 @@ export async function activate(activationToken: string, backend: string): Promis
 		}),
 	});
 
-	const result = await resp.json() as { success: boolean; data?: { uid: number; connectionToken: string }; msg?: string };
+	// REQ-029 (#29): server serializes Java Long uid as a JSON string; type it string to match the wire contract.
+	const result = await resp.json() as { success: boolean; data?: { uid: string; connectionToken: string }; msg?: string };
 
 	if (!result.success || !result.data) {
 		console.error(`[activate] Failed: ${result.msg || 'Unknown error'}`);
