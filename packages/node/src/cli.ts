@@ -8,7 +8,6 @@ import { handleFindFriend } from './commands/find-friend.js';
 import { handleListGroups } from './commands/list-groups.js';
 import { handleListGroupMembers } from './commands/list-group-members.js';
 import { handleGroupConfig } from './commands/group-config.js';
-import { handleCcBind } from './commands/cc-bind.js';
 import { installSkill } from './capability/skill.js';
 
 const args = process.argv.slice(2);
@@ -44,10 +43,6 @@ switch (command) {
 		break;
 	case 'group-config':
 		await handleGroupConfig(args.slice(1));
-		break;
-	// REQ-010 S7: claude-code owner-driven bind — print the copy-paste launch command for a room
-	case 'cc-bind':
-		await handleCcBind(args.slice(1));
 		break;
 	case 'install-skill': {
 		const written = installSkill();
@@ -106,8 +101,6 @@ Commands:
   install-skill                                  Install the aichat-reply opencode skill
   group-config --room <roomId>                   Query group config
   group-config --room <roomId> [options...]      Update group config
-  cc-bind --room <roomId> [--uid <ccUid>]        Print the claude-code launch command bound to a room
-                                                 (CC is owner-driven: run the printed command yourself)
 
 Examples:
   aichat activate --backend openclaw --token eyJ...

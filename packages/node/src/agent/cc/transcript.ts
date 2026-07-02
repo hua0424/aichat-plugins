@@ -27,6 +27,8 @@ export interface CcTranscriptRecord {
 	text?: string;
 	/** tool_use tool name. */
 	tool?: string;
+	/** truncated JSON of the tool_use input. */
+	tool_input?: string;
 }
 
 /**

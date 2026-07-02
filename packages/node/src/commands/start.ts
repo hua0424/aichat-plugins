@@ -11,13 +11,11 @@ import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
 import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
-import { CcDriver, parseCcBinding } from '../agent/cc/cc-driver.js';
-import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import { CcHeadlessDriver, parseCcBinding } from '../agent/cc/headless-driver.js';
 import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
-import { ccBindAdminHandler } from '../capability/cc-bind.js';
 import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
@@ -174,17 +172,6 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
-		// REQ-010 S7: cc-bind admin route (loopback-only setup op, NOT identity-resolved). Reads the
-		// LIVE supervisor.agents each call so a cc identity that came online late is still found.
-		adminHandlers: {
-			'cc-bind': (body) =>
-				ccBindAdminHandler(
-					supervisor.agents.map((a) => ({
-						uid: a.uid,
-						driver: a.driver as unknown as { type: string; bind?: CcDriver['bind'] },
-					})),
-				)(body),
-		},
 	});
 	await endpoint.listen(capabilitySocketPath());
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);

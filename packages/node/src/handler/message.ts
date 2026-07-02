@@ -1,9 +1,7 @@
-import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO, CcBindRequestDTO } from '../stream/protocol.js';
+import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
-import type { CcDriver } from '../agent/cc/cc-driver.js';
-import type { OpencodeChatContext } from '../agent/opencode/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
@@ -162,14 +160,6 @@ export class MessageHandler {
 	/** thinking session 超时时间（5 分钟） */
 	private readonly THINKING_SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 
-	/**
-	 * REQ-010 S7: 外部（owner 发起）thinking 的合成 triggerMsgId 计数器。
-	 * CC 轮无房间触发消息，故 triggerMsgId 由本地单调计数器派生（`cc-ext-<roomId>-<n>`），
-	 * 不用 Date/random（仓库约束）。server 对 THINKING_START 一视同仁，按 sessionKey+triggerMsgId
-	 * 回填 thinkingId（handleThinkingStartBroadcast），合成 id 同样流通无碍。
-	 */
-	private externalThinkingCounter = 0;
-
 	// REQ-004 M3: 防循环守卫 + 群配置缓存
 	private antiLoopGuard: AntiLoopGuard;
 	private groupConfigCache: GroupConfigCache;
@@ -243,9 +233,6 @@ export class MessageHandler {
 				break;
 			case 'thinkingEnd':
 				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
-				break;
-			case 'ccBindRequest':
-				this.handleCcBindRequest(msg.data as CcBindRequestDTO);
 				break;
 			case 'tokenExpired':
 				// REQ-008 #76: 有 onTokenExpired（多身份）→ 仅降级本身份，不退进程；
@@ -745,55 +732,6 @@ export class MessageHandler {
 		}
 	}
 
-	/**
-	 * REQ-010 S9: handle a server `ccBindRequest` → compute the CC owner-launch command via
-	 * `CcDriver.bind()` and reply `CC_BIND_RESULT` keyed by `requestId`. This is the node half of a
-	 * server↔node RPC over the aiclaw WS: the HuLa client surfaces the CC owner-launch command, the
-	 * server routes the request here (only to cc aiclaws), node generates the command and replies.
-	 *
-	 * Exactly one of `{launchCommand, workspaceDir}` (success) OR `{error}` (failure) is sent.
-	 * The handler is fully defensive: it NEVER throws out of `handle()`.
-	 *  - non-cc driver (or no `bind`) → error result (the server only routes to cc aiclaws, but guard).
-	 *  - bind throws → error result (`String(err)`).
-	 */
-	private handleCcBindRequest({ roomId: rawRoomId, roomType, counterpartUid: rawCounterpartUid, requestId }: CcBindRequestDTO): void {
-		try {
-			// REQ-029 (#29): normalize inbound ids to opaque strings (never Number()).
-			const roomId = String(rawRoomId);
-			const counterpartUid = rawCounterpartUid === undefined ? undefined : String(rawCounterpartUid);
-			// Defensive guard: only a cc driver exposing `bind` can answer (server routes only to cc
-			// aiclaws, but a misroute / non-cc identity must not crash or silently drop).
-			const driver = this.driver as Partial<CcDriver>;
-			if (driver.type !== 'cc' || typeof driver.bind !== 'function') {
-				this.ws.send(WSReqType.CC_BIND_RESULT, {
-					requestId,
-					error: 'identity is not a claude-code (cc) agent',
-				});
-				return;
-			}
-
-			// Build the chatContext exactly as CcDriver.bind/deriveWorkspaceDir expect:
-			//   group (roomType=1) → { roomType:1, roomId }
-			//   dm    (roomType=2) → { roomType:2, roomId, counterpartUid }  (counterpartUid only when present)
-			const chatContext: OpencodeChatContext =
-				roomType === 2
-					? { roomType: 2, roomId, ...(counterpartUid !== undefined ? { counterpartUid } : {}) }
-					: { roomType, roomId };
-
-			const b = (driver as CcDriver).bind(this.selfUid, roomId, chatContext);
-			this.ws.send(WSReqType.CC_BIND_RESULT, {
-				requestId,
-				launchCommand: b.launchCommand,
-				workspaceDir: b.workspaceDir,
-			});
-		} catch (err) {
-			this.ws.send(WSReqType.CC_BIND_RESULT, {
-				requestId,
-				error: String(err),
-			});
-		}
-	}
-
 	/** M3: 发送 autoReply（限流/退避触发时调用） */
 	private sendAutoReply(roomId: string, reason: string): void {
 		if (!this.apiClient) {
@@ -836,95 +774,6 @@ export class MessageHandler {
 			channel.pendingMessages = [];
 		}
 		this.roomChannels.clear();
-	}
-
-	/**
-	 * REQ-010 S7: 启动一个**外部驱动**（CC broker / owner 发起）的 thinking 会话。
-	 *
-	 * 与 triggerAgentLoop 的房间触发路径不同：CC 轮没有房间触发消息，故 triggerMsgId 用本地
-	 * 单调计数器合成（`cc-ext-<roomId>-<n>`，非 Date/random）。复用既有 thinkingSessions map +
-	 * sessionKey 方案（`aiclaw-{fromUid}-room-{roomId}`），server 对 THINKING_START 一视同仁，
-	 * handleThinkingStartBroadcast 按 sessionKey+triggerMsgId 回填 thinkingId，合成 id 流通无碍。
-	 *
-	 * 双重 begin 守卫：同一 sessionKey 已有 active session 时直接 no-op（不重发 START）。
-	 *
-	 * 假设：一个 aiclaw-room 由 driver loop **或** CC broker 单独驱动，二者不并发（codex/opencode
-	 * aiclaw 不是 CC aiclaw）。共享同一 map + sessionKey 方案，是为了让 thinkingId 回填路径统一。
-	 */
-	beginExternalThinking(roomId: string, fromUid: string): void {
-		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
-		if (this.thinkingSessions.has(sessionKey)) {
-			// 已有 active session（driver loop 或上一次外部 begin）→ 守卫双重 begin。
-			return;
-		}
-		const triggerMsgId = `cc-ext-${roomId}-${this.externalThinkingCounter++}`;
-		const session: ThinkingSession = {
-			sessionKey,
-			thinkingId: '',
-			triggerMsgId,
-			startTime: Date.now(),
-			accumulatedContent: '',
-			finalized: false,
-			events: [],
-		};
-		// 复用与 triggerAgentLoop 一致的 5 分钟超时兜底（CC 轮卡死时也能收尾）。
-		session.timeoutId = setTimeout(() => {
-			if (session.finalized) return;
-			session.finalized = true;
-			console.error(`[thinking] external timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
-				durationMs: Date.now() - session.startTime,
-				status: 'error',
-				error: 'thinking_session_timeout',
-				content: capUtf8Bytes(session.accumulatedContent),
-			});
-			this.thinkingSessions.delete(sessionKey);
-		}, this.THINKING_SESSION_TIMEOUT_MS);
-
-		this.thinkingSessions.set(sessionKey, session);
-		console.log(`[thinking] external start triggerMsgId=${triggerMsgId} sessionKey=${sessionKey}`);
-		this.ws.send(WSReqType.THINKING_START, {
-			fromUid,
-			roomId,
-			triggerMsgId,
-		});
-	}
-
-	/**
-	 * REQ-010 S7: 外部 thinking 增量。与既有 thinking 一致**仅本地累计**，不逐帧发 THINKING_DELTA
-	 * （内容随 THINKING_END 一次性整发）。无 active session 时安全 no-op。
-	 */
-	externalThinkingDelta(roomId: string, fromUid: string, text: string): void {
-		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
-		const session = this.thinkingSessions.get(sessionKey);
-		if (!session || session.finalized) return;
-		session.accumulatedContent += text;
-	}
-
-	/**
-	 * REQ-010 S7: 结束外部 thinking → 发 THINKING_END {status:'complete', content, durationMs}
-	 * （镜像 finalizeComplete 的帧形状），并清理会话。无 active session / 已 finalized 时安全 no-op。
-	 * 收尾后 flushPendingMessages，让外部 thinking 活跃期间入队的消息得以重新交付。
-	 *
-	 * REQ-011 S2: cc 已改为 node-driven（CcHeadlessDriver），thinking 经 CcBroker→CcSessionRegistry
-	 * 桥接进 driver 的 AgentEvent 流，走标准路径。以下 external-thinking 方法保留（无害）但生产不再调用。
-	 */
-	endExternalThinking(roomId: string, fromUid: string): void {
-		const sessionKey = `aiclaw-${fromUid}-room-${roomId}`;
-		const session = this.thinkingSessions.get(sessionKey);
-		if (!session || session.finalized) return;
-		session.finalized = true;
-		if (session.timeoutId) clearTimeout(session.timeoutId);
-		this.ws.send(WSReqType.THINKING_END, {
-			thinkingId: session.thinkingId || undefined,
-			durationMs: Date.now() - session.startTime,
-			status: 'complete',
-			content: capUtf8Bytes(session.accumulatedContent),
-		});
-		console.log(`[thinking] external end session=${sessionKey} durationMs=${Date.now() - session.startTime}`);
-		this.thinkingSessions.delete(sessionKey);
-		this.flushPendingMessages(roomId);
 	}
 
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */

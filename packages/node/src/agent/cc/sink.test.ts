@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CcBroker } from './broker.js';
-import { parseCcBinding } from './cc-driver.js';
+import { parseCcBinding } from './headless-driver.js';
 import { CcSessionRegistry, buildCcBridgeSink, type CcEventPush } from './sink.js';
 import type { AgentEvent } from '../events.js';
 

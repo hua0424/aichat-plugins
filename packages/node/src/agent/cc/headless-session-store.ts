@@ -12,16 +12,16 @@ export interface StoredCcHeadlessSession {
  * node-driven claude-code headless turn. Tests use an in-memory fake; production uses the file-backed
  * impl below.
  *
- * Parallel to codex's CodexSessionStore, keyed on claude's `session_id` (captured from the headless
- * stdout `system/init` event). NOTE: unlike codex there is NO reverse lookup — resolveSession parses
- * the AICHAT_BIND binding (parseCcBinding) directly, so the store is only consulted to reuse a
- * `session_id` for `--resume` on the next turn of the same (aiclawUid, roomId).
- * Key = `aiclaw-{uid}-room-{roomId}`.
+ * Forward-only BY DESIGN. CC receives the full binding string via `AICHAT_BIND`, so `resolveSession`
+ * is a pure parse (`parseCcBinding`) exactly like openclaw/opencode — it needs no reverse lookup, and
+ * so this store has none. The store is consulted ONLY by the forward key `aiclaw-{uid}-room-{roomId}`
+ * to reuse a `session_id` for `--resume` on the next turn of the same (aiclawUid, roomId). (Codex
+ * differs: it gets `CODEX_THREAD_ID`, not the binding, so it must reverse-look-up the (uid, room).)
  */
 export interface CcHeadlessSessionStore {
 	get(key: string): StoredCcHeadlessSession | undefined;
 	set(key: string, val: StoredCcHeadlessSession): void;
-	/** Drop a binding (parity with codex; kept for symmetry / future self-heal). */
+	/** Drop a binding — used by resetSession and the dead-`--resume` self-heal to clear a stale sessionId. */
 	delete(key: string): void;
 }
 
