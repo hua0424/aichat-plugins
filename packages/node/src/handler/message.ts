@@ -3,7 +3,7 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { reduceThinking } from '../agent/thinking-map.js';
-import { filterOpenclawNoReply } from '../agent/openclaw-driver.js';
+import { filterOpenclawThinking } from '../agent/openclaw-driver.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -538,9 +538,9 @@ export class MessageHandler {
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
-			// openclaw-only: 过滤 openclaw 自有的 NO_REPLY 哨兵（整段匹配才替换），其它 driver 逐字节不变。
+			// openclaw-only: 过滤 openclaw 自有的 NO_REPLY 哨兵（整段匹配）及空/纯空白思考正文，其它 driver 逐字节不变。
 			const rawContent =
-				this.driver.type === 'openclaw' ? filterOpenclawNoReply(outcome.content) : outcome.content;
+				this.driver.type === 'openclaw' ? filterOpenclawThinking(outcome.content) : outcome.content;
 			this.ws.send(WSReqType.THINKING_END, {
 				thinkingId: session.thinkingId || undefined,
 				durationMs: outcome.durationMs,
