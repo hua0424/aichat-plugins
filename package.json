@@ -4,6 +4,7 @@
   "private": true,
   "description": "HuLa-Server 与 AI 助手（openclaw 等）的通讯桥接服务 — monorepo",
   "type": "module",
+  "packageManager": "pnpm@11.9.0",
   "scripts": {
     "dev": "pnpm -r --filter @aichat/node dev",
     "build": "pnpm -r build",

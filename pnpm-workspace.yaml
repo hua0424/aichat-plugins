@@ -1,2 +1,24 @@
 packages:
   - 'packages/*'
+
+# BL-013: pnpm 11 defaults strictDepBuilds:true → install FAILS if any dep build script is ignored
+# (and pnpm auto-scaffolds an allowBuilds stub). Keep the pnpm 10 posture: DON'T run these
+# native/binary postinstalls — esbuild ships a prebuilt platform binary via its optional dep and
+# msgpackr-extract falls back to pure-JS, so the deploy container needs no compile toolchain. Declare
+# both explicitly (prevents re-scaffolding) and relax strict mode so install succeeds with a warning.
+allowBuilds:
+  esbuild: false
+  msgpackr-extract: false
+strictDepBuilds: false
+
+# BL-013 (aichatoverview#127): supply-chain publish cooldown — a newly published registry version
+# must be ≥24h (1440 min) old before it can be installed. Only affects registry resolution + `time`
+# metadata; internal workspace:* links and git/file deps are unaffected. Registries lacking `time`
+# metadata skip the check by default (non-strict) rather than erroring.
+minimumReleaseAge: 1440
+# Exempt the deliberately version-pinned official OpenAI/codex platform deps (BL-012: this package's
+# cooldown once blocked deployment). Entries are package-name patterns — NOT semver ranges (pnpm
+# errors on ranges).
+minimumReleaseAgeExclude:
+  - '@openai/codex'
+  - '@openai/codex-sdk'

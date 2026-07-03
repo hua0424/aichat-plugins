@@ -10,9 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # BL-013: pnpm version is read from package.json `packageManager` (pnpm@11.9.0) — single source
+      # of truth; no `version:` pin here to drift out of sync.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
