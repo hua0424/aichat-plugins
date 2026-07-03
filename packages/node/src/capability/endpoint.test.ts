@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CapabilityEndpoint } from './endpoint.js';
+import { CapabilityEndpoint, maskSessionKey, sanitizeLogField } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 
@@ -171,6 +171,70 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 		expect(line).toContain('…(');
 		expect(line).toContain('opencode:ses_0123'); // prefix + first 8 chars of the id
 		expect(line).not.toContain(longId); // the full id must NOT appear
+	});
+
+	it('capability-throw branch (500) logs one err line with resolved uid/room', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		// send-message with no content → sendMessageCapability throws → 500 path.
+		const res = await endpoint.handle({ body: body({ args: {} }) });
+		expect(res.status).toBe(500);
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) err=send-message: `content` is required/);
+	});
+
+	it('prefix-parse-failure branch (400) logs one (unresolved) unknown session key prefix line', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		// `raw:` is not a KNOWN agent-type prefix → parseSessionKey fails → 400 before resolve.
+		const res = await endpoint.handle({ body: body({ sessionKey: 'raw:whatever' }) });
+		expect(res.status).toBe(400);
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).toBe('[capability] send-message raw:whatever → (unresolved) err=unknown session key prefix');
+	});
+
+	it('unknown-command branch (400) logs one err line with resolved uid/room', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		const res = await endpoint.handle({ body: body({ command: 'nope-not-registered' }) });
+		expect(res.status).toBe(400);
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).toBe('[capability] nope-not-registered opencode:ses_1 → (uid=7, room=42) err=unknown command');
+	});
+
+	it('CRLF in an untrusted command cannot forge a second log line', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		// Attacker-controlled command with an embedded newline + fake log line, on the unknown-command path.
+		await endpoint.handle({ body: body({ command: 'evil\n[capability] FORGED → (uid=0, room=0) ok' }) });
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		// Exactly ONE console.log call, and the embedded newline is neutralized (→ space) so the forged
+		// text can never become a SEPARATE physical log line. (The text survives inline, harmlessly.)
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).not.toContain('\n');
+		expect(capLines[0]).toContain('[capability] evil [capability] FORGED'); // newline flattened to a space
+	});
+});
+
+describe('endpoint log-sanitizer helpers', () => {
+	it('sanitizeLogField replaces CR/LF + control chars with spaces', () => {
+		expect(sanitizeLogField('a\r\nb\tc')).toBe('a  b c');
+		expect(sanitizeLogField('plain')).toBe('plain');
+	});
+
+	it('sanitizeLogField truncates past max with an ellipsis', () => {
+		expect(sanitizeLogField('x'.repeat(10), 4)).toBe('xxxx…');
+		expect(sanitizeLogField('abc', 4)).toBe('abc');
+	});
+
+	it('maskSessionKey: no colon → <no-prefix>; short id kept; long id masked; control chars stripped', () => {
+		expect(maskSessionKey('noprefix')).toBe('<no-prefix>');
+		expect(maskSessionKey('cc:short')).toBe('cc:short');
+		expect(maskSessionKey('opencode:0123456789abcdef')).toBe('opencode:01234567…(16)');
+		expect(maskSessionKey('cc:a\nb')).toBe('cc:a b'); // embedded newline in a short id → space
 	});
 });
 
