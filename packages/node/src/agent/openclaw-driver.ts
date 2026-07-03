@@ -2,21 +2,31 @@ import type { AgentDriver, AgentSession, AgentEvent } from './events.js';
 import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
 
 /**
- * REQ (openclaw NO_REPLY sentinel): upstream openclaw's built-in agent contract emits the literal
+ * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
  * string `NO_REPLY` on its `assistant` text stream when it has no user-visible prose to add (the
- * reply itself already went out via the hula_send_message tool). We consume that stream as thinking
- * text, so the bare sentinel would otherwise land in the thinking panel / DB. Filter it — but ONLY
- * when the WHOLE thinking text is the sentinel (openclaw's own regex is whole-string with optional
- * surrounding whitespace), so a real thought that merely CONTAINS "NO_REPLY" survives verbatim.
+ * reply itself already went out via the hula_send_message tool); it ALSO emits a purely empty /
+ * whitespace-only assistant stream on some turns. We consume that stream as thinking text, so both
+ * the bare sentinel and an empty stream would otherwise land as a blank/broken thinking panel / DB
+ * row. Filter both — but for the sentinel ONLY when the WHOLE thinking text is the sentinel
+ * (openclaw's own regex is whole-string with optional surrounding whitespace), so a real thought
+ * that merely CONTAINS "NO_REPLY" survives verbatim.
  *
  * Note: `.test()` on a non-global regex is stateless — do NOT add the `g` flag (lastIndex would
  * make repeated calls non-deterministic).
  */
 export const OPENCLAW_NO_REPLY_SENTINEL = /^\s*NO_REPLY\s*$/;
-export const OPENCLAW_NO_REPLY_PLACEHOLDER = '（本轮无思考正文，回复已直接发出）';
+/** Neutral placeholder for an openclaw turn with no real thinking prose (bare NO_REPLY sentinel OR
+ *  empty/whitespace-only assistant stream). Deliberately makes NO claim about whether a reply was
+ *  sent: the node can't know that at finalize time (reply goes out-of-band via the openclaw tool),
+ *  and empty-turns with no reply exist — so "回复已直接发出" would be false for them. */
+export const OPENCLAW_EMPTY_THINKING_PLACEHOLDER = '（本轮无思考正文）';
 
-export function filterOpenclawNoReply(content: string): string {
-	return OPENCLAW_NO_REPLY_SENTINEL.test(content) ? OPENCLAW_NO_REPLY_PLACEHOLDER : content;
+/** openclaw-only: bare NO_REPLY sentinel OR empty/whitespace-only thinking → neutral placeholder;
+ *  any real thinking (even if it merely CONTAINS "NO_REPLY") is returned verbatim. */
+export function filterOpenclawThinking(content: string): string {
+	return OPENCLAW_NO_REPLY_SENTINEL.test(content) || content.trim() === ''
+		? OPENCLAW_EMPTY_THINKING_PLACEHOLDER
+		: content;
 }
 
 /**
