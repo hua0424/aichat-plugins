@@ -137,6 +137,43 @@ describe('CapabilityEndpoint.handle', () => {
 	});
 });
 
+describe('CapabilityEndpoint.handle observability log ([capability])', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('success branch logs one ok line with resolved uid/room', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		const res = await endpoint.handle({ body: body() });
+		expect(res.status).toBe(200);
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) ok$/);
+	});
+
+	it('resolve-failure branch logs one (unresolved) unknown session line', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: undefined });
+		const res = await endpoint.handle({ body: body() });
+		expect(res.status).toBe(404);
+		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
+		expect(capLines).toHaveLength(1);
+		expect(capLines[0]).toBe('[capability] send-message opencode:ses_1 → (unresolved) err=unknown session');
+	});
+
+	it('maskSessionKey masks a long id: prefix + first 8 chars + length, never the full id', async () => {
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const { endpoint } = build({ resolveRoom: 42 });
+		const longId = 'ses_0123456789abcdef_secret_tail';
+		await endpoint.handle({ body: body({ sessionKey: `opencode:${longId}` }) });
+		const line = logSpy.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[capability]'))!;
+		expect(line).toContain('…(');
+		expect(line).toContain('opencode:ses_0123'); // prefix + first 8 chars of the id
+		expect(line).not.toContain(longId); // the full id must NOT appear
+	});
+});
+
 describe('CapabilityEndpoint.listen socket permissions', () => {
 	const dirs: string[] = [];
 	let endpoint: CapabilityEndpoint | null = null;
