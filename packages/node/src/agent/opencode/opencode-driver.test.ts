@@ -394,3 +394,25 @@ describe('OpencodeSession.send', () => {
 		expect(server.restart).toHaveBeenCalled();
 	});
 });
+
+describe('OpencodeDriver.resetSession (aichatoverview#124)', () => {
+	it('drops the stored session for (uid,room) and returns true', () => {
+		const { client } = mockClient();
+		const store = memStore();
+		store.set('aiclaw-1-room-2', { sessionID: 'S1', directory: '/tmp/oc-ws/group/2' });
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: store });
+		expect(driver.resetSession('1', '2')).toBe(true);
+		expect(store.get('aiclaw-1-room-2')).toBeUndefined();
+		expect(store.del).toHaveBeenCalledWith('aiclaw-1-room-2');
+	});
+
+	it('other rooms are unaffected', () => {
+		const { client } = mockClient();
+		const store = memStore();
+		store.set('aiclaw-1-room-2', { sessionID: 'S1', directory: '/tmp/oc-ws/group/2' });
+		store.set('aiclaw-1-room-3', { sessionID: 'S2', directory: '/tmp/oc-ws/group/3' });
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: store });
+		driver.resetSession('1', '2');
+		expect(store.get('aiclaw-1-room-3')).toEqual({ sessionID: 'S2', directory: '/tmp/oc-ws/group/3' });
+	});
+});

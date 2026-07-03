@@ -238,6 +238,28 @@ describe('CodexDriver.resolveSession', () => {
 	});
 });
 
+describe('CodexDriver.resetSession (aichatoverview#124)', () => {
+	it('drops the stored thread for (uid,room) and returns true', () => {
+		const { codex } = mockCodex();
+		const store = memStore();
+		store.set('aiclaw-1-room-2', { threadId: 'T1' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		expect(driver.resetSession('1', '2')).toBe(true);
+		expect(store.get('aiclaw-1-room-2')).toBeUndefined();
+		expect(store.del).toHaveBeenCalledWith('aiclaw-1-room-2');
+	});
+
+	it('other rooms are unaffected', () => {
+		const { codex } = mockCodex();
+		const store = memStore();
+		store.set('aiclaw-1-room-2', { threadId: 'T1' });
+		store.set('aiclaw-1-room-3', { threadId: 'T2' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		driver.resetSession('1', '2');
+		expect(store.get('aiclaw-1-room-3')).toEqual({ threadId: 'T2' });
+	});
+});
+
 describe('CodexSession.send', () => {
 	it('thread.started captured+stored NOT yielded; reasoning/agent_message→thinking; command_execution→tool start/end deduped; turn.completed→done', async () => {
 		const { codex, ctl, runStreamed } = mockCodex();

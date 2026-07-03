@@ -80,6 +80,15 @@ export class OpencodeDriver implements AgentDriver {
 		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
+	/**
+	 * aichatoverview#124 — drop the stored session for this (uid,room) so the NEXT turn creates a FRESH
+	 * opencode session (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
+	 */
+	resetSession(aiclawUid: string, roomId: string): boolean {
+		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		return true;
+	}
+
 	async disconnect(): Promise<void> {
 		// No-op. The shared opencode server is NOT owned by any single driver — it is a
 		// singleton serving N opencode identities, so stopping it here would kill ALL of

@@ -82,6 +82,15 @@ export class CodexDriver implements AgentDriver {
 		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
+	/**
+	 * aichatoverview#124 — drop the stored thread for this (uid,room) so the NEXT turn starts a FRESH
+	 * codex thread (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
+	 */
+	resetSession(aiclawUid: string, roomId: string): boolean {
+		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		return true;
+	}
+
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;

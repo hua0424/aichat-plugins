@@ -48,4 +48,11 @@ export interface AgentDriver {
 	 * implement it. Returns undefined when the key is unknown/unparseable.
 	 */
 	resolveSession?(sessionKey: string): { aiclawUid: string; roomId: string } | undefined;
+	/**
+	 * Runtime per-room session reset (aichatoverview#124): drop any stored per-(uid,room) session state
+	 * so the NEXT inbound message opens a FRESH session (context cleared). Other rooms are unaffected.
+	 * Returns true if this driver maintains per-room session state (state was dropped); false if the
+	 * driver is stateless per-room (no store → no-op, e.g. openclaw whose binding IS the session).
+	 */
+	resetSession?(aiclawUid: string, roomId: string): boolean;
 }

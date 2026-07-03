@@ -46,6 +46,14 @@ export class OpenclawDriver implements AgentDriver {
 		return { aiclawUid: m[1], roomId: m[2] };
 	}
 
+	/**
+	 * aichatoverview#124 — no per-room store: openclaw's binding IS the sessionKey, so there is
+	 * nothing to reset. No-op, returns false.
+	 */
+	resetSession(): boolean {
+		return false;
+	}
+
 	async connect(): Promise<void> {
 		await this.adapter.connect();
 	}

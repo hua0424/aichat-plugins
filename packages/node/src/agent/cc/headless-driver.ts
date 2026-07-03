@@ -173,8 +173,9 @@ export class CcHeadlessDriver implements AgentDriver {
 	 * spawns fresh, so this simply returns a room to that state. Minimal v1 entry point (a method; no
 	 * client UX) — an `aichat` CLI subcommand can wrap it later if needed.
 	 */
-	resetSession(aiclawUid: string, roomId: string): void {
+	resetSession(aiclawUid: string, roomId: string): boolean {
 		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		return true;
 	}
 
 	async openSession(o: {
