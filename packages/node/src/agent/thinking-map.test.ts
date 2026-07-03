@@ -62,4 +62,21 @@ describe('reduceThinking (pure event reducer)', () => {
 			status: 'complete',
 		});
 	});
+
+	// #120 NO-REGRESSION: the CC panel fix teed {thinking} events from stdout so this SHARED reducer (used
+	// by all four drivers) builds the panel content. Prove the reducer still concatenates {thinking} into
+	// content and ignores {tool} — the invariant openclaw/opencode/codex also rely on, unchanged by #120.
+	it('#120 no-regression: concatenates {thinking} events into content and ignores {tool}', () => {
+		const events: AgentEvent[] = [
+			{ type: 'thinking', text: 'let me reason' },
+			{ type: 'tool', name: 'Bash', phase: 'end' },
+			{ type: 'thinking', text: ' then narrate' },
+			{ type: 'done', durationMs: 7 },
+		];
+		expect(reduceThinking(events)).toEqual({
+			content: 'let me reason then narrate',
+			status: 'complete',
+			durationMs: 7,
+		});
+	});
 });

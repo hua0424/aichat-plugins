@@ -4,15 +4,19 @@ import type { AddressInfo } from 'node:net';
 /**
  * REQ-010 S7 / REQ-011 S2 — the claude-code (CC) hook broker.
  *
- * CC has no gateway/server: node sources a CC turn's THINKING/tool activity from claude-code **hooks**
- * that POST to this node-local HTTP broker. Each hook fires in CC's headless (`-p`) run, reads
- * `$AICHAT_BIND` (the binding string placed in CC's launch env), and POSTs to `http://127.0.0.1:<port>/`
- * with `Authorization: Bearer <AICHAT_BIND>` and a JSON hook body.
+ * CC has no gateway/server: node sources a CC turn's TOOL activity from claude-code **hooks** that POST
+ * to this node-local HTTP broker. Each hook fires in CC's headless (`-p`) run, reads `$AICHAT_BIND` (the
+ * binding string placed in CC's launch env), and POSTs to `http://127.0.0.1:<port>/` with
+ * `Authorization: Bearer <AICHAT_BIND>` and a JSON hook body.
  *
- * REQ-011 S2: CC is now NODE-DRIVEN. The broker no longer drives an "external thinking" session; it
- * routes each resolved hook into the active CcHeadlessSession's AgentEvent stream via the injected
- * CcHookSink (a CcSessionRegistry bridge, src/agent/cc/sink.ts), so the handler's STANDARD path renders
- * the panel — identical to codex/opencode.
+ * (#120) THINKING is NOT sourced here: the original MessageDisplay→broker→panel hook path never delivered
+ * content (claude-code's MessageDisplay payload carries the assistant text in a `delta` field, not the
+ * `content` the broker read), so the panel stayed blank. THINKING is now teed from the driver's stdout
+ * (see headless-driver.ts teeOutput). The broker's live job is PostToolUse (→ `{tool}`) + Stop (flush).
+ *
+ * REQ-011 S2: CC is NODE-DRIVEN. The broker routes each resolved hook into the active CcHeadlessSession's
+ * AgentEvent stream via the injected CcHookSink (a CcSessionRegistry bridge, src/agent/cc/sink.ts), so
+ * the handler's STANDARD path renders the panel — identical to codex/opencode.
  *
  * `handle()` is the pure-ish, unit-testable core (local-only guard → Bearer extract → resolve →
  * hook-event → sink mapping). `listen()`/`close()` are a thin node:http wrapper over a 127.0.0.1 TCP
@@ -30,9 +34,7 @@ import type { AddressInfo } from 'node:net';
 export interface CcHookSink {
 	/** PostToolUse → a `{tool}` AgentEvent for the room (name only; reduceThinking ignores tools). */
 	tool(roomId: string, aiclawUid: string, toolName: string): void;
-	/** MessageDisplay / assistant text → a `{thinking}` AgentEvent for the room (rendered in the panel). */
-	thinking(roomId: string, aiclawUid: string, text: string): void;
-	/** Stop → flush any final thinking; do NOT close — the session's `done` comes from stdout EOF. */
+	/** Stop → flush any final tool activity; do NOT close — the session's `done` comes from stdout EOF. */
 	flush(roomId: string, aiclawUid: string): void;
 }
 
@@ -101,15 +103,11 @@ export class CcBroker {
 				this.sink.tool(roomId, aiclawUid, toolName);
 				break;
 			}
-			case 'MessageDisplay': {
-				const content = typeof hook.body.content === 'string' ? hook.body.content : '';
-				if (content) this.sink.thinking(roomId, aiclawUid, content);
-				break;
-			}
 			case 'Stop':
-				// last_assistant_message is the agent's thinking text, NOT the reply — the reply goes
-				// through the CLI capability path, not here. Stop flushes any final thinking; it does NOT
-				// close the session (the session's `done` comes from the driver's stdout EOF/`result`).
+				// The reply goes through the CLI capability path, not here. Stop flushes any final tool
+				// activity; it does NOT close the session (the session's `done` comes from the driver's
+				// stdout EOF/`result`). (#120) THINKING is no longer sourced from hooks — it is teed from
+				// the driver's stdout (see headless-driver.ts teeOutput), so there is no MessageDisplay case.
 				this.sink.flush(roomId, aiclawUid);
 				break;
 			default:

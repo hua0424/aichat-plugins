@@ -6,9 +6,9 @@ import type { CcHookSink } from './broker.js';
  *
  * CC is now node-driven (CcHeadlessDriver): the standard MessageHandler path opens a CcHeadlessSession
  * whose `send()` emits an AgentEvent stream. The reply and turn-completion come from that session
- * (`aichat send-message` CLI + stdout control-plane), but the THINKING/tool activity is sourced from
- * CC's **hooks**, which POST to the CcBroker. This registry is how a hook (resolved to a room) reaches
- * the active session's event queue:
+ * (`aichat send-message` CLI + stdout control-plane), and THINKING is teed from the driver's stdout
+ * (#120). TOOL activity is sourced from CC's **hooks** (PostToolUse), which POST to the CcBroker. This
+ * registry is how a hook (resolved to a room) reaches the active session's event queue:
  *
  *   CC hook → CcBroker.handle → CcHookSink (buildCcBridgeSink) → CcSessionRegistry.push(roomId, ev)
  *          → the active CcHeadlessSession's push → its send() AsyncIterable → the handler's standard path
@@ -46,18 +46,17 @@ export class CcSessionRegistry {
 /**
  * Build the CcHookSink that bridges resolved CC hooks into the per-room session stream:
  *   - PostToolUse  → a `{tool}` AgentEvent (name only; reduceThinking ignores tools, exactly like codex)
- *   - MessageDisplay / assistant text → a `{thinking}` AgentEvent (rendered into the panel)
- *   - Stop         → flush (no-op): thinking is pushed as it arrives; the session's `done` comes from
- *                    the driver's stdout EOF/`result`, NOT from the Stop hook.
- * SessionStart / UserPromptSubmit lifecycle events are ignored by the broker (the handler's standard
- * path already sends THINKING_START). A push into a room with no active session is a safe no-op.
+ *   - Stop         → flush (no-op): the session's `done` comes from the driver's stdout EOF/`result`,
+ *                    NOT from the Stop hook.
+ * (#120) THINKING is NOT bridged from hooks — it is teed from the driver's stdout (headless-driver.ts
+ * teeOutput). SessionStart / UserPromptSubmit lifecycle events are ignored by the broker (the handler's
+ * standard path already sends THINKING_START). A push into a room with no active session is a safe no-op.
  */
 export function buildCcBridgeSink(registry: CcSessionRegistry): CcHookSink {
 	return {
 		tool: (roomId, _uid, toolName) => registry.push(roomId, { type: 'tool', name: toolName, phase: 'end' }),
-		thinking: (roomId, _uid, text) => registry.push(roomId, { type: 'thinking', text }),
 		flush: () => {
-			/* no-op: thinking is pushed synchronously as hooks arrive; done comes from stdout EOF */
+			/* no-op: the session's `done` comes from stdout EOF; nothing to flush from the Stop hook */
 		},
 	};
 }

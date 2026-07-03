@@ -55,26 +55,23 @@ describe('CcSessionRegistry', () => {
 });
 
 describe('buildCcBridgeSink', () => {
-	it('tool → {tool} event; thinking → {thinking} event; flush → no push', () => {
+	// #120: the sink no longer has a `thinking` method — thinking is teed from the driver's stdout, not
+	// bridged from a hook. Only `tool` (PostToolUse) pushes an event; `flush` (Stop) is a no-op.
+	it('tool → {tool} event; flush → no push', () => {
 		const reg = new CcSessionRegistry();
 		const got: AgentEvent[] = [];
 		reg.register(9, (e) => got.push(e));
 		const sink = buildCcBridgeSink(reg);
 
-		sink.thinking(9, 5, 'reasoning...');
 		sink.tool(9, 5, 'Bash');
 		sink.flush(9, 5);
 
-		expect(got).toEqual([
-			{ type: 'thinking', text: 'reasoning...' },
-			{ type: 'tool', name: 'Bash', phase: 'end' },
-		]);
+		expect(got).toEqual([{ type: 'tool', name: 'Bash', phase: 'end' }]);
 	});
 
 	it('a hook for a room with no active session is dropped safely', () => {
 		const reg = new CcSessionRegistry();
 		const sink = buildCcBridgeSink(reg);
-		expect(() => sink.thinking(999, 5, 'no session')).not.toThrow();
 		expect(() => sink.tool(999, 5, 'Bash')).not.toThrow();
 		expect(() => sink.flush(999, 5)).not.toThrow();
 	});
@@ -97,17 +94,15 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 		return { reg, got, register, broker };
 	}
 
-	it('MessageDisplay → {thinking}; PostToolUse → {tool}; on the binding-owner room only', async () => {
+	it('#120: PostToolUse → {tool} on the binding-owner room only; MessageDisplay routes nothing', async () => {
 		const h = harness();
 		h.register('42'); // active session for room 42 (uid 5)
 
+		// #120: MessageDisplay is no longer bridged (thinking is teed from stdout) — it pushes nothing.
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'MessageDisplay', content: 'streaming' } });
 		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 
-		expect(h.got.get('42')).toEqual([
-			{ type: 'thinking', text: 'streaming' },
-			{ type: 'tool', name: 'Bash', phase: 'end' },
-		]);
+		expect(h.got.get('42')).toEqual([{ type: 'tool', name: 'Bash', phase: 'end' }]);
 	});
 
 	it('SessionStart / UserPromptSubmit lifecycle → nothing pushed (handler does THINKING_START)', async () => {
@@ -128,7 +123,7 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 
 	it('late/racing hook with NO active session for the room → 200 ok, safe no-op drop (no throw)', async () => {
 		const h = harness(); // no register() → no active session
-		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'MessageDisplay', content: 'orphan' } });
+		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(200);
 		expect(h.got.get('42')).toBeUndefined();
 	});
@@ -137,7 +132,7 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 		const h = harness();
 		const spy = vi.fn();
 		h.reg.register(9, spy);
-		const res = await h.broker.handle({ authToken: 'garbage', body: { hook_event_name: 'MessageDisplay', content: 'x' } });
+		const res = await h.broker.handle({ authToken: 'garbage', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(401);
 		expect(spy).not.toHaveBeenCalled();
 	});
