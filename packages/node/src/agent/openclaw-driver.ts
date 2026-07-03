@@ -2,6 +2,24 @@ import type { AgentDriver, AgentSession, AgentEvent } from './events.js';
 import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
 
 /**
+ * REQ (openclaw NO_REPLY sentinel): upstream openclaw's built-in agent contract emits the literal
+ * string `NO_REPLY` on its `assistant` text stream when it has no user-visible prose to add (the
+ * reply itself already went out via the hula_send_message tool). We consume that stream as thinking
+ * text, so the bare sentinel would otherwise land in the thinking panel / DB. Filter it — but ONLY
+ * when the WHOLE thinking text is the sentinel (openclaw's own regex is whole-string with optional
+ * surrounding whitespace), so a real thought that merely CONTAINS "NO_REPLY" survives verbatim.
+ *
+ * Note: `.test()` on a non-global regex is stateless — do NOT add the `g` flag (lastIndex would
+ * make repeated calls non-deterministic).
+ */
+export const OPENCLAW_NO_REPLY_SENTINEL = /^\s*NO_REPLY\s*$/;
+export const OPENCLAW_NO_REPLY_PLACEHOLDER = '（本轮无思考正文，回复已直接发出）';
+
+export function filterOpenclawNoReply(content: string): string {
+	return OPENCLAW_NO_REPLY_SENTINEL.test(content) ? OPENCLAW_NO_REPLY_PLACEHOLDER : content;
+}
+
+/**
  * REQ-008 #75 — OpenclawDriver: the first AgentDriver, a thin WRAPPER around the
  * unchanged OpenclawAdapter WS engine. It bridges the adapter's push-style
  * ThinkingCallbacks into the pull-style AgentEvent async stream; it does NOT

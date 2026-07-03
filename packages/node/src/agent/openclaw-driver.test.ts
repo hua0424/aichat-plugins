@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { OpenclawDriver } from './openclaw-driver.js';
+import {
+	OpenclawDriver,
+	filterOpenclawNoReply,
+	OPENCLAW_NO_REPLY_PLACEHOLDER,
+} from './openclaw-driver.js';
 import type { ClawAdapter, ThinkingCallbacks, ChatContext } from '../claw/interface.js';
 import type { AgentEvent } from './events.js';
 
@@ -209,5 +213,38 @@ describe('OpenclawDriver.resolveSession (REQ-010 S6 Phase-2)', () => {
 		expect(d.resolveSession!('aiclaw-abc-room-42')).toBeUndefined();
 		expect(d.resolveSession!('notaiclaw-7-room-42')).toBeUndefined();
 		expect(d.resolveSession!('')).toBeUndefined();
+	});
+});
+
+describe('filterOpenclawNoReply — openclaw NO_REPLY sentinel', () => {
+	// ① pure sentinel → placeholder
+	it('replaces a bare NO_REPLY with the placeholder', () => {
+		expect(filterOpenclawNoReply('NO_REPLY')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
+	});
+
+	// ② sentinel with surrounding whitespace → placeholder (whole-string regex allows \s)
+	it('replaces NO_REPLY with leading/trailing whitespace', () => {
+		expect(filterOpenclawNoReply('  NO_REPLY\n')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
+		expect(filterOpenclawNoReply('\n NO_REPLY ')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
+	});
+
+	// ③ a real thought CONTAINING the substring → returned UNCHANGED (verbatim)
+	it('preserves a real thought that merely contains the substring', () => {
+		const a = '我判断这条不用回复，本想输出 NO_REPLY 但其实要答';
+		const b = 'NO_REPLY_HANDLER 是个变量名';
+		expect(filterOpenclawNoReply(a)).toBe(a);
+		expect(filterOpenclawNoReply(b)).toBe(b);
+	});
+
+	// ④ guard documentation: a plain non-sentinel thought passes through untouched (no-op),
+	// so any non-openclaw driver — which never calls this at all — is unaffected by construction.
+	it('is a no-op for an ordinary non-sentinel thought', () => {
+		expect(filterOpenclawNoReply('普通思考正文')).toBe('普通思考正文');
+	});
+
+	// stateless: repeated calls on the same non-global regex never drift (no lastIndex).
+	it('is stateless across repeated calls', () => {
+		expect(filterOpenclawNoReply('NO_REPLY')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
+		expect(filterOpenclawNoReply('NO_REPLY')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
 	});
 });
