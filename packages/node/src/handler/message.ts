@@ -169,6 +169,9 @@ export class MessageHandler {
 	// REQ-004 M3: 内嵌 HulaApiClient（仅用于 autoReply / CLI）
 	private apiClient: HulaApiClient | null = null;
 
+	// #132: this aiclaw's own display name, resolved once + cached, for the cc system-prompt identity anchor.
+	private selfName: string | undefined;
+
 	/** debounce 配置（可注入，便于测试） */
 	private readonly debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number };
 
@@ -194,6 +197,23 @@ export class MessageHandler {
 		this.apiClient = apiClient || null;
 		this.debounceOptions = debounceOptions;
 		this.onTokenExpired = onTokenExpired;
+	}
+
+	/**
+	 * #132: this aiclaw's own display name, resolved once + cached, for the cc system-prompt identity anchor.
+	 * cc-only — the model needs to know it IS <name> to recognize @<name> in group chat as itself.
+	 */
+	private async resolveSelfName(): Promise<string | undefined> {
+		if (this.selfName !== undefined) return this.selfName;
+		if (!this.apiClient) return undefined;
+		try {
+			const p = await this.apiClient.getMemberInfo(this.selfUid);
+			const name = (p.name ?? p.nickName ?? p.account) as string | undefined;
+			if (name) this.selfName = name;
+			return this.selfName;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -517,6 +537,10 @@ export class MessageHandler {
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
 		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
+		// #132: cc-only — resolve this aiclaw's own display name (cached) and thread it in via chatContext so
+		// the cc system-prompt can anchor its identity (model must know it IS <name> to recognise @<name> in a
+		// group as itself). Other drivers don't use it → skip the fetch to avoid a needless member-info call.
+		const selfName = this.driver.type === 'cc' ? await this.resolveSelfName() : undefined;
 		const agentSession = await this.driver.openSession({
 			aiclawUid: this.selfUid,
 			roomId,
@@ -527,6 +551,7 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
+				...(selfName !== undefined ? { selfName } : {}),
 			},
 		});
 		session.agentSession = agentSession;

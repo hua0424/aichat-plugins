@@ -252,7 +252,12 @@ describe('CcHeadlessDriver — shape', () => {
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
-		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: { roomType: 2, roomId: '9' } });
+		// #132: chatContext carries this aiclaw's own display name → threaded into the system-prompt anchor.
+		const session = await driver.openSession({
+			aiclawUid: '5',
+			roomId: '9',
+			chatContext: { roomType: 2, roomId: '9', selfName: 'CCTestAI' },
+		});
 		// REQ-013 S1: the message arriving at send() is ALREADY the unified attribution envelope (built at
 		// the handler common layer). The driver forwards it verbatim — no per-driver envelope building.
 		session.send('[HuLa 私聊]\n[小明(100)]: 原始用户消息');
@@ -272,13 +277,18 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 			'--settings',
 			expect.stringContaining('settings.json'),
 			'--append-system-prompt',
-			CC_REPLY_CONTRACT,
+			// #132: identity anchor (self name + uid) prefixed to the #102 reply contract body.
+			expect.stringContaining('CCTestAI'),
 		]);
 		// no stored session → no --resume
 		expect(call.args).not.toContain('--resume');
-		// #102 reply contract delivered at the SYSTEM level (once per turn) via --append-system-prompt,
-		// NOT prepended to each stdin user message. The contract itself mandates the aichat send-message CLI.
-		expect(CC_REPLY_CONTRACT).toContain('aichat send-message');
+		// #132: the --append-system-prompt value carries BOTH the self display name and this aiclaw's uid,
+		// AND the full #102 reply contract body (delivered at the SYSTEM level, once per turn).
+		const systemPrompt = call.args[call.args.indexOf('--append-system-prompt') + 1];
+		expect(systemPrompt).toContain('CCTestAI');
+		expect(systemPrompt).toContain('5'); // aiclaw uid
+		expect(systemPrompt).toContain(CC_REPLY_CONTRACT);
+		expect(systemPrompt).toContain('aichat send-message');
 
 		const env = call.options.env as NodeJS.ProcessEnv;
 		expect(env.AICHAT_BIND).toBe('aiclaw-5-room-9');

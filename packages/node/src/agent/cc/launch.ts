@@ -43,6 +43,27 @@ export const CC_REPLY_CONTRACT =
 	'本轮无需回复时不运行即可（本轮自然结束、不发送任何消息）。' +
 	'在你真正运行过该命令之前，绝不要声称已发送。';
 
+/**
+ * #132 — build the CC launch-level system prompt: an IDENTITY ANCHOR prepended to {@link CC_REPLY_CONTRACT}.
+ *
+ * WHY: the headless CC model reads the group transcript verbatim, including `@<name>` mentions of ITSELF.
+ * Without a self-name anchor it has no way to know which name it answers to, so it treats `@CCTestAI` as a
+ * message to a THIRD party and silently declines to reply (the #132 identity-recognition gap). The anchor
+ * tells the model it IS `<displayName>（uid <uid>）`, so a routed message — including a group @-mention of
+ * that name — is understood as addressed to it. The display name is resolved from HuLa (getMemberInfo) at
+ * the handler and threaded in; when it can't be resolved the anchor still pins the uid.
+ *
+ * Style matches the existing Chinese reply-contract prose; the contract body is appended UNCHANGED.
+ */
+export function buildCcSystemPrompt(identity: { displayName?: string; uid: string }): string {
+	const who = identity.displayName ? `${identity.displayName}（uid ${identity.uid}）` : `（uid ${identity.uid}）`;
+	const anchor =
+		`你是本 HuLa 聊天会话的 AI 助理 ${who}。凡系统路由到你这里的消息——包括群聊里对你` +
+		`${identity.displayName ? `（@${identity.displayName}）` : ''}的点名——都是在对你说话，` +
+		`应据内容按下述约定回复；本轮无需回复时自然结束、不发送即可。\n`;
+	return anchor + CC_REPLY_CONTRACT;
+}
+
 /** A single claude-code command-hook entry. */
 interface CcCommandHook {
 	type: 'command';
