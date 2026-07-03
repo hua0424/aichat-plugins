@@ -79,6 +79,11 @@ export class CapabilityEndpoint {
 		// than letting it fall through to resolve. (A valid prefix that simply has no live driver/session
 		// still returns the existing 404 'unknown session' via resolve → undefined.)
 		if (!parseSessionKey(parsed.sessionKey)) {
+			// parsed.command exists here → cheap "解析失败" observability signal.
+			// command + sessionKey are untrusted request input → sanitize to prevent CRLF log forgery.
+			console.log(
+				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (unresolved) err=unknown session key prefix`,
+			);
 			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
 		}
 
@@ -91,10 +96,18 @@ export class CapabilityEndpoint {
 		const resolved = this.resolve(parsed.sessionKey);
 		if (!resolved) {
 			// not cached — an unresolved session is transient (could resolve next time)
+			console.log(
+				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (unresolved) err=unknown session`,
+			);
 			return { status: 404, json: { ok: false, error: 'unknown session' } };
 		}
 
 		if (!this.registry.has(parsed.command)) {
+			// Failure path — AC "成功/失败都有" covers it. command failed the registry whitelist → untrusted,
+			// sanitize. uid/room are known here (session resolved), so log the full locator.
+			console.log(
+				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}) err=unknown command`,
+			);
 			return { status: 400, json: { ok: false, error: `unknown command: ${parsed.command}` } };
 		}
 
@@ -104,12 +117,21 @@ export class CapabilityEndpoint {
 			apiClient: resolved.apiClient,
 		};
 
+		// One structured line per real resolution+invocation outcome (REQ-013 style: one line, key
+		// locating fields, content truncated). No args (may hold message content), no idempotencyKey,
+		// masked sessionKey, truncated error text — no credential/token leak.
+		// command is whitelist-validated here (registry.has passed), but sanitize anyway for consistency.
+		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
 		let response: CapabilityResponse;
 		try {
 			const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
 			response = { status: 200, json: { ok: true, result } };
+			console.log(`${loc} ok`);
 		} catch (err) {
-			response = { status: 500, json: { ok: false, error: err instanceof Error ? err.message : String(err) } };
+			const msg = err instanceof Error ? err.message : String(err);
+			response = { status: 500, json: { ok: false, error: msg } };
+			// capability error text is untrusted (may contain CR/LF) → sanitize + truncate.
+			console.log(`${loc} err=${sanitizeLogField(msg)}`);
 		}
 
 		// Cache the resolved outcome (success OR failure) so a retried idempotencyKey is stable.
@@ -197,6 +219,35 @@ function parseBody(body: unknown): CapabilityRequest | undefined {
 	if (typeof b.idempotencyKey !== 'string' || b.idempotencyKey.length === 0) return undefined;
 	const args = b.args && typeof b.args === 'object' ? (b.args as Record<string, unknown>) : {};
 	return { sessionKey: b.sessionKey, command: b.command, args, idempotencyKey: b.idempotencyKey };
+}
+
+/**
+ * Sanitize an untrusted string for a ONE-LINE log field: strip CR/LF + other ASCII control chars
+ * (prevents CRLF log-forgery from request-controlled `command` / session-key / capability-error
+ * text — an attacker could otherwise embed `\n[capability] …` to inject a fake log line), then
+ * truncate with an ellipsis. Everything logged that originates from the request body or a capability
+ * error goes through here. Exported for direct unit tests.
+ */
+export function sanitizeLogField(s: string, max = 200): string {
+	// eslint-disable-next-line no-control-regex
+	const clean = s.replace(/[\x00-\x1f\x7f]/g, ' ');
+	return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
+}
+
+/**
+ * Mask a sessionKey for logs: keep the driver prefix (`cc:`/`codex:`/`openclaw:`/`opencode:`),
+ * shorten+mask the id after the first `:`. The id is a session/binding, not a token, but we mask it
+ * anyway per the no-leak requirement and to keep log lines short. No `:` → `<no-prefix>`. The result
+ * runs through sanitizeLogField so an injected CR/LF in the prefix or a short id can't forge a line.
+ * Exported for direct unit tests.
+ */
+export function maskSessionKey(sessionKey: string): string {
+	const idx = sessionKey.indexOf(':');
+	if (idx === -1) return '<no-prefix>';
+	const prefix = sessionKey.slice(0, idx + 1); // includes the colon
+	const id = sessionKey.slice(idx + 1);
+	const masked = id.length <= 8 ? `${prefix}${id}` : `${prefix}${id.slice(0, 8)}…(${id.length})`;
+	return sanitizeLogField(masked, 64);
 }
 
 /** Default socket path: AICHAT_CAPABILITY_SOCK override, else ~/.aichat/capability.sock. */
