@@ -7,6 +7,7 @@ import {
 	findFriendCapability,
 	listGroupsCapability,
 	listGroupMembersCapability,
+	resetSessionCapability,
 	type CapabilityContext,
 } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
@@ -194,6 +195,32 @@ describe('listGroupMembersCapability (REQ-010 S4)', () => {
 		const ctx = ctxWith(listGroupMembers, 42);
 		const out = await listGroupMembersCapability()(ctx, {});
 		expect(out).toEqual({ roomId: 42, error: 'HuLa API failed: 当前不在群聊中' });
+	});
+});
+
+describe('resetSessionCapability (aichatoverview#124)', () => {
+	it('calls resetFor with ctx.aiclawUid + ctx.roomId and returns { roomId, driverType, reset }', async () => {
+		const resetFor = vi.fn(() => ({ driverType: 'codex', reset: true }));
+		const apiClient = {} as unknown as HulaApiClient;
+		const ctx: CapabilityContext = { aiclawUid: 7, roomId: 42, apiClient };
+		const out = await resetSessionCapability(resetFor)(ctx, {});
+		expect(resetFor).toHaveBeenCalledWith(7, 42);
+		expect(out).toEqual({ roomId: 42, driverType: 'codex', reset: true });
+	});
+
+	it('passes through reset=false (stateless driver no-op)', async () => {
+		const resetFor = vi.fn(() => ({ driverType: 'openclaw', reset: false }));
+		const apiClient = {} as unknown as HulaApiClient;
+		const ctx: CapabilityContext = { aiclawUid: 7, roomId: 42, apiClient };
+		const out = await resetSessionCapability(resetFor)(ctx, {});
+		expect(out).toEqual({ roomId: 42, driverType: 'openclaw', reset: false });
+	});
+
+	it('throws when resetFor returns undefined (no live agent for this identity)', async () => {
+		const resetFor = vi.fn(() => undefined);
+		const apiClient = {} as unknown as HulaApiClient;
+		const ctx: CapabilityContext = { aiclawUid: 7, roomId: 42, apiClient };
+		await expect(resetSessionCapability(resetFor)(ctx, {})).rejects.toThrow('no live agent');
 	});
 });
 

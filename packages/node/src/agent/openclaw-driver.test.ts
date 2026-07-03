@@ -248,3 +248,11 @@ describe('filterOpenclawNoReply — openclaw NO_REPLY sentinel', () => {
 		expect(filterOpenclawNoReply('NO_REPLY')).toBe(OPENCLAW_NO_REPLY_PLACEHOLDER);
 	});
 });
+
+describe('OpenclawDriver.resetSession (aichatoverview#124)', () => {
+	it('returns false (no per-room store — binding IS the session) and does not throw', () => {
+		const { adapter } = fakeAdapter(() => {});
+		const d = new OpenclawDriver(adapter);
+		expect(d.resetSession!('7', '42')).toBe(false);
+	});
+});

@@ -2,6 +2,7 @@
 import { activate } from './commands/activate.js';
 import { start } from './commands/start.js';
 import { handleSendMessage } from './commands/send-message.js';
+import { handleResetSession } from './commands/reset-session.js';
 import { handleMemberInfo } from './commands/member-info.js';
 import { handleListFriends } from './commands/list-friends.js';
 import { handleFindFriend } from './commands/find-friend.js';
@@ -23,6 +24,10 @@ switch (command) {
 	// REQ-004 M3: CLI 扩展
 	case 'send-message':
 		await handleSendMessage(args.slice(1));
+		break;
+	// aichatoverview#124: runtime per-room agent session reset
+	case 'reset-session':
+		await handleResetSession(args.slice(1));
 		break;
 	// REQ-010 S3: read-only query subcommands
 	case 'member-info':
@@ -89,6 +94,7 @@ Commands:
   send-message --content <text>                  Reply to the current chat
                                                  (room + identity are bound automatically
                                                   from your agent session — never passed in)
+  reset-session                                  Reset this room's agent session (fresh next msg)
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
   find-friend <keyword>                          Search users by keyword (substring match)

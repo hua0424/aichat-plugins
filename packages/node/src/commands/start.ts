@@ -29,6 +29,7 @@ import {
 	findFriendCapability,
 	listGroupsCapability,
 	listGroupMembersCapability,
+	resetSessionCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
 import { resolveBoundSession } from '../capability/session-key.js';
@@ -169,6 +170,17 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// REQ-010 S4: group query capabilities (list-groups token-scoped; list-group-members server-validated)
 	registry$.register('list-groups', listGroupsCapability());
 	registry$.register('list-group-members', listGroupMembersCapability());
+	// aichatoverview#124: runtime per-room session reset. Identity+room come from the resolved session
+	// (ctx), never args; the closure dispatches to the owning agent's driver.resetSession.
+	registry$.register(
+		'reset-session',
+		resetSessionCapability((aiclawUid, roomId) => {
+			const owner = supervisor.agents.find((a) => a.uid === aiclawUid);
+			if (!owner) return undefined;
+			const reset = owner.driver.resetSession?.(aiclawUid, roomId) ?? false;
+			return { driverType: owner.driver.type, reset };
+		}),
+	);
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),

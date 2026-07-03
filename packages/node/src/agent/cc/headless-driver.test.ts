@@ -236,6 +236,17 @@ describe('CcHeadlessDriver — shape', () => {
 		expect(typeof s.send).toBe('function');
 		await expect(driver.disconnect()).resolves.toBeUndefined();
 	});
+
+	// aichatoverview#124: runtime per-room session reset — drop the stored session_id so the NEXT turn
+	// spawns fresh (no --resume). Returns true (cc is stateful per-room). Other rooms unaffected.
+	it('resetSession drops the stored session_id for (uid,room), returns true, other rooms unaffected', () => {
+		const { driver, store } = makeDriver();
+		store.set('aiclaw-1-room-2', { sessionId: 'sess_a' });
+		store.set('aiclaw-1-room-3', { sessionId: 'sess_b' });
+		expect(driver.resetSession('1', '2')).toBe(true);
+		expect(store.get('aiclaw-1-room-2')).toBeUndefined();
+		expect(store.get('aiclaw-1-room-3')).toEqual({ sessionId: 'sess_b' });
+	});
 });
 
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {

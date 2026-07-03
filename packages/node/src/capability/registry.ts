@@ -56,6 +56,22 @@ export function sendMessageCapability(): Capability {
 }
 
 /**
+ * aichatoverview#124 — reset the agent session bound to ctx (identity+room come from the resolved
+ * session, never args → anti-spoofing). Delegates to a `resetFor` closure (injected at registration)
+ * that owns the identity→driver dispatch. Returns which driver handled it + whether per-room state
+ * was actually reset (false = stateless driver like openclaw, a no-op).
+ */
+export function resetSessionCapability(
+	resetFor: (aiclawUid: string, roomId: string) => { driverType: string; reset: boolean } | undefined,
+): Capability {
+	return async (ctx) => {
+		const r = resetFor(ctx.aiclawUid, ctx.roomId);
+		if (!r) throw new Error('reset-session: no live agent for this identity');
+		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset };
+	};
+}
+
+/**
  * REQ-010 S3 — read-only query capabilities (member-info / list-friends / find-friend).
  *
  * ANTI-SPOOFING: identity/scope come ONLY from the resolved `ctx.apiClient` (the aiclaw's token,
