@@ -2,7 +2,7 @@ import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
-import { buildCcSettings, writeCcSettings, CC_REPLY_CONTRACT } from './launch.js';
+import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
@@ -188,6 +188,9 @@ export class CcHeadlessDriver implements AgentDriver {
 		await mkdir(workspaceDir, { recursive: true });
 		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
 
+		// #132: the display name of THIS aiclaw, threaded in via chatContext (resolved once + cached at the
+		// handler). Optional — an unresolved name still anchors the uid in the system prompt.
+		const selfName = (o.chatContext as Record<string, unknown>).selfName as string | undefined;
 		const binding = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
 		const session = new CcHeadlessSession({
 			binding,
@@ -195,6 +198,8 @@ export class CcHeadlessDriver implements AgentDriver {
 			workspaceDir,
 			settingsPath,
 			claudeBin: this.claudeBin,
+			aiclawUid: o.aiclawUid,
+			selfName,
 			sessionStore: this.sessionStore,
 			registry: this.registry,
 			transcript: this.transcript,
@@ -216,6 +221,10 @@ interface CcHeadlessSessionDeps {
 	workspaceDir: string;
 	settingsPath: string;
 	claudeBin: string;
+	/** #132: this aiclaw's own uid, pinned into the cc system-prompt identity anchor. */
+	aiclawUid: string;
+	/** #132: this aiclaw's display name for the anchor; optional — may be unresolved. */
+	selfName?: string;
 	sessionStore: CcHeadlessSessionStore;
 	registry: CcSessionRegistry;
 	transcript: CcTranscriptWriter;
@@ -472,8 +481,10 @@ class CcHeadlessSession implements AgentSession {
 			// REQ-011 S2: deliver the #102 reply contract at the SYSTEM level once per spawned turn
 			// (--append-system-prompt, PR #43's proven method) — NOT prepended to each stdin user message
 			// (which would pollute the content). Each headless turn is a fresh process, so it's per-turn.
+			// #132: prefixed with an identity anchor (self name + uid) so the model recognises a group
+			// @-mention of its own name as addressed to it (else it silently declines to reply).
 			'--append-system-prompt',
-			CC_REPLY_CONTRACT,
+			buildCcSystemPrompt({ displayName: this.d.selfName, uid: this.d.aiclawUid }),
 		];
 		const stored = this.d.sessionStore.get(this.key);
 		if (stored?.sessionId) {
