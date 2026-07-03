@@ -12,15 +12,21 @@ import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js
  * opencode, codex). The channel approach was abandoned; CC now runs HEADLESS, spawned per inbound turn.
  *
  * A deliberate HYBRID: `drivesTurns=true` (node drives the turn, like the other three), but the reply
- * and thinking exits are UNCHANGED from the owner-driven model:
+ * exit is UNCHANGED from the owner-driven model:
  *   - REPLY    = CC itself runs `aichat send-message` (the #102 capability CLI, out-of-band). NOT parsed
  *                from stdout.
- *   - THINKING = sourced from CC's HOOKS (which fire under headless), POSTed to the CcBroker and bridged
- *                into THIS session's AgentEvent stream via the CcSessionRegistry, so the handler's
- *                standard reduceThinking path renders the panel. NOT parsed from stdout.
- *   - STDOUT   = CONTROL-PLANE ONLY: capture `session_id` (system/init), detect turn-complete
- *                (`result` event / EOF), first-event timeout, errors. NO assistant/reply/thinking text
- *                is parsed from stdout (it would conflict with the CLI reply).
+ *   - THINKING = sourced from the STDOUT TEE (`teeOutput`): each assistant `text`/`thinking` content
+ *                block — the same data that populates the per-room transcript — is pushed as a
+ *                `{thinking}` AgentEvent into THIS session's stream, so the handler's standard
+ *                reduceThinking path renders the panel. This is DISPLAY ONLY; it never becomes the reply.
+ *                (#120) The original design sourced THINKING from CC's HOOKS (MessageDisplay → broker →
+ *                panel), but that path never delivered content: claude-code's MessageDisplay hook carries
+ *                the assistant text in a `delta` field, not `content`, so the broker's `content` read was
+ *                always empty and the CC panel stayed blank. That hooks→panel path is removed.
+ *   - STDOUT   = capture `session_id` (system/init), detect turn-complete (`result` event / EOF),
+ *                first-event timeout, errors — AND tee assistant `text`/`thinking` blocks to the panel +
+ *                transcript (display only). The reply is NEVER parsed from stdout (it would conflict with
+ *                the CLI reply); tool activity stays on the PostToolUse hook path.
  *
  * Per-turn spawn (PoC-verified, claude-code 2.1.195):
  *   claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages
@@ -224,9 +230,10 @@ interface CcHeadlessSessionDeps {
  * One node-driven CC turn. `send()` spawns `claude` headless, writes the given user envelope (already
  * the unified attribution transcript, built at the handler common layer) to stdin, and merges TWO async
  * sources into one AgentEvent stream:
- *   1. stdout control-plane → captures session_id, emits `done` on `result`/EOF (after a brief drain),
- *      or `error` on failure/timeout.
- *   2. hooks (via the registry) → `thinking`/`tool` events, pushed as they arrive.
+ *   1. stdout → captures session_id, emits `done` on `result`/EOF (after a brief drain) or `error` on
+ *      failure/timeout, AND tees each assistant `text`/`thinking` block as a `{thinking}` event for the
+ *      panel (#120, display only — the reply is out-of-band via the CLI).
+ *   2. hooks (via the registry) → `{tool}` events (PostToolUse), pushed as they arrive.
  * Mirrors the codex push→pull queue so events landing before the consumer awaits are never lost.
  */
 class CcHeadlessSession implements AgentSession {
@@ -301,9 +308,9 @@ class CcHeadlessSession implements AgentSession {
 	private complete(): void {
 		if (this.ended || this.turnComplete) return;
 		this.turnComplete = true;
-		// Order the `done` AFTER any pending thinking pushes: a final Stop/MessageDisplay hook still
-		// racing over loopback HTTP lands in the buffer BEFORE done during this drain window, so the
-		// tail thinking is never lost (the handler stops consuming at `done`).
+		// Order the `done` AFTER any pending pushes: a final Stop/PostToolUse hook still racing over
+		// loopback HTTP lands in the buffer BEFORE done during this drain window, so tail tool activity
+		// is never lost (the handler stops consuming at `done`).
 		this.drainTimer = setTimeout(() => {
 			if (this.ended) return;
 			this.push({ type: 'done', durationMs: Date.now() - this.turnStart });
@@ -389,6 +396,12 @@ class CcHeadlessSession implements AgentSession {
 	 * REQ-011 S3 (AC9): tee an `assistant` stdout event's content blocks to the transcript — assistant
 	 * text / thinking as `text`, tool_use as a `tool` name. Best-effort: any shape it doesn't recognise is
 	 * ignored, and it never throws (a transcript hiccup must not break the turn).
+	 *
+	 * (#120) The `text`/`thinking` blocks ALSO feed the thinking PANEL: each is pushed as a `{thinking}`
+	 * AgentEvent so reduceThinking concatenates it into the THINKING_END content (the panel now shows the
+	 * same text as the transcript). This is DISPLAY ONLY — the reply is out-of-band via the agent running
+	 * `aichat send-message` (the CLI capability); no reply is ever extracted from stdout. `tool_use` blocks
+	 * push NO thinking event (tool activity stays on the PostToolUse hook path).
 	 */
 	private teeOutput(obj: Record<string, unknown>): void {
 		try {
@@ -400,8 +413,13 @@ class CcHeadlessSession implements AgentSession {
 				const ts = Date.now();
 				if (block.type === 'text' && typeof block.text === 'string') {
 					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'assistant', text: block.text });
+					// #120: tee assistant narration to the thinking panel for DISPLAY only; the reply is
+					// sent out-of-band via the agent's `aichat send-message` CLI, never parsed from stdout.
+					this.push({ type: 'thinking', text: block.text });
 				} else if (block.type === 'thinking' && typeof block.thinking === 'string') {
 					this.d.transcript.append(this.d.binding, { ts, session_id: this.sessionId, kind: 'thinking', text: block.thinking });
+					// #120: tee extended reasoning to the thinking panel for DISPLAY only (see above).
+					this.push({ type: 'thinking', text: block.thinking });
 				} else if (block.type === 'tool_use' && typeof block.name === 'string') {
 					// Capture the FULL tool input as JSON (truncated past the cap) so the transcript shows what
 					// the tool was actually called with, not just its name. Only when an input is present.

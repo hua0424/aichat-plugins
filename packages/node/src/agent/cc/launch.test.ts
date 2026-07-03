@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { buildCcHooksSettings, buildCcSettings, writeCcSettings, CC_REPLY_CONTRACT } from './launch.js';
 
-/** The events chunk-2 must wire (the broker dispatches by hook_event_name). */
-const EVENTS = ['UserPromptSubmit', 'PostToolUse', 'MessageDisplay', 'Stop', 'SessionStart'] as const;
+/** The events chunk-2 must wire (the broker dispatches by hook_event_name). #120: MessageDisplay is NOT
+ * wired — thinking is teed from the driver's stdout, not sourced from a hook. */
+const EVENTS = ['UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionStart'] as const;
 
 /** Narrow the loosely-typed settings shape to the claude-code hooks subset we assert on. */
 interface HookCmd {
@@ -31,12 +32,17 @@ function commandFor(hooks: CcHooks, event: string): string {
 describe('buildCcHooksSettings', () => {
 	const PORT = 9573; // non-default port to prove interpolation
 
-	it('wires all five lifecycle events', () => {
+	it('wires the four lifecycle events', () => {
 		const hooks = hooksOf({ hooks: buildCcHooksSettings(PORT) });
 		for (const event of EVENTS) {
 			expect(hooks[event], `missing hook for ${event}`).toBeDefined();
 			expect(hooks[event][0].hooks[0].type).toBe('command');
 		}
+	});
+
+	it('#120: does NOT wire a MessageDisplay hook (thinking is teed from stdout, not a hook)', () => {
+		const hooks = hooksOf({ hooks: buildCcHooksSettings(PORT) });
+		expect(hooks.MessageDisplay).toBeUndefined();
 	});
 
 	it('each command POSTs to the broker /hook with the Bearer header and --data-binary @-', () => {

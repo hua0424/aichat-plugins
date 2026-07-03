@@ -289,20 +289,21 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 });
 
 describe('CcHeadlessSession.send — stdout control-plane', () => {
-	it('system:init → session_id stored; result → {done}; NO thinking/text yielded from stdout', async () => {
+	it('#120: system:init → session_id stored; assistant text → {thinking} (panel); result → {done}', async () => {
 		const { driver, fs, store } = makeDriver();
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		fs.emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sid-abc' })}\n`);
-		// an assistant/text stdout event MUST NOT become a thinking event (reply comes from the CLI)
+		// #120: an assistant/text stdout block is teed to the thinking PANEL as a {thinking} event (display
+		// only). The REPLY still comes from the CLI capability — no reply is parsed from stdout.
 		fs.emitStdout(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'hello world' }] } })}\n`);
 		fs.emitStdout(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'sid-abc' })}\n`);
 
 		const events = await drain(stream);
 		expect(store.map.get(KEY)?.sessionId).toBe('sid-abc');
-		expect(events).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
-		expect(events.some((e) => e.type === 'thinking')).toBe(false);
+		expect(events).toContainEqual({ type: 'thinking', text: 'hello world' });
+		expect(events[events.length - 1]).toEqual({ type: 'done', durationMs: expect.any(Number) });
 	});
 
 	it('EOF (stdout end) with no `result` still finishes as a backstop', async () => {
@@ -323,6 +324,61 @@ describe('CcHeadlessSession.send — stdout control-plane', () => {
 		fs.emitStdout(`data: ${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream);
 		expect(store.map.get(KEY)?.sessionId).toBe('sid-sse');
+	});
+});
+
+// ─── #120: stdout assistant text/thinking blocks feed the thinking PANEL (display only) ───
+// The bug: the CC panel (im_aiclaw_thinking.content) was always empty because it was fed ONLY by the
+// broker's MessageDisplay hook, whose payload carries text in `delta` not `content`. Fix (option B):
+// tee the stdout assistant `text`/`thinking` blocks — the same data that fills the transcript — as
+// {thinking} events so reduceThinking concatenates them into the panel. `tool_use` stays off this path.
+
+describe('CcHeadlessSession.send — #120 stdout → thinking panel', () => {
+	it('assistant text + thinking blocks → {thinking} events (panel) AND transcript records', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		fs.emitStdout(
+			`${JSON.stringify({
+				type: 'assistant',
+				message: {
+					content: [
+						{ type: 'thinking', thinking: 'let me reason' },
+						{ type: 'text', text: 'here is my narration' },
+					],
+				},
+			})}\n`,
+		);
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+
+		// panel: BOTH blocks pushed as {thinking} events (so reduceThinking concatenates them into content)
+		expect(events).toContainEqual({ type: 'thinking', text: 'let me reason' });
+		expect(events).toContainEqual({ type: 'thinking', text: 'here is my narration' });
+		// the transcript still records them (the existing tee is unchanged)
+		const recs = transcript.records.filter((r) => r.key === KEY).map((r) => r.record);
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'thinking', text: 'let me reason' }));
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'assistant', text: 'here is my narration' }));
+	});
+
+	it('a tool_use block emits NO {thinking} event (transcript only — tools stay on the hook path)', async () => {
+		const { driver, fs, transcript } = makeDriver();
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const stream = session.send('hi');
+
+		fs.emitStdout(
+			`${JSON.stringify({
+				type: 'assistant',
+				message: { content: [{ type: 'tool_use', name: 'Bash', input: { cmd: 'ls' } }] },
+			})}\n`,
+		);
+		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
+		const events = await drain(stream);
+
+		expect(events.some((e) => e.type === 'thinking')).toBe(false); // a tool_use block pushes no thinking
+		const recs = transcript.records.filter((r) => r.key === KEY).map((r) => r.record);
+		expect(recs).toContainEqual(expect.objectContaining({ kind: 'tool_use', tool: 'Bash' }));
 	});
 });
 
@@ -387,29 +443,30 @@ describe('CcHeadlessSession.send — timeout & errors', () => {
 	});
 });
 
-describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registry)', () => {
+describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 thinking is stdout-teed)', () => {
 	/** Drive a hook through the REAL broker → bridge sink → the session's registered room push. */
 	function brokerFor(registry: CcSessionRegistry) {
 		return new CcBroker({ resolve: parseCcBinding, sink: buildCcBridgeSink(registry) });
 	}
 
-	it('MessageDisplay/PostToolUse hooks → {thinking}/{tool} appear in send()`s stream', async () => {
+	it('#120: a PostToolUse hook → {tool} appears in the stream; a MessageDisplay hook is now a no-op', async () => {
 		const { driver, fs, registry } = makeDriver();
 		const broker = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
-		await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'thinking A' } });
+		// #120: MessageDisplay no longer produces a thinking event (thinking is teed from stdout instead).
+		await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'ignored now' } });
 		await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 
 		const events = await drain(stream);
-		expect(events).toContainEqual({ type: 'thinking', text: 'thinking A' });
 		expect(events).toContainEqual({ type: 'tool', name: 'Bash', phase: 'end' });
+		expect(events.some((e) => e.type === 'thinking')).toBe(false); // no hook-sourced thinking anymore
 		expect(events[events.length - 1].type).toBe('done');
 	});
 
-	it('ORDER boundary: a Stop-hook thinking racing AFTER stdout-complete still flushes BEFORE done', async () => {
+	it('ORDER boundary: a PostToolUse hook racing AFTER stdout-complete still flushes BEFORE done', async () => {
 		const { driver, fs, registry } = makeDriver({ drainMs: 40 });
 		const broker = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
@@ -417,15 +474,15 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 
 		// stdout says the turn is complete FIRST (starts the drain window)...
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
-		// ...then a final thinking hook lands DURING the drain (the race the drain protects against).
-		await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'tail thinking' } });
+		// ...then a final tool hook lands DURING the drain (the race the drain protects against).
+		await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Grep' } });
 
 		const events = await drain(stream);
-		const thinkingIdx = events.findIndex((e) => e.type === 'thinking' && e.text === 'tail thinking');
+		const toolIdx = events.findIndex((e) => e.type === 'tool' && e.name === 'Grep');
 		const doneIdx = events.findIndex((e) => e.type === 'done');
-		expect(thinkingIdx).toBeGreaterThanOrEqual(0);
+		expect(toolIdx).toBeGreaterThanOrEqual(0);
 		expect(doneIdx).toBeGreaterThanOrEqual(0);
-		expect(thinkingIdx).toBeLessThan(doneIdx); // tail thinking flushed before done
+		expect(toolIdx).toBeLessThan(doneIdx); // tail tool flushed before done
 	});
 
 	it('a hook for a room with NO active session (turn already finished) is a safe no-op (no throw)', async () => {
@@ -436,7 +493,7 @@ describe('CcHeadlessSession.send — hooks bridge (thinking/tool via the registr
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream); // session finished → deregistered from the room
 
-		const res = await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'late' } });
+		const res = await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(200); // resolved fine; the bridge just drops it
 	});
 });
@@ -536,7 +593,8 @@ describe('CcHeadlessDriver — REQ-011 S3 transcript (owner replaces watching th
 		expect(recs).toContainEqual(expect.objectContaining({ kind: 'tool_use', tool: 'Bash', session_id: 'sid-abc' }));
 		// every record carries a numeric ts
 		expect(recs.every((r) => typeof r.ts === 'number')).toBe(true);
-		// the tee does NOT leak CC output into the reply/thinking AgentEvent stream from stdout (control-plane only)
+		// #120: text/thinking blocks ALSO feed the thinking panel (covered above); the REPLY is never
+		// parsed from stdout — it goes out-of-band via the `aichat send-message` CLI capability.
 	});
 
 	it('appends (never overwrites) across turns — a second send() adds more records', async () => {

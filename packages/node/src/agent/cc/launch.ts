@@ -90,18 +90,20 @@ function hookEntry(brokerPort: number): CcHookMatcher {
  * non-blocking (`async: true`) command hook POSTing to `http://127.0.0.1:<brokerPort>/hook`. The
  * broker routes by `hook_event_name`, so one URL serves all events.
  *
- *   UserPromptSubmit → broker begins the external thinking session
- *   PostToolUse      → broker mirrors a `[工具] ...` delta (matcher `*` = every tool)
- *   MessageDisplay   → broker mirrors assistant thinking text as a delta
- *   Stop             → broker finalizes the thinking session (the reply goes via the CLI, not here)
- *   SessionStart     → broker begins the session (turn boot)
+ *   UserPromptSubmit → lifecycle (ignored by the broker; the handler sends THINKING_START)
+ *   PostToolUse      → broker routes a `{tool}` event (matcher `*` = every tool)
+ *   Stop             → broker flushes (the reply goes via the CLI, not here)
+ *   SessionStart     → lifecycle (turn boot; ignored by the broker)
+ *
+ * (#120) There is NO MessageDisplay hook: THINKING is teed from the driver's stdout (headless-driver.ts
+ * teeOutput), not sourced from a hook — the MessageDisplay payload carried its text in `delta`, not the
+ * `content` the broker read, so that path never delivered panel content.
  */
 export function buildCcHooksSettings(brokerPort: number): CcHooks {
 	const entry = () => [hookEntry(brokerPort)];
 	return {
 		UserPromptSubmit: entry(),
 		PostToolUse: entry(),
-		MessageDisplay: entry(),
 		Stop: entry(),
 		SessionStart: entry(),
 	};
