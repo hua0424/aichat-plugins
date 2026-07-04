@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CcHeadlessDriver, parseCcBinding, type CcChild, type CcSpawnFn } from './headless-driver.js';
+import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from './headless-driver.js';
 import type { CcTranscriptRecord } from './transcript.js';
 import { CC_REPLY_CONTRACT } from './launch.js';
 import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
@@ -480,20 +480,24 @@ describe('CcHeadlessSession.send — timeout & errors', () => {
 });
 
 describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 thinking is stdout-teed)', () => {
-	/** Drive a hook through the REAL broker → bridge sink → the session's registered room push. */
+	/** Drive a hook through the REAL broker → bridge sink → the session's registered room push. The broker
+	 *  resolves the OPAQUE bind token (BL-014 #141) via a store, exactly like production start.ts. */
 	function brokerFor(registry: CcSessionRegistry) {
-		return new CcBroker({ resolve: parseCcBinding, sink: buildCcBridgeSink(registry) });
+		const bindTokens = new InMemoryBindTokenStore();
+		const token = bindTokens.mint('5', '9'); // the (uid,room) these tests drive (== KEY's binding)
+		const broker = new CcBroker({ resolve: (t) => bindTokens.resolve(t), sink: buildCcBridgeSink(registry) });
+		return { broker, token };
 	}
 
 	it('#120: a PostToolUse hook → {tool} appears in the stream; a MessageDisplay hook is now a no-op', async () => {
 		const { driver, fs, registry } = makeDriver();
-		const broker = brokerFor(registry);
+		const { broker, token } = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// #120: MessageDisplay no longer produces a thinking event (thinking is teed from stdout instead).
-		await broker.handle({ authToken: KEY, body: { hook_event_name: 'MessageDisplay', content: 'ignored now' } });
-		await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
+		await broker.handle({ authToken: token, body: { hook_event_name: 'MessageDisplay', content: 'ignored now' } });
+		await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 
 		const events = await drain(stream);
@@ -504,14 +508,14 @@ describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 t
 
 	it('ORDER boundary: a PostToolUse hook racing AFTER stdout-complete still flushes BEFORE done', async () => {
 		const { driver, fs, registry } = makeDriver({ drainMs: 40 });
-		const broker = brokerFor(registry);
+		const { broker, token } = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 
 		// stdout says the turn is complete FIRST (starts the drain window)...
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		// ...then a final tool hook lands DURING the drain (the race the drain protects against).
-		await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Grep' } });
+		await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Grep' } });
 
 		const events = await drain(stream);
 		const toolIdx = events.findIndex((e) => e.type === 'tool' && e.name === 'Grep');
@@ -523,13 +527,13 @@ describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 t
 
 	it('a hook for a room with NO active session (turn already finished) is a safe no-op (no throw)', async () => {
 		const { driver, fs, registry } = makeDriver();
-		const broker = brokerFor(registry);
+		const { broker, token } = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream); // session finished → deregistered from the room
 
-		const res = await broker.handle({ authToken: KEY, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
+		const res = await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(200); // resolved fine; the bridge just drops it
 	});
 });
@@ -992,29 +996,5 @@ describe('CcHeadlessSession.send — REQ-011 S5 --resume self-heal', () => {
 		expect(events.some((e) => e.type === 'error')).toBe(false);
 		expect(events.filter((e) => e.type === 'done')).toHaveLength(1);
 		expect(store.map.get(KEY)?.sessionId).toBe('sid-ok');
-	});
-});
-
-describe('parseCcBinding', () => {
-	it('valid binding → uids', () => {
-		expect(parseCcBinding('aiclaw-12-room-34')).toEqual({ aiclawUid: '12', roomId: '34' });
-	});
-
-	it('REQ-029 (#29): a >2^53 binding parses to EXACT strings (Number() would corrupt)', () => {
-		expect(parseCcBinding('aiclaw-9007199254740993-room-9007199254740994')).toEqual({
-			aiclawUid: '9007199254740993',
-			roomId: '9007199254740994',
-		});
-	});
-
-	it('garbage → undefined', () => {
-		expect(parseCcBinding('garbage')).toBeUndefined();
-		expect(parseCcBinding('')).toBeUndefined();
-		expect(parseCcBinding('aiclaw-1-room-')).toBeUndefined();
-		expect(parseCcBinding('aiclaw--room-2')).toBeUndefined();
-	});
-
-	it('still-prefixed cc:… → undefined (the endpoint must strip cc: first)', () => {
-		expect(parseCcBinding('cc:aiclaw-1-room-2')).toBeUndefined();
 	});
 });

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CcBroker } from './broker.js';
-import { parseCcBinding } from './headless-driver.js';
+import { InMemoryBindTokenStore } from '../bind-token-store.js';
 import { CcSessionRegistry, buildCcBridgeSink, type CcEventPush } from './sink.js';
 import type { AgentEvent } from '../events.js';
 
@@ -77,11 +77,11 @@ describe('buildCcBridgeSink', () => {
 	});
 });
 
-/** Drive a hook end-to-end through the real broker (resolve = parseCcBinding, sink = the bridge). */
+/** Drive a hook end-to-end through the real broker (resolve = opaque bind-token store, sink = the bridge). */
 describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () => {
 	function harness() {
 		const reg = new CcSessionRegistry();
-		// REQ-029 (#29): roomId keys are opaque strings (the broker resolves them from the binding).
+		// REQ-029 (#29): roomId keys are opaque strings (the broker resolves them from the bind token).
 		const got = new Map<string, AgentEvent[]>();
 		const register = (roomId: string): CcEventPush => {
 			const arr: AgentEvent[] = [];
@@ -90,8 +90,11 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 			reg.register(roomId, push);
 			return push;
 		};
-		const broker = new CcBroker({ resolve: parseCcBinding, sink: buildCcBridgeSink(reg) });
-		return { reg, got, register, broker };
+		// BL-014 (#141): the broker resolves the OPAQUE minted token via the store, exactly like start.ts.
+		const bindTokens = new InMemoryBindTokenStore();
+		const token = bindTokens.mint('5', '42'); // the (uid,room) these tests drive
+		const broker = new CcBroker({ resolve: (t) => bindTokens.resolve(t), sink: buildCcBridgeSink(reg) });
+		return { reg, got, register, broker, token };
 	}
 
 	it('#120: PostToolUse → {tool} on the binding-owner room only; MessageDisplay routes nothing', async () => {
@@ -99,8 +102,8 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 		h.register('42'); // active session for room 42 (uid 5)
 
 		// #120: MessageDisplay is no longer bridged (thinking is teed from stdout) — it pushes nothing.
-		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'MessageDisplay', content: 'streaming' } });
-		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
+		await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'MessageDisplay', content: 'streaming' } });
+		await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 
 		expect(h.got.get('42')).toEqual([{ type: 'tool', name: 'Bash', phase: 'end' }]);
 	});
@@ -108,22 +111,22 @@ describe('CcBroker → buildCcBridgeSink end-to-end routing (REQ-011 S2)', () =>
 	it('SessionStart / UserPromptSubmit lifecycle → nothing pushed (handler does THINKING_START)', async () => {
 		const h = harness();
 		h.register('42');
-		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'SessionStart' } });
-		await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'UserPromptSubmit' } });
+		await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'SessionStart' } });
+		await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'UserPromptSubmit' } });
 		expect(h.got.get('42')).toEqual([]);
 	});
 
 	it('Stop → 200 ok, nothing pushed, no throw (done comes from stdout EOF, not the hook)', async () => {
 		const h = harness();
 		h.register('42');
-		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'Stop', last_assistant_message: 'x' } });
+		const res = await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'Stop', last_assistant_message: 'x' } });
 		expect(res.status).toBe(200);
 		expect(h.got.get('42')).toEqual([]);
 	});
 
 	it('late/racing hook with NO active session for the room → 200 ok, safe no-op drop (no throw)', async () => {
 		const h = harness(); // no register() → no active session
-		const res = await h.broker.handle({ authToken: 'aiclaw-5-room-42', body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
+		const res = await h.broker.handle({ authToken: h.token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(200);
 		expect(h.got.get('42')).toBeUndefined();
 	});

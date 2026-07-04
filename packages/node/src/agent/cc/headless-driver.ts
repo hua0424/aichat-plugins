@@ -111,19 +111,6 @@ const DEFAULT_KILL_GRACE_MS = 2_000;
 /** Cap on the serialized tool_use input captured into the transcript (truncated past this). */
 const MAX_TOOL_INPUT_CHARS = 2000;
 
-/**
- * Parse a CC binding string `aiclaw-{uid}-room-{roomId}` → `{ aiclawUid, roomId }`, or undefined on
- * any garbage/prefixed input. Shared by `CcHeadlessDriver.resolveSession` AND `CcBroker.resolve` so the
- * two paths can never diverge. A still-prefixed `cc:aiclaw-…` must never arrive here (the endpoint strips
- * `cc:` first) and is rejected by the strict `^…$` anchors.
- */
-export function parseCcBinding(binding: string): { aiclawUid: string; roomId: string } | undefined {
-	const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(binding);
-	if (!m) return undefined;
-	// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-	return { aiclawUid: m[1], roomId: m[2] };
-}
-
 export class CcHeadlessDriver implements AgentDriver {
 	readonly type = 'cc';
 	/** Node DRIVES cc turns now (headless, spawn-per-turn) — the standard supervised path applies. */
