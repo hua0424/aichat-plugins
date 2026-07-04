@@ -50,7 +50,8 @@ function capUtf8Bytes(text: string, maxBytes: number = THINKING_END_MAX_BYTES): 
  * Used only at log sites; the un-redacted text still flows to the agent driver.
  */
 function redactUrls(text: string): string {
-	return text.replace(/^(\s*url:\s*)\S+/gm, '$1<redacted>');
+	// #146 review P1：用 `.+`（而非 `\S+`）吃到行尾——防御 url 内含空格/被截断也整行遮蔽。
+	return text.replace(/^(\s*url:\s*).+$/gm, '$1<redacted>');
 }
 
 /**
