@@ -92,4 +92,36 @@ describe('buildAgentInjection', () => {
 		expect(out).not.toBeNull();
 		expect(out!.endsWith('用户附言：看这个')).toBe(true);
 	});
+
+	// REQ-146 (#146): the caller resolves a SHORT-lived signed URL and passes it in.
+	it('10. resolvedFileUrl is used OVER body.url when provided', () => {
+		const out = buildAgentInjection(
+			msg(4, { url: 'http://minio/OLD-7day.pdf?stale=1', size: 456, mime: 'application/pdf', fileName: 'd.pdf' }),
+			'http://minio/tmp/chat/2_d.pdf?X-Amz-Signature=fresh-short',
+		);
+		expect(out).not.toBeNull();
+		const text = out!;
+		expect(text).toContain('url: http://minio/tmp/chat/2_d.pdf?X-Amz-Signature=fresh-short');
+		expect(text).not.toContain('OLD-7day');
+	});
+
+	it('11. short-lived hint line is present in the file-attachment block', () => {
+		const out = buildAgentInjection(
+			msg(3, { url: 'http://x/y.png?x=1', size: 1, fileName: 'y.png' }),
+			'http://x/signed.png?sig=1',
+		);
+		expect(out).not.toBeNull();
+		expect(out!).toContain('链接短效有效，需要时立即获取，过期需重新索取');
+	});
+
+	it('12. resolvedFileUrl undefined → falls back to body.url (old pre-deploy messages / no apiClient)', () => {
+		const out = buildAgentInjection(msg(3, { url: 'http://x/fallback.png?x=1', size: 1, fileName: 'y.png' }));
+		expect(out).not.toBeNull();
+		expect(out!).toContain('url: http://x/fallback.png?x=1');
+	});
+
+	it('13. neither resolvedFileUrl nor body.url → null (defensive)', () => {
+		expect(buildAgentInjection(msg(3, { size: 1, fileName: 'a.png' }), undefined)).toBeNull();
+		expect(buildAgentInjection(msg(4, { url: '   ', size: 1 }), '  ')).toBeNull();
+	});
 });

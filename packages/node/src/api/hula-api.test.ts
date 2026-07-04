@@ -313,6 +313,41 @@ describe('HulaApiClient group query methods (REQ-010 S4 #94)', () => {
 	});
 });
 
+describe('HulaApiClient.signDownload (REQ-146 #146)', () => {
+	it('POST /api/im/file/sign-download with body { msgId }, token header, unwraps data.{url,expiresIn}', async () => {
+		const signed = 'http://minio/tmp/chat/55_pic.png?X-Amz-Signature=short-lived-xyz';
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: { url: signed, expiresIn: 300 } }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		// REQ-029 (#29): a >2^53 msgId is passed through as-is (opaque string, never Number()).
+		const out = await client.signDownload('9007199254740993');
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/file/sign-download');
+		expect((init as RequestInit).method).toBe('POST');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(JSON.parse((init as RequestInit).body as string)).toEqual({ msgId: '9007199254740993' });
+		expect(out).toEqual({ url: signed, expiresIn: 300 });
+	});
+
+	it('missing data → { url: "", expiresIn: 0 }', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0 }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.signDownload(1)).resolves.toEqual({ url: '', expiresIn: 0 });
+	});
+
+	it('a success:false business error rejects with the server msg (sibling-method parity)', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: false, code: 1, msg: '未加入该房间，无法下载' }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.signDownload(42)).rejects.toThrow('未加入该房间，无法下载');
+	});
+});
+
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
