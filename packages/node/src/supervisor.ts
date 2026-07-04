@@ -4,6 +4,7 @@ import type { AgentDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
+import { retryAsync } from './util/retry.js';
 
 /**
  * REQ-008 #76 — 监督器依赖注入面。
@@ -143,16 +144,20 @@ export class Supervisor {
 				// REQ-008 #76 P2: 重连成功 → 回到 online。**但 offline 是 terminal**：
 				// 已降级身份的迟到重连回调不得翻回 online（degrade 已断 ws/driver）。
 				this.markReconnected(cred.uid);
-				// REQ #26: 首连 + 每次重连主动预热全量群配置（fire-and-forget，内部已容错）。
-				ref.handler?.prewarmGroupConfigs().catch(() => {});
-				// REQ-009 #83: 连接成功后上报 agent 类型（fire-and-forget，不阻塞/不破坏连接）。
-				// 每次连接（含重连）都报，server upsert 幂等。
-				api.reportAgentType(entry.tool).catch((err) =>
-					console.error(
-						'[supervisor] reportAgentType failed:',
-						err instanceof Error ? err.message : String(err),
-					),
-				);
+				// REQ #26 / BL-015 #140: 首连 + 每次重连主动预热全量群配置。Nacos 重注册窗口内会失败，
+				// 交给 retryAsync 有界退避重试自愈（fire-and-forget，永不 reject，不阻塞 onopen）。
+				// handler 在 onConnected 触发前必已就绪（见 ref 注释），故此处非空断言安全。
+				// ponytail: 刻意简化（manager 批准的取舍）—— WS 快速抖动时，上一次 onConnected 触发的
+				// 重试链可能尚未跑完，本次 onConnected 又起一条新链，两者短暂 stack。可接受，因为：
+				// (1) 每条链都有界（tries 上限，用尽即 give-up）；(2) 两个动作幂等 —— prewarm 用最新一次
+				// 成功覆盖 cache，reportAgentType 是 server 端 upsert（无副作用）。故 stack 无害，最坏只是
+				// 一小段重复日志。升级路径：若日志噪音真的碍事，可在 onDisconnected 里 cancel 在飞的重试链
+				// （给 retryAsync 传 AbortSignal），当前 YAGNI 不做。
+				// label 带 uid：多身份模式下日志才分得清是哪条身份在重试/放弃。
+				void retryAsync(() => ref.handler!.prewarmGroupConfigs(), { label: `prewarm uid=${cred.uid}` });
+				// REQ-009 #83 / BL-015 #140: 连接成功后上报 agent 类型。每次连接（含重连）都报，
+				// server upsert 幂等；同样带退避重试熬过 Nacos 重注册窗口。
+				void retryAsync(() => api.reportAgentType(entry.tool), { label: `reportAgentType uid=${cred.uid}` });
 			},
 			onDisconnected: () => {
 				// REQ-008 #76 P2: 掉线 → reconnecting（瞬态，HulaWSClient 自行重连）。

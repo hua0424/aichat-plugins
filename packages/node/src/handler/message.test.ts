@@ -1458,20 +1458,35 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		expect(c10!.rateLimitPerMinute).toBe(5);
 	});
 
-	it('prewarmToleratesApiFailure: list API 抛错时不抛、且不破坏已有 cache', async () => {
+	// BL-015 / #140: 契约翻转 —— list API 抛错时 prewarm **抛出**（交给调用方 retryAsync 重试 + 记日志），
+	// 但仍不破坏已有 cache（cache 只在成功循环里写）。一条测试串起完整故事：
+	// 成功预热填充 cache → 后续预热在 Nacos 重注册窗口内抛错时 REJECT → 两种写路径的旧值（prewarm 成功项 +
+	// groupConfigChange 预置项）都天然保留。
+	it('prewarmThrowsButPreservesCache: 成功预热填充 cache → 后续预热抛错 REJECT，且旧 cache 不被清空', async () => {
 		const { adapter } = fakeAdapter();
 		const { ws } = fakeWs();
+		let shouldThrow = false;
 		const { apiClient } = fakeApiClient(async () => {
-			throw new Error('network jitter');
+			if (shouldThrow) throw new Error('nacos re-register window');
+			return [{ roomId: 42, mentionRequired: 1, respondToAi: 1, rateLimitPerMinute: 5, dailyLimit: 100 }];
 		});
 		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
 
-		// 预置一条已有 cache（模拟 groupConfigChange 已填充）
+		// 另经 groupConfigChange 预置一条已有 cache（不同写路径，一并验证不被清空）。
 		setGroupConfig(handler, 7, { mentionRequired: false, rateLimitPerMinute: 9 });
 
-		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+		// 首次预热成功 → 房间 42 从 list API 进入 cache。
+		await handler.prewarmGroupConfigs();
+		const cached42 = getCachedConfig(handler, 42);
+		expect(cached42).toBeDefined();
+		expect(cached42!.rateLimitPerMinute).toBe(5);
 
-		// 原有条目仍在，未被破坏
+		// 后续预热在 Nacos 重注册窗口内失败 → 必须 REJECT（交给调用方 retryAsync）；旧行为是吞掉。
+		shouldThrow = true;
+		await expect(handler.prewarmGroupConfigs()).rejects.toThrow('nacos re-register window');
+
+		// 抛出后两条旧值天然保留（cache 只在成功循环里写）。
+		expect(getCachedConfig(handler, 42)).toEqual(cached42);
 		const c7 = getCachedConfig(handler, 7);
 		expect(c7).toBeDefined();
 		expect(c7!.mentionRequired).toBe(false);

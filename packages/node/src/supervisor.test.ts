@@ -25,6 +25,9 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		// REQ-009 #83: capture each api client's reportAgentType per uid so the test can assert
 		// onConnected reports the agent type.
 		reportAgentTypeByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// REQ #26 / BL-015 #140: capture each handler's prewarmGroupConfigs per uid so the test can
+		// assert onConnected also prewarms group configs (not just reportAgentType).
+		prewarmByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -63,9 +66,11 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				built.tokenExpiredByUid.set(uid, onTokenExpired);
 				const destroy = vi.fn();
 				built.destroyByUid.set(uid, destroy);
+				const prewarmGroupConfigs = vi.fn().mockResolvedValue(undefined);
+				built.prewarmByUid.set(uid, prewarmGroupConfigs);
 				return {
 					handle: vi.fn(),
-					prewarmGroupConfigs: vi.fn().mockResolvedValue(undefined),
+					prewarmGroupConfigs,
 					destroy,
 				} as unknown as MessageHandler;
 			},
@@ -343,20 +348,25 @@ describe('Supervisor reconnect status (REQ-008 #76 P2)', () => {
 	});
 });
 
-describe('Supervisor reportAgentType on connect (REQ-009 #83)', () => {
-	it('firing onConnected reports the entry tool via api.reportAgentType', async () => {
+describe('Supervisor reportAgentType + prewarm on connect (REQ-009 #83 / REQ #26 / BL-015 #140)', () => {
+	it('firing onConnected reports the entry tool AND prewarms group configs for that identity', async () => {
 		const { deps, built } = makeDeps();
 		const sup = new Supervisor(deps);
 		await sup.start(entries);
 
 		// uid=2 was built from entry { tool: 'openclaw', token: 'tok-2' }
 		const report = built.reportAgentTypeByUid.get(2)!;
+		const prewarm = built.prewarmByUid.get(2)!;
 		expect(report).toBeTypeOf('function');
+		expect(prewarm).toBeTypeOf('function');
 
 		// drive the captured onConnected hook for uid=2
 		built.hooksByUid.get(2)!.onConnected();
 
+		// both are fire-and-forget `void retryAsync(...)`; the first attempt runs synchronously up to
+		// the first `await fn()`, so `fn` (reportAgentType / prewarmGroupConfigs) is invoked synchronously.
 		expect(report).toHaveBeenCalledWith('openclaw');
+		expect(prewarm).toHaveBeenCalledTimes(1);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

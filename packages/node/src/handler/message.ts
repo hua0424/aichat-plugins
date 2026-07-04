@@ -658,28 +658,24 @@ export class MessageHandler {
 	 * 唯一其它填充点是 server 的 groupConfigChange 广播（仅 on-change），node 重启后
 	 * cache 清空、自定义群配置会静默退默认；这里在 onConnected 时补一次全量拉取。
 	 *
-	 * 失败容错：整段 try/catch，网络抖动只记日志、不抛、不破坏已有 cache（启动期不能让
-	 * node 崩或阻塞收消息）。apiClient 为 null（未注入）时直接 noop。
+	 * 失败语义（BL-015 / #140）：**抛出**，交给调用方 retryAsync 做有界退避重试 + 失败日志。
+	 * cache 仅在下方成功循环里写入 → 抛出时旧值天然保留。apiClient 为 null（未注入）时直接 noop。
 	 */
 	async prewarmGroupConfigs(): Promise<void> {
 		if (!this.apiClient) return;
-		try {
-			const list = await this.apiClient.listSelfGroupConfigs();
-			for (const item of list) {
-				this.groupConfigCache.set(this.selfUid, item.roomId, {
-					mentionRequired: Boolean(item.mentionRequired),
-					respondToAi: Boolean(item.respondToAi),
-					rateLimitPerMinute: item.rateLimitPerMinute ?? 0,
-					dailyLimit: item.dailyLimit ?? 0,
-					// REQ-009 #85: carry owner workspace override + groupkey through the cache.
-					workspaceDir: item.workspaceDir,
-					account: item.account,
-				});
-			}
-			console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
-		} catch (err) {
-			console.error(`[config] prewarmGroupConfigs failed (cache preserved):`, (err as Error).message);
+		const list = await this.apiClient.listSelfGroupConfigs();
+		for (const item of list) {
+			this.groupConfigCache.set(this.selfUid, item.roomId, {
+				mentionRequired: Boolean(item.mentionRequired),
+				respondToAi: Boolean(item.respondToAi),
+				rateLimitPerMinute: item.rateLimitPerMinute ?? 0,
+				dailyLimit: item.dailyLimit ?? 0,
+				// REQ-009 #85: carry owner workspace override + groupkey through the cache.
+				workspaceDir: item.workspaceDir,
+				account: item.account,
+			});
 		}
+		console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
 	}
 
 	/** M3: 群配置变更通知处理 */
