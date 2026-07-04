@@ -37,6 +37,19 @@ describe('createSendMessageTool (factory)', () => {
 		expect(result).toEqual({ ok: true, msgId: 42 });
 	});
 
+	it('#141 B+: resolves owner from a COMPOUND `<token>:<binding>` sessionKey (tool path survives the compound)', async () => {
+		const clientA = fakeClient();
+		const pool = fakePool({ '100': clientA });
+
+		// openclaw hands the tool ctx.sessionKey = `agent:main:<token>:aiclaw-100-room-555`; the tool
+		// parses the binding suffix and replies through the REAL bound room — no 会话归属无法解析 rejection.
+		const tool = createSendMessageTool(pool, ctx('agent:main:V6i2s-Kx_9token:aiclaw-100-room-555'));
+		const result = await tool.execute('call-c', { content: 'hello' });
+
+		expect(clientA.sendMessage).toHaveBeenCalledWith('555', 'hello', undefined);
+		expect(result).toEqual({ ok: true, msgId: 42 });
+	});
+
 	it('routes two sessions to their own room + own aiclaw client', async () => {
 		const clientA = fakeClient();
 		const clientB = fakeClient();

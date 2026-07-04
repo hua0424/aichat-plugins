@@ -47,11 +47,16 @@ export class OpenclawDriver implements AgentDriver {
 	/**
 	 * BL-014 (#141) — resolve the openclaw capability session id back to its bound identity+room.
 	 *
-	 * The session id is now an OPAQUE node-minted token (not the plaintext `aiclaw-{uid}-room-{roomId}`
-	 * binding): aichat-claw's resolve_exec_env hook injects the token as OPENCLAW_BIND, the CLI emits
-	 * `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling this. So
-	 * this is a STORE LOOKUP, not a parse — a forged plaintext binding an agent could guess by
-	 * overwriting its env never appears in the store → undefined (the endpoint then 404s).
+	 * The CLI/exec-env path delivers a BARE opaque node-minted token here (aichat-claw's resolve_exec_env
+	 * hook extracts the token PREFIX out of the compound sessionKey and injects it as OPENCLAW_BIND, the
+	 * CLI emits `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling
+	 * this). So this is an EXACT STORE LOOKUP, NOT a parse and NOT a split.
+	 *
+	 * #141 B+ (regression fix): openSession now hands the adapter a COMPOUND `<token>:<binding>`
+	 * sessionKey (see openSession). resolveSession must NOT split that compound — it looks up the whole
+	 * argument as-is. The only thing that legitimately reaches here is the bare token; a forged plaintext
+	 * binding, OR a compound an attacker appends a binding tail to, is never a stored key → undefined
+	 * (the endpoint then 404s). The compound only legitimately exists gateway-side, inside adapter.chat.
 	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		return this.bindTokens.resolve(sessionKey);
@@ -78,11 +83,23 @@ export class OpenclawDriver implements AgentDriver {
 		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
-		// BL-014 (#141): the agent-facing sessionKey is a STABLE opaque token (not the plaintext binding).
-		// aichat-claw injects it as OPENCLAW_BIND → the CLI emits `openclaw:<token>` → resolveSession looks
-		// it up. mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
+		// #141 B+ (regression fix): openclaw does NOT reply via the `aichat` CLI — it replies via the
+		// in-gateway aichat-claw `hula_send_message` TOOL, which resolves ctx.sessionKey by PARSING the
+		// plaintext binding (`/(?:^|[:/])aiclaw-\d+-room-\d+$/`). openclaw carries ONE sessionKey shared by
+		// BOTH the tool path (needs the plaintext binding) and the CLI/exec-env path (needs an unforgeable
+		// token). So we carry BOTH in ONE COMPOUND sessionKey: `<token>:<binding>` — the opaque token
+		// FIRST, a literal `:`, then the plaintext binding LAST.
+		//   • The binding is LAST so the tool's `$`-anchored regex matches it (the char before `aiclaw` is `:`).
+		//   • The token is a base64url string (`[A-Za-z0-9_-]`, contains no `:`) so the split is unambiguous.
+		//   • aichat-claw's resolve_exec_env extracts the token PREFIX → OPENCLAW_BIND → CLI `openclaw:<token>`.
+		// CONFINEMENT: this compound is used ONLY here, as adapter.chat's sessionKey. It is NEVER a
+		// node-internal key — the node-side thinking sessionKey is computed independently from (uid,room)
+		// in the message handler, and resolveSession keys on the BARE token alone (it must NOT split the
+		// compound; a compound arriving at the endpoint = forgery → store miss → undefined).
+		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
 		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
-		return new OpenclawSession(this.adapter, token, o.roomId);
+		const sessionKey = `${token}:aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		return new OpenclawSession(this.adapter, sessionKey, o.roomId);
 	}
 }
 

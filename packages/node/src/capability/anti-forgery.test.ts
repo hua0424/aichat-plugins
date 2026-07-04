@@ -79,6 +79,18 @@ describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves
 		expect((genuine.json as { ok: boolean }).ok).toBe(true);
 		// and the resolved room is the REAL bound room 42 (never taken from args).
 		expect((api7 as unknown as { sendMessage: ReturnType<typeof vi.fn> }).sendMessage).toHaveBeenCalledWith('42', 'hi');
+
+		// (3) COMPOUND forgery (#141 B+ manager hard requirement #1): an attacker appends a plaintext
+		//     binding tail to a GENUINELY-MINTED token → `openclaw:<token>:aiclaw-999-room-888`. The
+		//     compound `<token>:<binding>` only legitimately exists GATEWAY-SIDE (in adapter.chat's
+		//     ctx.sessionKey). The endpoint's resolveSession does an EXACT store lookup of the WHOLE
+		//     post-prefix id — it NEVER splits on `:` — so the compound is not a stored key → store MISS
+		//     → 404. This locks that the bare token from (2) is the only thing that resolves at the endpoint.
+		const compound = await endpoint.handle({
+			body: { sessionKey: `openclaw:${mintedToken}:aiclaw-999-room-888`, command: 'send-message', args: { content: 'pwn' }, idempotencyKey: 'c1' },
+		});
+		expect(compound.status).toBe(404);
+		expect((compound.json as { error: string }).error).toBe('unknown session');
 	});
 
 	it('cc: a minted token resolves; a forged `cc:aiclaw-…` plaintext binding → endpoint 404', async () => {

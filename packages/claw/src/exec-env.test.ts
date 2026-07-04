@@ -2,22 +2,34 @@ import { describe, it, expect } from 'vitest';
 import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
 
 /**
- * REQ-010 S6 Phase-2 — buildOpenclawExecEnv: pure helper for the resolve_exec_env hook.
+ * REQ-010 S6 Phase-2 / #141 B+ — buildOpenclawExecEnv: pure helper for the resolve_exec_env hook.
  *
- * Maps an openclaw-normalized sessionKey (`agent:main:aiclaw-{uid}-room-{roomId}`) to the
- * env vars to MERGE into the agent's exec invocation. Only a well-formed binding yields
- * `{ OPENCLAW_BIND: <binding> }`; everything else yields `{}` (inject nothing, never throw).
+ * openclaw fires the hook with a ctx.sessionKey of the openclaw-normalized COMPOUND form
+ * `agent:main:<token>:aiclaw-{uid}-room-{roomId}` (node builds `<token>:<binding>`; openclaw wraps it
+ * with `agent:main:`). We strip the namespace prefix and extract the BARE opaque token PREFIX (the part
+ * before the `:aiclaw-…-room-…` binding suffix) → `{ OPENCLAW_BIND: <token> }`, which the CLI reads to
+ * emit an `openclaw:<token>` capability session key. The tail binding is only for the in-gateway tool
+ * (via ctx.sessionKey), not for the CLI path. Anything that is not a well-formed compound yields `{}`
+ * (inject nothing, never throw).
  */
 describe('buildOpenclawExecEnv', () => {
-	it('agent:main:<binding> → { OPENCLAW_BIND: <binding> }', () => {
+	it('agent:main:<token>:<binding> → { OPENCLAW_BIND: <token> } (extracts the token prefix)', () => {
 		expect(
-			buildOpenclawExecEnv('agent:main:aiclaw-140789091499520-room-163347643904512'),
-		).toEqual({ OPENCLAW_BIND: 'aiclaw-140789091499520-room-163347643904512' });
+			buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-140789091499520-room-163347643904512'),
+		).toEqual({ OPENCLAW_BIND: 'TOKEN123' });
 	});
 
-	it('small ids still map', () => {
-		expect(buildOpenclawExecEnv('agent:main:aiclaw-1-room-2')).toEqual({
-			OPENCLAW_BIND: 'aiclaw-1-room-2',
+	it('the canonical example: token prefix + binding tail → the token only', () => {
+		expect(buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-1-room-2')).toEqual({
+			OPENCLAW_BIND: 'TOKEN123',
+		});
+	});
+
+	it('a base64url token (contains - and _) is extracted intact', () => {
+		// the real minted token is base64url (`[A-Za-z0-9_-]`, no `:`), so `-`/`_` inside it must survive.
+		const token = 'aB3-_xYz09-QW_er';
+		expect(buildOpenclawExecEnv(`agent:main:${token}:aiclaw-5-room-9`)).toEqual({
+			OPENCLAW_BIND: token,
 		});
 	});
 
@@ -28,13 +40,14 @@ describe('buildOpenclawExecEnv', () => {
 	});
 
 	it('non agent:main: prefix → {} (do not inject)', () => {
-		// bare binding without the openclaw namespace prefix is not injected
-		expect(buildOpenclawExecEnv('aiclaw-1-room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:other:aiclaw-1-room-2')).toEqual({});
+		// bare compound without the openclaw namespace prefix is not injected
+		expect(buildOpenclawExecEnv('TOKEN123:aiclaw-1-room-2')).toEqual({});
+		expect(buildOpenclawExecEnv('agent:other:TOKEN123:aiclaw-1-room-2')).toEqual({});
 		expect(buildOpenclawExecEnv('foo:bar')).toEqual({});
 	});
 
-	it('agent:main: prefix but malformed binding → {} (never inject a malformed binding)', () => {
+	it('agent:main: prefix but non-compound garbage (no binding suffix) → {} (inject nothing)', () => {
+		// without a well-formed `:aiclaw-\d+-room-\d+` tail there is no compound to split → {}.
 		expect(buildOpenclawExecEnv('agent:main:aiclaw-1-room-')).toEqual({});
 		expect(buildOpenclawExecEnv('agent:main:aiclaw--room-2')).toEqual({});
 		expect(buildOpenclawExecEnv('agent:main:aiclaw-abc-room-2')).toEqual({});
