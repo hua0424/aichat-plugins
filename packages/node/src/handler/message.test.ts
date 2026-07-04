@@ -1458,7 +1458,9 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		expect(c10!.rateLimitPerMinute).toBe(5);
 	});
 
-	it('prewarmToleratesApiFailure: list API 抛错时不抛、且不破坏已有 cache', async () => {
+	// BL-015 / #140: 契约翻转 —— list API 抛错时 prewarm **抛出**（交给调用方 retryAsync 重试 + 记日志），
+	// 但仍不破坏已有 cache（cache 只在成功循环里写）。
+	it('prewarmThrowsButPreservesCache: list API 抛错时 REJECT，且不破坏已有 cache', async () => {
 		const { adapter } = fakeAdapter();
 		const { ws } = fakeWs();
 		const { apiClient } = fakeApiClient(async () => {
@@ -1469,7 +1471,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		// 预置一条已有 cache（模拟 groupConfigChange 已填充）
 		setGroupConfig(handler, 7, { mentionRequired: false, rateLimitPerMinute: 9 });
 
-		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
+		await expect(handler.prewarmGroupConfigs()).rejects.toThrow('network jitter');
 
 		// 原有条目仍在，未被破坏
 		const c7 = getCachedConfig(handler, 7);
@@ -1747,5 +1749,43 @@ describe('MessageHandler REQ-029 (#29): >2^53 roomId precision', () => {
 		const start = sent.find((f) => f.type === WSReqType.THINKING_START)!.data as Record<string, unknown>;
 		expect(start.roomId).toBe(bigRoom);
 		expect(start.roomId).not.toBe(9007199254740992);
+	});
+});
+
+// BL-015 / #140: prewarmGroupConfigs now THROWS on failure (retry owns failure logging),
+// and preserves the previously-cached config for each room when it throws.
+describe('prewarmGroupConfigs 失败语义（#140）', () => {
+	it('listSelfGroupConfigs 抛错时 prewarmGroupConfigs REJECT（交给 retry），且旧 cache 不被清空', async () => {
+		const { ws } = fakeWs();
+		const { adapter } = fakeAdapter();
+		let shouldThrow = false;
+		const listSelfGroupConfigs = vi.fn(async () => {
+			if (shouldThrow) throw new Error('nacos re-register window');
+			return [
+				{
+					roomId: '42',
+					mentionRequired: 1,
+					respondToAi: 1,
+					rateLimitPerMinute: 5,
+					dailyLimit: 100,
+				},
+			];
+		});
+		const apiClient = { listSelfGroupConfigs } as unknown as import('../api/hula-api.js').HulaApiClient;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+
+		// 首次预热成功 → 房间 42 进入 cache。
+		await handler.prewarmGroupConfigs();
+		const cachedBefore = getCachedConfig(handler, '42');
+		expect(cachedBefore).toBeDefined();
+		expect(cachedBefore?.rateLimitPerMinute).toBe(5);
+
+		// 后续预热在 Nacos 重注册窗口内失败 → 必须 REJECT（旧行为是吞掉）。
+		shouldThrow = true;
+		await expect(handler.prewarmGroupConfigs()).rejects.toThrow('nacos re-register window');
+
+		// 抛出后旧值天然保留（cache 只在成功循环里写）。
+		const cachedAfter = getCachedConfig(handler, '42');
+		expect(cachedAfter).toEqual(cachedBefore);
 	});
 });

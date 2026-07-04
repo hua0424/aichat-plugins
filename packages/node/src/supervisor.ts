@@ -4,6 +4,7 @@ import type { AgentDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
+import { retryAsync } from './util/retry.js';
 
 /**
  * REQ-008 #76 — 监督器依赖注入面。
@@ -143,16 +144,13 @@ export class Supervisor {
 				// REQ-008 #76 P2: 重连成功 → 回到 online。**但 offline 是 terminal**：
 				// 已降级身份的迟到重连回调不得翻回 online（degrade 已断 ws/driver）。
 				this.markReconnected(cred.uid);
-				// REQ #26: 首连 + 每次重连主动预热全量群配置（fire-and-forget，内部已容错）。
-				ref.handler?.prewarmGroupConfigs().catch(() => {});
-				// REQ-009 #83: 连接成功后上报 agent 类型（fire-and-forget，不阻塞/不破坏连接）。
-				// 每次连接（含重连）都报，server upsert 幂等。
-				api.reportAgentType(entry.tool).catch((err) =>
-					console.error(
-						'[supervisor] reportAgentType failed:',
-						err instanceof Error ? err.message : String(err),
-					),
-				);
+				// REQ #26 / BL-015 #140: 首连 + 每次重连主动预热全量群配置。Nacos 重注册窗口内会失败，
+				// 交给 retryAsync 有界退避重试自愈（fire-and-forget，永不 reject，不阻塞 onopen）。
+				// handler 在 onConnected 触发前必已就绪（见 ref 注释），故此处非空断言安全。
+				void retryAsync(() => ref.handler!.prewarmGroupConfigs(), { label: 'prewarm' });
+				// REQ-009 #83 / BL-015 #140: 连接成功后上报 agent 类型。每次连接（含重连）都报，
+				// server upsert 幂等；同样带退避重试熬过 Nacos 重注册窗口。
+				void retryAsync(() => api.reportAgentType(entry.tool), { label: 'reportAgentType' });
 			},
 			onDisconnected: () => {
 				// REQ-008 #76 P2: 掉线 → reconnecting（瞬态，HulaWSClient 自行重连）。
