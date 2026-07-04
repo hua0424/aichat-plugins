@@ -12,11 +12,11 @@ export interface StoredCcHeadlessSession {
  * node-driven claude-code headless turn. Tests use an in-memory fake; production uses the file-backed
  * impl below.
  *
- * Forward-only BY DESIGN. CC receives the full binding string via `AICHAT_BIND`, so `resolveSession`
- * is a pure parse (`parseCcBinding`) exactly like openclaw/opencode — it needs no reverse lookup, and
- * so this store has none. The store is consulted ONLY by the forward key `aiclaw-{uid}-room-{roomId}`
- * to reuse a `session_id` for `--resume` on the next turn of the same (aiclawUid, roomId). (Codex
- * differs: it gets `CODEX_THREAD_ID`, not the binding, so it must reverse-look-up the (uid, room).)
+ * Forward-only BY DESIGN, and keyed by the INTERNAL binding string `aiclaw-{uid}-room-{roomId}` (which
+ * the node retains for its own keying — it is NOT the opaque bind-token used for capability identity, a
+ * separate concern in `BindTokenStore`). The store is consulted ONLY by that forward key to reuse a
+ * `session_id` for `--resume` on the next turn of the same (aiclawUid, roomId); it needs no reverse lookup.
+ * (Codex differs: it gets `CODEX_THREAD_ID`, not the binding, so it must reverse-look-up the (uid, room).)
  */
 export interface CcHeadlessSessionStore {
 	get(key: string): StoredCcHeadlessSession | undefined;

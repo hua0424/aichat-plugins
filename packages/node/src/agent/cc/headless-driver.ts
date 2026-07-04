@@ -6,6 +6,7 @@ import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
+import type { BindTokenStore } from '../bind-token-store.js';
 
 /**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
@@ -76,6 +77,12 @@ export interface CcHeadlessDriverDeps {
 	brokerPort: number;
 	/** Persisted (uid,room)→session_id map for cross-turn/restart `--resume`. */
 	sessionStore: CcHeadlessSessionStore;
+	/**
+	 * BL-014 (#141): opaque agent-facing binding token store. The value injected into CC's `AICHAT_BIND`
+	 * env is a node-minted token (not the plaintext `aiclaw-{uid}-room-{roomId}` binding), so an agent
+	 * that overwrites AICHAT_BIND cannot forge another (uid,room). resolveSession looks the token up here.
+	 */
+	bindTokens: BindTokenStore;
 	/** Per-room bridge: hooks routed by the broker land in the active session's stream via this. */
 	registry: CcSessionRegistry;
 	/**
@@ -104,19 +111,6 @@ const DEFAULT_KILL_GRACE_MS = 2_000;
 /** Cap on the serialized tool_use input captured into the transcript (truncated past this). */
 const MAX_TOOL_INPUT_CHARS = 2000;
 
-/**
- * Parse a CC binding string `aiclaw-{uid}-room-{roomId}` → `{ aiclawUid, roomId }`, or undefined on
- * any garbage/prefixed input. Shared by `CcHeadlessDriver.resolveSession` AND `CcBroker.resolve` so the
- * two paths can never diverge. A still-prefixed `cc:aiclaw-…` must never arrive here (the endpoint strips
- * `cc:` first) and is rejected by the strict `^…$` anchors.
- */
-export function parseCcBinding(binding: string): { aiclawUid: string; roomId: string } | undefined {
-	const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(binding);
-	if (!m) return undefined;
-	// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-	return { aiclawUid: m[1], roomId: m[2] };
-}
-
 export class CcHeadlessDriver implements AgentDriver {
 	readonly type = 'cc';
 	/** Node DRIVES cc turns now (headless, spawn-per-turn) — the standard supervised path applies. */
@@ -126,6 +120,7 @@ export class CcHeadlessDriver implements AgentDriver {
 	private readonly workspaceBase: string;
 	private readonly brokerPort: number;
 	private readonly sessionStore: CcHeadlessSessionStore;
+	private readonly bindTokens: BindTokenStore;
 	private readonly registry: CcSessionRegistry;
 	private readonly transcript: CcTranscriptWriter;
 	private readonly spawn: CcSpawnFn;
@@ -142,6 +137,7 @@ export class CcHeadlessDriver implements AgentDriver {
 		this.workspaceBase = deps.workspaceBase;
 		this.brokerPort = deps.brokerPort;
 		this.sessionStore = deps.sessionStore;
+		this.bindTokens = deps.bindTokens;
 		this.registry = deps.registry;
 		this.transcript = deps.transcript ?? new FileCcTranscriptWriter();
 		this.spawn = deps.spawn ?? (nodeSpawn as unknown as CcSpawnFn);
@@ -162,9 +158,13 @@ export class CcHeadlessDriver implements AgentDriver {
 		}
 	}
 
-	/** Pure parse of the AICHAT_BIND binding back to (aiclawUid, roomId). Same contract as codex/opencode. */
+	/**
+	 * BL-014 (#141): resolve the opaque AICHAT_BIND token back to (aiclawUid, roomId) via the store.
+	 * No longer a parse of the plaintext binding (which an agent could forge by overwriting AICHAT_BIND) —
+	 * a forged plaintext binding is not a minted token → undefined → the capability endpoint 404s.
+	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
-		return parseCcBinding(sessionKey);
+		return this.bindTokens.resolve(sessionKey);
 	}
 
 	/**
@@ -191,9 +191,14 @@ export class CcHeadlessDriver implements AgentDriver {
 		// #132: the display name of THIS aiclaw, threaded in via chatContext (resolved once + cached at the
 		// handler). Optional — an unresolved name still anchors the uid in the system prompt.
 		const selfName = (o.chatContext as Record<string, unknown>).selfName as string | undefined;
+		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
+		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
+		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).
 		const binding = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const bindToken = this.bindTokens.mint(o.aiclawUid, o.roomId);
 		const session = new CcHeadlessSession({
 			binding,
+			bindToken,
 			roomId: o.roomId,
 			workspaceDir,
 			settingsPath,
@@ -217,6 +222,11 @@ export class CcHeadlessDriver implements AgentDriver {
 
 interface CcHeadlessSessionDeps {
 	binding: string;
+	/**
+	 * BL-014 (#141): the opaque token to inject as the spawn's `AICHAT_BIND` env — the ONLY agent-facing
+	 * binding value. Everything else (session_id store, transcript, registry keys) uses `binding`.
+	 */
+	bindToken: string;
 	roomId: string;
 	workspaceDir: string;
 	settingsPath: string;
@@ -547,7 +557,9 @@ class CcHeadlessSession implements AgentSession {
 		try {
 			child = this.d.spawn(this.d.claudeBin, this.buildArgv(), {
 				cwd: this.d.workspaceDir,
-				env: { ...process.env, AICHAT_BIND: this.d.binding, CLAUDE_NON_INTERACTIVE: '1' },
+				// BL-014 (#141): AICHAT_BIND carries the OPAQUE token, never the plaintext binding — the CC
+				// hook broker reads it as its `Authorization: Bearer <token>` and the reply CLI emits `cc:<token>`.
+				env: { ...process.env, AICHAT_BIND: this.d.bindToken, CLAUDE_NON_INTERACTIVE: '1' },
 				detached: true,
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});

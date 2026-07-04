@@ -235,19 +235,19 @@ export function sanitizeLogField(s: string, max = 200): string {
 }
 
 /**
- * Mask a sessionKey for logs: keep the driver prefix (`cc:`/`codex:`/`openclaw:`/`opencode:`),
- * shorten+mask the id after the first `:`. The id is a session/binding, not a token, but we mask it
- * anyway per the no-leak requirement and to keep log lines short. No `:` → `<no-prefix>`. The result
- * runs through sanitizeLogField so an injected CR/LF in the prefix or a short id can't forge a line.
- * Exported for direct unit tests.
+ * Mask a sessionKey for logs: keep the driver prefix (`cc:`/`codex:`/`openclaw:`/`opencode:`) and FULLY
+ * mask the id after the first `:` — show only its length, never any character of it. BL-014 (#141): the
+ * post-`cc:`/`openclaw:` id is now an OPAQUE capability token (a credential); leaking even a head of it
+ * to logs would weaken the anti-forgery guarantee, so nothing of the id is emitted. No `:` →
+ * `<no-prefix>`. The result runs through sanitizeLogField so an injected CR/LF in the prefix can't forge
+ * a line. Exported for direct unit tests.
  */
 export function maskSessionKey(sessionKey: string): string {
 	const idx = sessionKey.indexOf(':');
 	if (idx === -1) return '<no-prefix>';
 	const prefix = sessionKey.slice(0, idx + 1); // includes the colon
 	const id = sessionKey.slice(idx + 1);
-	const masked = id.length <= 8 ? `${prefix}${id}` : `${prefix}${id.slice(0, 8)}…(${id.length})`;
-	return sanitizeLogField(masked, 64);
+	return sanitizeLogField(`${prefix}…(${id.length})`, 64);
 }
 
 /** Default socket path: AICHAT_CAPABILITY_SOCK override, else ~/.aichat/capability.sock. */

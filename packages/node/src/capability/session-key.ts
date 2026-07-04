@@ -13,15 +13,15 @@ import type { HulaApiClient } from '../api/hula-api.js';
 /** Known session-key prefix → the AgentDriver.type that owns that key namespace.
  *
  * `openclaw:` (REQ-010 S6 Phase-2) routes openclaw agent replies through the same unified CLI path
- * as opencode/codex. Its id is the bare binding `aiclaw-{uid}-room-{roomId}` — OpenclawDriver.resolveSession
- * parses it directly (no store: openclaw's binding IS the sessionKey).
+ * as opencode/codex. Its id is now a node-minted OPAQUE token (BL-014 #141) — OpenclawDriver.resolveSession
+ * resolves it via the shared `BindTokenStore` (no longer a parse of a plaintext binding).
  */
 export const KNOWN_PREFIXES: Record<string, string> = {
 	'opencode:': 'opencode',
 	'codex:': 'codex',
 	'openclaw:': 'openclaw',
-	// REQ-010 S7: claude-code. Its id is the bare binding `aiclaw-{uid}-room-{roomId}` (read from the
-	// agent's `AICHAT_BIND` env) — CcHeadlessDriver.resolveSession parses it directly (no store: like openclaw).
+	// REQ-010 S7: claude-code. Its id is a node-minted OPAQUE token (BL-014 #141), injected as the agent's
+	// `AICHAT_BIND` env — CcHeadlessDriver.resolveSession resolves it via the `BindTokenStore` (not a parse).
 	'cc:': 'cc',
 };
 

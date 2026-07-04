@@ -6,6 +6,13 @@ import {
 } from './openclaw-driver.js';
 import type { ClawAdapter, ThinkingCallbacks, ChatContext } from '../claw/interface.js';
 import type { AgentEvent } from './events.js';
+import { InMemoryBindTokenStore } from './bind-token-store.js';
+
+/** A deterministic bind-token store: tokens are `tok-1`, `tok-2`, … so assertions are stable. */
+function makeStore(): InMemoryBindTokenStore {
+	let n = 0;
+	return new InMemoryBindTokenStore(() => `tok-${++n}`);
+}
 
 /**
  * Fake ClawAdapter whose chat() invokes a per-test script of callbacks. The
@@ -38,21 +45,27 @@ async function drain(stream: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
 describe('OpenclawDriver', () => {
 	it('connect/disconnect delegate to the adapter', async () => {
 		const { adapter } = fakeAdapter(() => {});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		await driver.connect();
 		await driver.disconnect();
 		expect((adapter.connect as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
 		expect((adapter.disconnect as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
 	});
 
-	it('openSession binds the correct sessionKey and roomId', async () => {
+	it('openSession mints an OPAQUE token as the sessionKey (NOT the plaintext binding); resolveSession reverses it', async () => {
 		const { adapter, calls } = fakeAdapter((cb) => {
 			cb.onThinkingEnd(10);
 		});
-		const driver = new OpenclawDriver(adapter);
+		const store = makeStore();
+		const driver = new OpenclawDriver(adapter, store);
 		const session = await driver.openSession({ aiclawUid: '999', roomId: '7', chatContext: {} });
 		await drain(session.send('hi'));
-		expect(calls[0].sessionKey).toBe('aiclaw-999-room-7');
+		// BL-014 (#141): the value handed to the openclaw agent is the minted token, never the guessable
+		// plaintext `aiclaw-999-room-7` (which an agent could forge by overwriting OPENCLAW_BIND).
+		expect(calls[0].sessionKey).toBe('tok-1');
+		expect(calls[0].sessionKey).not.toBe('aiclaw-999-room-7');
+		// the token round-trips back to the real (uid,room) via the store lookup.
+		expect(driver.resolveSession!('tok-1')).toEqual({ aiclawUid: '999', roomId: '7' });
 		expect(calls[0].context).toEqual({ roomId: '7' });
 		expect(calls[0].message).toBe('hi');
 	});
@@ -67,7 +80,7 @@ describe('OpenclawDriver', () => {
 			// onTerminalTool is no longer provided by the driver → adapter never calls it (retired).
 			cb.onThinkingEnd(123);
 		});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([
@@ -82,7 +95,7 @@ describe('OpenclawDriver', () => {
 			// driver provides no onTerminalTool; a skip turn just ends with done.
 			cb.onThinkingEnd(50);
 		});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([{ type: 'done', durationMs: 50 }]);
@@ -93,7 +106,7 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingDelta('partial');
 			cb.onError(new Error('boom'));
 		});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const events = await drain(session.send('m'));
 		expect(events).toEqual([
@@ -110,7 +123,7 @@ describe('OpenclawDriver', () => {
 			cb.onThinkingDelta('b');
 			cb.onThinkingEnd(7);
 		});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 		// Yield a macrotask so chat() has fully run and buffered everything first.
@@ -132,7 +145,7 @@ describe('OpenclawDriver', () => {
 			// never call onThinkingEnd/onError
 			return new Promise<void>(() => {}); // chat stays pending
 		});
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 		const collected: AgentEvent[] = [];
@@ -155,7 +168,7 @@ describe('OpenclawDriver', () => {
 		// await with an empty buffer. close() must wake that parked promise so the
 		// for-await completes (done) rather than hanging forever.
 		const { adapter } = fakeAdapter(() => new Promise<void>(() => {})); // never resolves, no callbacks
-		const driver = new OpenclawDriver(adapter);
+		const driver = new OpenclawDriver(adapter, makeStore());
 		const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} });
 		const stream = session.send('m');
 
@@ -183,36 +196,42 @@ describe('OpenclawDriver', () => {
 	});
 });
 
-describe('OpenclawDriver.resolveSession (REQ-010 S6 Phase-2)', () => {
-	// The OPENCLAW_BIND value IS the binding; resolveBoundSession strips the `openclaw:` prefix
-	// upstream, so resolveSession receives the bare `aiclaw-{uid}-room-{roomId}` and just parses it
-	// (no store — openclaw's binding IS the sessionKey).
-	function driver() {
+describe('OpenclawDriver.resolveSession (BL-014 #141 — opaque token store lookup)', () => {
+	// The OPENCLAW_BIND value is now a node-minted OPAQUE token; resolveBoundSession strips the
+	// `openclaw:` prefix upstream, so resolveSession receives the bare token and LOOKS IT UP in the
+	// store (no longer a parse — the plaintext binding is never trusted from the agent's env).
+	function driverWithStore() {
 		const { adapter } = fakeAdapter(() => {});
-		return new OpenclawDriver(adapter);
+		const store = makeStore();
+		return { driver: new OpenclawDriver(adapter, store), store };
 	}
 
-	it('valid bare binding → { aiclawUid, roomId }', () => {
-		// REQ-029 (#29): a >2^53 binding must survive as an EXACT string (Number() would corrupt it).
-		expect(driver().resolveSession!('aiclaw-7-room-42')).toEqual({ aiclawUid: '7', roomId: '42' });
-		expect(driver().resolveSession!('aiclaw-9007199254740993-room-9007199254740994')).toEqual({
+	it('a MINTED token → { aiclawUid, roomId } (exact opaque strings, REQ-029)', async () => {
+		const { driver } = driverWithStore();
+		// mint happens on openSession; a >2^53 uid/room must survive as an EXACT string.
+		await driver.openSession({ aiclawUid: '9007199254740993', roomId: '9007199254740994', chatContext: {} });
+		expect(driver.resolveSession!('tok-1')).toEqual({
 			aiclawUid: '9007199254740993',
 			roomId: '9007199254740994',
 		});
 	});
 
-	it('a `openclaw:`-prefixed input is NOT valid here (prefix is stripped upstream) → undefined', () => {
-		expect(driver().resolveSession!('openclaw:aiclaw-7-room-42')).toBeUndefined();
+	it('a FORGED plaintext binding (never minted) → undefined (anti-forgery: cannot impersonate)', () => {
+		const { driver } = driverWithStore();
+		// what an agent gets by overwriting OPENCLAW_BIND with a guessed (uid,room) — not a minted token.
+		expect(driver.resolveSession!('aiclaw-999-room-888')).toBeUndefined();
+		expect(driver.resolveSession!('aiclaw-7-room-42')).toBeUndefined();
 	});
 
-	it('garbage / partial / non-numeric → undefined', () => {
-		const d = driver();
-		expect(d.resolveSession!('garbage')).toBeUndefined();
-		expect(d.resolveSession!('aiclaw-7-room-')).toBeUndefined();
-		expect(d.resolveSession!('aiclaw--room-42')).toBeUndefined();
-		expect(d.resolveSession!('aiclaw-abc-room-42')).toBeUndefined();
-		expect(d.resolveSession!('notaiclaw-7-room-42')).toBeUndefined();
-		expect(d.resolveSession!('')).toBeUndefined();
+	it('a still-`openclaw:`-prefixed input (prefix stripped upstream) → undefined', () => {
+		const { driver } = driverWithStore();
+		expect(driver.resolveSession!('openclaw:tok-1')).toBeUndefined();
+	});
+
+	it('garbage / empty → undefined', () => {
+		const { driver } = driverWithStore();
+		expect(driver.resolveSession!('garbage')).toBeUndefined();
+		expect(driver.resolveSession!('')).toBeUndefined();
 	});
 });
 
@@ -263,7 +282,7 @@ describe('filterOpenclawThinking — openclaw NO_REPLY sentinel + empty thinking
 describe('OpenclawDriver.resetSession (aichatoverview#124)', () => {
 	it('returns false (no per-room store — binding IS the session) and does not throw', () => {
 		const { adapter } = fakeAdapter(() => {});
-		const d = new OpenclawDriver(adapter);
+		const d = new OpenclawDriver(adapter, makeStore());
 		expect(d.resetSession!('7', '42')).toBe(false);
 	});
 });
