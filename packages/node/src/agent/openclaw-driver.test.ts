@@ -52,7 +52,7 @@ describe('OpenclawDriver', () => {
 		expect((adapter.disconnect as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
 	});
 
-	it('openSession mints an OPAQUE token as the sessionKey (NOT the plaintext binding); resolveSession reverses it', async () => {
+	it('openSession passes the COMPOUND `<token>:<binding>` to adapter.chat; resolveSession reverses the BARE token only', async () => {
 		const { adapter, calls } = fakeAdapter((cb) => {
 			cb.onThinkingEnd(10);
 		});
@@ -60,14 +60,41 @@ describe('OpenclawDriver', () => {
 		const driver = new OpenclawDriver(adapter, store);
 		const session = await driver.openSession({ aiclawUid: '999', roomId: '7', chatContext: {} });
 		await drain(session.send('hi'));
-		// BL-014 (#141): the value handed to the openclaw agent is the minted token, never the guessable
-		// plaintext `aiclaw-999-room-7` (which an agent could forge by overwriting OPENCLAW_BIND).
-		expect(calls[0].sessionKey).toBe('tok-1');
+		// #141 B+ regression fix: the value handed to the openclaw adapter is a COMPOUND sessionKey —
+		// the opaque token FIRST, a literal `:`, then the plaintext binding LAST. The tail binding lets
+		// the in-gateway aichat-claw hula_send_message TOOL parse ctx.sessionKey (its $-anchored regex
+		// matches the suffix); the prefix token lets the CLI/exec-env path recover an unforgeable token.
+		expect(calls[0].sessionKey).toBe('tok-1:aiclaw-999-room-7');
+		// still NOT the bare guessable plaintext binding on its own.
 		expect(calls[0].sessionKey).not.toBe('aiclaw-999-room-7');
-		// the token round-trips back to the real (uid,room) via the store lookup.
+		// resolveSession is an EXACT store lookup of the BARE token — it must NOT split the compound.
 		expect(driver.resolveSession!('tok-1')).toEqual({ aiclawUid: '999', roomId: '7' });
+		// the compound itself is NOT a stored key → forgery (or an accidental compound arriving at the
+		// endpoint) misses the store → undefined. The compound only legitimately lives gateway-side.
+		expect(driver.resolveSession!('tok-1:aiclaw-999-room-7')).toBeUndefined();
 		expect(calls[0].context).toEqual({ roomId: '7' });
 		expect(calls[0].message).toBe('hi');
+	});
+
+	it('confinement: the compound sessionKey is used ONLY in adapter.chat, never leaked as a node-internal key', async () => {
+		// #141 B+ manager hard requirement #2: the compound must stay confined to the adapter call — the
+		// node-side thinking sessionKey is computed independently from (uid,room) in the message handler,
+		// and openclaw has no transcript/registry/session_id store (those are cc-only). So the ONLY place
+		// the compound appears is the adapter.chat argument; resolveSession keys on the bare token alone.
+		const { adapter, calls } = fakeAdapter((cb) => {
+			cb.onThinkingEnd(1);
+		});
+		const store = makeStore();
+		const driver = new OpenclawDriver(adapter, store);
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: {} });
+		await drain(session.send('hi'));
+		const compound = 'tok-1:aiclaw-5-room-9';
+		// adapter.chat saw the compound…
+		expect(calls[0].sessionKey).toBe(compound);
+		// …but the driver never treats the compound as a keying value: neither resolveSession nor
+		// resetSession recognise it (resolveSession → undefined, resetSession is a flat no-op).
+		expect(driver.resolveSession!(compound)).toBeUndefined();
+		expect(driver.resetSession!('5', '9')).toBe(false);
 	});
 
 	// REQ-010 S1: the terminal AgentEvent is retired. onTerminalTool is NO LONGER bridged into the
@@ -221,6 +248,16 @@ describe('OpenclawDriver.resolveSession (BL-014 #141 — opaque token store look
 		// what an agent gets by overwriting OPENCLAW_BIND with a guessed (uid,room) — not a minted token.
 		expect(driver.resolveSession!('aiclaw-999-room-888')).toBeUndefined();
 		expect(driver.resolveSession!('aiclaw-7-room-42')).toBeUndefined();
+	});
+
+	it('a COMPOUND `<token>:<binding>` (never stored as one key) → undefined (endpoint must not split it)', async () => {
+		const { driver } = driverWithStore();
+		await driver.openSession({ aiclawUid: '999', roomId: '888', chatContext: {} });
+		// the bare minted token resolves…
+		expect(driver.resolveSession!('tok-1')).toEqual({ aiclawUid: '999', roomId: '888' });
+		// …but the compound (what an attacker might forge by appending a binding tail to a token) is NOT
+		// a stored key → exact lookup misses → undefined. resolveSession NEVER splits on `:`.
+		expect(driver.resolveSession!('tok-1:aiclaw-999-room-888')).toBeUndefined();
 	});
 
 	it('a still-`openclaw:`-prefixed input (prefix stripped upstream) → undefined', () => {
