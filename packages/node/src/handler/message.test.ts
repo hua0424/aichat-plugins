@@ -9,6 +9,7 @@ import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
+import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 import type { CcTranscriptRecord } from '../agent/cc/transcript.js';
@@ -1711,6 +1712,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 			workspaceBase: ccTmpBase(),
 			brokerPort: 9100,
 			sessionStore: memCcStore(),
+			bindTokens: new InMemoryBindTokenStore(),
 			registry: new CcSessionRegistry(),
 			transcript: { append: (_k, r) => void transcriptRecords.push(r) },
 			spawn: fs.spawn,

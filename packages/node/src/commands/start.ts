@@ -11,7 +11,8 @@ import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
 import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
-import { CcHeadlessDriver, parseCcBinding } from '../agent/cc/headless-driver.js';
+import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import { FileBindTokenStore } from '../agent/bind-token-store.js';
 import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
@@ -97,12 +98,18 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
 	const ccTranscript = new FileCcTranscriptWriter();
 
+	// BL-014 (#141): ONE shared opaque bind-token store for the whole node. openclaw/cc drivers mint a
+	// stable token per (uid,room) as the AGENT-FACING binding (OPENCLAW_BIND / AICHAT_BIND); the capability
+	// endpoint + CC broker resolve that token back to (uid,room) here. Persisted (0600) so a token minted
+	// before a restart still resolves. codex/opencode keep their own runtime-id stores (already unforgeable).
+	const bindTokenStore = new FileBindTokenStore();
+
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
 		buildDriver: (entry) => {
 			if (entry.tool === 'openclaw') {
-				return new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token));
+				return new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token), bindTokenStore);
 			}
 			if (entry.tool === 'opencode') {
 				return new OpencodeDriver({
@@ -133,6 +140,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
 					sessionStore: new FileCcHeadlessSessionStore(),
+					bindTokens: bindTokenStore,
 					registry: ccRegistry,
 					transcript: ccTranscript,
 				});
@@ -191,13 +199,14 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 
 	// REQ-011 S2: if any cc identity is registered, start the CC hook broker. CC's headless hooks POST
 	// here; the bridge sink routes each resolved hook into the active CcHeadlessSession's AgentEvent
-	// stream via the shared ccRegistry, so the standard node-driven path renders the panel. resolve() =
-	// the shared parseCcBinding (same parse as CcHeadlessDriver.resolveSession). Only bound when a cc
-	// identity exists (don't bind 9100 otherwise). Closed on shutdown.
+	// stream via the shared ccRegistry, so the standard node-driven path renders the panel. BL-014 (#141):
+	// resolve() = the shared opaque bind-token store lookup (CC's hook Authorization: Bearer <token> carries
+	// the same AICHAT_BIND token, so the broker resolves it exactly like CcHeadlessDriver.resolveSession).
+	// Only bound when a cc identity exists (don't bind 9100 otherwise). Closed on shutdown.
 	let ccBroker: CcBroker | null = null;
 	if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
 		ccBroker = new CcBroker({
-			resolve: parseCcBinding,
+			resolve: (token) => bindTokenStore.resolve(token),
 			sink: buildCcBridgeSink(ccRegistry),
 		});
 		await ccBroker.listen(ccBrokerPort());
@@ -247,8 +256,12 @@ async function startSingleIdentity(config: AichatConfig): Promise<void> {
 	console.log(`[start] Machine: ${credentials.machineCode}`);
 
 	// 创建路由器并注册驱动（OpenclawDriver 包裹未改动的 OpenclawAdapter WS 引擎）
+	// BL-014 (#141): single-identity is openclaw-only (no cc broker); still needs its own bind-token store
+	// so the agent-facing OPENCLAW_BIND is an opaque token and resolveSession is a store lookup.
 	const router = new AgentRouter();
-	router.register(new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token)));
+	router.register(
+		new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token), new FileBindTokenStore()),
+	);
 
 	// 连接所有驱动
 	await router.connectAll();

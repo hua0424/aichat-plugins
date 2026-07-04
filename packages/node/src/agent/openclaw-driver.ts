@@ -1,5 +1,6 @@
 import type { AgentDriver, AgentSession, AgentEvent } from './events.js';
 import type { ClawAdapter, ThinkingCallbacks } from '../claw/interface.js';
+import type { BindTokenStore } from './bind-token-store.js';
 
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
@@ -38,22 +39,22 @@ export function filterOpenclawThinking(content: string): string {
 export class OpenclawDriver implements AgentDriver {
 	readonly type = 'openclaw';
 
-	constructor(private readonly adapter: ClawAdapter) {}
+	constructor(
+		private readonly adapter: ClawAdapter,
+		private readonly bindTokens: BindTokenStore,
+	) {}
 
 	/**
-	 * REQ-010 S6 Phase-2 — resolve the openclaw capability session id back to its bound identity+room.
+	 * BL-014 (#141) — resolve the openclaw capability session id back to its bound identity+room.
 	 *
-	 * Unlike opencode/codex (which keep a threadId→binding store), openclaw's binding IS the session
-	 * key: aichat-claw's resolve_exec_env hook injects the bare `aiclaw-{uid}-room-{roomId}` as
-	 * OPENCLAW_BIND, the CLI emits `openclaw:<binding>`, and resolveBoundSession strips the `openclaw:`
-	 * prefix before calling this. So this is a pure PARSE, not a lookup. Returns undefined on any
-	 * unparseable/garbage input (including a still-prefixed `openclaw:...`, which must never arrive here).
+	 * The session id is now an OPAQUE node-minted token (not the plaintext `aiclaw-{uid}-room-{roomId}`
+	 * binding): aichat-claw's resolve_exec_env hook injects the token as OPENCLAW_BIND, the CLI emits
+	 * `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling this. So
+	 * this is a STORE LOOKUP, not a parse — a forged plaintext binding an agent could guess by
+	 * overwriting its env never appears in the store → undefined (the endpoint then 404s).
 	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
-		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(sessionKey);
-		if (!m) return undefined;
-		// REQ-029 (#29): return the captured groups as opaque strings (never Number() — >2^53 corrupts).
-		return { aiclawUid: m[1], roomId: m[2] };
+		return this.bindTokens.resolve(sessionKey);
 	}
 
 	/**
@@ -77,8 +78,11 @@ export class OpenclawDriver implements AgentDriver {
 		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
-		const sessionKey = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
-		return new OpenclawSession(this.adapter, sessionKey, o.roomId);
+		// BL-014 (#141): the agent-facing sessionKey is a STABLE opaque token (not the plaintext binding).
+		// aichat-claw injects it as OPENCLAW_BIND → the CLI emits `openclaw:<token>` → resolveSession looks
+		// it up. mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
+		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
+		return new OpenclawSession(this.adapter, token, o.roomId);
 	}
 }
 

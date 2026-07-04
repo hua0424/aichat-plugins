@@ -159,17 +159,17 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 		expect(res.status).toBe(404);
 		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
 		expect(capLines).toHaveLength(1);
-		expect(capLines[0]).toBe('[capability] send-message opencode:ses_1 → (unresolved) err=unknown session');
+		expect(capLines[0]).toBe('[capability] send-message opencode:…(5) → (unresolved) err=unknown session');
 	});
 
-	it('maskSessionKey masks a long id: prefix + first 8 chars + length, never the full id', async () => {
+	it('BL-014 (#141): maskSessionKey FULLY masks the id (prefix + length only, no head)', async () => {
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		const { endpoint } = build({ resolveRoom: 42 });
 		const longId = 'ses_0123456789abcdef_secret_tail';
 		await endpoint.handle({ body: body({ sessionKey: `opencode:${longId}` }) });
 		const line = logSpy.mock.calls.map((c) => String(c[0])).find((l) => l.startsWith('[capability]'))!;
-		expect(line).toContain('…(');
-		expect(line).toContain('opencode:ses_0123'); // prefix + first 8 chars of the id
+		expect(line).toContain(`opencode:…(${longId.length})`); // prefix + length only
+		expect(line).not.toContain('ses_0123'); // NOT even the first 8 chars — the token is a credential
 		expect(line).not.toContain(longId); // the full id must NOT appear
 	});
 
@@ -192,7 +192,7 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 		expect(res.status).toBe(400);
 		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
 		expect(capLines).toHaveLength(1);
-		expect(capLines[0]).toBe('[capability] send-message raw:whatever → (unresolved) err=unknown session key prefix');
+		expect(capLines[0]).toBe('[capability] send-message raw:…(8) → (unresolved) err=unknown session key prefix');
 	});
 
 	it('unknown-command branch (400) logs one err line with resolved uid/room', async () => {
@@ -202,7 +202,7 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 		expect(res.status).toBe(400);
 		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
 		expect(capLines).toHaveLength(1);
-		expect(capLines[0]).toBe('[capability] nope-not-registered opencode:ses_1 → (uid=7, room=42) err=unknown command');
+		expect(capLines[0]).toBe('[capability] nope-not-registered opencode:…(5) → (uid=7, room=42) err=unknown command');
 	});
 
 	it('CRLF in an untrusted command cannot forge a second log line', async () => {
@@ -230,11 +230,11 @@ describe('endpoint log-sanitizer helpers', () => {
 		expect(sanitizeLogField('abc', 4)).toBe('abc');
 	});
 
-	it('maskSessionKey: no colon → <no-prefix>; short id kept; long id masked; control chars stripped', () => {
+	it('BL-014 (#141): maskSessionKey → prefix + length only (id fully masked); no colon → <no-prefix>', () => {
 		expect(maskSessionKey('noprefix')).toBe('<no-prefix>');
-		expect(maskSessionKey('cc:short')).toBe('cc:short');
-		expect(maskSessionKey('opencode:0123456789abcdef')).toBe('opencode:01234567…(16)');
-		expect(maskSessionKey('cc:a\nb')).toBe('cc:a b'); // embedded newline in a short id → space
+		expect(maskSessionKey('cc:short')).toBe('cc:…(5)'); // even a short id is masked (it is a token)
+		expect(maskSessionKey('opencode:0123456789abcdef')).toBe('opencode:…(16)');
+		expect(maskSessionKey('cc:a\nb')).toBe('cc:…(3)'); // id `a\nb` has length 3; nothing of it is emitted
 	});
 });
 

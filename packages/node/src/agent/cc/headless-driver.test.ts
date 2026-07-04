@@ -9,6 +9,13 @@ import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
 import { CcBroker } from './broker.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from './headless-session-store.js';
 import type { AgentEvent } from '../events.js';
+import { InMemoryBindTokenStore } from '../bind-token-store.js';
+
+/** A deterministic bind-token store (tokens `tok-1`, `tok-2`, …) so AICHAT_BIND assertions are stable. */
+function makeBindTokens(): InMemoryBindTokenStore {
+	let n = 0;
+	return new InMemoryBindTokenStore(() => `tok-${++n}`);
+}
 
 const tmpDirs: string[] = [];
 function freshBase(): string {
@@ -191,6 +198,7 @@ function makeDriver(overrides: Partial<Parameters<typeof CcHeadlessDriver.protot
 	const fs = fakeSpawn();
 	const registry = new CcSessionRegistry();
 	const store = memStore();
+	const bindTokens = makeBindTokens();
 	const kill = vi.fn();
 	const transcript = fakeTranscript();
 	const driver = new CcHeadlessDriver({
@@ -198,6 +206,7 @@ function makeDriver(overrides: Partial<Parameters<typeof CcHeadlessDriver.protot
 		workspaceBase: freshBase(),
 		brokerPort: 9100,
 		sessionStore: store,
+		bindTokens,
 		registry,
 		transcript,
 		spawn: fs.spawn,
@@ -207,7 +216,7 @@ function makeDriver(overrides: Partial<Parameters<typeof CcHeadlessDriver.protot
 		killGraceMs: 50,
 		...overrides,
 	});
-	return { driver, fs, registry, store, kill, transcript };
+	return { driver, fs, registry, store, bindTokens, kill, transcript };
 }
 
 /** Read the text of the stdin user envelope this fake spawn received. */
@@ -222,11 +231,15 @@ describe('CcHeadlessDriver — shape', () => {
 		expect(driver.drivesTurns).toBe(true);
 	});
 
-	it('resolveSession mirrors parseCcBinding', () => {
-		const { driver } = makeDriver();
-		expect(driver.resolveSession('aiclaw-7-room-8')).toEqual({ aiclawUid: '7', roomId: '8' });
+	it('resolveSession is an opaque-token STORE LOOKUP (BL-014 #141), not a plaintext parse', async () => {
+		const { driver, bindTokens } = makeDriver();
+		// mint via openSession; the minted token round-trips, a forged plaintext binding does NOT.
+		await driver.openSession({ aiclawUid: '7', roomId: '8', chatContext: BASE_CTX });
+		const token = bindTokens.mint('7', '8'); // stable → the same token openSession minted (tok-1)
+		expect(driver.resolveSession(token)).toEqual({ aiclawUid: '7', roomId: '8' });
+		// anti-forgery: a guessed plaintext binding an agent could set in AICHAT_BIND does NOT resolve.
+		expect(driver.resolveSession('aiclaw-7-room-8')).toBeUndefined();
 		expect(driver.resolveSession('garbage')).toBeUndefined();
-		expect(parseCcBinding('aiclaw-7-room-8')).toEqual(driver.resolveSession('aiclaw-7-room-8'));
 	});
 
 	it('connect/disconnect resolve; openSession returns a session', async () => {
@@ -291,7 +304,9 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 		expect(systemPrompt).toContain('aichat send-message');
 
 		const env = call.options.env as NodeJS.ProcessEnv;
-		expect(env.AICHAT_BIND).toBe('aiclaw-5-room-9');
+		// BL-014 (#141): AICHAT_BIND is the OPAQUE minted token (tok-1), NOT the guessable plaintext binding.
+		expect(env.AICHAT_BIND).toBe('tok-1');
+		expect(env.AICHAT_BIND).not.toBe('aiclaw-5-room-9');
 		expect(env.CLAUDE_NON_INTERACTIVE).toBe('1');
 		expect(call.options.detached).toBe(true);
 		expect(call.options.stdio).toEqual(['pipe', 'pipe', 'pipe']);
