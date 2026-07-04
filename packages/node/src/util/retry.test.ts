@@ -68,4 +68,30 @@ describe('retryAsync', () => {
 		// 3 次尝试 → 2 次退避（最后一次 give-up 不退避）。
 		expect(backoffMs.mock.calls).toEqual([[1], [2]]);
 	});
+
+	// BL-015 / #140: WS flapping —— onConnected 多次触发（重连抖动）会各起一条独立重试链。
+	// manager 批准的取舍是「stack 但每条各自有界 + 幂等」。本用例钉住有界性：N 次调用、每次都用
+	// 恒失败 fn，总调用数恰为 N*tries，且每条链都 resolve（永不 hang、永不越过自己的 tries 上限）。
+	it('flapping stacks but stays bounded: N 次独立 retryAsync（恒失败）→ 恰好 N*tries 次调用，每条都 resolve', async () => {
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		const N = 4;
+		const tries = 3;
+		// 每条链一个独立的恒失败 fn（模拟每次 onConnected 各自触发的 prewarm/reportAgentType）。
+		const fns = Array.from({ length: N }, () => vi.fn().mockRejectedValue(new Error('always')));
+
+		// 并发触发 N 条链（stack），全部必须落地 resolve（fire-and-forget 契约：永不 reject/hang）。
+		await Promise.all(
+			fns.map((fn) => expect(retryAsync(fn, { label: 'flap', tries, ...instant })).resolves.toBeUndefined()),
+		);
+
+		// 每条链独立有界：恰好 tries 次，从不越顶。
+		for (const fn of fns) {
+			expect(fn).toHaveBeenCalledTimes(tries);
+		}
+		// 全局：总调用数正好是 N*tries（stack 不会相互放大）。
+		const total = fns.reduce((sum, fn) => sum + fn.mock.calls.length, 0);
+		expect(total).toBe(N * tries);
+	});
 });

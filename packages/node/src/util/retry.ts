@@ -7,6 +7,10 @@
  *
  * 语义：fire-and-forget —— 本函数**永不 reject**。用尽次数后记一行 error 并返回，
  * 调用方（ws onConnected）不得因此崩溃/阻塞收消息。日志沿用 supervisor.ts 既有单行风格。
+ *
+ * ponytail: 无取消机制（manager 批准的取舍）。WS 快速抖动时，多次 onConnected 会各起一条独立
+ * 重试链，短暂 stack。可接受：每条链各自有界（`tries` 上限），且调用点动作幂等，故 stack 无害。
+ * 若日后需取消在飞的链，可加 AbortSignal —— 当前 YAGNI 不做。
  */
 export interface RetryOptions {
 	/** 日志标签，如 'prewarm' / 'reportAgentType'。 */
