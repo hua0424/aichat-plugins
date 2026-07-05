@@ -742,6 +742,81 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		expect(ctx.selfName).toBeUndefined();
 	});
 
+	// REQ-146 (#146) sign-on-access: media messages resolve a SHORT-lived signed download URL via
+	// apiClient.signDownload(msgId) and inject it into the turn — and the URL must NEVER reach node logs.
+	it('REQ-146: media (type 3) resolves signDownload(msgId), injects the signed url, and never logs it', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const SIGNED = 'http://minio/tmp/chat/55_pic.png?X-Amz-Signature=short-lived-secret';
+		const signDownload = vi.fn(async () => ({ url: SIGNED, expiresIn: 300 }));
+		const apiClient = { signDownload } as unknown as import('../api/hula-api.js').HulaApiClient;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		// roomType=2 (private) → always trigger-eligible. body.url is the now-unusable old link.
+		const media = {
+			fromUser: { uid: 100, name: 'user', userType: 1 },
+			message: {
+				id: 55,
+				roomId: 5,
+				type: 3,
+				roomType: 2,
+				body: { url: 'http://minio/OLD-7day.png?stale=1', size: 9, mime: 'image/png', fileName: 'pic.png' },
+			},
+		} as unknown as ReceivedMessage;
+
+		handler.handle({ type: 'receiveMessage', data: media } as never);
+		await waitFor(() => calls.length >= 1);
+
+		// signDownload called with the raw msgId; the signed url (not the stale one) reaches the agent turn.
+		expect(signDownload).toHaveBeenCalledWith(55);
+		expect(calls[0].message).toContain(SIGNED);
+		expect(calls[0].message).not.toContain('OLD-7day');
+
+		// the short-lived signed url must never appear in any console output.
+		const allLogs = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errSpy.mock.calls].flat().join(' ');
+		expect(allLogs).not.toContain(SIGNED);
+
+		logSpy.mockRestore();
+		warnSpy.mockRestore();
+		errSpy.mockRestore();
+	});
+
+	it('REQ-146: signDownload throws → falls back to body.url, no crash, url still not logged', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const signDownload = vi.fn(async () => {
+			throw new Error('HuLa API error: 403 forbidden');
+		});
+		const apiClient = { signDownload } as unknown as import('../api/hula-api.js').HulaApiClient;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+
+		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+		const FALLBACK = 'http://minio/pre-deploy.png?legacy=1';
+		const media = {
+			fromUser: { uid: 100, name: 'user', userType: 1 },
+			message: { id: 56, roomId: 5, type: 3, roomType: 2, body: { url: FALLBACK, size: 9, fileName: 'p.png' } },
+		} as unknown as ReceivedMessage;
+
+		handler.handle({ type: 'receiveMessage', data: media } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(signDownload).toHaveBeenCalledWith(56);
+		// falls back to the embedded (old) url so the pre-deploy message still works.
+		expect(calls[0].message).toContain(FALLBACK);
+		// even the fallback url must not be printed (envelope/preview logs redact url: lines).
+		const allLogs = [...logSpy.mock.calls, ...warnSpy.mock.calls].flat().join(' ');
+		expect(allLogs).not.toContain(FALLBACK);
+
+		logSpy.mockRestore();
+		warnSpy.mockRestore();
+	});
+
 	it('group + mention_required + NO @bot → NOT triggered, message accumulated', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();

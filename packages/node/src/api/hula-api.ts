@@ -42,6 +42,19 @@ export class HulaApiClient {
 	}
 
 	/**
+	 * REQ-146 (#146) sign-on-access — 为一条消息的文件签发一个 SHORT-lived（~5 分钟）预签名 GET 地址。
+	 * server 侧 POST /api/im/file/sign-download 校验调用方（token 身份）是房间成员后返回 { url, expiresIn }。
+	 * 老的 7 天下载地址已停发：新的图片(3)/文件(4)消息 body.url 不再可用，media 落地时用本端点即时换取短效地址喂给 agent。
+	 * REQ-029 (#29): msgId 为不透明字符串/大整数，原样透传（不 Number()）。
+	 * 非 ok / success:false 时与兄弟方法一致由 parseResponse 抛出。
+	 */
+	async signDownload(msgId: string | number): Promise<{ url: string; expiresIn: number }> {
+		const resp = await this.post('/api/im/file/sign-download', { msgId });
+		const data = resp.data as { url?: string; expiresIn?: number } | undefined;
+		return { url: data?.url ?? '', expiresIn: data?.expiresIn ?? 0 };
+	}
+
+	/**
 	 * REQ-010 S3 #93 — 查询单个成员的公开资料。
 	 * GET /api/im/user/getById/{uid} → data = 公开资料对象。
 	 */

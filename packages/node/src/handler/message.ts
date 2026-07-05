@@ -45,6 +45,16 @@ function capUtf8Bytes(text: string, maxBytes: number = THINKING_END_MAX_BYTES): 
 }
 
 /**
+ * REQ-146 (#146): mask `url:` lines so short-lived signed download URLs never reach node logs.
+ * Matches a line-leading `url: <value>` (the file-attachment block's url line) and replaces the value.
+ * Used only at log sites; the un-redacted text still flows to the agent driver.
+ */
+function redactUrls(text: string): string {
+	// #146 review P1：用 `.+`（而非 `\S+`）吃到行尾——防御 url 内含空格/被截断也整行遮蔽。
+	return text.replace(/^(\s*url:\s*).+$/gm, '$1<redacted>');
+}
+
+/**
  * REQ-004: Thinking 会话状态
  */
 interface ThinkingSession {
@@ -217,6 +227,28 @@ export class MessageHandler {
 	}
 
 	/**
+	 * REQ-146 (#146): resolve a SHORT-lived signed download URL for a media message so the agent can
+	 * access the file (server stopped emitting the old 7-day body.url). Returns the signed url on success;
+	 * on no apiClient / signDownload failure returns undefined, letting buildAgentInjection fall back to
+	 * body.url (old pre-deploy messages) or skip the attachment. Never crashes the message loop.
+	 *
+	 * IMPORTANT: never logs the URL. On failure it logs only msgId/roomId + a non-URL error string
+	 * (signDownload's thrown message carries the HTTP status/server msg, not the signed url).
+	 */
+	private async resolveDownloadUrl(message: ReceivedMessage['message']): Promise<string | undefined> {
+		if (!this.apiClient) return undefined;
+		try {
+			const { url } = await this.apiClient.signDownload(message.id);
+			return url?.trim() ? url : undefined;
+		} catch (err) {
+			console.warn(
+				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return undefined;
+		}
+	}
+
+	/**
 	 * REQ-004 S2: 获取/创建指定房间的处理通道。
 	 * 每个房间有独立的 debouncer，flush 时只触发该房间的 agent loop。
 	 */
@@ -245,7 +277,12 @@ export class MessageHandler {
 	handle(msg: WSResponse): void {
 		switch (msg.type) {
 			case 'receiveMessage':
-				this.handleReceiveMessage(msg.data as ReceivedMessage);
+				// REQ-146: media messages now resolve a short-lived signed URL (async) before injection,
+				// so handleReceiveMessage is async. ACK/dedup run in its synchronous prefix (before any await),
+				// so they still fire promptly; we don't await here (fire-and-forget, mirroring prior behavior).
+				this.handleReceiveMessage(msg.data as ReceivedMessage).catch((err) => {
+					console.error('[handler] handleReceiveMessage error:', err instanceof Error ? err.message : String(err));
+				});
 				break;
 			case 'thinkingStart':
 				this.handleThinkingStartBroadcast(msg.data as ThinkingStartDTO);
@@ -275,7 +312,7 @@ export class MessageHandler {
 		}
 	}
 
-	private handleReceiveMessage(data: ReceivedMessage): void {
+	private async handleReceiveMessage(data: ReceivedMessage): Promise<void> {
 		const msgId = String(data.message.id);
 
 		// 1. 发送 ACK（REQ-029 #29: msgId 作为不透明字符串发送，绝不 Number()——>2^53 会精度丢失）
@@ -296,8 +333,13 @@ export class MessageHandler {
 
 		// 3. 忽略自己发的消息
 		if (String(data.fromUser.uid) === String(this.selfUid)) return;
-		// REQ-007 #73: 文本(1)直接用；图片(3)/文件(4)注入 file-attachment；其余类型跳过
-		const content = buildAgentInjection(data.message);
+		// REQ-007 #73: 文本(1)直接用；图片(3)/文件(4)注入 file-attachment；其余类型跳过。
+		// REQ-146 (#146): server 已停发 7 天下载地址——图片(3)/文件(4)落地时先 async 换取一个短效签名地址
+		// （signDownload），把它作为 resolvedFileUrl 注入本轮 agent 输入；文本(1)不触发任何网络调用（同步路径不变）。
+		const mediaType = data.message.type;
+		const resolvedFileUrl =
+			mediaType === 3 || mediaType === 4 ? await this.resolveDownloadUrl(data.message) : undefined;
+		const content = buildAgentInjection(data.message, resolvedFileUrl);
 		if (!content?.trim()) return;
 
 		// REQ-029 (#29): normalize inbound ids with String(...) (NOT Number()) — opaque strings end-to-end.
@@ -365,7 +407,9 @@ export class MessageHandler {
 		const fromName = data.fromUser.name ?? 'unknown';
 		channel.lastCtx = { roomId, fromUid, fromName, msgId, roomType: roomType ?? 1, isOwner };
 
-		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${content.substring(0, 50)}...`);
+		// REQ-146: redact any `url:` line before previewing — media injections now embed a short-lived
+		// signed download URL that must NEVER reach node logs.
+		console.log(`[handler] Message from ${data.fromUser.name ?? 'unknown'}(${data.fromUser.uid}) in room ${roomId}: ${redactUrls(content).substring(0, 50)}...`);
 
 		// 5.6. 【S8-7 issue #22】更新本轮触发 BATCH 的防循环标志。
 		//   必须在「思考活跃/退避入队」(step 6) 之前——无论该消息随即入队还是直接 debounce，
@@ -484,8 +528,10 @@ export class MessageHandler {
 		// EXACT text handed to the driver — room header + `[name(uid)]` attribution — with newlines escaped
 		// so it stays one grep-able line; capped at 300 chars to bound log volume. This is the only place the
 		// four-driver envelope is emitted, so a log grep here is the structural evidence for AC1/AC5.
+		// REQ-146: redact `url:` lines — the media file-attachment block now carries a short-lived signed
+		// download URL, which must NEVER be printed. The real (un-redacted) envelope still goes to the driver.
 		console.log(
-			`[handler] envelope→driver(${this.driver.type}) room=${roomId} from=${channel.lastCtx.fromName}(${fromUid}) roomType=${roomType}: ${agentEnvelope.slice(0, 300).replace(/\n/g, '\\n')}`,
+			`[handler] envelope→driver(${this.driver.type}) room=${roomId} from=${channel.lastCtx.fromName}(${fromUid}) roomType=${roomType}: ${redactUrls(agentEnvelope).slice(0, 300).replace(/\n/g, '\\n')}`,
 		);
 
 		// 创建 thinking session（thinkingId 初始为空，等 server 广播回填）
