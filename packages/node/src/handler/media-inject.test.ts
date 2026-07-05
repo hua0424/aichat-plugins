@@ -124,4 +124,17 @@ describe('buildAgentInjection', () => {
 		expect(buildAgentInjection(msg(3, { size: 1, fileName: 'a.png' }), undefined)).toBeNull();
 		expect(buildAgentInjection(msg(4, { url: '   ', size: 1 }), '  ')).toBeNull();
 	});
+
+	it('14. #146: objectKey-only media body (url key OMITTED) + resolvedFileUrl → injection (NOT null)', () => {
+		// server 对 url=null 省略字段：新 objectKey-only 消息 body 无 url 键。旧 `'url' in body` guard
+		// 会误判非媒体→静默丢失。判别应只看 message.type(3/4)。
+		const outFile = buildAgentInjection(msg(4, { size: 120, fileName: 'a.txt', objectKey: 'chat/a.txt' }), 'http://signed/re-signed?X-Amz=1');
+		expect(outFile).not.toBeNull();
+		expect(outFile!).toContain('url: http://signed/re-signed?X-Amz=1');
+		expect(outFile!).toContain('name: a.txt');
+
+		const outImg = buildAgentInjection(msg(3, { size: 60, width: 1, height: 1, objectKey: 'chat/b.png' }), 'http://signed/img?X-Amz=2');
+		expect(outImg).not.toBeNull();
+		expect(outImg!).toContain('url: http://signed/img?X-Amz=2');
+	});
 });
