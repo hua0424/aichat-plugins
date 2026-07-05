@@ -239,7 +239,12 @@ export class MessageHandler {
 		if (!this.apiClient) return undefined;
 		try {
 			const { url } = await this.apiClient.signDownload(message.id);
-			return url?.trim() ? url : undefined;
+			if (!url?.trim()) {
+				// #146: 服务端 200 但 data.url 空——补观测（曾静默返回 undefined→媒体消息被跳）。不打 url 明文。
+				console.warn(`[media] signDownload msgId=${String(message.id)} returned empty url (server ok, no data.url)`);
+				return undefined;
+			}
+			return url;
 		} catch (err) {
 			console.warn(
 				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${err instanceof Error ? err.message : String(err)}`,
@@ -340,7 +345,17 @@ export class MessageHandler {
 		const resolvedFileUrl =
 			mediaType === 3 || mediaType === 4 ? await this.resolveDownloadUrl(data.message) : undefined;
 		const content = buildAgentInjection(data.message, resolvedFileUrl);
-		if (!content?.trim()) return;
+		if (!content?.trim()) {
+			// #146: 空注入即跳过——补一行观测（曾是静默黑洞，导致 objectKey-only 文件消息无声丢失）。
+			// 只打类型/长度/布尔，绝不打 url 明文。
+			if (mediaType === 3 || mediaType === 4) {
+				const bodyUrlBlank = !((data.message.body as { url?: string })?.url?.trim());
+				console.log(
+					`[handler] media msgId=${msgId} type=${mediaType} skipped: empty injection (signedUrlLen=${resolvedFileUrl?.length ?? 0}, bodyUrlBlank=${bodyUrlBlank})`,
+				);
+			}
+			return;
+		}
 
 		// REQ-029 (#29): normalize inbound ids with String(...) (NOT Number()) — opaque strings end-to-end.
 		const roomId = String(data.message.roomId);

@@ -1,5 +1,4 @@
 import type { ReceivedMessage, MediaMessageBody, TextMessageBody } from '../stream/protocol.js';
-import { isMediaMessageBody } from '../stream/protocol.js';
 
 /**
  * REQ-007 #73: 把一条 receiveMessage 的 message 归一化为「喂给 openclaw agent 的纯文本」。
@@ -32,8 +31,10 @@ export function buildAgentInjection(
 	}
 
 	if (type === 3 || type === 4) {
-		if (!isMediaMessageBody(body)) return null;
-		return buildFileAttachment(body, resolvedFileUrl);
+		// #146: 判别由 message.type 决定（见 protocol 注释），**不**用 `'url' in body`——
+		// server 对 url=null 字段会省略（objectKey-only 新消息 body 无 url 键），旧 guard
+		// `isMediaMessageBody('url' in b)` 会把这类消息误判成非媒体→整条静默丢失。
+		return buildFileAttachment(body as MediaMessageBody, resolvedFileUrl);
 	}
 
 	// 其它类型（音频/视频/撤回……）超出范围，跳过。
@@ -85,7 +86,9 @@ function resolveName(body: MediaMessageBody): string {
 	return derived ?? 'file';
 }
 
-function deriveNameFromUrl(url: string): string | null {
+function deriveNameFromUrl(url: string | undefined): string | null {
+	// #146: objectKey-only 消息 body 无 url 键（server 省略 null）→ url 可能为 undefined，防御。
+	if (!url) return null;
 	// 去掉 query（? 之后）与 fragment（# 之后），取最后一段。
 	const path = url.split('?')[0].split('#')[0];
 	const segment = path.split('/').pop();
