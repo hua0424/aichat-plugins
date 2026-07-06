@@ -285,3 +285,114 @@ describe('HulaWSClient reliability fixes (PR#67 P1)', () => {
 		expect(ws.terminate).not.toHaveBeenCalled();
 	});
 });
+
+// #152 rewarm fix: a transient non-101 handshake response (e.g. HTTP 200 while the
+// gateway's ws routes warm up after a restart / docker unpause) must NOT be classified
+// as auth-fatal. Only genuine auth codes (401/403/406) permanently stop reconnect;
+// everything else stays retryable through the existing 'close'(1006) → scheduleReconnect
+// backoff. The real ws lib emits 'error' then 'close' on a failed handshake, so the tests
+// drive both events in that order.
+describe('HulaWSClient handshake reconnect classification (#152 rewarm)', () => {
+	beforeEach(() => {
+		hoisted.instances.length = 0;
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it('200 transient → stays retryable: closed=false, reconnects via backoff, onAuthError NOT called', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => true);
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		// gateway rewarm: upgrade answered with HTTP 200, then the ws lib's follow-up close(1006)
+		ws.emit('error', new Error('Unexpected server response: 200'));
+		ws.emit('close', 1006, Buffer.from('rewarm'));
+
+		// core regression: this must NOT be treated as auth-fatal
+		expect(client.closed).toBe(false);
+		expect(onAuthError).not.toHaveBeenCalled();
+
+		// the 'close' handler scheduled a backoff reconnect (1000ms) → a brand-new ws instance
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	it('401 still fatal: closed=true, onAuthError invoked, no plain-backoff reconnect when it returns false', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false); // refresh failed → cannot retry
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		ws.emit('error', new Error('Unexpected server response: 401'));
+		ws.emit('close', 1006, Buffer.from('auth'));
+
+		// auth-fatal path: closed set immediately by the error handler
+		expect(client.closed).toBe(true);
+
+		// let the awaited onAuthError() microtask settle
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+
+		// onAuthError returned false → no reconnect; the 'close' also saw closed=true so it
+		// did not schedule a plain backoff reconnect either → no new socket
+		expect(hoisted.instances.length).toBe(before);
+	});
+
+	it('401 fatal but onAuthError returns true → reconnects (unchanged behavior)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => true); // token refreshed → retry ok
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		ws.emit('error', new Error('Unexpected server response: 401'));
+		ws.emit('close', 1006, Buffer.from('auth'));
+
+		await vi.runAllTimersAsync(); // onAuthError → closed=false + scheduleReconnect + backoff fires
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+		expect(client.closed).toBe(false);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	it('503 transient → stays retryable like 200 (proves it is not 200-specific)', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => true);
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		ws.emit('error', new Error('Unexpected server response: 503'));
+		ws.emit('close', 1006, Buffer.from('unavailable'));
+
+		expect(client.closed).toBe(false);
+		expect(onAuthError).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	it('502 transient → stays retryable (extra transient code)', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client, ws } = makeClient();
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		ws.emit('error', new Error('Unexpected server response: 502'));
+		ws.emit('close', 1006, Buffer.from('bad gateway'));
+
+		expect(client.closed).toBe(false);
+
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+});
