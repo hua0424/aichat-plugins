@@ -119,11 +119,16 @@ export class HulaWSClient {
 			// them). The auth-error reconnect semantics below are unchanged.
 			this.stopHeartbeat();
 			this.stopWatchdog();
-			// 检测 WS 握手失败（非 101 响应，通常是认证问题）
+			// 检测 WS 握手失败（非 101 响应）
+			// #152 rewarm fix: only a genuine auth rejection is fatal. The gateway can answer a reconnect
+			// upgrade with a transient non-101 (e.g. HTTP 200 while ws routes warm up after a restart) —
+			// treating that as auth-fatal permanently strands the node. Everything non-auth stays retryable
+			// via the existing 'close' → scheduleReconnect backoff.
+			const AUTH_FATAL_CODES = ['401', '403', '406'];
 			if (err.message.includes('Unexpected server response')) {
 				const statusCode = err.message.match(/(\d{3})/)?.[1];
-				if (statusCode && statusCode !== '101') {
-					console.warn(`[hula-ws] Auth/connection failed with HTTP ${statusCode}, stopping reconnect`);
+				if (statusCode && AUTH_FATAL_CODES.includes(statusCode)) {
+					console.warn(`[hula-ws] Auth failed with HTTP ${statusCode}, stopping reconnect`);
 					this.closed = true;
 					if (this.reconnectTimer) {
 						clearTimeout(this.reconnectTimer);
@@ -140,6 +145,15 @@ export class HulaWSClient {
 							console.error('[hula-ws] onAuthError failed:', e);
 						}
 					}
+				} else if (statusCode) {
+					// transient non-101 (e.g. 200 during gateway rewarm) — NOT auth-fatal.
+					// Do NOT set this.closed and do NOT touch reconnectTimer: the ws lib emits
+					// 'close' (code 1006) right after this 'error' on a failed handshake (verified
+					// against ws 8.19 emitErrorAndClose), and that 'close' drives scheduleReconnect
+					// via the existing backoff. Scheduling here too would be redundant.
+					console.warn(
+						`[hula-ws] Handshake got HTTP ${statusCode} (transient, e.g. gateway rewarm); will retry via backoff`,
+					);
 				}
 			}
 		});
