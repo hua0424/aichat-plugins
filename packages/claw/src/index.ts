@@ -1,136 +1,29 @@
-import type { OpenClawPluginApi, ChannelPlugin } from './types.js';
+import type { OpenClawPluginApi } from './types.js';
 import { hulaChannel } from './channel/index.js';
-import { HulaApiClientPool } from './hula-api-pool.js';
-import { registerTools } from './tools/index.js';
 import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
 
 /**
- * 从多个可能的路径读取 hula 配置（兼容不同 openclaw 版本的 config 传递方式）
- */
-function resolveHulaConfig(
-	runtimeConfig: Record<string, unknown>
-): { serverUrl?: string; aiclawToken?: string; tokens?: Record<string, string> } {
-	// 路径 1: runtime.config.hula（标准路径）
-	const direct = runtimeConfig.hula as Record<string, unknown> | undefined;
-	if (direct?.aiclawToken || direct?.serverUrl) {
-		return {
-			serverUrl: direct.serverUrl as string | undefined,
-			aiclawToken: direct.aiclawToken as string | undefined,
-			tokens: direct.tokens as Record<string, string> | undefined,
-		};
-	}
-
-	// 路径 2: runtime.config.plugins.entries.aichat-claw.config.hula（某些 openclaw 版本）
-	const plugins = runtimeConfig.plugins as Record<string, unknown> | undefined;
-	const entries = plugins?.entries as Record<string, unknown> | undefined;
-	const pluginConfig = entries?.['aichat-claw'] as Record<string, unknown> | undefined;
-	const nestedHula = pluginConfig?.config as Record<string, unknown> | undefined;
-	if (nestedHula?.hula) {
-		const h = nestedHula.hula as Record<string, unknown>;
-		return {
-			serverUrl: h.serverUrl as string | undefined,
-			aiclawToken: h.aiclawToken as string | undefined,
-			tokens: h.tokens as Record<string, string> | undefined,
-		};
-	}
-
-	// 路径 3: runtime.config 直接就是 hula 对象（fallback）
-	if (runtimeConfig.aiclawToken || runtimeConfig.serverUrl) {
-		return {
-			serverUrl: runtimeConfig.serverUrl as string | undefined,
-			aiclawToken: runtimeConfig.aiclawToken as string | undefined,
-			tokens: runtimeConfig.tokens as Record<string, string> | undefined,
-		};
-	}
-
-	return {};
-}
-
-/**
- * aichat-claw Plugin 入口
- * 注册 HuLa Channel + Agent Tools
+ * aichat-claw Plugin 入口（aichatoverview#161 — ADR-0004 收尾）
  *
- * REQ-004: 使用 HulaApiClientPool 支持多 aiclaw 独立 token（方案 B 保底）
+ * 退役 Agent Tools 后，claw 只做两件事：
+ *  1. 注册 HuLa Channel——openclaw 据此路由 direct/group 聊天；
+ *  2. 注册 `resolve_exec_env` hook——把复合 sessionKey 的 token 前缀注入 OPENCLAW_BIND，
+ *     让 openclaw agent 在 exec 里跑统一的 `aichat send-message` CLI 回复（与 opencode/codex/cc 一致）。
+ *
+ * 回复不再经插件内的 hula_send_message / hula_find_friend / hula_skip_reply 工具，
+ * 也不再持有独立的 HuLa API 客户端——凭据信任点收敛到 aichat-node 单一 server 节点。
  */
 export default function register(api: OpenClawPluginApi) {
 	api.logger.info('aichat-claw loading');
 
-	// DEBUG: 输出 runtime.config 完整结构，帮助诊断 config 传递问题
-	api.logger.info('runtime.config keys: ' + Object.keys(api.runtime.config || {}).join(', '));
-	// DEBUG: 输出 runtime.config 完整结构，敏感字段脱敏
-	const configForLog = JSON.stringify(
-		api.runtime.config || {},
-		(key, value) => (/token|password|secret|key/i.test(key) && typeof value === 'string') ? '***' : value,
-		2
-	);
-	api.logger.info('runtime.config: ' + configForLog);
+	// 注册 HuLa Channel（自带骨架 outbound；实际回复走 CLI，不经此路径）
+	api.registerChannel({ plugin: hulaChannel });
 
-	// 多路径解析 hula 配置
-	const hulaConfig = resolveHulaConfig(api.runtime.config || {});
-	let serverUrl = hulaConfig.serverUrl || 'http://localhost:18760';
-	let aiclawToken = hulaConfig.aiclawToken || '';
-
-	// 环境变量 fallback（容器部署时最可靠）
-	if (!aiclawToken) {
-		aiclawToken = process.env.HULA_AICLAW_TOKEN || '';
-		if (aiclawToken) {
-			api.logger.info('aichat-claw: using HULA_AICLAW_TOKEN from env');
-		}
-	}
-	if (!serverUrl || serverUrl === 'http://localhost:18760') {
-		const envUrl = process.env.HULA_SERVER_URL;
-		if (envUrl) {
-			serverUrl = envUrl;
-			api.logger.info('aichat-claw: using HULA_SERVER_URL from env');
-		}
-	}
-
-	api.logger.info(`aichat-claw: resolved serverUrl=${serverUrl}, token=${aiclawToken ? '***' : '(empty)'}`);
-
-	const pool = new HulaApiClientPool(serverUrl);
-
-	// 注册 HuLa Channel（带 outbound adapter，支持 agent 直接发送消息）
-	const channel: ChannelPlugin = {
-		...hulaChannel,
-		outbound: {
-			async sendText(params) {
-				// 身份限制：channel.outbound 这条路径没有会话上下文（无 ctx.sessionKey），
-				// 因此只能用默认客户端 pool.get() 发送，无法按 aiclaw 归属选择身份。
-				// 多 aiclaw 的逐实例绑定仅在 hula_send_message 的 tool-factory 路径上生效
-				// （工厂从 ctx.sessionKey 解析 aiclawUid，再 pool.get(uid)）。
-				//
-				// REQ-004 S3 (Fork B) loud-fail 守卫：多 token 模式下没有会话上下文
-				// 就无法挑选正确身份，绝不以默认身份冒名发送——直接拒绝并报错。
-				if (pool.isMultiToken) {
-					return {
-						ok: false,
-						error: '多 aiclaw 模式下 channel.outbound 无会话上下文，拒绝以默认身份发送（避免冒名）',
-					};
-				}
-				const client = pool.get();
-				if (!client) {
-					return { ok: false, error: 'HulaApiClient not available' };
-				}
-				try {
-					await client.sendMessage(Number(params.to), params.text);
-					return { ok: true };
-				} catch (err) {
-					return { ok: false, error: err instanceof Error ? err.message : String(err) };
-				}
-			},
-		},
-	};
-	api.registerChannel({ plugin: channel });
-
-	// REQ-010 S6 Phase-2: route openclaw agent replies through the SAME unified `aichat send-message`
-	// CLI path as opencode/codex. The agent CAN run shell (exec tool), so we inject the room binding
-	// into its exec env via the `resolve_exec_env` hook. The CLI's resolveAgentSessionKey() reads
-	// OPENCLAW_BIND → emits `openclaw:<binding>` to the loopback capability endpoint.
-	//
-	// handler signature is (event, ctx) — sessionKey lives on the 2nd arg (ctx), real-machine-verified.
-	// We stay shape-tolerant (mirror the Phase-1 probe): prefer ctx.sessionKey, fall back to
-	// event.ctx.sessionKey / event.sessionKey. buildOpenclawExecEnv never throws and never injects a
-	// malformed binding (returns {} otherwise) — a safe no-op that keeps the legacy aichat-claw tools.
+	// REQ-010 S6 Phase-2 / #141 B+: openclaw agent CAN run shell（exec 工具），故统一走
+	// `aichat send-message` CLI。复合 sessionKey 是 `agent:main:<token>:aiclaw-{uid}-room-{roomId}`；
+	// buildOpenclawExecEnv 剥掉命名空间前缀、抽出 token 前缀注入 OPENCLAW_BIND → CLI 的
+	// resolveAgentSessionKey() 读它 → 发 `openclaw:<token>` 给 node CapabilityEndpoint 精确反查。
+	// 非良构 sessionKey 返回 {}（不注入）——绝不 throw、绝不注入畸形值。
 	if (typeof api.on === 'function') {
 		api.on(
 			'resolve_exec_env',
@@ -147,24 +40,5 @@ export default function register(api: OpenClawPluginApi) {
 		api.logger.info('aichat-claw: registered resolve_exec_env hook (OPENCLAW_BIND injection)');
 	}
 
-	if (aiclawToken) {
-		// 向后兼容：全局 token 作为默认客户端
-		pool.setDefault(aiclawToken);
-
-		// REQ-004: 若配置中存在多 aiclaw token 映射，注册到实例池
-		const tokens = hulaConfig.tokens;
-		if (tokens) {
-			for (const [uid, token] of Object.entries(tokens)) {
-				pool.register(uid, token);
-				api.logger.info(`aichat-claw: registered client for aiclaw ${uid}`);
-			}
-		}
-
-		// REQ-004 S2: tool factory 注册——execute 身份/房间由 ctx.sessionKey 动态绑定
-		registerTools(api, pool);
-		api.logger.info('aichat-claw loaded: channel=hula, tools=hula_find_friend,hula_send_message');
-	} else {
-		api.logger.warn('aichat-claw: hula.aiclawToken not configured, tools disabled');
-		api.logger.info('aichat-claw loaded: channel=hula (tools disabled)');
-	}
+	api.logger.info('aichat-claw loaded: channel=hula (replies via aichat CLI)');
 }
