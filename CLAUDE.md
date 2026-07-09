@@ -79,7 +79,7 @@ WebSocket RPC frame types: `req`/`res`/`event`. After connect handshake (`connec
 
 - Agent chat: send `agent` req with `{ message, sessionKey, idempotencyKey }`
 - Streamed via `event` frames: `assistant` stream = thinking deltas; `lifecycle` stream with `phase=end/error` = completion
-- The message is prefixed with a role-instruction telling the agent to reply by running `aichat send-message --content "…"` in bash (plain text, NOT `[SYSTEM]` markers — filtered by openclaw security). Built in `buildOpenclawReplyMessage` (`packages/node/src/agent/openclaw/openclaw-driver.ts`).
+- The message is prefixed with a role-instruction telling the agent to reply by running `aichat send-message --content "…"` in bash (plain text, NOT `[SYSTEM]` markers — filtered by openclaw security). Built by the shared `buildReplyInstruction` (`packages/node/src/agent/reply-contract.ts` — single source for openclaw/opencode/codex; cc wraps the same base, since aichatoverview#165).
 
 ### aichat-claw Plugin (`packages/claw/src/index.ts`)
 
