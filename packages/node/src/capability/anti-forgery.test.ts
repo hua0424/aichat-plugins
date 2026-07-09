@@ -2,11 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import { resolveBoundSession, type BindableAgent } from './session-key.js';
-import { OpenclawDriver } from '../agent/openclaw-driver.js';
+import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
 import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
-import type { ClawAdapter } from '../claw/interface.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 
@@ -23,18 +22,6 @@ import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/c
  * A genuinely minted token resolves to its real (uid,room). This test proves BOTH, at the endpoint level.
  */
 
-function noopClawAdapter(): ClawAdapter {
-	return {
-		type: 'openclaw',
-		connect: vi.fn().mockResolvedValue(undefined),
-		disconnect: vi.fn().mockResolvedValue(undefined),
-		get isConnected() {
-			return true;
-		},
-		chat: vi.fn().mockResolvedValue(undefined),
-	} as unknown as ClawAdapter;
-}
-
 function memCcStore(): CcHeadlessSessionStore {
 	const map = new Map<string, StoredCcHeadlessSession>();
 	return { get: (k) => map.get(k), set: (k, v) => void map.set(k, v), delete: (k) => void map.delete(k) };
@@ -49,7 +36,9 @@ describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves
 	it('openclaw: a minted token resolves to its real (uid,room); a forged plaintext binding → endpoint 404', async () => {
 		// ONE shared store, as in start.ts. Mint the REAL binding via the driver's openSession.
 		const store = new InMemoryBindTokenStore();
-		const openclaw = new OpenclawDriver(noopClawAdapter(), store);
+		// The gateway socket is never opened here — this test only exercises openSession (mint) +
+		// resolveSession (store lookup), so the default ws factory is fine (connect() is not called).
+		const openclaw = new OpenclawDriver('ws://localhost:18789', '', store);
 		const api7 = fakeApi('uid-7');
 		await openclaw.openSession({ aiclawUid: '7', roomId: '42', chatContext: {} });
 		const mintedToken = store.mint('7', '42'); // stable → the exact token openSession minted

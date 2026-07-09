@@ -3,8 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
-import { OpenclawAdapter } from '../claw/openclaw.js';
-import { OpenclawDriver } from '../agent/openclaw-driver.js';
+import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
 import { FileSessionStore } from '../agent/opencode/session-store.js';
@@ -109,7 +108,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
 		buildDriver: (entry) => {
 			if (entry.tool === 'openclaw') {
-				return new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token), bindTokenStore);
+				return new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, bindTokenStore);
 			}
 			if (entry.tool === 'opencode') {
 				return new OpencodeDriver({
@@ -255,12 +254,12 @@ async function startSingleIdentity(config: AichatConfig): Promise<void> {
 	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
 	console.log(`[start] Machine: ${credentials.machineCode}`);
 
-	// 创建路由器并注册驱动（OpenclawDriver 包裹未改动的 OpenclawAdapter WS 引擎）
+	// 创建路由器并注册驱动（OpenclawDriver 自带 openclaw gateway WS 引擎）
 	// BL-014 (#141): single-identity is openclaw-only (no cc broker); still needs its own bind-token store
 	// so the agent-facing OPENCLAW_BIND is an opaque token and resolveSession is a store lookup.
 	const router = new AgentRouter();
 	router.register(
-		new OpenclawDriver(new OpenclawAdapter(clawConfig.gatewayUrl, clawConfig.token), new FileBindTokenStore()),
+		new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, new FileBindTokenStore()),
 	);
 
 	// 连接所有驱动

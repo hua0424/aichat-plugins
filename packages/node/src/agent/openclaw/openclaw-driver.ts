@@ -3,44 +3,35 @@ import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import type { ClawAdapter, ChatContext, ThinkingCallbacks } from './interface.js';
+import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
+import type { BindTokenStore } from '../bind-token-store.js';
 
 /**
- * Device identity for gateway authentication
+ * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
+ * string `NO_REPLY` on its `assistant` text stream when it has no user-visible prose to add (the
+ * reply itself already went out via the `aichat send-message` CLI); it ALSO emits a purely empty /
+ * whitespace-only assistant stream on some turns. We consume that stream as thinking text, so both
+ * the bare sentinel and an empty stream would otherwise land as a blank/broken thinking panel / DB
+ * row. Filter both — but for the sentinel ONLY when the WHOLE thinking text is the sentinel
+ * (openclaw's own regex is whole-string with optional surrounding whitespace), so a real thought
+ * that merely CONTAINS "NO_REPLY" survives verbatim.
+ *
+ * Note: `.test()` on a non-global regex is stateless — do NOT add the `g` flag (lastIndex would
+ * make repeated calls non-deterministic).
  */
-interface DeviceIdentity {
-	deviceId: string;
-	publicKeyPem: string;
-	privateKeyPem: string;
-}
+export const OPENCLAW_NO_REPLY_SENTINEL = /^\s*NO_REPLY\s*$/;
+/** Neutral placeholder for an openclaw turn with no real thinking prose (bare NO_REPLY sentinel OR
+ *  empty/whitespace-only assistant stream). Deliberately makes NO claim about whether a reply was
+ *  sent: the node can't know that at finalize time (reply goes out-of-band via the `aichat send-message`
+ *  CLI), and empty-turns with no reply exist — so "回复已直接发出" would be false for them. */
+export const OPENCLAW_EMPTY_THINKING_PLACEHOLDER = '（本轮无思考正文）';
 
-function loadDeviceIdentity(): DeviceIdentity | null {
-	const path = resolve(homedir(), '.openclaw', 'identity', 'device.json');
-	if (!existsSync(path)) return null;
-	try {
-		const raw = readFileSync(path, 'utf-8');
-		const parsed = JSON.parse(raw);
-		if (parsed.deviceId && parsed.publicKeyPem && parsed.privateKeyPem) {
-			return parsed as DeviceIdentity;
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-function signPayload(privateKeyPem: string, payload: string): string {
-	const key = createPrivateKey(privateKeyPem);
-	const sig = sign(null, Buffer.from(payload, 'utf8'), key);
-	return sig.toString('base64url');
-}
-
-function publicKeyRawBase64Url(publicKeyPem: string): string {
-	const key = createPublicKey(publicKeyPem);
-	const der = key.export({ type: 'spki', format: 'der' });
-	// Ed25519 SPKI DER: 12-byte header + 32-byte raw key
-	const raw = der.subarray(der.length - 32);
-	return raw.toString('base64url');
+/** openclaw-only: bare NO_REPLY sentinel OR empty/whitespace-only thinking → neutral placeholder;
+ *  any real thinking (even if it merely CONTAINS "NO_REPLY") is returned verbatim. */
+export function filterOpenclawThinking(content: string): string {
+	return OPENCLAW_NO_REPLY_SENTINEL.test(content) || content.trim() === ''
+		? OPENCLAW_EMPTY_THINKING_PLACEHOLDER
+		: content;
 }
 
 /**
@@ -144,6 +135,44 @@ export function buildOpenclawReplyMessage(message: string): string {
 }
 
 /**
+ * Device identity for gateway authentication
+ */
+interface DeviceIdentity {
+	deviceId: string;
+	publicKeyPem: string;
+	privateKeyPem: string;
+}
+
+function loadDeviceIdentity(): DeviceIdentity | null {
+	const path = resolve(homedir(), '.openclaw', 'identity', 'device.json');
+	if (!existsSync(path)) return null;
+	try {
+		const raw = readFileSync(path, 'utf-8');
+		const parsed = JSON.parse(raw);
+		if (parsed.deviceId && parsed.publicKeyPem && parsed.privateKeyPem) {
+			return parsed as DeviceIdentity;
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+function signPayload(privateKeyPem: string, payload: string): string {
+	const key = createPrivateKey(privateKeyPem);
+	const sig = sign(null, Buffer.from(payload, 'utf8'), key);
+	return sig.toString('base64url');
+}
+
+function publicKeyRawBase64Url(publicKeyPem: string): string {
+	const key = createPublicKey(publicKeyPem);
+	const der = key.export({ type: 'spki', format: 'der' });
+	// Ed25519 SPKI DER: 12-byte header + 32-byte raw key
+	const raw = der.subarray(der.length - 32);
+	return raw.toString('base64url');
+}
+
+/**
  * Gateway 帧类型定义（精简版，基于 openclaw gateway protocol schema）
  */
 
@@ -169,7 +198,9 @@ interface EventFrame {
 	seq?: number;
 }
 
-interface AgentEvent {
+/** A single agent stream event frame from the gateway (renamed from the wire's `agent` payload so
+ *  it never collides with the driver-facing `AgentEvent` vocabulary this file also emits). */
+interface GatewayAgentEvent {
 	runId: string;
 	seq: number;
 	stream: string;
@@ -186,23 +217,53 @@ interface PendingRequest {
 	timeout: ReturnType<typeof setTimeout> | null;
 }
 
+/**
+ * The push→pull sink an in-flight turn writes its AgentEvents into. Owned by an OpenclawSession's
+ * send() queue; the driver's gateway engine translates its wire events (assistant deltas →
+ * `thinking`, lifecycle `phase:end` → `done`, `phase:error` → `error`) into pushes on this sink.
+ */
+interface ChatSink {
+	push: (ev: AgentEvent) => void;
+	finish: () => void;
+}
+
+/**
+ * One active agent turn tracked by the gateway engine. Holds the session sink it delivers into
+ * (instead of the retired ThinkingCallbacks) plus the run bookkeeping.
+ */
 interface PendingChat {
-	callbacks: ThinkingCallbacks;
+	sink: ChatSink;
 	fullContent: string;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
 }
 
+/** Factory for the underlying gateway WebSocket. Injectable so tests can drive scripted frames
+ *  without a live socket; the default builds the real `ws` socket with the production maxPayload. */
+export type OpenclawSocketFactory = (url: string) => WebSocket;
+
+const defaultOpenclawSocketFactory: OpenclawSocketFactory = (url) =>
+	new WebSocket(url, { maxPayload: 25 * 1024 * 1024 });
+
 /**
- * openclaw WS RPC 适配器
- * 通过 WebSocket 连接 openclaw gateway，走完整 agent pipeline
+ * OpenclawDriver — the openclaw AgentDriver (aichatoverview#162).
+ *
+ * Melts what used to be three layers (the imagined `ClawAdapter` seam + `OpenclawAdapter` gateway
+ * engine + a thin wrapper driver) into ONE driver that owns the gateway WS engine and emits
+ * `AgentEvent` natively — matching the opencode/codex/cc drivers' directory-and-shape convention.
+ *
+ * It connects to the openclaw gateway via WebSocket RPC with a device identity signature (v3
+ * payload) + token auth, negotiates protocol v4, and streams each turn's assistant text as
+ * `thinking` AgentEvents with a `done`/`error` terminal.
  */
-export class OpenclawAdapter implements ClawAdapter {
+export class OpenclawDriver implements AgentDriver {
 	readonly type = 'openclaw';
 
 	private ws: WebSocket | null = null;
 	private url: string;
 	private token: string;
+	private readonly bindTokens: BindTokenStore;
+	private readonly wsFactory: OpenclawSocketFactory;
 	private closed = false;
 	private connected = false;
 	private reconnectDelay = 1000;
@@ -235,9 +296,66 @@ export class OpenclawAdapter implements ClawAdapter {
 	private connectResolve: (() => void) | null = null;
 	private connectReject: ((err: Error) => void) | null = null;
 
-	constructor(url = 'ws://localhost:18789', token = '') {
+	constructor(
+		url: string,
+		token: string,
+		bindTokens: BindTokenStore,
+		wsFactory: OpenclawSocketFactory = defaultOpenclawSocketFactory,
+	) {
 		this.url = url;
 		this.token = token;
+		this.bindTokens = bindTokens;
+		this.wsFactory = wsFactory;
+	}
+
+	/**
+	 * BL-014 (#141) — resolve the openclaw capability session id back to its bound identity+room.
+	 *
+	 * The CLI/exec-env path delivers a BARE opaque node-minted token here (aichat-claw's resolve_exec_env
+	 * hook extracts the token PREFIX out of the compound sessionKey and injects it as OPENCLAW_BIND, the
+	 * CLI emits `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling
+	 * this). So this is an EXACT STORE LOOKUP, NOT a parse and NOT a split.
+	 *
+	 * #141 B+ (regression fix): openSession now hands the gateway a COMPOUND `<token>:<binding>`
+	 * sessionKey (see openSession). resolveSession must NOT split that compound — it looks up the whole
+	 * argument as-is. The only thing that legitimately reaches here is the bare token; a forged plaintext
+	 * binding, OR a compound an attacker appends a binding tail to, is never a stored key → undefined
+	 * (the endpoint then 404s). The compound only legitimately exists gateway-side, inside beginChat.
+	 */
+	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
+		return this.bindTokens.resolve(sessionKey);
+	}
+
+	/**
+	 * aichatoverview#124 — no per-room store: openclaw's binding IS the sessionKey, so there is
+	 * nothing to reset. No-op, returns false.
+	 */
+	resetSession(): boolean {
+		return false;
+	}
+
+	async openSession(o: {
+		aiclawUid: string;
+		roomId: string;
+		chatContext: Record<string, unknown>;
+	}): Promise<AgentSession> {
+		// #161 (ADR-0004): openclaw replies via the unified `aichat send-message` CLI — the in-gateway
+		// aichat-claw `hula_send_message` TOOL was retired. We still hand the gateway a COMPOUND sessionKey
+		// `<token>:<binding>` — the opaque token FIRST, a literal `:`, then the plaintext binding LAST:
+		//   • aichat-claw's resolve_exec_env extracts the token PREFIX → OPENCLAW_BIND → CLI `openclaw:<token>`.
+		//   • the `aiclaw-{uid}-room-{roomId}` binding TAIL is retained for openclaw gateway-side session
+		//     isolation (keeps openclaw's conversation key unique + stable per room).
+		//   • the token is lowercase hex (`[0-9a-f]`, contains no `:`) so the `<token>:<binding>` split is
+		//     unambiguous. (#161 A′: hex is lowercase-native — openclaw lowercases the sessionKey it echoes
+		//     back through resolve_exec_env, and a hex token survives that round-trip; mixed-case would not.)
+		// CONFINEMENT: this compound is used ONLY here, as the gateway `agent` req sessionKey. It is NEVER a
+		// node-internal key — the node-side thinking sessionKey is computed independently from (uid,room)
+		// in the message handler, and resolveSession keys on the BARE token alone (it must NOT split the
+		// compound; a compound arriving at the endpoint = forgery → store miss → undefined).
+		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
+		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
+		const sessionKey = `${token}:aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink));
 	}
 
 	async connect(): Promise<void> {
@@ -255,14 +373,24 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.closed = true;
 		this.connected = false;
 		this.clearTimers();
-		this.flushPendingErrors(new Error('adapter disconnected'));
+		this.flushPendingErrors(new Error('driver disconnected'));
 		this.ws?.close();
 		this.ws = null;
 	}
 
-	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks, _context?: ChatContext): Promise<void> {
+	get isConnected(): boolean {
+		return this.connected;
+	}
+
+	/**
+	 * Begin one in-flight agent turn over the gateway, delivering its AgentEvents into `sink`.
+	 * Called by an OpenclawSession's send(); the gateway's streamed reply is mapped to the sink by
+	 * processAgentStreamEvent (assistant → thinking, lifecycle end/error → done/error).
+	 */
+	private beginChat(message: string, sessionKey: string, sink: ChatSink): void {
 		if (!this.connected || !this.ws) {
-			callbacks.onError(new Error('openclaw gateway not connected'));
+			sink.push({ type: 'error', message: 'openclaw gateway not connected' });
+			sink.finish();
 			return;
 		}
 
@@ -294,7 +422,8 @@ export class OpenclawAdapter implements ClawAdapter {
 				const chat = this.findChatByRequestId(requestId);
 				if (chat && !chat.done) {
 					chat.done = true;
-					callbacks.onError(err instanceof Error ? err : new Error(String(err)));
+					chat.sink.push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+					chat.sink.finish();
 					this.cleanupChat(requestId);
 				}
 			},
@@ -305,7 +434,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		// 预注册 chat state
 		this.requestToRunId.set(requestId, '');
 		this.activeChats.set(`req:${requestId}`, {
-			callbacks,
+			sink,
 			fullContent: '',
 			done: false,
 			startTime: Date.now(),
@@ -314,18 +443,12 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.ws.send(JSON.stringify(frame));
 	}
 
-	get isConnected(): boolean {
-		return this.connected;
-	}
-
 	// ─── WebSocket lifecycle ───
 
 	private startWs(): void {
 		if (this.closed) return;
 
-		const ws = new WebSocket(this.url, {
-			maxPayload: 25 * 1024 * 1024,
-		});
+		const ws = this.wsFactory(this.url);
 		this.ws = ws;
 
 		ws.on('open', () => {
@@ -410,7 +533,7 @@ export class OpenclawAdapter implements ClawAdapter {
 
 		// agent 事件 → 流式回复
 		if (evt.event === 'agent') {
-			const agentEvt = evt.payload as unknown as AgentEvent;
+			const agentEvt = evt.payload as unknown as GatewayAgentEvent;
 			if (agentEvt?.runId) {
 				this.handleAgentEvent(agentEvt);
 			}
@@ -455,7 +578,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		}
 	}
 
-	private handleAgentEvent(evt: AgentEvent): void {
+	private handleAgentEvent(evt: GatewayAgentEvent): void {
 		const chat = this.activeChats.get(`run:${evt.runId}`);
 		if (!chat) {
 			// 可能 runId 还没关联，尝试通过 requestId 查找并关联
@@ -477,7 +600,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.processAgentStreamEvent(chat, evt);
 	}
 
-	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
+	private processAgentStreamEvent(chat: PendingChat, evt: GatewayAgentEvent): void {
 		// aichatoverview#161: item 流曾用于终结动作分类（send/skip），随工具退役已无消费者
 		// （onTerminalTool 自 REQ-010 S1 起未桥接；回复改走 CLI 由 node CapabilityEndpoint 记账）。
 		// assistant 流 → thinking delta (REQ-004)
@@ -485,7 +608,7 @@ export class OpenclawAdapter implements ClawAdapter {
 			const delta = evt.data.delta as string | undefined;
 			if (delta) {
 				chat.fullContent += delta;
-				chat.callbacks.onThinkingDelta(delta);
+				chat.sink.push({ type: 'thinking', text: delta });
 			}
 		}
 		// lifecycle 流 → thinking end (REQ-004)
@@ -494,7 +617,8 @@ export class OpenclawAdapter implements ClawAdapter {
 			if (phase === 'end') {
 				chat.done = true;
 				const durationMs = Date.now() - chat.startTime;
-				chat.callbacks.onThinkingEnd(durationMs);
+				chat.sink.push({ type: 'done', durationMs });
+				chat.sink.finish();
 				// P1-2 假设：openclaw 在 lifecycle phase==='end' 之前已投递本 run 内所有 tool 流
 				// 事件（end 语义即"run 已完成"，按协议先于它的 tool result 都应已处理）。此处同步
 				// cleanup 会丢弃 run:{runId}，若有 tool result 在 end 之后到达将找不到 chat 被丢弃
@@ -503,7 +627,8 @@ export class OpenclawAdapter implements ClawAdapter {
 				this.cleanupChatByRunId(evt.runId);
 			} else if (phase === 'error') {
 				chat.done = true;
-				chat.callbacks.onError(new Error(evt.data.error as string || 'agent run failed'));
+				chat.sink.push({ type: 'error', message: (evt.data.error as string) || 'agent run failed' });
+				chat.sink.finish();
 				this.cleanupChatByRunId(evt.runId);
 			}
 		}
@@ -740,10 +865,94 @@ export class OpenclawAdapter implements ClawAdapter {
 		for (const [, chat] of this.activeChats) {
 			if (!chat.done) {
 				chat.done = true;
-				chat.callbacks.onError(err);
+				chat.sink.push({ type: 'error', message: err.message });
+				chat.sink.finish();
 			}
 		}
 		this.activeChats.clear();
 		this.requestToRunId.clear();
+	}
+}
+
+/**
+ * One in-flight agent turn over the OpenclawDriver's gateway engine (single-flight for this slice).
+ * send() returns an async iterable backed by a minimal push→pull queue so events fired by the
+ * engine (possibly synchronously, before the consumer awaits) are buffered and never lost.
+ */
+class OpenclawSession implements AgentSession {
+	private closed = false;
+	/**
+	 * REQ-008 #75 P1-1①: the in-flight stream's `finish` closure, registered when
+	 * send() starts. close() calls it to wake a consumer parked on the await inside
+	 * the async iterator (single-flight per session for this slice). Calling finish
+	 * twice is a no-op (it guards on `done`), so this stays idempotent; after a send
+	 * completes a stale closeActive pointing at an already-finished stream is harmless.
+	 */
+	private closeActive: (() => void) | null = null;
+
+	/**
+	 * `startChat` begins a turn on the shared gateway engine, delivering its AgentEvents into the
+	 * sink send() hands it. The driver builds this closure in openSession (capturing the compound
+	 * sessionKey) so the gateway engine stays encapsulated on the driver.
+	 */
+	constructor(private readonly startChat: (message: string, sink: ChatSink) => void) {}
+
+	send(message: string): AsyncIterable<AgentEvent> {
+		const buffer: AgentEvent[] = [];
+		let done = false;
+		let resolveNext: (() => void) | null = null;
+
+		const wake = () => {
+			if (resolveNext) {
+				const r = resolveNext;
+				resolveNext = null;
+				r();
+			}
+		};
+		const push = (ev: AgentEvent) => {
+			if (done) return;
+			buffer.push(ev);
+			wake();
+		};
+		const finish = () => {
+			if (done) return;
+			done = true;
+			wake();
+		};
+		// Register this stream's finish so close() can wake a parked iterator.
+		this.closeActive = finish;
+
+		// Fire the turn on the gateway engine. The engine maps the streamed gateway reply into
+		// AgentEvents on this sink: assistant deltas → `thinking`; lifecycle phase:end → `done`
+		// (then finish); phase:error / any engine-side failure → `error` (then finish).
+		// REQ-010 S1 / aichatoverview#161: no terminal AgentEvent — the openclaw agent sends its
+		// reply out-of-band by running `aichat send-message` (accounted at the node's
+		// CapabilityEndpoint), so there is no in-stream terminal tool to bridge.
+		this.startChat(message, { push, finish });
+
+		const isClosed = () => this.closed;
+
+		return {
+			async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+				while (true) {
+					while (buffer.length > 0) {
+						yield buffer.shift()!;
+					}
+					if (done || isClosed()) return;
+					await new Promise<void>((resolve) => {
+						resolveNext = resolve;
+					});
+				}
+			},
+		};
+	}
+
+	async close(): Promise<void> {
+		this.closed = true;
+		// REQ-008 #75 P1-1①: wake a consumer parked on the await inside the iterator.
+		// finish() marks done + wakes the pending resolveNext; the iterator then drains
+		// any remaining buffer (drain-before-done ordering preserved) and returns.
+		// Idempotent: finish guards on `done`, so a repeat / post-completion call is a no-op.
+		if (this.closeActive) this.closeActive();
 	}
 }
