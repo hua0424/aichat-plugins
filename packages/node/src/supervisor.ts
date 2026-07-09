@@ -4,7 +4,7 @@ import type { AgentDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
-import { retryAsync } from './util/retry.js';
+import { retryAsync, expoBackoffMs, defaultDelay } from './util/retry.js';
 import { errMsg } from './util/err.js';
 
 /**
@@ -45,11 +45,8 @@ export interface SupervisorDeps {
 	isTransientConnectError?: (err: unknown) => boolean;
 }
 
-/** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s。 */
-const defaultConnectBackoffMs = (attempt: number): number => Math.min(1000 * 2 ** (attempt - 1), 8000);
-
-/** 生产缺省 sleep。 */
-const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+/** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s（曲线单源自 util/retry）。 */
+const defaultConnectBackoffMs = (attempt: number): number => expoBackoffMs(attempt, 8000);
 
 /**
  * REQ-008 #79：判断 driver.connect() 失败是否为**瞬态**（可重试）。

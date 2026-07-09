@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import { readJsonBody } from '../util/http-body.js';
 import { unlinkSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
@@ -164,22 +165,13 @@ export class CapabilityEndpoint {
 		}
 		this.socketPath = socketPath;
 		this.server = createServer((req, res) => {
-			const chunks: Buffer[] = [];
-			req.on('data', (c: Buffer) => chunks.push(c));
-			req.on('end', () => {
-				void (async () => {
-					let body: unknown;
-					try {
-						body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf-8')) : {};
-					} catch {
-						body = undefined;
-					}
-					const remoteAddress = req.socket.remoteAddress;
-					const out = await this.handle({ body, remoteAddress });
-					res.writeHead(out.status, { 'Content-Type': 'application/json' });
-					res.end(JSON.stringify(out.json));
-				})();
-			});
+			void (async () => {
+				const body = await readJsonBody(req);
+				const remoteAddress = req.socket.remoteAddress;
+				const out = await this.handle({ body, remoteAddress });
+				res.writeHead(out.status, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(out.json));
+			})();
 		});
 
 		await new Promise<void>((resolve, reject) => {

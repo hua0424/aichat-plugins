@@ -25,8 +25,12 @@ export interface RetryOptions {
 	delay?: (ms: number) => Promise<void>;
 }
 
-const defaultBackoffMs = (attempt: number): number => Math.min(1000 * 2 ** (attempt - 1), 30000);
-const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+/** Exponential backoff: attempt 1 → 1s, 2 → 2s, 4 → 4s … capped at `capMs`. Single-sourced curve. */
+export const expoBackoffMs = (attempt: number, capMs: number): number => Math.min(1000 * 2 ** (attempt - 1), capMs);
+/** Production sleep (test-injectable everywhere via an opts.delay override). */
+export const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+
+const defaultBackoffMs = (attempt: number): number => expoBackoffMs(attempt, 30000);
 
 export async function retryAsync(fn: () => Promise<void>, opts: RetryOptions): Promise<void> {
 	const { label } = opts;
