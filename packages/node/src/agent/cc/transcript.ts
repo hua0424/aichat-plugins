@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AICHAT_HOME } from '../../config.js';
 
@@ -43,17 +43,41 @@ export interface CcTranscriptWriter {
 export const DEFAULT_CC_TRANSCRIPTS_DIR = join(AICHAT_HOME, 'cc', 'transcripts');
 
 /**
- * File-backed CcTranscriptWriter: one append-only `<binding>.jsonl` per room. Each `append` mkdir -p's
- * the dir and appends a single JSON line. Write failures degrade to a no-op (a transcript hiccup must
- * never crash a turn) rather than throwing.
+ * File-backed CcTranscriptWriter: one append-only `<binding>.jsonl` per room.
+ *
+ * aichatoverview#166: the transcript is written on EVERY streamed CC event (3+/turn), so the writes are
+ * moved OFF the shared event loop — mkdir once (memoized), and each `append` chains an async `appendFile`
+ * PER KEY (a per-file promise chain preserves line order without a sync write). Write failures degrade to
+ * a no-op (a transcript hiccup must never crash a turn) rather than throwing.
  */
 export class FileCcTranscriptWriter implements CcTranscriptWriter {
+	private dirEnsured = false;
+	/** Per-key append chain: serializes appends to the SAME file so line order is preserved. */
+	private readonly chains = new Map<string, Promise<void>>();
+
 	constructor(private readonly dir: string = DEFAULT_CC_TRANSCRIPTS_DIR) {}
 
 	append(key: string, record: CcTranscriptRecord): void {
+		const line = `${JSON.stringify(record)}\n`;
+		const prev = this.chains.get(key) ?? Promise.resolve();
+		this.chains.set(
+			key,
+			prev.then(() => this.flush(key, line)).catch(() => {}),
+		);
+	}
+
+	/** Resolve when all queued appends across every key have drained (tests / graceful shutdown). */
+	whenWritten(): Promise<void> {
+		return Promise.all(this.chains.values()).then(() => {});
+	}
+
+	private async flush(key: string, line: string): Promise<void> {
 		try {
-			mkdirSync(this.dir, { recursive: true });
-			appendFileSync(join(this.dir, `${key}.jsonl`), `${JSON.stringify(record)}\n`, 'utf-8');
+			if (!this.dirEnsured) {
+				await mkdir(this.dir, { recursive: true });
+				this.dirEnsured = true;
+			}
+			await appendFile(join(this.dir, `${key}.jsonl`), line, 'utf-8');
 		} catch {
 			/* best-effort: a transcript write failure must never break the turn */
 		}

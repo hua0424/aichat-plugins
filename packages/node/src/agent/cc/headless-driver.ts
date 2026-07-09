@@ -131,6 +131,13 @@ export class CcHeadlessDriver implements AgentDriver {
 	/** Active sessions, so node teardown (disconnect) reaps every spawned child's process group. */
 	private readonly active = new Set<CcHeadlessSession>();
 
+	/**
+	 * aichatoverview#166: settings.json content is `brokerPort`-only (a process constant), yet it was
+	 * re-written every turn. Memoize workspaceDir → its settings path so each dir is written ONCE per
+	 * process (later turns in that dir reuse the path, no disk write).
+	 */
+	private readonly settingsPathByDir = new Map<string, string>();
+
 	constructor(deps: CcHeadlessDriverDeps) {
 		this.claudeBin = deps.claudeBin ?? 'claude';
 		this.workspaceBase = deps.workspaceBase;
@@ -185,7 +192,12 @@ export class CcHeadlessDriver implements AgentDriver {
 		const ctx = o.chatContext;
 		const workspaceDir = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workspaceDir, { recursive: true });
-		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
+		// #166: write settings.json once per workspaceDir (content is the process-constant brokerPort).
+		let settingsPath = this.settingsPathByDir.get(workspaceDir);
+		if (settingsPath === undefined) {
+			settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
+			this.settingsPathByDir.set(workspaceDir, settingsPath);
+		}
 
 		// #132: the display name of THIS aiclaw, resolved LAZILY via chatContext.getSelfName (cc-only — no
 		// other driver calls it, so no needless member-info fetch). Optional — an unresolved name still

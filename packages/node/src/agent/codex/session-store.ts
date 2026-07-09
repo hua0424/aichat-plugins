@@ -57,4 +57,9 @@ export class FileCodexSessionStore implements CodexSessionStore {
 	findKeyByThreadId(threadId: string): string | undefined {
 		return this.store.findKey((v) => v.threadId === threadId);
 	}
+
+	/** aichatoverview#166: await the async persist chain (tests / graceful shutdown). */
+	whenPersisted(): Promise<void> {
+		return this.store.whenPersisted();
+	}
 }

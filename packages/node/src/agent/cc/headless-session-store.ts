@@ -51,4 +51,9 @@ export class FileCcHeadlessSessionStore implements CcHeadlessSessionStore {
 	delete(key: string): void {
 		this.store.delete(key);
 	}
+
+	/** aichatoverview#166: await the async persist chain (tests / graceful shutdown). */
+	whenPersisted(): Promise<void> {
+		return this.store.whenPersisted();
+	}
 }

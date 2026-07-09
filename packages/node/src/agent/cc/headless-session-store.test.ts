@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FileCcHeadlessSessionStore } from './headless-session-store.js';
@@ -29,9 +29,11 @@ describe('FileCcHeadlessSessionStore', () => {
 		expect(store.get('aiclaw-5-room-999')).toBeUndefined();
 	});
 
-	it('persists to disk and reloads across instances', () => {
+	it('persists to disk and reloads across instances', async () => {
 		const path = freshPath();
-		new FileCcHeadlessSessionStore(path).set('aiclaw-1-room-2', { sessionId: 'sid-1' });
+		const store = new FileCcHeadlessSessionStore(path);
+		store.set('aiclaw-1-room-2', { sessionId: 'sid-1' });
+		await store.whenPersisted(); // #166: persist is async now
 		expect(existsSync(path)).toBe(true);
 		const reopened = new FileCcHeadlessSessionStore(path);
 		expect(reopened.get('aiclaw-1-room-2')?.sessionId).toBe('sid-1');
@@ -54,13 +56,25 @@ describe('FileCcHeadlessSessionStore', () => {
 		expect(store.get('aiclaw-1-room-1')?.sessionId).toBe('sid-x');
 	});
 
-	it('set overwrites an existing sessionId (rebind on a fresh turn)', () => {
+	it('set overwrites an existing sessionId (rebind on a fresh turn)', async () => {
 		const path = freshPath();
 		const store = new FileCcHeadlessSessionStore(path);
 		store.set('aiclaw-1-room-1', { sessionId: 'sid-old' });
 		store.set('aiclaw-1-room-1', { sessionId: 'sid-new' });
 		expect(store.get('aiclaw-1-room-1')?.sessionId).toBe('sid-new');
+		await store.whenPersisted(); // #166: persist is async now
 		// on-disk reflects the new id
 		expect(JSON.parse(readFileSync(path, 'utf-8'))['aiclaw-1-room-1'].sessionId).toBe('sid-new');
+	});
+
+	it('#166: setting the SAME sessionId is a skip-if-unchanged no-op (no rewrite)', async () => {
+		const path = freshPath();
+		const store = new FileCcHeadlessSessionStore(path);
+		store.set('aiclaw-1-room-1', { sessionId: 'sid-x' });
+		await store.whenPersisted();
+		const mtime1 = statSync(path).mtimeMs;
+		store.set('aiclaw-1-room-1', { sessionId: 'sid-x' }); // unchanged → no write queued
+		await store.whenPersisted();
+		expect(statSync(path).mtimeMs).toBe(mtime1); // file untouched
 	});
 });

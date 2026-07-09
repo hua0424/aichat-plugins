@@ -218,6 +218,11 @@ interface PendingChat {
 	sink: ChatSink;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
+	/**
+	 * aichatoverview#166: 放弃-run 兜底定时。gateway 若永不投递本 run 的 lifecycle end/error（agent 崩/
+	 * 掉 run），三 map 条目会活到连接断开（长稳单调泄漏）。到点终结 sink + cleanup。正常终结时清定时。
+	 */
+	timeout?: ReturnType<typeof setTimeout>;
 }
 
 /** Factory for the underlying gateway WebSocket. Injectable so tests can drive scripted frames
@@ -226,6 +231,9 @@ export type OpenclawSocketFactory = (url: string) => WebSocket;
 
 const defaultOpenclawSocketFactory: OpenclawSocketFactory = (url) =>
 	new WebSocket(url, { maxPayload: 25 * 1024 * 1024 });
+
+/** aichatoverview#166: abandoned-run backstop, aligned with the handler's 5-min thinking-session cap. */
+const OPENCLAW_CHAT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * OpenclawDriver — the openclaw AgentDriver (aichatoverview#162).
@@ -422,13 +430,13 @@ export class OpenclawDriver implements AgentDriver {
 			timeout: null,
 		});
 
-		// 预注册 chat state
+		// 预注册 chat state + 放弃-run 兜底定时（gateway 永不终结本 run 时到点回收三 map，防长稳泄漏）。
+		// .unref()：兜底定时不应单独把进程钉活（正常终结会清它）。
 		this.requestToRunId.set(requestId, '');
-		this.activeChats.set(`req:${requestId}`, {
-			sink,
-			done: false,
-			startTime: Date.now(),
-		});
+		const chat: PendingChat = { sink, done: false, startTime: Date.now() };
+		chat.timeout = setTimeout(() => this.expireChat(requestId), OPENCLAW_CHAT_TIMEOUT_MS);
+		chat.timeout.unref?.();
+		this.activeChats.set(`req:${requestId}`, chat);
 
 		this.ws.send(JSON.stringify(frame));
 	}
@@ -781,7 +789,29 @@ export class OpenclawDriver implements AgentDriver {
 		return undefined;
 	}
 
+	/**
+	 * aichatoverview#166: the abandoned-run backstop fired — the gateway never sent this run's terminal.
+	 * Finish the sink with an error (wake any parked consumer) if still open, then reclaim the three maps.
+	 *
+	 * Window-race safety (#74 review P2): a normal terminal that lands in the SAME tick the timer fires
+	 * clears it via cleanupChatByRunId, so expireChat only runs when the run is genuinely abandoned. If a
+	 * late terminal still races in, `findChatByRequestId` may return undefined (already cleaned) → the sink
+	 * block is skipped; `chat.done` guards a double-finish; and cleanupChat is idempotent (delete-if-present
+	 * on all three maps). So expireChat is safe to run even against a partially/fully cleaned chat.
+	 */
+	private expireChat(requestId: string): void {
+		const chat = this.findChatByRequestId(requestId);
+		if (chat && !chat.done) {
+			chat.done = true;
+			chat.sink.push({ type: 'error', message: 'openclaw_chat_timeout' });
+			chat.sink.finish();
+		}
+		this.cleanupChat(requestId);
+	}
+
 	private cleanupChat(requestId: string): void {
+		const chat = this.findChatByRequestId(requestId);
+		if (chat?.timeout) clearTimeout(chat.timeout);
 		this.activeChats.delete(`req:${requestId}`);
 		const runId = this.requestToRunId.get(requestId);
 		if (runId) {
@@ -792,9 +822,15 @@ export class OpenclawDriver implements AgentDriver {
 	}
 
 	private cleanupChatByRunId(runId: string): void {
+		// aichatoverview#166: clear the abandoned-run backstop on normal termination (req:/run: point to the
+		// SAME PendingChat, so either key clears the one timer).
+		const chat = this.activeChats.get(`run:${runId}`);
+		if (chat?.timeout) clearTimeout(chat.timeout);
 		this.activeChats.delete(`run:${runId}`);
 		for (const [reqId, rId] of this.requestToRunId) {
 			if (rId === runId) {
+				const reqChat = this.activeChats.get(`req:${reqId}`);
+				if (reqChat?.timeout) clearTimeout(reqChat.timeout);
 				this.activeChats.delete(`req:${reqId}`);
 				this.requestToRunId.delete(reqId);
 				this.pending.delete(reqId);

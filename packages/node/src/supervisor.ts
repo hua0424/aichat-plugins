@@ -111,23 +111,33 @@ export class Supervisor {
 	}
 
 	/**
-	 * 顺序拉起每一项（确定性、便于测试）。任一项抛错 → 该身份记为降级并跳过，其余继续。
+	 * 并行拉起每一项。任一项抛错 → 该身份记为降级并跳过，其余继续。
+	 *
+	 * 容器冷启时各身份 connect 常需等 openclaw gateway ready（代码注释亦记为常态），串行 `for…await`
+	 * 会把单身份最坏 ~15s×N 叠加到分钟级 → 改 `Promise.allSettled` 并发。**确定性保留**：预分配定长
+	 * 槽位、每项只写自己下标（无共享可变态竞争），全部 settle 后按 entries 顺序过滤空位一次性赋值
+	 * supervised —— `agents` 顺序仍 = entries 顺序（便于测试）。onConnected/onDisconnected 在各 driver
+	 * connect 完成（start 返回、supervised 已就绪）之后才由 HuLa ws 触发，故无「startup 窗口内标记丢失」。
 	 */
 	async start(entries: AgentEntry[]): Promise<void> {
-		for (const entry of entries) {
-			try {
-				await this.startAgent(entry);
-			} catch (err) {
-				const reason = errMsg(err);
-				console.error(`[supervisor] agent (tool=${entry.tool}) failed to start, skipped: ${reason}`);
-			}
-		}
+		const slots: Array<SupervisedAgent | null> = entries.map(() => null);
+		await Promise.allSettled(
+			entries.map(async (entry, i) => {
+				try {
+					slots[i] = await this.buildAgent(entry);
+				} catch (err) {
+					console.error(`[supervisor] agent (tool=${entry.tool}) failed to start, skipped: ${errMsg(err)}`);
+				}
+			}),
+		);
+		this.supervised = slots.filter((s): s is SupervisedAgent => s !== null);
 	}
 
 	/**
-	 * 拉起单条身份链路。任一步抛错向上冒泡给 start 隔离处理（本身份不进入 supervised online 列表）。
+	 * 构建单条身份链路并返回 SupervisedAgent（不再自行 push——由 start 放进保序槽位）。任一步抛错向上
+	 * 冒泡给 start 隔离处理（本身份不进入 supervised online 列表）。
 	 */
-	private async startAgent(entry: AgentEntry): Promise<void> {
+	private async buildAgent(entry: AgentEntry): Promise<SupervisedAgent> {
 		// resolveCredential 的失败（如「已激活」不可恢复）**不是瞬态**，绝不重试 → 直接冒泡降级。
 		const cred = await this.deps.resolveCredential(entry);
 		const driver = await this.connectWithRetry(entry);
@@ -171,8 +181,9 @@ export class Supervisor {
 
 		ws.connect();
 
-		this.supervised.push({ entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler, api });
+		const agent: SupervisedAgent = { entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler, api };
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);
+		return agent;
 	}
 
 	/**

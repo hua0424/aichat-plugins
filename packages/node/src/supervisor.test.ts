@@ -122,6 +122,25 @@ describe('Supervisor.start', () => {
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 
+	it('#166: starts in PARALLEL yet preserves entries order (pre-sized slots, deterministic)', async () => {
+		const completion: number[] = [];
+		const { deps } = makeDeps({
+			resolveCredential: vi.fn(async (entry: AgentEntry): Promise<AichatCredentials> => {
+				const uid = Number(entry.token.replace(/\D/g, '')) || 1;
+				// reverse delay: uid 3 finishes first, uid 1 last → completion order != entries order.
+				// serial `for…await` would force completion order [1,2,3]; getting [3,2,1] proves concurrency.
+				await new Promise((r) => setTimeout(r, (4 - uid) * 15));
+				completion.push(uid);
+				return { uid, connectionToken: `conn-${uid}`, machineCode: `mc-${uid}`, activatedAt: 'now' };
+			}),
+		});
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		expect(completion).toEqual([3, 2, 1]); // concurrent: finished in reverse-delay order
+		expect(sup.agents.map((a) => a.uid)).toEqual([1, 2, 3]); // slots preserve entries order (NOT completion order)
+	});
+
 	it('ISOLATION: the 2nd entry failing does not block the other two', async () => {
 		const { deps } = makeDeps({
 			resolveCredential: vi.fn(async (entry: AgentEntry): Promise<AichatCredentials> => {
