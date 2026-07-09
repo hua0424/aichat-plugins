@@ -55,6 +55,25 @@ describe('BindTokenStore.resolve — rejects unknown / garbage / forged', () => 
 	});
 });
 
+describe('BindTokenStore — case-insensitive (openclaw lowercases the sessionKey)', () => {
+	it('a case-mangled token still resolves to its exact (uid,room) — openclaw may lowercase what it echoes back', () => {
+		// DEFAULT generator (mixed-case-capable source) → mint normalizes to lowercase.
+		const store = new InMemoryBindTokenStore();
+		const token = store.mint('7', '42');
+		const bound = { aiclawUid: '7', roomId: '42' };
+		// openclaw returns the token upper-cased (a stand-in for its lowercasing/case-mangling):
+		expect(store.resolve(token.toUpperCase())).toEqual(bound);
+		// …and the as-minted (already-lowercase) token resolves too:
+		expect(store.resolve(token)).toEqual(bound);
+	});
+
+	it('the DEFAULT generator yields a lowercase-only token (hex, no-op under openclaw lowercasing)', () => {
+		const token = new InMemoryBindTokenStore().mint('1', '2');
+		expect(token).toMatch(/^[0-9a-f]+$/);
+		expect(token).toBe(token.toLowerCase());
+	});
+});
+
 describe('FileBindTokenStore — persistence + reload', () => {
 	it('persists mints; a fresh instance on the same path reloads (token still resolves, mint still stable)', () => {
 		const path = freshFile();
