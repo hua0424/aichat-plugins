@@ -16,7 +16,7 @@ import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
 export default function register(api: OpenClawPluginApi) {
 	api.logger.info('aichat-claw loading');
 
-	// 注册 HuLa Channel（自带骨架 outbound；实际回复走 CLI，不经此路径）
+	// 注册 HuLa Channel（无 outbound 适配器；回复走 aichat CLI，ADR-0004）
 	api.registerChannel({ plugin: hulaChannel });
 
 	// REQ-010 S6 Phase-2 / #141 B+: openclaw agent CAN run shell（exec 工具），故统一走
