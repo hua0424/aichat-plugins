@@ -3,13 +3,14 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { reduceThinking } from '../agent/thinking-map.js';
-import { filterOpenclawThinking } from '../agent/openclaw/openclaw-driver.js';
+import { bindingKey } from '../agent/bind-token-store.js';
 import { MessageDebouncer } from '../util/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { buildAgentInjection } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -147,6 +148,15 @@ interface RoomChannel {
 const ACCUMULATED_MESSAGES_CAP = 50;
 
 /**
+ * M4: server 限流拒绝（error code）→ autoReply 文案。单源，rate/daily 两条广播路径共用。
+ * error code 不在此表 = 非限流错误（no autoReply）。
+ */
+const LIMIT_REASONS: Record<string, string> = {
+	rate_limit_exceeded: '发言频率限制，已自动跳过本次响应',
+	daily_limit_exceeded: '今日发言上限已达，已自动跳过本次响应',
+};
+
+/**
  * 消息处理器（REQ-004 Agent Loop 模型）
  * 接收用户消息 → ACK → 去重 → 触发 agent loop → THINKING 流式输出
  */
@@ -227,6 +237,33 @@ export class MessageHandler {
 	}
 
 	/**
+	 * 单点发送 THINKING_END：thinkingId 兜底 + 帧安全截断（capUtf8Bytes 256KB，server 仍是唯一截断权威）。
+	 * 三条 finalize 路径（timeout/complete/error）共用，帧结构一处维护。error 缺省时不带该字段。
+	 */
+	private sendThinkingEnd(
+		session: ThinkingSession,
+		frame: { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string },
+	): void {
+		this.ws.send(WSReqType.THINKING_END, {
+			thinkingId: session.thinkingId || undefined,
+			durationMs: frame.durationMs,
+			status: frame.status,
+			...(frame.error !== undefined ? { error: frame.error } : {}),
+			content: capUtf8Bytes(frame.content),
+		});
+	}
+
+	/**
+	 * 会话收尾（所有终结路径共用）：可选 best-effort 关闭 driver session（唤醒仍 park 的 for-await）、
+	 * 从 thinkingSessions 删除、flush 待发消息。clean-complete/error 路径不关（迭代器已自然结束）→ closeDriver=false。
+	 */
+	private teardownSession(session: ThinkingSession, roomId: string, closeDriver: boolean): void {
+		if (closeDriver) void session.agentSession?.close();
+		this.thinkingSessions.delete(session.sessionKey);
+		this.flushPendingMessages(roomId);
+	}
+
+	/**
 	 * REQ-146 (#146): resolve a SHORT-lived signed download URL for a media message so the agent can
 	 * access the file (server stopped emitting the old 7-day body.url). Returns the signed url on success;
 	 * on no apiClient / signDownload failure returns undefined, letting buildAgentInjection fall back to
@@ -247,7 +284,7 @@ export class MessageHandler {
 			return url;
 		} catch (err) {
 			console.warn(
-				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${err instanceof Error ? err.message : String(err)}`,
+				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${errMsg(err)}`,
 			);
 			return undefined;
 		}
@@ -286,7 +323,7 @@ export class MessageHandler {
 				// so handleReceiveMessage is async. ACK/dedup run in its synchronous prefix (before any await),
 				// so they still fire promptly; we don't await here (fire-and-forget, mirroring prior behavior).
 				this.handleReceiveMessage(msg.data as ReceivedMessage).catch((err) => {
-					console.error('[handler] handleReceiveMessage error:', err instanceof Error ? err.message : String(err));
+					console.error('[handler] handleReceiveMessage error:', errMsg(err));
 				});
 				break;
 			case 'thinkingStart':
@@ -381,21 +418,12 @@ export class MessageHandler {
 		//   注意：此判定必须在「thinking 活跃入队」(step 6) 之前——否则未点名消息会被错误地排入 pendingMessages 并在本轮思考结束后误触发。
 		const roomType = data.message.roomType;
 		const isPrivate = roomType === 2;
-		let triggerEligible: boolean;
-		if (isPrivate) {
-			triggerEligible = true;
-		} else {
-			// 群聊：默认需点名（与 server 新默认 1 对齐：配置未缓存时按需点名处理）
-			const mentionRequired = this.groupConfigCache.get(this.selfUid, roomId)?.mentionRequired ?? true;
-			if (!mentionRequired) {
-				triggerEligible = true;
-			} else {
-				const atUidList = data.message.body?.atUidList ?? [];
-				// 仅显式 @ 机器人（atUidList 含 selfUid）才算点名；0=@所有人 不算点名（裁决）。
-				const isMentioned = atUidList.map(String).includes(String(this.selfUid));
-				triggerEligible = isMentioned;
-			}
-		}
+		// 私聊始终触发；群聊：mentionRequired（缺省 true，与 server 新默认对齐）关闭时全触发，开启时仅显式
+		// @ 机器人（atUidList 含 selfUid）才算点名——0=@所有人 不算点名（裁决）。短路求值：私聊不读群配置/atUid。
+		const triggerEligible =
+			isPrivate ||
+			!(this.groupConfigCache.get(this.selfUid, roomId)?.mentionRequired ?? true) ||
+			(data.message.body?.atUidList ?? []).map(String).includes(String(this.selfUid));
 
 		if (!triggerEligible) {
 			// 惰性积累：标注发言者，FIFO 上限 50。@所有人 落在此处（不触发但仍积累）。
@@ -431,7 +459,7 @@ export class MessageHandler {
 			channel.batchSawHuman = true;
 		}
 
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 
 		// 6. thinking 活跃 **或** 处于退避窗口时入队——退避窗口内不另起触发、不丢消息，
 		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
@@ -464,7 +492,7 @@ export class MessageHandler {
 		}
 
 		const { msgId, roomType, fromUid, isOwner } = channel.lastCtx;
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 
 		// 【S8-7 issue #22】防循环守卫：在汇聚点按本轮 BATCH 评估，先于创建 thinking / 发 THINKING_START。
 		//   - skipGuard=true（退避 reschedule 落地）跳过：本轮已评估过，不重复评估。
@@ -559,18 +587,14 @@ export class MessageHandler {
 			if (session.finalized) return;
 			session.finalized = true;
 			console.error(`[thinking] timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
+			this.sendThinkingEnd(session, {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: 'thinking_session_timeout',
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(session.accumulatedContent),
+				content: session.accumulatedContent,
 			});
 			// REQ-008 #75: best-effort 收尾 driver session，让卡住的迭代器能终止。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			this.teardownSession(session, roomId, true);
 		}, this.THINKING_SESSION_TIMEOUT_MS);
 
 		this.thinkingSessions.set(sessionKey, session);
@@ -592,10 +616,6 @@ export class MessageHandler {
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
 		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
-		// #132: cc-only — resolve this aiclaw's own display name (cached) and thread it in via chatContext so
-		// the cc system-prompt can anchor its identity (model must know it IS <name> to recognise @<name> in a
-		// group as itself). Other drivers don't use it → skip the fetch to avoid a needless member-info call.
-		const selfName = this.driver.type === 'cc' ? await this.resolveSelfName() : undefined;
 		const agentSession = await this.driver.openSession({
 			aiclawUid: this.selfUid,
 			roomId,
@@ -606,7 +626,9 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
-				...(selfName !== undefined ? { selfName } : {}),
+				// #132: LAZY self-name resolver (cached). cc's system-prompt anchors identity on it; other
+				// drivers never call it -> no needless member-info fetch, and the handler needs no per-driver branch.
+				getSelfName: () => this.resolveSelfName(),
 			},
 		});
 		session.agentSession = agentSession;
@@ -618,19 +640,12 @@ export class MessageHandler {
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
-			// openclaw-only: 过滤 openclaw 自有的 NO_REPLY 哨兵（整段匹配）及空/纯空白思考正文，其它 driver 逐字节不变。
-			const rawContent =
-				this.driver.type === 'openclaw' ? filterOpenclawThinking(outcome.content) : outcome.content;
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
-				durationMs: outcome.durationMs,
-				status: 'complete',
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(rawContent),
-			});
+			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
+			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
+			this.sendThinkingEnd(session, { durationMs: outcome.durationMs, status: 'complete', content: rawContent });
 			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}`);
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			// clean-complete：迭代器已自然结束，不再 close（closeDriver=false）。
+			this.teardownSession(session, roomId, false);
 		};
 
 		// error 事件：与既有 onError 一致的 finalize-error 路径。
@@ -639,16 +654,13 @@ export class MessageHandler {
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			console.error(`[thinking] error session=${sessionKey} reason=${message}`);
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
+			this.sendThinkingEnd(session, {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: message,
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(session.accumulatedContent),
+				content: session.accumulatedContent,
 			});
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			this.teardownSession(session, roomId, false);
 		};
 
 		try {
@@ -674,7 +686,7 @@ export class MessageHandler {
 				// reduceThinking's accounting at done.
 			}
 		} catch (err) {
-			finalizeError(err instanceof Error ? err.message : String(err));
+			finalizeError(errMsg(err));
 		} finally {
 			// REQ-008 #75 P2: 无论 done / error / break / throw，总在退出消费循环时收尾 driver session。
 			// 与 Fix 1 配合：close() 唤醒仍 park 在 adapter 上的 for-await。幂等，安全多调。
@@ -690,7 +702,7 @@ export class MessageHandler {
 		if (String(fromUid) !== this.selfUid) return;
 
 		// REQ-029 (#29): String(roomId) (drop Number()) — inbound roomId may be a >2^53 numeric string.
-		const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
+		const sessionKey = bindingKey(this.selfUid, String(roomId));
 		const session = this.thinkingSessions.get(sessionKey);
 		if (!session) {
 			console.warn(`[thinking] received thinkingStart broadcast but no active session for ${sessionKey}`);
@@ -755,19 +767,15 @@ export class MessageHandler {
 			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 session
 			if (status === 'error' && (error === 'rate_limit_exceeded' || error === 'daily_limit_exceeded')) {
 				if (String(data.fromUid) === String(this.selfUid)) {
-					const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
+					const sessionKey = bindingKey(this.selfUid, String(roomId));
 					const session = this.thinkingSessions.get(sessionKey);
 					if (session) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
-						const reason = error === 'rate_limit_exceeded'
-							? '发言频率限制，已自动跳过本次响应'
-							: '今日发言上限已达，已自动跳过本次响应';
+						const reason = LIMIT_REASONS[error];
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(String(roomId), reason);
 						// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-						void session.agentSession?.close();
-						this.thinkingSessions.delete(sessionKey);
-						this.flushPendingMessages(String(roomId));
+						this.teardownSession(session, String(roomId), true);
 					}
 				}
 			}
@@ -788,33 +796,24 @@ export class MessageHandler {
 		}
 		if (session?.finalized) {
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(String(roomId));
+			this.teardownSession(session, String(roomId), true);
 			return;
 		}
 
 		if (status === 'error' && error) {
-			switch (error) {
-				case 'rate_limit_exceeded':
-					console.log(`[thinking] server rejected: rate_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(String(roomId), '发言频率限制，已自动跳过本次响应');
-					break;
-				case 'daily_limit_exceeded':
-					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(String(roomId), '今日发言上限已达，已自动跳过本次响应');
-					break;
-				default:
-					console.log(`[thinking] server error: ${error} (no autoReply)`);
+			const reason = LIMIT_REASONS[error];
+			if (reason) {
+				console.log(`[thinking] server rejected: ${error}, sending autoReply roomId=${roomId}`);
+				this.sendAutoReply(String(roomId), reason);
+			} else {
+				console.log(`[thinking] server error: ${error} (no autoReply)`);
 			}
 		}
 
 		if (session) {
 			session.finalized = true;
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(String(roomId));
+			this.teardownSession(session, String(roomId), true);
 		}
 	}
 
@@ -830,7 +829,7 @@ export class MessageHandler {
 				console.log(`[anti-loop] autoReply sent: msgId=${result.msgId} roomId=${roomId}`);
 			})
 			.catch((err) => {
-				console.error('[anti-loop] autoReply failed:', err instanceof Error ? err.message : String(err));
+				console.error('[anti-loop] autoReply failed:', errMsg(err));
 			});
 	}
 
@@ -885,7 +884,7 @@ export class MessageHandler {
 	private maybeEvictRoom(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
 		if (!channel) return;
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (
 			channel.pendingMessages.length === 0 &&
 			channel.debouncer.pending === 0 &&

@@ -4,7 +4,8 @@ import type { AgentDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
-import { retryAsync } from './util/retry.js';
+import { retryAsync, expoBackoffMs, defaultDelay } from './util/retry.js';
+import { errMsg } from './util/err.js';
 
 /**
  * REQ-008 #76 — 监督器依赖注入面。
@@ -44,11 +45,8 @@ export interface SupervisorDeps {
 	isTransientConnectError?: (err: unknown) => boolean;
 }
 
-/** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s。 */
-const defaultConnectBackoffMs = (attempt: number): number => Math.min(1000 * 2 ** (attempt - 1), 8000);
-
-/** 生产缺省 sleep。 */
-const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+/** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s（曲线单源自 util/retry）。 */
+const defaultConnectBackoffMs = (attempt: number): number => expoBackoffMs(attempt, 8000);
 
 /**
  * REQ-008 #79：判断 driver.connect() 失败是否为**瞬态**（可重试）。
@@ -57,7 +55,7 @@ const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTime
  * 「已激活」等不可恢复错误不走 connect 路径（resolveCredential 阶段就抛，不在此重试）。
  */
 function defaultIsTransientConnectError(err: unknown): boolean {
-	const msg = err instanceof Error ? err.message : String(err);
+	const msg = errMsg(err);
 	return /gateway starting|unavailable|econnrefused|timeout|starting|temporarily/i.test(msg);
 }
 
@@ -120,7 +118,7 @@ export class Supervisor {
 			try {
 				await this.startAgent(entry);
 			} catch (err) {
-				const reason = err instanceof Error ? err.message : String(err);
+				const reason = errMsg(err);
 				console.error(`[supervisor] agent (tool=${entry.tool}) failed to start, skipped: ${reason}`);
 			}
 		}
@@ -205,7 +203,7 @@ export class Supervisor {
 				// 清理失败的 driver，避免其内部重连定时器泄漏。
 				await driver.disconnect().catch(() => {});
 				if (isTransient(err) && attempt < maxAttempts) {
-					const reason = err instanceof Error ? err.message : String(err);
+					const reason = errMsg(err);
 					console.error(
 						`[supervisor] agent (tool=${entry.tool}) connect attempt ${attempt}/${maxAttempts} failed (transient): ${reason}; retrying...`,
 					);

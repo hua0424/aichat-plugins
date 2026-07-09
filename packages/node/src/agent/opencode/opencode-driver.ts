@@ -1,10 +1,13 @@
 import { mkdir } from 'node:fs/promises';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from './workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
+import { buildReplyInstruction } from '../reply-contract.js';
+import { bindingKey, parseBindingKey } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /** Parsed `"providerID/modelID"` model override. */
 interface ParsedModel {
@@ -73,11 +76,7 @@ export class OpencodeDriver implements AgentDriver {
 	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyBySessionID(sessionKey);
-		if (!key) return undefined;
-		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
-		if (!m) return undefined;
-		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-		return { aiclawUid: m[1], roomId: m[2] };
+		return key ? parseBindingKey(key) : undefined;
 	}
 
 	/**
@@ -85,7 +84,7 @@ export class OpencodeDriver implements AgentDriver {
 	 * opencode session (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
@@ -105,14 +104,14 @@ export class OpencodeDriver implements AgentDriver {
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		// REQ-008 #77 fix: namespace the workspace by aiclawUid so two identities never collide.
 		const directory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(directory, { recursive: true });
 
-		const key = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const key = bindingKey(o.aiclawUid, o.roomId);
 		const client = this.server.getClient();
 
 		// Lazy create-or-reuse: a persisted binding for the SAME directory is reusable.
@@ -251,20 +250,9 @@ class OpencodeSession implements AgentSession {
 			return false;
 		};
 
-		// REQ-010 S1: prepend a role-instruction so the agent treats its text output as
-		// thinking/analysis (NOT shown to the user) and replies ONLY by running the
-		// `aichat send-message --content "<reply>"` command in bash (per the aichat skill). The
-		// command is bound to THIS chat's room+identity automatically — the agent must NEVER pass
-		// any room/identity (anti-spoofing). If it does not run the command, no reply is sent and
-		// the turn simply ends. Plain string prefix, no [SYSTEM] markers (those get filtered by
-		// gateway security hardening).
-		const enrichedMessage =
-			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
-			'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
-			'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
-			'--- 用户消息如下 ---\n' +
-			message;
+		// REQ-010 S1: prepend the shared role-instruction (agent/reply-contract.ts): text output is thinking,
+		// reply ONLY via `aichat send-message` in bash, room/identity auto-bound, no reply -> run nothing.
+		const enrichedMessage = buildReplyInstruction(message);
 
 		// Drive the SDK: subscribe first (avoid the race), then prompt, then pump events.
 		void (async () => {
@@ -287,7 +275,7 @@ class OpencodeSession implements AgentSession {
 				promptPromise.then(
 					() => {},
 					(err: unknown) => {
-						push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+						push({ type: 'error', message: errMsg(err) });
 						finish();
 						// P2③: prompt rejected (session/server gone) → invalidate for lazy rebuild.
 						this.onSessionError?.();
@@ -314,7 +302,7 @@ class OpencodeSession implements AgentSession {
 					}
 				}
 			} catch (err) {
-				push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+				push({ type: 'error', message: errMsg(err) });
 				// P2③: subscribe (or other setup) threw → invalidate for lazy rebuild on next turn.
 				this.onSessionError?.();
 			} finally {

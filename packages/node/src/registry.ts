@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { AICHAT_HOME, type AichatConfig, type AichatCredentials } from './config.js';
+import { AICHAT_HOME, readJsonc, type AichatConfig, type AichatCredentials } from './config.js';
+import { errMsg } from './util/err.js';
 
 /**
  * REQ-008 #76 — 静态 agent 注册表项。
@@ -99,35 +100,31 @@ export function cacheFilePath(token: string, dir: string): string {
  * 解析为合法 AichatCredentials（含 uid / connectionToken / machineCode）则返回，否则 null。
  */
 function readCachedCredential(path: string): AichatCredentials | null {
-	if (!existsSync(path)) return null;
-	try {
-		const raw = readFileSync(path, 'utf-8');
-		const json = raw.replace(/^\s*\/\/.*$/gm, '');
-		const parsed = JSON.parse(json) as { uid?: unknown; connectionToken?: unknown; machineCode?: unknown; activatedAt?: unknown };
-		// REQ-029 (#29)：uid 一律**不透明字符串**。缓存文件可能是字符串 uid（新写入）或旧版数字 uid
-		// （backward-compat：早期 Number() 收敛落盘）——两者都 String() 归一，绝不 Number() 化
-		// （>2^53 会精度丢失）。校验为非空纯数字串且非 '0'。
-		const uid =
-			typeof parsed.uid === 'number'
-				? String(parsed.uid)
-				: typeof parsed.uid === 'string'
-					? parsed.uid
-					: undefined;
-		if (
-			typeof uid === 'string' &&
-			/^\d+$/.test(uid) &&
-			uid !== '0' &&
-			typeof parsed.connectionToken === 'string' &&
-			parsed.connectionToken !== '' &&
-			typeof parsed.machineCode === 'string' &&
-			parsed.machineCode !== ''
-		) {
-			return { ...parsed, uid } as AichatCredentials;
-		}
-		return null;
-	} catch {
-		return null;
+	const parsed = readJsonc(path) as
+		| { uid?: unknown; connectionToken?: unknown; machineCode?: unknown; activatedAt?: unknown }
+		| undefined;
+	if (!parsed || typeof parsed !== 'object') return null;
+	// REQ-029 (#29)：uid 一律**不透明字符串**。缓存文件可能是字符串 uid（新写入）或旧版数字 uid
+	// （backward-compat：早期 Number() 收敛落盘）——两者都 String() 归一，绝不 Number() 化
+	// （>2^53 会精度丢失）。校验为非空纯数字串且非 '0'。
+	const uid =
+		typeof parsed.uid === 'number'
+			? String(parsed.uid)
+			: typeof parsed.uid === 'string'
+				? parsed.uid
+				: undefined;
+	if (
+		typeof uid === 'string' &&
+		/^\d+$/.test(uid) &&
+		uid !== '0' &&
+		typeof parsed.connectionToken === 'string' &&
+		parsed.connectionToken !== '' &&
+		typeof parsed.machineCode === 'string' &&
+		parsed.machineCode !== ''
+	) {
+		return { ...parsed, uid } as AichatCredentials;
 	}
+	return null;
 }
 
 /**
@@ -167,7 +164,7 @@ export async function resolveAgentCredential(
 		});
 		result = (await resp.json()) as ActivateResponse;
 	} catch (err) {
-		throw new Error(`activate request failed: ${err instanceof Error ? err.message : String(err)}`);
+		throw new Error(`activate request failed: ${errMsg(err)}`);
 	}
 
 	if (!result.success || !result.data) {

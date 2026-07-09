@@ -1,4 +1,5 @@
 import type { HulaApiClient } from '../api/hula-api.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * REQ-010 S1 — capability execution context.
@@ -160,7 +161,7 @@ export function listGroupMembersCapability(): Capability {
 			// node never judges room type; the server is the authority. Pass its structured business
 			// message ("当前不在群聊中" / "未加入该群聊，无法查询成员") through cleanly to the agent
 			// (CLI exit 0 with an `error` field) instead of surfacing it as a hard CLI failure.
-			return { roomId, error: err instanceof Error ? err.message : String(err) };
+			return { roomId, error: errMsg(err) };
 		}
 	};
 }

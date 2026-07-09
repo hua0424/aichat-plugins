@@ -705,7 +705,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		expect(ctx.account).toBe('888888');
 	});
 
-	it('#132: cc driver openSession chatContext carries selfName resolved from apiClient.getMemberInfo (cached)', async () => {
+	it('#132: openSession chatContext carries a LAZY getSelfName that resolves via getMemberInfo, cached across turns', async () => {
 		const { adapter, calls } = fakeAdapter();
 		(adapter as unknown as { type: string }).type = 'cc';
 		const { ws } = fakeWs();
@@ -716,20 +716,25 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
-		// a turn in a DIFFERENT room must NOT re-fetch — the name is resolved once + cached
+		// the handler is now driver-agnostic: it threads a LAZY resolver and does NOT eagerly fetch.
+		expect(getMemberInfo).not.toHaveBeenCalled();
+
+		const ctx = openSession.mock.calls[0][0].chatContext as { getSelfName?: () => Promise<string | undefined> };
+		expect(typeof ctx.getSelfName).toBe('function');
+		expect(await ctx.getSelfName!()).toBe('CCTestAI');
+		expect(getMemberInfo).toHaveBeenCalledWith(SELF_UID);
+
+		// a turn in a DIFFERENT room resolves the SAME cached name — never re-fetches
 		handler.handle({ type: 'receiveMessage', data: humanMessage(2, 100, 'hi again', 2) } as never);
 		await waitFor(() => calls.length >= 2);
-
-		const ctx = openSession.mock.calls[0][0].chatContext as { selfName?: string };
-		expect(ctx.selfName).toBe('CCTestAI');
-		expect(getMemberInfo).toHaveBeenCalledWith(SELF_UID);
-		expect(getMemberInfo).toHaveBeenCalledTimes(1); // cached across turns
+		const ctx2 = openSession.mock.calls[1][0].chatContext as { getSelfName?: () => Promise<string | undefined> };
+		expect(await ctx2.getSelfName!()).toBe('CCTestAI');
+		expect(getMemberInfo).toHaveBeenCalledTimes(1); // cached across calls + turns
 	});
 
-	it('#132: non-cc driver does NOT fetch getMemberInfo and passes no selfName', async () => {
-		const { adapter, calls } = fakeAdapter(); // type: 'fake'
+	it('#132: a driver that never calls getSelfName triggers NO getMemberInfo fetch (pay-per-use)', async () => {
+		const { adapter, calls } = fakeAdapter(); // type: 'fake' — ignores the thunk
 		const { ws } = fakeWs();
-		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
 		const getMemberInfo = vi.fn(async () => ({ name: 'CCTestAI' }));
 		const apiClient = { getMemberInfo } as unknown as import('../api/hula-api.js').HulaApiClient;
 		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
@@ -737,9 +742,8 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
 
+		// handler never eagerly fetches; the fake driver never invokes getSelfName → zero member-info calls.
 		expect(getMemberInfo).not.toHaveBeenCalled();
-		const ctx = openSession.mock.calls[0][0].chatContext as { selfName?: string };
-		expect(ctx.selfName).toBeUndefined();
 	});
 
 	// REQ-146 (#146) sign-on-access: media messages resolve a SHORT-lived signed download URL via

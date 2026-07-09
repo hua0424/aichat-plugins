@@ -12,6 +12,8 @@
  * 重试链，短暂 stack。可接受：每条链各自有界（`tries` 上限），且调用点动作幂等，故 stack 无害。
  * 若日后需取消在飞的链，可加 AbortSignal —— 当前 YAGNI 不做。
  */
+import { errMsg } from './err.js';
+
 export interface RetryOptions {
 	/** 日志标签，如 'prewarm' / 'reportAgentType'。 */
 	label: string;
@@ -23,8 +25,12 @@ export interface RetryOptions {
 	delay?: (ms: number) => Promise<void>;
 }
 
-const defaultBackoffMs = (attempt: number): number => Math.min(1000 * 2 ** (attempt - 1), 30000);
-const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+/** Exponential backoff: attempt 1 → 1s, 2 → 2s, 4 → 4s … capped at `capMs`. Single-sourced curve. */
+export const expoBackoffMs = (attempt: number, capMs: number): number => Math.min(1000 * 2 ** (attempt - 1), capMs);
+/** Production sleep (test-injectable everywhere via an opts.delay override). */
+export const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
+
+const defaultBackoffMs = (attempt: number): number => expoBackoffMs(attempt, 30000);
 
 export async function retryAsync(fn: () => Promise<void>, opts: RetryOptions): Promise<void> {
 	const { label } = opts;
@@ -40,7 +46,7 @@ export async function retryAsync(fn: () => Promise<void>, opts: RetryOptions): P
 			}
 			return;
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
+			const msg = errMsg(err);
 			if (attempt === tries) {
 				console.error(`[retry] ${label} gave up after ${tries} attempts: ${msg}`);
 				return;

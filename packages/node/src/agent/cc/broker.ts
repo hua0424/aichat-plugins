@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { readJsonBody } from '../../util/http-body.js';
 
 /**
  * REQ-010 S7 / REQ-011 S2 — the claude-code (CC) hook broker.
@@ -121,23 +122,14 @@ export class CcBroker {
 	/** Wire node:http over a 127.0.0.1 TCP port → handle(). Parses the Bearer header + JSON body. */
 	async listen(port: number = ccBrokerPort(), host = '127.0.0.1'): Promise<void> {
 		this.server = createServer((req, res) => {
-			const chunks: Buffer[] = [];
-			req.on('data', (c: Buffer) => chunks.push(c));
-			req.on('end', () => {
-				void (async () => {
-					let body: unknown;
-					try {
-						body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf-8')) : {};
-					} catch {
-						body = undefined;
-					}
-					const authToken = parseBearer(req.headers['authorization']);
-					const remoteAddress = req.socket.remoteAddress;
-					const out = await this.handle({ body, remoteAddress, authToken });
-					res.writeHead(out.status, { 'Content-Type': 'application/json' });
-					res.end(JSON.stringify(out.json));
-				})();
-			});
+			void (async () => {
+				const body = await readJsonBody(req);
+				const authToken = parseBearer(req.headers['authorization']);
+				const remoteAddress = req.socket.remoteAddress;
+				const out = await this.handle({ body, remoteAddress, authToken });
+				res.writeHead(out.status, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify(out.json));
+			})();
 		});
 
 		await new Promise<void>((resolve, reject) => {

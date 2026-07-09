@@ -1,12 +1,13 @@
 import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
-import type { BindTokenStore } from '../bind-token-store.js';
+import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
@@ -172,27 +173,28 @@ export class CcHeadlessDriver implements AgentDriver {
 	 * client UX) — an `aichat` CLI subcommand can wrap it later if needed.
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		const workspaceDir = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workspaceDir, { recursive: true });
 		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
 
-		// #132: the display name of THIS aiclaw, threaded in via chatContext (resolved once + cached at the
-		// handler). Optional — an unresolved name still anchors the uid in the system prompt.
-		const selfName = (o.chatContext as Record<string, unknown>).selfName as string | undefined;
+		// #132: the display name of THIS aiclaw, resolved LAZILY via chatContext.getSelfName (cc-only — no
+		// other driver calls it, so no needless member-info fetch). Optional — an unresolved name still
+		// anchors the uid in the system prompt.
+		const selfName = await ctx.getSelfName?.();
 		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
 		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
 		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).
-		const binding = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const binding = bindingKey(o.aiclawUid, o.roomId);
 		const bindToken = this.bindTokens.mint(o.aiclawUid, o.roomId);
 		const session = new CcHeadlessSession({
 			binding,
@@ -562,7 +564,7 @@ class CcHeadlessSession implements AgentSession {
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 			return;
 		}
 		this.child = child;
@@ -595,7 +597,7 @@ class CcHeadlessSession implements AgentSession {
 		});
 		child.on('error', (err) => {
 			if (myAttempt !== this.attemptSeq) return;
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 		});
 		child.on('exit', (code) => {
 			if (myAttempt !== this.attemptSeq) return;
@@ -617,7 +619,7 @@ class CcHeadlessSession implements AgentSession {
 			child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			child.stdin?.end();
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 		}
 	}
 

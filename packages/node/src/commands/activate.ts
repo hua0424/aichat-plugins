@@ -2,6 +2,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { AICHAT_HOME, loadConfig, getServerUrl } from '../config.js';
 import { resolveAgentCredential } from '../registry.js';
 import { getMachineCode } from '../auth/machine.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * aichat activate --token <activation-token>
@@ -35,7 +36,7 @@ export async function activate(activationToken: string): Promise<void> {
 		console.log(`  UID: ${cred.uid}`);
 		console.log(`  Add this token to the "agents" registry in ~/.aichat/config.jsonc, then run 'aichat start'.\n`);
 	} catch (err) {
-		console.error(`[activate] Failed: ${err instanceof Error ? err.message : String(err)}`);
+		console.error(`[activate] Failed: ${errMsg(err)}`);
 		process.exit(1);
 	}
 }

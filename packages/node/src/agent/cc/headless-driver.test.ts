@@ -264,11 +264,11 @@ describe('CcHeadlessDriver — shape', () => {
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
-		// #132: chatContext carries this aiclaw's own display name → threaded into the system-prompt anchor.
+		// #132: chatContext exposes a lazy getSelfName → resolved name threaded into the system-prompt anchor.
 		const session = await driver.openSession({
 			aiclawUid: '5',
 			roomId: '9',
-			chatContext: { roomType: 2, roomId: '9', selfName: 'CCTestAI' },
+			chatContext: { roomType: 2, roomId: '9', getSelfName: async () => 'CCTestAI' },
 		});
 		// REQ-013 S1: the message arriving at send() is ALREADY the unified attribution envelope (built at
 		// the handler common layer). The driver forwards it verbatim — no per-driver envelope building.

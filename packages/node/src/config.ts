@@ -56,16 +56,20 @@ const DEFAULT_SERVER_URL = 'ws://localhost:18760/api/ws/ws';
  * 加载配置
  */
 export function loadConfig(): AichatConfig {
-	if (!existsSync(CONFIG_PATH)) {
-		return {};
-	}
+	const c = readJsonc(CONFIG_PATH);
+	return c === undefined ? {} : (c as AichatConfig);
+}
+
+/**
+ * 读取并解析 JSONC 文件（简易：去掉 // 注释行）。文件缺失或解析失败 → undefined（永不抛）。
+ * config.jsonc 与 per-token 凭证缓存共用同一 strip-comment 解析（aichatoverview#165 单源）。
+ */
+export function readJsonc(path: string): unknown {
+	if (!existsSync(path)) return undefined;
 	try {
-		const raw = readFileSync(CONFIG_PATH, 'utf-8');
-		// 简易 JSONC 解析：去掉 // 注释行
-		const json = raw.replace(/^\s*\/\/.*$/gm, '');
-		return JSON.parse(json);
+		return JSON.parse(readFileSync(path, 'utf-8').replace(/^\s*\/\/.*$/gm, ''));
 	} catch {
-		return {};
+		return undefined;
 	}
 }
 

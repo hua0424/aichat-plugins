@@ -7,7 +7,6 @@ import {
 	OPENCLAW_EMPTY_THINKING_PLACEHOLDER,
 	buildConnectParams,
 	parseHelloOk,
-	buildOpenclawReplyMessage,
 } from './openclaw-driver.js';
 import type { AgentEvent } from '../events.js';
 import { InMemoryBindTokenStore } from '../bind-token-store.js';
@@ -372,28 +371,6 @@ describe('filterOpenclawThinking — openclaw NO_REPLY sentinel + empty thinking
 	it('is stateless across repeated calls', () => {
 		expect(filterOpenclawThinking('NO_REPLY')).toBe(OPENCLAW_EMPTY_THINKING_PLACEHOLDER);
 		expect(filterOpenclawThinking('NO_REPLY')).toBe(OPENCLAW_EMPTY_THINKING_PLACEHOLDER);
-	});
-});
-
-describe('buildOpenclawReplyMessage (aichatoverview#161 — reply via CLI, not retired tools)', () => {
-	// ADR-0004 收尾：openclaw 回复统一走 `aichat send-message` CLI，与 opencode/codex/cc 对齐。
-	const out = buildOpenclawReplyMessage('原始用户消息');
-
-	it('instructs the `aichat send-message` CLI', () => {
-		expect(out).toContain('aichat send-message');
-	});
-
-	it('does NOT reference the retired hula tools', () => {
-		expect(out).not.toContain('hula_send_message');
-		expect(out).not.toContain('hula_skip_reply');
-	});
-
-	it('preserves the user message verbatim at the tail', () => {
-		expect(out.endsWith('原始用户消息')).toBe(true);
-	});
-
-	it('uses no [SYSTEM] markers (filtered by openclaw security hardening)', () => {
-		expect(out).not.toContain('[SYSTEM]');
 	});
 });
 

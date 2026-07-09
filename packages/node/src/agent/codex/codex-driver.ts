@@ -1,9 +1,12 @@
 import { mkdir } from 'node:fs/promises';
 import type { Codex, Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
+import { buildReplyInstruction } from '../reply-contract.js';
+import { bindingKey, parseBindingKey } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /**
  * The slice of the codex SDK `Codex` client this driver needs. Injecting an interface (rather than a
@@ -75,11 +78,7 @@ export class CodexDriver implements AgentDriver {
 	 */
 	resolveSession(threadId: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyByThreadId(threadId);
-		if (!key) return undefined;
-		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
-		if (!m) return undefined;
-		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-		return { aiclawUid: m[1], roomId: m[2] };
+		return key ? parseBindingKey(key) : undefined;
 	}
 
 	/**
@@ -87,22 +86,22 @@ export class CodexDriver implements AgentDriver {
 	 * codex thread (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		// Namespace the workspace by aiclawUid so two identities never collide (reuse opencode's
 		// deriveWorkspaceDir — it already handles group/dm + the `~` expansion).
 		const workingDirectory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workingDirectory, { recursive: true });
 
-		const key = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const key = bindingKey(o.aiclawUid, o.roomId);
 
 		// codex's default bubblewrap sandbox FAILS in the container → danger-full-access. approvalPolicy
 		// "never" so the agent runs unattended; skipGitRepoCheck so a non-git workspace is fine.
@@ -264,17 +263,8 @@ class CodexSession implements AgentSession {
 			return false;
 		};
 
-		// Same role-instruction prefix as opencode-driver: the agent's text output is thinking; it
-		// replies ONLY by running `aichat send-message --content "..."` in its shell. The command is
-		// bound to THIS chat's room+identity automatically — never pass room/identity. No reply → run
-		// nothing. Plain string prefix (no [SYSTEM] markers — filtered by gateway security hardening).
-		const enrichedMessage =
-			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
-			'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
-			'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
-			'--- 用户消息如下 ---\n' +
-			message;
+		// Same shared role-instruction as the other node-driven drivers (agent/reply-contract.ts).
+		const enrichedMessage = buildReplyInstruction(message);
 
 		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
 		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.
@@ -294,7 +284,7 @@ class CodexSession implements AgentSession {
 			}
 		};
 
-		const errOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+		const errOf = (e: unknown) => (errMsg(e));
 
 		void (async () => {
 			try {
@@ -349,7 +339,7 @@ class CodexSession implements AgentSession {
  * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry.
  */
 export function isResumeFailure(err: unknown): boolean {
-	const msg = err instanceof Error ? err.message : String(err);
+	const msg = errMsg(err);
 	return /no rollout found|thread\/resume failed|-32600/i.test(msg);
 }
 
