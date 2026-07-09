@@ -147,6 +147,15 @@ interface RoomChannel {
 const ACCUMULATED_MESSAGES_CAP = 50;
 
 /**
+ * M4: server 限流拒绝（error code）→ autoReply 文案。单源，rate/daily 两条广播路径共用。
+ * error code 不在此表 = 非限流错误（no autoReply）。
+ */
+const LIMIT_REASONS: Record<string, string> = {
+	rate_limit_exceeded: '发言频率限制，已自动跳过本次响应',
+	daily_limit_exceeded: '今日发言上限已达，已自动跳过本次响应',
+};
+
+/**
  * 消息处理器（REQ-004 Agent Loop 模型）
  * 接收用户消息 → ACK → 去重 → 触发 agent loop → THINKING 流式输出
  */
@@ -224,6 +233,33 @@ export class MessageHandler {
 		} catch {
 			return undefined;
 		}
+	}
+
+	/**
+	 * 单点发送 THINKING_END：thinkingId 兜底 + 帧安全截断（capUtf8Bytes 256KB，server 仍是唯一截断权威）。
+	 * 三条 finalize 路径（timeout/complete/error）共用，帧结构一处维护。error 缺省时不带该字段。
+	 */
+	private sendThinkingEnd(
+		session: ThinkingSession,
+		frame: { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string },
+	): void {
+		this.ws.send(WSReqType.THINKING_END, {
+			thinkingId: session.thinkingId || undefined,
+			durationMs: frame.durationMs,
+			status: frame.status,
+			...(frame.error !== undefined ? { error: frame.error } : {}),
+			content: capUtf8Bytes(frame.content),
+		});
+	}
+
+	/**
+	 * 会话收尾（所有终结路径共用）：可选 best-effort 关闭 driver session（唤醒仍 park 的 for-await）、
+	 * 从 thinkingSessions 删除、flush 待发消息。clean-complete/error 路径不关（迭代器已自然结束）→ closeDriver=false。
+	 */
+	private teardownSession(session: ThinkingSession, roomId: string, closeDriver: boolean): void {
+		if (closeDriver) void session.agentSession?.close();
+		this.thinkingSessions.delete(session.sessionKey);
+		this.flushPendingMessages(roomId);
 	}
 
 	/**
@@ -381,21 +417,12 @@ export class MessageHandler {
 		//   注意：此判定必须在「thinking 活跃入队」(step 6) 之前——否则未点名消息会被错误地排入 pendingMessages 并在本轮思考结束后误触发。
 		const roomType = data.message.roomType;
 		const isPrivate = roomType === 2;
-		let triggerEligible: boolean;
-		if (isPrivate) {
-			triggerEligible = true;
-		} else {
-			// 群聊：默认需点名（与 server 新默认 1 对齐：配置未缓存时按需点名处理）
-			const mentionRequired = this.groupConfigCache.get(this.selfUid, roomId)?.mentionRequired ?? true;
-			if (!mentionRequired) {
-				triggerEligible = true;
-			} else {
-				const atUidList = data.message.body?.atUidList ?? [];
-				// 仅显式 @ 机器人（atUidList 含 selfUid）才算点名；0=@所有人 不算点名（裁决）。
-				const isMentioned = atUidList.map(String).includes(String(this.selfUid));
-				triggerEligible = isMentioned;
-			}
-		}
+		// 私聊始终触发；群聊：mentionRequired（缺省 true，与 server 新默认对齐）关闭时全触发，开启时仅显式
+		// @ 机器人（atUidList 含 selfUid）才算点名——0=@所有人 不算点名（裁决）。短路求值：私聊不读群配置/atUid。
+		const triggerEligible =
+			isPrivate ||
+			!(this.groupConfigCache.get(this.selfUid, roomId)?.mentionRequired ?? true) ||
+			(data.message.body?.atUidList ?? []).map(String).includes(String(this.selfUid));
 
 		if (!triggerEligible) {
 			// 惰性积累：标注发言者，FIFO 上限 50。@所有人 落在此处（不触发但仍积累）。
@@ -559,18 +586,14 @@ export class MessageHandler {
 			if (session.finalized) return;
 			session.finalized = true;
 			console.error(`[thinking] timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
+			this.sendThinkingEnd(session, {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: 'thinking_session_timeout',
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(session.accumulatedContent),
+				content: session.accumulatedContent,
 			});
 			// REQ-008 #75: best-effort 收尾 driver session，让卡住的迭代器能终止。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			this.teardownSession(session, roomId, true);
 		}, this.THINKING_SESSION_TIMEOUT_MS);
 
 		this.thinkingSessions.set(sessionKey, session);
@@ -618,16 +641,10 @@ export class MessageHandler {
 			const outcome = reduceThinking(session.events);
 			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
 			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
-				durationMs: outcome.durationMs,
-				status: 'complete',
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(rawContent),
-			});
+			this.sendThinkingEnd(session, { durationMs: outcome.durationMs, status: 'complete', content: rawContent });
 			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}`);
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			// clean-complete：迭代器已自然结束，不再 close（closeDriver=false）。
+			this.teardownSession(session, roomId, false);
 		};
 
 		// error 事件：与既有 onError 一致的 finalize-error 路径。
@@ -636,16 +653,13 @@ export class MessageHandler {
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			console.error(`[thinking] error session=${sessionKey} reason=${message}`);
-			this.ws.send(WSReqType.THINKING_END, {
-				thinkingId: session.thinkingId || undefined,
+			this.sendThinkingEnd(session, {
 				durationMs: Date.now() - session.startTime,
 				status: 'error',
 				error: message,
-				// 帧安全截断（256KB）；server 仍是唯一截断权威
-				content: capUtf8Bytes(session.accumulatedContent),
+				content: session.accumulatedContent,
 			});
-			this.thinkingSessions.delete(sessionKey);
-			this.flushPendingMessages(roomId);
+			this.teardownSession(session, roomId, false);
 		};
 
 		try {
@@ -756,15 +770,11 @@ export class MessageHandler {
 					const session = this.thinkingSessions.get(sessionKey);
 					if (session) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
-						const reason = error === 'rate_limit_exceeded'
-							? '发言频率限制，已自动跳过本次响应'
-							: '今日发言上限已达，已自动跳过本次响应';
+						const reason = LIMIT_REASONS[error];
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(String(roomId), reason);
 						// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-						void session.agentSession?.close();
-						this.thinkingSessions.delete(sessionKey);
-						this.flushPendingMessages(String(roomId));
+						this.teardownSession(session, String(roomId), true);
 					}
 				}
 			}
@@ -785,33 +795,24 @@ export class MessageHandler {
 		}
 		if (session?.finalized) {
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(String(roomId));
+			this.teardownSession(session, String(roomId), true);
 			return;
 		}
 
 		if (status === 'error' && error) {
-			switch (error) {
-				case 'rate_limit_exceeded':
-					console.log(`[thinking] server rejected: rate_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(String(roomId), '发言频率限制，已自动跳过本次响应');
-					break;
-				case 'daily_limit_exceeded':
-					console.log(`[thinking] server rejected: daily_limit_exceeded, sending autoReply roomId=${roomId}`);
-					this.sendAutoReply(String(roomId), '今日发言上限已达，已自动跳过本次响应');
-					break;
-				default:
-					console.log(`[thinking] server error: ${error} (no autoReply)`);
+			const reason = LIMIT_REASONS[error];
+			if (reason) {
+				console.log(`[thinking] server rejected: ${error}, sending autoReply roomId=${roomId}`);
+				this.sendAutoReply(String(roomId), reason);
+			} else {
+				console.log(`[thinking] server error: ${error} (no autoReply)`);
 			}
 		}
 
 		if (session) {
 			session.finalized = true;
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
-			void session.agentSession?.close();
-			this.thinkingSessions.delete(session.sessionKey);
-			this.flushPendingMessages(String(roomId));
+			this.teardownSession(session, String(roomId), true);
 		}
 	}
 
