@@ -10,6 +10,7 @@ import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { buildAgentInjection } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -283,7 +284,7 @@ export class MessageHandler {
 			return url;
 		} catch (err) {
 			console.warn(
-				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${err instanceof Error ? err.message : String(err)}`,
+				`[media] signDownload failed msgId=${String(message.id)} roomId=${String(message.roomId)}; falling back to embedded url if present: ${errMsg(err)}`,
 			);
 			return undefined;
 		}
@@ -322,7 +323,7 @@ export class MessageHandler {
 				// so handleReceiveMessage is async. ACK/dedup run in its synchronous prefix (before any await),
 				// so they still fire promptly; we don't await here (fire-and-forget, mirroring prior behavior).
 				this.handleReceiveMessage(msg.data as ReceivedMessage).catch((err) => {
-					console.error('[handler] handleReceiveMessage error:', err instanceof Error ? err.message : String(err));
+					console.error('[handler] handleReceiveMessage error:', errMsg(err));
 				});
 				break;
 			case 'thinkingStart':
@@ -685,7 +686,7 @@ export class MessageHandler {
 				// reduceThinking's accounting at done.
 			}
 		} catch (err) {
-			finalizeError(err instanceof Error ? err.message : String(err));
+			finalizeError(errMsg(err));
 		} finally {
 			// REQ-008 #75 P2: 无论 done / error / break / throw，总在退出消费循环时收尾 driver session。
 			// 与 Fix 1 配合：close() 唤醒仍 park 在 adapter 上的 for-await。幂等，安全多调。
@@ -828,7 +829,7 @@ export class MessageHandler {
 				console.log(`[anti-loop] autoReply sent: msgId=${result.msgId} roomId=${roomId}`);
 			})
 			.catch((err) => {
-				console.error('[anti-loop] autoReply failed:', err instanceof Error ? err.message : String(err));
+				console.error('[anti-loop] autoReply failed:', errMsg(err));
 			});
 	}
 

@@ -5,6 +5,7 @@ import { AICHAT_HOME } from '../config.js';
 import type { CapabilityRegistry, CapabilityContext } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
+import { errMsg } from '../util/err.js';
 
 /** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
 type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
@@ -128,7 +129,7 @@ export class CapabilityEndpoint {
 			response = { status: 200, json: { ok: true, result } };
 			console.log(`${loc} ok`);
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
+			const msg = errMsg(err);
 			response = { status: 500, json: { ok: false, error: msg } };
 			// capability error text is untrusted (may contain CR/LF) → sanitize + truncate.
 			console.log(`${loc} err=${sanitizeLogField(msg)}`);

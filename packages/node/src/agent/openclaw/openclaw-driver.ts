@@ -7,6 +7,7 @@ import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
 import type { ChatContext } from '../workspace.js';
+import { errMsg } from '../../util/err.js';
 
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
@@ -412,7 +413,7 @@ export class OpenclawDriver implements AgentDriver {
 				const chat = this.findChatByRequestId(requestId);
 				if (chat && !chat.done) {
 					chat.done = true;
-					chat.sink.push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+					chat.sink.push({ type: 'error', message: errMsg(err) });
 					chat.sink.finish();
 					this.cleanupChat(requestId);
 				}

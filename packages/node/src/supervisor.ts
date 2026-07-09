@@ -5,6 +5,7 @@ import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
 import { retryAsync } from './util/retry.js';
+import { errMsg } from './util/err.js';
 
 /**
  * REQ-008 #76 — 监督器依赖注入面。
@@ -57,7 +58,7 @@ const defaultDelay = (ms: number): Promise<void> => new Promise((res) => setTime
  * 「已激活」等不可恢复错误不走 connect 路径（resolveCredential 阶段就抛，不在此重试）。
  */
 function defaultIsTransientConnectError(err: unknown): boolean {
-	const msg = err instanceof Error ? err.message : String(err);
+	const msg = errMsg(err);
 	return /gateway starting|unavailable|econnrefused|timeout|starting|temporarily/i.test(msg);
 }
 
@@ -120,7 +121,7 @@ export class Supervisor {
 			try {
 				await this.startAgent(entry);
 			} catch (err) {
-				const reason = err instanceof Error ? err.message : String(err);
+				const reason = errMsg(err);
 				console.error(`[supervisor] agent (tool=${entry.tool}) failed to start, skipped: ${reason}`);
 			}
 		}
@@ -205,7 +206,7 @@ export class Supervisor {
 				// 清理失败的 driver，避免其内部重连定时器泄漏。
 				await driver.disconnect().catch(() => {});
 				if (isTransient(err) && attempt < maxAttempts) {
-					const reason = err instanceof Error ? err.message : String(err);
+					const reason = errMsg(err);
 					console.error(
 						`[supervisor] agent (tool=${entry.tool}) connect attempt ${attempt}/${maxAttempts} failed (transient): ${reason}; retrying...`,
 					);

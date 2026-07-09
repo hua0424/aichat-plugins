@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AICHAT_HOME, type AichatConfig, type AichatCredentials } from './config.js';
+import { errMsg } from './util/err.js';
 
 /**
  * REQ-008 #76 — 静态 agent 注册表项。
@@ -167,7 +168,7 @@ export async function resolveAgentCredential(
 		});
 		result = (await resp.json()) as ActivateResponse;
 	} catch (err) {
-		throw new Error(`activate request failed: ${err instanceof Error ? err.message : String(err)}`);
+		throw new Error(`activate request failed: ${errMsg(err)}`);
 	}
 
 	if (!result.success || !result.data) {

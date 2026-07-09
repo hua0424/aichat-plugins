@@ -6,6 +6,7 @@ import { loadConfig, getServerUrl, type AichatCredentials } from '../config.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
 import { getMachineCode } from '../auth/machine.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
+import { errMsg } from '../util/err.js';
 
 export async function handleGroupConfig(args: string[]): Promise<void> {
 	// REQ-029 (#29): roomId is an opaque string (never Number() — >2^53 corrupts).
@@ -45,7 +46,7 @@ export async function handleGroupConfig(args: string[]): Promise<void> {
 	try {
 		credentials = await resolveAgentCredential(registry[0], { machineCode: getMachineCode(), httpBase });
 	} catch (err) {
-		console.error(`Credential resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+		console.error(`Credential resolution failed: ${errMsg(err)}`);
 		process.exit(1);
 	}
 

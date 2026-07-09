@@ -7,6 +7,7 @@ import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
 import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
@@ -563,7 +564,7 @@ class CcHeadlessSession implements AgentSession {
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 			return;
 		}
 		this.child = child;
@@ -596,7 +597,7 @@ class CcHeadlessSession implements AgentSession {
 		});
 		child.on('error', (err) => {
 			if (myAttempt !== this.attemptSeq) return;
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 		});
 		child.on('exit', (code) => {
 			if (myAttempt !== this.attemptSeq) return;
@@ -618,7 +619,7 @@ class CcHeadlessSession implements AgentSession {
 			child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			child.stdin?.end();
 		} catch (err) {
-			this.onAttemptFailure(err instanceof Error ? err.message : String(err));
+			this.onAttemptFailure(errMsg(err));
 		}
 	}
 

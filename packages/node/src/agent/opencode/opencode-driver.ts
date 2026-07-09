@@ -7,6 +7,7 @@ import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
 import { bindingKey, parseBindingKey } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /** Parsed `"providerID/modelID"` model override. */
 interface ParsedModel {
@@ -274,7 +275,7 @@ class OpencodeSession implements AgentSession {
 				promptPromise.then(
 					() => {},
 					(err: unknown) => {
-						push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+						push({ type: 'error', message: errMsg(err) });
 						finish();
 						// P2③: prompt rejected (session/server gone) → invalidate for lazy rebuild.
 						this.onSessionError?.();
@@ -301,7 +302,7 @@ class OpencodeSession implements AgentSession {
 					}
 				}
 			} catch (err) {
-				push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+				push({ type: 'error', message: errMsg(err) });
 				// P2③: subscribe (or other setup) threw → invalidate for lazy rebuild on next turn.
 				this.onSessionError?.();
 			} finally {

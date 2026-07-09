@@ -12,6 +12,8 @@
  * 重试链，短暂 stack。可接受：每条链各自有界（`tries` 上限），且调用点动作幂等，故 stack 无害。
  * 若日后需取消在飞的链，可加 AbortSignal —— 当前 YAGNI 不做。
  */
+import { errMsg } from './err.js';
+
 export interface RetryOptions {
 	/** 日志标签，如 'prewarm' / 'reportAgentType'。 */
 	label: string;
@@ -40,7 +42,7 @@ export async function retryAsync(fn: () => Promise<void>, opts: RetryOptions): P
 			}
 			return;
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
+			const msg = errMsg(err);
 			if (attempt === tries) {
 				console.error(`[retry] ${label} gave up after ${tries} attempts: ${msg}`);
 				return;

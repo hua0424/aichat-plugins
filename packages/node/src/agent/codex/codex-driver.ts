@@ -6,6 +6,7 @@ import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
 import { bindingKey, parseBindingKey } from '../bind-token-store.js';
+import { errMsg } from '../../util/err.js';
 
 /**
  * The slice of the codex SDK `Codex` client this driver needs. Injecting an interface (rather than a
@@ -283,7 +284,7 @@ class CodexSession implements AgentSession {
 			}
 		};
 
-		const errOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+		const errOf = (e: unknown) => (errMsg(e));
 
 		void (async () => {
 			try {
@@ -338,7 +339,7 @@ class CodexSession implements AgentSession {
  * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry.
  */
 export function isResumeFailure(err: unknown): boolean {
-	const msg = err instanceof Error ? err.message : String(err);
+	const msg = errMsg(err);
 	return /no rollout found|thread\/resume failed|-32600/i.test(msg);
 }
 
