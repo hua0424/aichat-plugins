@@ -4,6 +4,7 @@ import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { filterOpenclawThinking } from '../agent/openclaw/openclaw-driver.js';
+import { bindingKey } from '../agent/bind-token-store.js';
 import { MessageDebouncer } from '../util/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -431,7 +432,7 @@ export class MessageHandler {
 			channel.batchSawHuman = true;
 		}
 
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 
 		// 6. thinking 活跃 **或** 处于退避窗口时入队——退避窗口内不另起触发、不丢消息，
 		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
@@ -464,7 +465,7 @@ export class MessageHandler {
 		}
 
 		const { msgId, roomType, fromUid, isOwner } = channel.lastCtx;
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 
 		// 【S8-7 issue #22】防循环守卫：在汇聚点按本轮 BATCH 评估，先于创建 thinking / 发 THINKING_START。
 		//   - skipGuard=true（退避 reschedule 落地）跳过：本轮已评估过，不重复评估。
@@ -690,7 +691,7 @@ export class MessageHandler {
 		if (String(fromUid) !== this.selfUid) return;
 
 		// REQ-029 (#29): String(roomId) (drop Number()) — inbound roomId may be a >2^53 numeric string.
-		const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
+		const sessionKey = bindingKey(this.selfUid, String(roomId));
 		const session = this.thinkingSessions.get(sessionKey);
 		if (!session) {
 			console.warn(`[thinking] received thinkingStart broadcast but no active session for ${sessionKey}`);
@@ -755,7 +756,7 @@ export class MessageHandler {
 			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 session
 			if (status === 'error' && (error === 'rate_limit_exceeded' || error === 'daily_limit_exceeded')) {
 				if (String(data.fromUid) === String(this.selfUid)) {
-					const sessionKey = `aiclaw-${this.selfUid}-room-${String(roomId)}`;
+					const sessionKey = bindingKey(this.selfUid, String(roomId));
 					const session = this.thinkingSessions.get(sessionKey);
 					if (session) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
@@ -885,7 +886,7 @@ export class MessageHandler {
 	private maybeEvictRoom(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
 		if (!channel) return;
-		const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (
 			channel.pendingMessages.length === 0 &&
 			channel.debouncer.pending === 0 &&

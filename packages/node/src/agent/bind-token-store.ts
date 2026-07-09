@@ -30,9 +30,20 @@ interface Bound {
 	roomId: string;
 }
 
-/** The internal (uid,room) → reverse-index key (kept identical to the legacy binding string). */
-function bindingKey(aiclawUid: string, roomId: string): string {
+/**
+ * The internal (uid,room) → binding string `aiclaw-{uid}-room-{roomId}` — the node's per-(uid,room)
+ * key for session stores / reverse index / cc session_id keying / the openclaw compound sessionKey.
+ * Single-sourced (aichatoverview#165): every driver + the handler build the key here, not inline.
+ */
+export function bindingKey(aiclawUid: string, roomId: string): string {
 	return `aiclaw-${aiclawUid}-room-${roomId}`;
+}
+
+/** Inverse of {@link bindingKey}: parse a binding string back to (uid,room), or undefined if malformed. */
+export function parseBindingKey(key: string): { aiclawUid: string; roomId: string } | undefined {
+	const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
+	// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
+	return m ? { aiclawUid: m[1], roomId: m[2] } : undefined;
 }
 
 /**

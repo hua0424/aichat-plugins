@@ -6,7 +6,7 @@ import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
-import type { BindTokenStore } from '../bind-token-store.js';
+import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
 
 /**
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
@@ -172,7 +172,7 @@ export class CcHeadlessDriver implements AgentDriver {
 	 * client UX) — an `aichat` CLI subcommand can wrap it later if needed.
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
@@ -192,7 +192,7 @@ export class CcHeadlessDriver implements AgentDriver {
 		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
 		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
 		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).
-		const binding = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const binding = bindingKey(o.aiclawUid, o.roomId);
 		const bindToken = this.bindTokens.mint(o.aiclawUid, o.roomId);
 		const session = new CcHeadlessSession({
 			binding,

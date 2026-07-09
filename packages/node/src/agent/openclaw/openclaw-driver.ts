@@ -4,7 +4,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import type { BindTokenStore } from '../bind-token-store.js';
+import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
 
 /**
@@ -334,7 +334,7 @@ export class OpenclawDriver implements AgentDriver {
 		// compound; a compound arriving at the endpoint = forgery → store miss → undefined).
 		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
 		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
-		const sessionKey = `${token}:aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const sessionKey = `${token}:${bindingKey(o.aiclawUid, o.roomId)}`;
 		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink));
 	}
 

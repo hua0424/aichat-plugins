@@ -5,6 +5,7 @@ import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/worksp
 import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
+import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 
 /**
  * The slice of the codex SDK `Codex` client this driver needs. Injecting an interface (rather than a
@@ -76,11 +77,7 @@ export class CodexDriver implements AgentDriver {
 	 */
 	resolveSession(threadId: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyByThreadId(threadId);
-		if (!key) return undefined;
-		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
-		if (!m) return undefined;
-		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-		return { aiclawUid: m[1], roomId: m[2] };
+		return key ? parseBindingKey(key) : undefined;
 	}
 
 	/**
@@ -88,7 +85,7 @@ export class CodexDriver implements AgentDriver {
 	 * codex thread (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
@@ -103,7 +100,7 @@ export class CodexDriver implements AgentDriver {
 		const workingDirectory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workingDirectory, { recursive: true });
 
-		const key = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const key = bindingKey(o.aiclawUid, o.roomId);
 
 		// codex's default bubblewrap sandbox FAILS in the container → danger-full-access. approvalPolicy
 		// "never" so the agent runs unattended; skipGitRepoCheck so a non-git workspace is fine.

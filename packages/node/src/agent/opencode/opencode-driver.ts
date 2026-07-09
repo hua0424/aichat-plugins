@@ -6,6 +6,7 @@ import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
+import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 
 /** Parsed `"providerID/modelID"` model override. */
 interface ParsedModel {
@@ -74,11 +75,7 @@ export class OpencodeDriver implements AgentDriver {
 	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyBySessionID(sessionKey);
-		if (!key) return undefined;
-		const m = /^aiclaw-(\d+)-room-(\d+)$/.exec(key);
-		if (!m) return undefined;
-		// REQ-029 (#29): opaque strings, never Number() (>2^53 corrupts routing).
-		return { aiclawUid: m[1], roomId: m[2] };
+		return key ? parseBindingKey(key) : undefined;
 	}
 
 	/**
@@ -86,7 +83,7 @@ export class OpencodeDriver implements AgentDriver {
 	 * opencode session (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
 	 */
 	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(`aiclaw-${aiclawUid}-room-${roomId}`);
+		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
 		return true;
 	}
 
@@ -113,7 +110,7 @@ export class OpencodeDriver implements AgentDriver {
 		const directory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(directory, { recursive: true });
 
-		const key = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
+		const key = bindingKey(o.aiclawUid, o.roomId);
 		const client = this.server.getClient();
 
 		// Lazy create-or-reuse: a persisted binding for the SAME directory is reusable.
