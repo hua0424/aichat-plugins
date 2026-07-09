@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { AICHAT_HOME } from '../../config.js';
+import { FileJsonMapStore } from '../file-map-store.js';
 
 /** A persisted opencode session binding: which opencode sessionID lives in which directory. */
 export interface StoredSession {
@@ -29,59 +29,32 @@ export interface SessionStore {
 export const DEFAULT_SESSIONS_PATH = join(AICHAT_HOME, 'opencode', 'sessions.json');
 
 /**
- * File-backed SessionStore (a tiny JSON object map). Loads once on construction; each set()
- * writes the whole map back (the map is small — one entry per (aiclawUid, roomId) pair).
- * Read/parse/write failures degrade to an empty/no-op store rather than crashing the node.
+ * File-backed SessionStore — the shared {@link FileJsonMapStore} keyed on `StoredSession`, validating
+ * both `sessionID` + `directory` are strings. Reverse lookup (findKeyBySessionID) is a `findKey` predicate.
  */
 export class FileSessionStore implements SessionStore {
-	private map: Record<string, StoredSession> = {};
+	private readonly store: FileJsonMapStore<StoredSession>;
 
-	constructor(private readonly path: string = DEFAULT_SESSIONS_PATH) {
-		this.load();
-	}
-
-	private load(): void {
-		if (!existsSync(this.path)) return;
-		try {
-			const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown;
-			if (parsed && typeof parsed === 'object') {
-				this.map = parsed as Record<string, StoredSession>;
-			}
-		} catch {
-			this.map = {};
-		}
+	constructor(path: string = DEFAULT_SESSIONS_PATH) {
+		this.store = new FileJsonMapStore(
+			path,
+			(v) => typeof v.sessionID === 'string' && typeof v.directory === 'string',
+		);
 	}
 
 	get(key: string): StoredSession | undefined {
-		const v = this.map[key];
-		if (v && typeof v.sessionID === 'string' && typeof v.directory === 'string') return v;
-		return undefined;
+		return this.store.get(key);
 	}
 
 	set(key: string, val: StoredSession): void {
-		this.map[key] = val;
-		this.persist();
+		this.store.set(key, val);
 	}
 
 	delete(key: string): void {
-		if (!(key in this.map)) return;
-		delete this.map[key];
-		this.persist();
+		this.store.delete(key);
 	}
 
 	findKeyBySessionID(sessionID: string): string | undefined {
-		for (const [key, val] of Object.entries(this.map)) {
-			if (val?.sessionID === sessionID) return key;
-		}
-		return undefined;
-	}
-
-	private persist(): void {
-		try {
-			mkdirSync(dirname(this.path), { recursive: true });
-			writeFileSync(this.path, JSON.stringify(this.map, null, 2), 'utf-8');
-		} catch {
-			/* best-effort: keep the in-memory map even if the disk write fails */
-		}
+		return this.store.findKey((v) => v.sessionID === sessionID);
 	}
 }

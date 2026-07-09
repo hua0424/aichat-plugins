@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { AICHAT_HOME } from '../../config.js';
+import { FileJsonMapStore } from '../file-map-store.js';
 
 /** A persisted CC headless session binding: which claude `session_id` is bound to a (uid, room) key. */
 export interface StoredCcHeadlessSession {
@@ -34,47 +34,21 @@ export const DEFAULT_CC_SESSIONS_PATH = join(AICHAT_HOME, 'cc', 'sessions.json')
  * Read/parse/write failures degrade to an empty/no-op store rather than crashing the node.
  */
 export class FileCcHeadlessSessionStore implements CcHeadlessSessionStore {
-	private map: Record<string, StoredCcHeadlessSession> = {};
+	private readonly store: FileJsonMapStore<StoredCcHeadlessSession>;
 
-	constructor(private readonly path: string = DEFAULT_CC_SESSIONS_PATH) {
-		this.load();
-	}
-
-	private load(): void {
-		if (!existsSync(this.path)) return;
-		try {
-			const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown;
-			if (parsed && typeof parsed === 'object') {
-				this.map = parsed as Record<string, StoredCcHeadlessSession>;
-			}
-		} catch {
-			this.map = {};
-		}
+	constructor(path: string = DEFAULT_CC_SESSIONS_PATH) {
+		this.store = new FileJsonMapStore(path, (v) => typeof v.sessionId === 'string');
 	}
 
 	get(key: string): StoredCcHeadlessSession | undefined {
-		const v = this.map[key];
-		if (v && typeof v.sessionId === 'string') return v;
-		return undefined;
+		return this.store.get(key);
 	}
 
 	set(key: string, val: StoredCcHeadlessSession): void {
-		this.map[key] = val;
-		this.persist();
+		this.store.set(key, val);
 	}
 
 	delete(key: string): void {
-		if (!(key in this.map)) return;
-		delete this.map[key];
-		this.persist();
-	}
-
-	private persist(): void {
-		try {
-			mkdirSync(dirname(this.path), { recursive: true });
-			writeFileSync(this.path, JSON.stringify(this.map, null, 2), 'utf-8');
-		} catch {
-			/* best-effort: keep the in-memory map even if the disk write fails */
-		}
+		this.store.delete(key);
 	}
 }

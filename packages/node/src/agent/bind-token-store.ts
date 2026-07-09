@@ -1,7 +1,7 @@
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
+import { readJsonMap, writeJsonMap } from './file-map-store.js';
 
 /**
  * BL-014 (#141) — opaque agent-facing binding token.
@@ -107,28 +107,21 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 	}
 
 	private load(): void {
-		if (!existsSync(this.path)) return;
-		try {
-			const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as unknown;
-			if (parsed && typeof parsed === 'object') {
-				for (const [token, val] of Object.entries(parsed as Record<string, unknown>)) {
-					if (val && typeof val === 'object') {
-						const b = val as Record<string, unknown>;
-						// REQ-029 (#29): uid/room are opaque strings — accept only string fields.
-						if (typeof b.aiclawUid === 'string' && typeof b.roomId === 'string') {
-							// #161 P1: a token file written before the lowercase-normalization stored the token
-							// key raw (mixed case). resolve()/mint() operate in lowercase, so normalize the key
-							// on load — otherwise resolve(token.toLowerCase()) would miss the mixed-case entry.
-							const key = token.toLowerCase();
-							this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
-							this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
-						}
-					}
+		// Shared read primitive ({} on missing/parse-fail); the dual-map + normalization below is
+		// bind-specific (a distinct security path, NOT the session stores' copy).
+		for (const [token, val] of Object.entries(readJsonMap<unknown>(this.path))) {
+			if (val && typeof val === 'object') {
+				const b = val as Record<string, unknown>;
+				// REQ-029 (#29): uid/room are opaque strings — accept only string fields.
+				if (typeof b.aiclawUid === 'string' && typeof b.roomId === 'string') {
+					// #161 P1: a token file written before the lowercase-normalization stored the token
+					// key raw (mixed case). resolve()/mint() operate in lowercase, so normalize the key
+					// on load — otherwise resolve(token.toLowerCase()) would miss the mixed-case entry.
+					const key = token.toLowerCase();
+					this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
+					this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
 				}
 			}
-		} catch {
-			this.forward.clear();
-			this.reverse.clear();
 		}
 	}
 
@@ -137,15 +130,9 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 	}
 
 	private persist(): void {
-		try {
-			mkdirSync(dirname(this.path), { recursive: true });
-			const obj: Record<string, Bound> = {};
-			for (const [token, val] of this.forward) obj[token] = val;
-			writeFileSync(this.path, JSON.stringify(obj, null, 2), 'utf-8');
-			// SECURITY (BL-014): the token file grants capability identity — lock it to owner-only rw.
-			chmodSync(this.path, 0o600);
-		} catch {
-			/* best-effort: keep the in-memory map even if the disk write fails */
-		}
+		const obj: Record<string, Bound> = {};
+		for (const [token, val] of this.forward) obj[token] = val;
+		// SECURITY (BL-014): the token file grants capability identity — lock it to owner-only rw (0600).
+		writeJsonMap(this.path, obj, 0o600);
 	}
 }
