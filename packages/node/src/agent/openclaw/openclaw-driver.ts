@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
+import type { ChatContext } from '../workspace.js';
 
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
@@ -307,6 +308,15 @@ export class OpenclawDriver implements AgentDriver {
 	}
 
 	/**
+	 * AgentDriver hook: strip openclaw's own `NO_REPLY` sentinel + empty/whitespace thinking bodies from
+	 * the reduced thinking content before THINKING_END. openclaw-specific (the sentinel is upstream
+	 * openclaw's built-in contract); other drivers don't implement the hook → their content is verbatim.
+	 */
+	finalizeThinking(content: string): string {
+		return filterOpenclawThinking(content);
+	}
+
+	/**
 	 * aichatoverview#124 — no per-room store: openclaw's binding IS the sessionKey, so there is
 	 * nothing to reset. No-op, returns false.
 	 */
@@ -317,7 +327,7 @@ export class OpenclawDriver implements AgentDriver {
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
 		// #161 (ADR-0004): openclaw replies via the unified `aichat send-message` CLI — the in-gateway
 		// aichat-claw `hula_send_message` TOOL was retired. We still hand the gateway a COMPOUND sessionKey

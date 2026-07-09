@@ -17,12 +17,15 @@ function expandTilde(p: string): string {
 }
 
 /**
- * REQ-008 #77 — the chat-context shape the opencode driver needs to isolate workspaces.
+ * The per-turn chat-context bag every AgentDriver's `openSession` receives (a driver reads only the
+ * keys it cares about). Named `ChatContext` (aichatoverview#165, formerly `OpencodeChatContext`) since
+ * codex + cc share it too, and hoisted to `agent/` above the opencode dir.
+ *
  * roomType: 1=GROUP, 2=FRIEND(1:1 DM); counterpartUid present for DMs (the other party).
  * isOwner: for DMs, whether the counterpart is the aiclaw's OWNER — read from the inbound
  *   WS message's `message.aiclaw.isOwner` (server fills it; present only on DM pushes).
  */
-export interface OpencodeChatContext {
+export interface ChatContext {
 	roomType: number;
 	// REQ-029 (#29): roomId/counterpartUid 为不透明字符串（防 >2^53 精度丢失）。
 	roomId: string;
@@ -38,6 +41,12 @@ export interface OpencodeChatContext {
 	 * the default group workspace segment so the owner can cd into a stable, human-readable path.
 	 */
 	account?: string | number;
+	/**
+	 * #132: LAZY resolver for this aiclaw's own display name (resolved once + cached at the handler).
+	 * cc-only — the cc system-prompt anchors identity on it; other drivers never call it, so no needless
+	 * member-info fetch. Kept a thunk (not an eager `selfName` field) so the cost is pay-per-use.
+	 */
+	getSelfName?: () => Promise<string | undefined>;
 }
 
 /**
@@ -62,7 +71,7 @@ export interface OpencodeChatContext {
  * owner vs friend is distinguished by `message.aiclaw.isOwner` on the inbound message
  * (server-computed senderUid==ownerUid; AiclawExt is present only on DM pushes).
  */
-export function deriveWorkspaceDir(base: string, aiclawUid: string, ctx: OpencodeChatContext): string {
+export function deriveWorkspaceDir(base: string, aiclawUid: string, ctx: ChatContext): string {
 	// REQ-009 #85: owner's absolute override wins for any context (in practice only groups carry it).
 	// REQ-010 S3: expand a leading `~` so a literal `~/.aichat/...` override resolves to the host home
 	// dir (not opencode's cwd) → a real absolute path, never `/workspace/~/...`.

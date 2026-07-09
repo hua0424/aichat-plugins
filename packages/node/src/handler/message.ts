@@ -3,7 +3,6 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { reduceThinking } from '../agent/thinking-map.js';
-import { filterOpenclawThinking } from '../agent/openclaw/openclaw-driver.js';
 import { bindingKey } from '../agent/bind-token-store.js';
 import { MessageDebouncer } from '../util/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
@@ -593,10 +592,6 @@ export class MessageHandler {
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
 		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
-		// #132: cc-only — resolve this aiclaw's own display name (cached) and thread it in via chatContext so
-		// the cc system-prompt can anchor its identity (model must know it IS <name> to recognise @<name> in a
-		// group as itself). Other drivers don't use it → skip the fetch to avoid a needless member-info call.
-		const selfName = this.driver.type === 'cc' ? await this.resolveSelfName() : undefined;
 		const agentSession = await this.driver.openSession({
 			aiclawUid: this.selfUid,
 			roomId,
@@ -607,7 +602,9 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
-				...(selfName !== undefined ? { selfName } : {}),
+				// #132: LAZY self-name resolver (cached). cc's system-prompt anchors identity on it; other
+				// drivers never call it -> no needless member-info fetch, and the handler needs no per-driver branch.
+				getSelfName: () => this.resolveSelfName(),
 			},
 		});
 		session.agentSession = agentSession;
@@ -619,9 +616,8 @@ export class MessageHandler {
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
-			// openclaw-only: 过滤 openclaw 自有的 NO_REPLY 哨兵（整段匹配）及空/纯空白思考正文，其它 driver 逐字节不变。
-			const rawContent =
-				this.driver.type === 'openclaw' ? filterOpenclawThinking(outcome.content) : outcome.content;
+			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
+			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
 			this.ws.send(WSReqType.THINKING_END, {
 				thinkingId: session.thinkingId || undefined,
 				durationMs: outcome.durationMs,

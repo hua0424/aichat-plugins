@@ -148,7 +148,7 @@ export function buildCcSettings(brokerPort: number): CcSettings {
 
 /**
  * (3) Write `settings.json` into `dir` (mkdir -p first), returning its absolute path. Pure IO — the
- * CCDriver calls this with the per-session workspace dir (see opencode/workspace deriveWorkspaceDir).
+ * CCDriver calls this with the per-session workspace dir (see agent/workspace deriveWorkspaceDir).
  */
 export function writeCcSettings(dir: string, settings: object): string {
 	mkdirSync(dir, { recursive: true });

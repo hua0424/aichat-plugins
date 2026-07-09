@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
@@ -179,16 +179,17 @@ export class CcHeadlessDriver implements AgentDriver {
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		const workspaceDir = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workspaceDir, { recursive: true });
 		const settingsPath = writeCcSettings(workspaceDir, buildCcSettings(this.brokerPort));
 
-		// #132: the display name of THIS aiclaw, threaded in via chatContext (resolved once + cached at the
-		// handler). Optional — an unresolved name still anchors the uid in the system prompt.
-		const selfName = (o.chatContext as Record<string, unknown>).selfName as string | undefined;
+		// #132: the display name of THIS aiclaw, resolved LAZILY via chatContext.getSelfName (cc-only — no
+		// other driver calls it, so no needless member-info fetch). Optional — an unresolved name still
+		// anchors the uid in the system prompt.
+		const selfName = await ctx.getSelfName?.();
 		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
 		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
 		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).

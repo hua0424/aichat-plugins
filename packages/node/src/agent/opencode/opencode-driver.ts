@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from './workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
@@ -103,9 +103,9 @@ export class OpencodeDriver implements AgentDriver {
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		// REQ-008 #77 fix: namespace the workspace by aiclawUid so two identities never collide.
 		const directory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(directory, { recursive: true });

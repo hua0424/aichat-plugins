@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import type { Codex, Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
+import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
 import { buildReplyInstruction } from '../reply-contract.js';
@@ -92,9 +92,9 @@ export class CodexDriver implements AgentDriver {
 	async openSession(o: {
 		aiclawUid: string;
 		roomId: string;
-		chatContext: Record<string, unknown>;
+		chatContext: ChatContext;
 	}): Promise<AgentSession> {
-		const ctx = o.chatContext as unknown as OpencodeChatContext;
+		const ctx = o.chatContext;
 		// Namespace the workspace by aiclawUid so two identities never collide (reuse opencode's
 		// deriveWorkspaceDir — it already handles group/dm + the `~` expansion).
 		const workingDirectory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
