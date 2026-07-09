@@ -153,10 +153,9 @@ class OpenclawSession implements AgentSession {
 
 		const callbacks: ThinkingCallbacks = {
 			onThinkingDelta: (text) => push({ type: 'thinking', text }),
-			// REQ-010 S1: the terminal AgentEvent is retired. The openclaw adapter still sends its
-			// reply internally (inside the gateway via aichat-claw's own tool), so an observed
-			// terminal tool no longer needs to surface as an AgentEvent — reduceThinking's ledger
-			// that used to consume it is gone. We simply don't bridge onTerminalTool.
+			// REQ-010 S1 / aichatoverview#161: no terminal AgentEvent. The openclaw agent sends its
+			// reply out-of-band by running `aichat send-message` (accounted at the node's
+			// CapabilityEndpoint), so there is no in-stream terminal tool to bridge.
 			onThinkingEnd: (durationMs) => {
 				push({ type: 'done', durationMs });
 				finish();

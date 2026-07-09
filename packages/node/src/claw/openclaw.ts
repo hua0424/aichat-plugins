@@ -123,41 +123,24 @@ export function parseHelloOk(payload: unknown): {
 }
 
 /**
- * REQ-004 S3: 纯函数——把一次 tool item 调用分类为终结动作（send / skip）或非终结动作（null）。
+ * aichatoverview#161 (ADR-0004 收尾) — 纯函数：给 openclaw agent 的消息注入角色分工说明。
  *
- * 真实数据形态（openclaw 2026.6.5 实测）：tool 调用经 `item` 流到达，end 事件只携带
- * name + status，**没有 args**（无 channel、无 reason）。故只能按 NAME + status==='completed'
- * 分类，无法从事件读取 channel / model 自填的 skip reason。
+ * openclaw gateway 不支持 instructions 字段，故把说明前置进 message。回复统一走 CLI：
+ * agent 在 bash 里跑 `aichat send-message --content "<回复>"`（房间/身份由 exec-env 的
+ * OPENCLAW_BIND 自动绑定，agent 绝不传 room/身份）——与 opencode/codex/cc 四家一致，
+ * 不再引导已退役的 hula_send_message / hula_skip_reply 工具。
  *
- * agent 可经两条合法路径回复 HuLa：
- *  - claw 工具 hula_send_message（→ sent）
- *  - openclaw 内置 message 工具（→ sent）
- * 跳过则走 hula_skip_reply（→ skipped，reason 固定为 'agent_skip_reply'）。
- * 其余工具名（hula_find_friend、command/patch/search 等）不是终结动作，返回 null。
- *
- * 仅 status==='completed' 才算终结动作；start / running / failed 一律 null。
+ * 避免 [SYSTEM] / [System Message] 等标记——会被 openclaw 安全机制过滤。
  */
-export function classifyTerminalTool(
-	name: string | undefined,
-	status: string | undefined,
-): { action: 'sent' | 'skipped'; tool: string; reason?: string } | null {
-	// 只统计成功完成的工具——start / running / failed 都不是终结动作
-	if (status !== 'completed') return null;
-
-	if (name === 'hula_send_message') {
-		return { action: 'sent', tool: 'hula_send_message' };
-	}
-	if (name === 'message') {
-		// 本进程仅注册 hula channel；message 只可能投递到 hula，故不校验 channel。
-		// 多 channel 场景下此判定会过计 send——后果是漏补 skip 而非误发消息。openclaw
-		// 未来若在 item 事件暴露 args 再收紧。
-		return { action: 'sent', tool: 'message' };
-	}
-	if (name === 'hula_skip_reply') {
-		// item 事件不含 model 自填的 reason，固定为显式跳过原因（与兜底 'agent_no_terminal_tool' 区分）。
-		return { action: 'skipped', tool: 'hula_skip_reply', reason: 'agent_skip_reply' };
-	}
-	return null;
+export function buildOpenclawReplyMessage(message: string): string {
+	return (
+		'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
+		'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
+		'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
+		'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
+		'--- 用户消息如下 ---\n' +
+		message
+	);
 }
 
 /**
@@ -277,7 +260,7 @@ export class OpenclawAdapter implements ClawAdapter {
 		this.ws = null;
 	}
 
-	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks, context?: ChatContext): Promise<void> {
+	async chat(message: string, sessionKey: string, callbacks: ThinkingCallbacks, _context?: ChatContext): Promise<void> {
 		if (!this.connected || !this.ws) {
 			callbacks.onError(new Error('openclaw gateway not connected'));
 			return;
@@ -286,20 +269,9 @@ export class OpenclawAdapter implements ClawAdapter {
 		const requestId = randomUUID();
 		const idempotencyKey = randomUUID();
 
-		// 在 message 中注入角色分工说明（openclaw gateway 不支持 instructions 字段）
-		// 注意：避免使用 [SYSTEM] / [System Message] 等标记，会被 openclaw 安全机制过滤
-		// REQ-004 S3：从「强制 send」改为语义化的角色分工引导——仍优先引导 hula_send_message，
-		// 但允许 hula_skip_reply 作为对等的合法终结动作（send 至少一次或 skip 恰好一次）。
-		const roomIdHint = context?.roomId
-			? `当前会话已绑定房间（room ${context.roomId}），hula_send_message 无需也不应再传 roomId。`
-			: '';
-		const enrichedMessage =
-			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请调用 hula_send_message 工具（已绑定当前房间，优先用它），把给用户看的内容写进 content。' +
-			roomIdHint +
-			'如果判断本轮无需回复（如纯客套、无实质内容、消息不需要回应），请调用 hula_skip_reply。' +
-			'send 至少一次或 skip 恰好一次，二者是本轮的合法终结动作。\n\n' +
-			'--- 用户消息如下 ---\n' + message;
+		// aichatoverview#161：回复统一走 CLI（`aichat send-message`），不再引导已退役的
+		// hula_send_message / hula_skip_reply 工具。房间/身份由 exec-env 的 OPENCLAW_BIND 绑定。
+		const enrichedMessage = buildOpenclawReplyMessage(message);
 
 		const params = {
 			message: enrichedMessage,
@@ -506,12 +478,8 @@ export class OpenclawAdapter implements ClawAdapter {
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: AgentEvent): void {
-		// REQ-004 S3: item 流 → 终结动作检测（send / skip）。
-		// openclaw 2026.6.5 实测：tool 调用走 `item` 流（不是 `tool`），故在此分流。
-		if (evt.stream === 'item') {
-			this.processItemStreamEvent(chat, evt);
-			return;
-		}
+		// aichatoverview#161: item 流曾用于终结动作分类（send/skip），随工具退役已无消费者
+		// （onTerminalTool 自 REQ-010 S1 起未桥接；回复改走 CLI 由 node CapabilityEndpoint 记账）。
 		// assistant 流 → thinking delta (REQ-004)
 		if (evt.stream === 'assistant') {
 			const delta = evt.data.delta as string | undefined;
@@ -539,31 +507,6 @@ export class OpenclawAdapter implements ClawAdapter {
 				this.cleanupChatByRunId(evt.runId);
 			}
 		}
-	}
-
-	/**
-	 * REQ-004 S3: 处理 item 流事件，识别终结动作并回调 onTerminalTool。
-	 *
-	 * openclaw 2026.6.5 实测：一次 tool 调用产生两个 `item` 事件——phase:'start'（status:'running'）
-	 * 与 phase:'end'（status:'completed' | 'failed'）。事件携带 name + status，**没有 args**。
-	 * 只在 kind==='tool' 且 phase==='end' 时按 name+status 分类（start/running 忽略；
-	 * 非 tool kind 如 command/patch/search/analysis 忽略）。无 args 可捕获，故无需 toolStarts 关联。
-	 */
-	private processItemStreamEvent(chat: PendingChat, evt: AgentEvent): void {
-		const data = evt.data;
-		if (data.kind !== 'tool') return;
-		if (data.phase !== 'end') return;
-
-		const name = data.name as string | undefined;
-		const status = data.status as string | undefined;
-		const classified = classifyTerminalTool(name, status);
-		if (!classified) return;
-
-		chat.callbacks.onTerminalTool?.({
-			action: classified.action,
-			tool: classified.tool,
-			reason: classified.reason,
-		});
 	}
 
 	// ─── Connect handshake ───
