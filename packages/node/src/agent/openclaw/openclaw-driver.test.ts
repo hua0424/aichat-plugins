@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type WebSocket from 'ws';
 import {
@@ -158,6 +158,64 @@ describe('OpenclawDriver — session keying', () => {
 		expect(driver.resolveSession(compound)).toBeUndefined();
 		expect(driver.resetSession()).toBe(false);
 		await driver.disconnect();
+	});
+});
+
+describe('OpenclawDriver — abandoned-run backstop (aichatoverview#166)', () => {
+	type Maps = { activeChats: Map<string, unknown>; pending: Map<string, unknown>; requestToRunId: Map<string, unknown> };
+	const flush = async () => {
+		await Promise.resolve();
+		await Promise.resolve();
+	};
+
+	it('a run the gateway never terminates → 5-min backstop finishes the stream + reclaims all three maps', async () => {
+		vi.useFakeTimers();
+		try {
+			const { driver } = await connectedDriver();
+			const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} as never });
+			const stream = session.send('hi');
+			await flush(); // let the gateway's `accepted`+runId res land (links run:, deletes pending)
+
+			const maps = driver as unknown as Maps;
+			expect(maps.activeChats.size).toBeGreaterThan(0); // the in-flight turn is tracked
+
+			vi.advanceTimersByTime(5 * 60 * 1000 + 1); // gateway never sent end/error → backstop fires
+			const events = await drain(stream);
+
+			expect(events.some((e) => e.type === 'error')).toBe(true); // consumer unblocked with an error
+			expect(maps.activeChats.size).toBe(0); // three maps reclaimed
+			expect(maps.pending.size).toBe(0);
+			expect(maps.requestToRunId.size).toBe(0);
+			await driver.disconnect();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('normal termination (lifecycle end) clears the backstop — no late error, maps already clean', async () => {
+		vi.useFakeTimers();
+		try {
+			const { driver, gw } = await connectedDriver();
+			const session = await driver.openSession({ aiclawUid: '1', roomId: '1', chatContext: {} as never });
+			const stream = session.send('hi');
+			await flush();
+			gw.emitEnd();
+			const events = await drain(stream);
+
+			expect(events.some((e) => e.type === 'done')).toBe(true);
+			expect(events.some((e) => e.type === 'error')).toBe(false);
+			const maps = driver as unknown as Maps;
+			expect(maps.activeChats.size).toBe(0);
+
+			// advancing past the backstop window must NOT resurrect an error (the timer was cleared on end)
+			const before = events.length;
+			vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+			await flush();
+			expect(events.length).toBe(before);
+			await driver.disconnect();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
