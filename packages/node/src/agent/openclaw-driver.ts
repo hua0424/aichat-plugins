@@ -5,7 +5,7 @@ import type { BindTokenStore } from './bind-token-store.js';
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
  * string `NO_REPLY` on its `assistant` text stream when it has no user-visible prose to add (the
- * reply itself already went out via the hula_send_message tool); it ALSO emits a purely empty /
+ * reply itself already went out via the `aichat send-message` CLI); it ALSO emits a purely empty /
  * whitespace-only assistant stream on some turns. We consume that stream as thinking text, so both
  * the bare sentinel and an empty stream would otherwise land as a blank/broken thinking panel / DB
  * row. Filter both — but for the sentinel ONLY when the WHOLE thinking text is the sentinel
@@ -18,8 +18,8 @@ import type { BindTokenStore } from './bind-token-store.js';
 export const OPENCLAW_NO_REPLY_SENTINEL = /^\s*NO_REPLY\s*$/;
 /** Neutral placeholder for an openclaw turn with no real thinking prose (bare NO_REPLY sentinel OR
  *  empty/whitespace-only assistant stream). Deliberately makes NO claim about whether a reply was
- *  sent: the node can't know that at finalize time (reply goes out-of-band via the openclaw tool),
- *  and empty-turns with no reply exist — so "回复已直接发出" would be false for them. */
+ *  sent: the node can't know that at finalize time (reply goes out-of-band via the `aichat send-message`
+ *  CLI), and empty-turns with no reply exist — so "回复已直接发出" would be false for them. */
 export const OPENCLAW_EMPTY_THINKING_PLACEHOLDER = '（本轮无思考正文）';
 
 /** openclaw-only: bare NO_REPLY sentinel OR empty/whitespace-only thinking → neutral placeholder;
@@ -83,15 +83,15 @@ export class OpenclawDriver implements AgentDriver {
 		roomId: string;
 		chatContext: Record<string, unknown>;
 	}): Promise<AgentSession> {
-		// #141 B+ (regression fix): openclaw does NOT reply via the `aichat` CLI — it replies via the
-		// in-gateway aichat-claw `hula_send_message` TOOL, which resolves ctx.sessionKey by PARSING the
-		// plaintext binding (`/(?:^|[:/])aiclaw-\d+-room-\d+$/`). openclaw carries ONE sessionKey shared by
-		// BOTH the tool path (needs the plaintext binding) and the CLI/exec-env path (needs an unforgeable
-		// token). So we carry BOTH in ONE COMPOUND sessionKey: `<token>:<binding>` — the opaque token
-		// FIRST, a literal `:`, then the plaintext binding LAST.
-		//   • The binding is LAST so the tool's `$`-anchored regex matches it (the char before `aiclaw` is `:`).
-		//   • The token is a base64url string (`[A-Za-z0-9_-]`, contains no `:`) so the split is unambiguous.
+		// #161 (ADR-0004): openclaw replies via the unified `aichat send-message` CLI — the in-gateway
+		// aichat-claw `hula_send_message` TOOL was retired. We still hand the adapter a COMPOUND sessionKey
+		// `<token>:<binding>` — the opaque token FIRST, a literal `:`, then the plaintext binding LAST:
 		//   • aichat-claw's resolve_exec_env extracts the token PREFIX → OPENCLAW_BIND → CLI `openclaw:<token>`.
+		//   • the `aiclaw-{uid}-room-{roomId}` binding TAIL is retained for openclaw gateway-side session
+		//     isolation (keeps openclaw's conversation key unique + stable per room).
+		//   • the token is lowercase hex (`[0-9a-f]`, contains no `:`) so the `<token>:<binding>` split is
+		//     unambiguous. (#161 A′: hex is lowercase-native — openclaw lowercases the sessionKey it echoes
+		//     back through resolve_exec_env, and a hex token survives that round-trip; mixed-case would not.)
 		// CONFINEMENT: this compound is used ONLY here, as adapter.chat's sessionKey. It is NEVER a
 		// node-internal key — the node-side thinking sessionKey is computed independently from (uid,room)
 		// in the message handler, and resolveSession keys on the BARE token alone (it must NOT split the
@@ -153,10 +153,9 @@ class OpenclawSession implements AgentSession {
 
 		const callbacks: ThinkingCallbacks = {
 			onThinkingDelta: (text) => push({ type: 'thinking', text }),
-			// REQ-010 S1: the terminal AgentEvent is retired. The openclaw adapter still sends its
-			// reply internally (inside the gateway via aichat-claw's own tool), so an observed
-			// terminal tool no longer needs to surface as an AgentEvent — reduceThinking's ledger
-			// that used to consume it is gone. We simply don't bridge onTerminalTool.
+			// REQ-010 S1 / aichatoverview#161: no terminal AgentEvent. The openclaw agent sends its
+			// reply out-of-band by running `aichat send-message` (accounted at the node's
+			// CapabilityEndpoint), so there is no in-stream terminal tool to bridge.
 			onThinkingEnd: (durationMs) => {
 				push({ type: 'done', durationMs });
 				finish();

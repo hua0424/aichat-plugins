@@ -35,9 +35,12 @@ function bindingKey(aiclawUid: string, roomId: string): string {
 	return `aiclaw-${aiclawUid}-room-${roomId}`;
 }
 
-/** Default token: 32 random bytes → base64url (~43 chars, unguessable, non-enumerable). */
+/**
+ * Default token: 32 random bytes → hex (64 lowercase chars, still 256-bit / unguessable / non-enumerable).
+ * Hex is lowercase-native so openclaw's sessionKey-lowercasing (#161) is a no-op on the round-trip.
+ */
 function defaultGenToken(): string {
-	return randomBytes(32).toString('base64url');
+	return randomBytes(32).toString('hex');
 }
 
 /** Default location: persists under ~/.aichat/ (a persistent volume) so tokens survive restarts. */
@@ -63,8 +66,12 @@ export class InMemoryBindTokenStore implements BindTokenStore {
 	mint(aiclawUid: string, roomId: string): string {
 		const bkey = bindingKey(aiclawUid, roomId);
 		const existing = this.reverse.get(bkey);
-		if (existing) return existing; // stable: reuse the token already minted for this (uid,room)
-		const token = this.genToken();
+		// #161 P1: normalize on the reuse path too — a token loaded from an old (pre-normalization)
+		// file may be mixed-case; return it lowercased so callers get the same form resolve() keys on.
+		if (existing) return existing.toLowerCase(); // stable: reuse the token already minted for this (uid,room)
+		// #161: openclaw lowercases the sessionKey it echoes back through resolve_exec_env, so store
+		// and return the token in normalized (lowercase) form → the received token matches the store key.
+		const token = this.genToken().toLowerCase();
 		this.forward.set(token, { aiclawUid, roomId });
 		this.reverse.set(bkey, token);
 		this.afterMint();
@@ -73,7 +80,8 @@ export class InMemoryBindTokenStore implements BindTokenStore {
 
 	resolve(token: string): { aiclawUid: string; roomId: string } | undefined {
 		if (!token) return undefined;
-		const v = this.forward.get(token);
+		// #161: openclaw lowercases the sessionKey, so normalize the input before lookup (tokens are stored lowercase).
+		const v = this.forward.get(token.toLowerCase());
 		return v ? { aiclawUid: v.aiclawUid, roomId: v.roomId } : undefined;
 	}
 
@@ -108,8 +116,12 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 						const b = val as Record<string, unknown>;
 						// REQ-029 (#29): uid/room are opaque strings — accept only string fields.
 						if (typeof b.aiclawUid === 'string' && typeof b.roomId === 'string') {
-							this.forward.set(token, { aiclawUid: b.aiclawUid, roomId: b.roomId });
-							this.reverse.set(bindingKey(b.aiclawUid, b.roomId), token);
+							// #161 P1: a token file written before the lowercase-normalization stored the token
+							// key raw (mixed case). resolve()/mint() operate in lowercase, so normalize the key
+							// on load — otherwise resolve(token.toLowerCase()) would miss the mixed-case entry.
+							const key = token.toLowerCase();
+							this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
+							this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
 						}
 					}
 				}

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, statSync, existsSync } from 'node:fs';
+import { mkdtempSync, statSync, existsSync, writeFileSync } from 'node:fs';
 import { InMemoryBindTokenStore, FileBindTokenStore } from './bind-token-store.js';
 
 /** A deterministic token generator: `tok-1`, `tok-2`, … so tests never depend on crypto randomness. */
@@ -55,6 +55,25 @@ describe('BindTokenStore.resolve — rejects unknown / garbage / forged', () => 
 	});
 });
 
+describe('BindTokenStore — case-insensitive (openclaw lowercases the sessionKey)', () => {
+	it('a case-mangled token still resolves to its exact (uid,room) — openclaw may lowercase what it echoes back', () => {
+		// DEFAULT generator (mixed-case-capable source) → mint normalizes to lowercase.
+		const store = new InMemoryBindTokenStore();
+		const token = store.mint('7', '42');
+		const bound = { aiclawUid: '7', roomId: '42' };
+		// openclaw returns the token upper-cased (a stand-in for its lowercasing/case-mangling):
+		expect(store.resolve(token.toUpperCase())).toEqual(bound);
+		// …and the as-minted (already-lowercase) token resolves too:
+		expect(store.resolve(token)).toEqual(bound);
+	});
+
+	it('the DEFAULT generator yields a lowercase-only token (hex, no-op under openclaw lowercasing)', () => {
+		const token = new InMemoryBindTokenStore().mint('1', '2');
+		expect(token).toMatch(/^[0-9a-f]+$/);
+		expect(token).toBe(token.toLowerCase());
+	});
+});
+
 describe('FileBindTokenStore — persistence + reload', () => {
 	it('persists mints; a fresh instance on the same path reloads (token still resolves, mint still stable)', () => {
 		const path = freshFile();
@@ -74,6 +93,21 @@ describe('FileBindTokenStore — persistence + reload', () => {
 		const store = new FileBindTokenStore(path, counterGen());
 		store.mint('5', '9');
 		expect(statSync(path).mode & 0o777).toBe(0o600);
+	});
+
+	it('loads a legacy MIXED-CASE token file and still resolves (P1)', () => {
+		// A bind-tokens.json written BEFORE #161 normalization stored the token key raw (mixed case).
+		// load() must lowercase the key on rebuild so resolve()/mint() (which use lowercase) still hit it.
+		const path = freshFile();
+		writeFileSync(path, JSON.stringify({ AbCdEf123: { aiclawUid: '7', roomId: '42' } }), 'utf-8');
+		const store = new FileBindTokenStore(path);
+		const bound = { aiclawUid: '7', roomId: '42' };
+		// the lowercased form openclaw would echo back:
+		expect(store.resolve('abcdef123')).toEqual(bound);
+		// the original mixed-case string also resolves (resolve lowercases its input):
+		expect(store.resolve('AbCdEf123')).toEqual(bound);
+		// mint reuses the SAME (uid,room), returning the normalized (lowercase) stored token:
+		expect(store.mint('7', '42')).toBe('abcdef123');
 	});
 
 	it('a corrupt/unparseable file degrades to an empty store (never crashes)', () => {

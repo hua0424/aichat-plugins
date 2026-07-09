@@ -7,9 +7,11 @@
  * `agent:main:<token>:aiclaw-{uid}-room-{roomId}` (aichat-node builds `<token>:<binding>` — see
  * OpenclawDriver.openSession; openclaw wraps it with `agent:main:`).
  *
- * ONE sessionKey serves TWO paths that must not be conflated:
- *   • the in-gateway hula_send_message TOOL parses ctx.sessionKey's TAIL binding to find its room;
- *   • THIS CLI/exec-env path extracts the PREFIX opaque token.
+ * The compound carries a PREFIX opaque token and a TAIL binding:
+ *   • THIS CLI/exec-env path extracts the PREFIX opaque token — the only consumer now that replies
+ *     go through the `aichat send-message` CLI;
+ *   • the TAIL binding `aiclaw-{uid}-room-{roomId}` is retained for openclaw gateway-side session
+ *     isolation (its former in-gateway hula_send_message TOOL consumer was retired in #161).
  * We strip the `agent:main:` namespace prefix, split the compound into `<token>:<binding>`, and export
  * the BARE token as `OPENCLAW_BIND` — which the CLI's `resolveAgentSessionKey()` reads to emit an
  * `openclaw:<token>` capability session key that the node resolves via an EXACT store lookup. Anything

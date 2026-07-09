@@ -1,52 +1,25 @@
 import { describe, it, expect } from 'vitest';
-import { buildConnectParams, parseHelloOk, classifyTerminalTool } from './openclaw.js';
+import { buildConnectParams, parseHelloOk, buildOpenclawReplyMessage } from './openclaw.js';
 
-describe('classifyTerminalTool (REQ-004 S3 terminal-action classifier — item-event shape)', () => {
-	// openclaw 2026.6.5: tool 调用经 `item` 流到达，end 事件只携带 name + status（无 args）。
-	// 分类纯按 name + status==='completed'。
+describe('buildOpenclawReplyMessage (aichatoverview#161 — reply via CLI, not retired tools)', () => {
+	// ADR-0004 收尾：openclaw 回复统一走 `aichat send-message` CLI，与 opencode/codex/cc 对齐。
+	const out = buildOpenclawReplyMessage('原始用户消息');
 
-	it('classifies hula_send_message + completed as sent', () => {
-		expect(classifyTerminalTool('hula_send_message', 'completed')).toEqual({
-			action: 'sent',
-			tool: 'hula_send_message',
-		});
+	it('instructs the `aichat send-message` CLI', () => {
+		expect(out).toContain('aichat send-message');
 	});
 
-	it('classifies built-in message tool + completed as sent (no channel check)', () => {
-		expect(classifyTerminalTool('message', 'completed')).toEqual({
-			action: 'sent',
-			tool: 'message',
-		});
+	it('does NOT reference the retired hula tools', () => {
+		expect(out).not.toContain('hula_send_message');
+		expect(out).not.toContain('hula_skip_reply');
 	});
 
-	it('classifies hula_skip_reply + completed as skipped with fixed reason agent_skip_reply', () => {
-		expect(classifyTerminalTool('hula_skip_reply', 'completed')).toEqual({
-			action: 'skipped',
-			tool: 'hula_skip_reply',
-			reason: 'agent_skip_reply',
-		});
+	it('preserves the user message verbatim at the tail', () => {
+		expect(out.endsWith('原始用户消息')).toBe(true);
 	});
 
-	it('ignores any tool with status "running" (phase:start, not terminal)', () => {
-		expect(classifyTerminalTool('hula_send_message', 'running')).toBeNull();
-		expect(classifyTerminalTool('message', 'running')).toBeNull();
-		expect(classifyTerminalTool('hula_skip_reply', 'running')).toBeNull();
-	});
-
-	it('ignores any tool with status "failed" (not a successful terminal action)', () => {
-		expect(classifyTerminalTool('hula_send_message', 'failed')).toBeNull();
-		expect(classifyTerminalTool('message', 'failed')).toBeNull();
-		expect(classifyTerminalTool('hula_skip_reply', 'failed')).toBeNull();
-	});
-
-	it('ignores undefined status', () => {
-		expect(classifyTerminalTool('hula_send_message', undefined)).toBeNull();
-	});
-
-	it('ignores unknown tool names even when completed', () => {
-		expect(classifyTerminalTool('hula_find_friend', 'completed')).toBeNull();
-		expect(classifyTerminalTool('some_other_tool', 'completed')).toBeNull();
-		expect(classifyTerminalTool(undefined, 'completed')).toBeNull();
+	it('uses no [SYSTEM] markers (filtered by openclaw security hardening)', () => {
+		expect(out).not.toContain('[SYSTEM]');
 	});
 });
 
