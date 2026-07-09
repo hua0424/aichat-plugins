@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import type { BindTokenStore } from '../bind-token-store.js';
+import { buildReplyInstruction } from '../reply-contract.js';
 
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
@@ -113,26 +114,6 @@ export function parseHelloOk(payload: unknown): {
 	return result;
 }
 
-/**
- * aichatoverview#161 (ADR-0004 收尾) — 纯函数：给 openclaw agent 的消息注入角色分工说明。
- *
- * openclaw gateway 不支持 instructions 字段，故把说明前置进 message。回复统一走 CLI：
- * agent 在 bash 里跑 `aichat send-message --content "<回复>"`（房间/身份由 exec-env 的
- * OPENCLAW_BIND 自动绑定，agent 绝不传 room/身份）——与 opencode/codex/cc 四家一致，
- * 不再引导已退役的 hula_send_message / hula_skip_reply 工具。
- *
- * 避免 [SYSTEM] / [System Message] 等标记——会被 openclaw 安全机制过滤。
- */
-export function buildOpenclawReplyMessage(message: string): string {
-	return (
-		'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-		'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
-		'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
-		'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
-		'--- 用户消息如下 ---\n' +
-		message
-	);
-}
 
 /**
  * Device identity for gateway authentication
@@ -398,7 +379,7 @@ export class OpenclawDriver implements AgentDriver {
 
 		// aichatoverview#161：回复统一走 CLI（`aichat send-message`），不再引导已退役的
 		// hula_send_message / hula_skip_reply 工具。房间/身份由 exec-env 的 OPENCLAW_BIND 绑定。
-		const enrichedMessage = buildOpenclawReplyMessage(message);
+		const enrichedMessage = buildReplyInstruction(message);
 
 		const params = {
 			message: enrichedMessage,

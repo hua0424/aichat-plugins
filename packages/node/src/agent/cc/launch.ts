@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { REPLY_COMMAND } from '../reply-contract.js';
 
 /**
  * REQ-010 S7 chunk 2 — claude-code (CC) side-channel config generators.
@@ -37,7 +38,10 @@ const AICHAT_BASH_RULE = 'Bash(aichat:*)';
  */
 export const CC_REPLY_CONTRACT =
 	'你是 HuLa 聊天会话里的 AI 助理。要把回复发送到当前聊天，你必须在 bash 中实际运行命令：' +
-	'aichat send-message --content "<你的回复>"。⚠️ 只有运行这条 bash 命令才会真正发送消息；' +
+	// cc's anti-injection wrapper is deliberately different from the per-turn buildReplyInstruction, but the
+	// COMMAND literal is single-sourced (REPLY_COMMAND) so it can never drift from the other drivers'.
+	REPLY_COMMAND +
+	'。⚠️ 只有运行这条 bash 命令才会真正发送消息；' +
 	'仅仅调用 aichat-reply 技能、或在回答里声称"已发送/我发了"都不会发送任何消息。' +
 	'房间和身份由系统经 AICHAT_BIND 自动绑定——绝不要传 --room/--to/收件人/身份参数。' +
 	'本轮无需回复时不运行即可（本轮自然结束、不发送任何消息）。' +

@@ -4,6 +4,7 @@ import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type OpencodeChatContext } from '../opencode/workspace.js';
 import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
+import { buildReplyInstruction } from '../reply-contract.js';
 
 /**
  * The slice of the codex SDK `Codex` client this driver needs. Injecting an interface (rather than a
@@ -264,17 +265,8 @@ class CodexSession implements AgentSession {
 			return false;
 		};
 
-		// Same role-instruction prefix as opencode-driver: the agent's text output is thinking; it
-		// replies ONLY by running `aichat send-message --content "..."` in its shell. The command is
-		// bound to THIS chat's room+identity automatically — never pass room/identity. No reply → run
-		// nothing. Plain string prefix (no [SYSTEM] markers — filtered by gateway security hardening).
-		const enrichedMessage =
-			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
-			'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
-			'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
-			'--- 用户消息如下 ---\n' +
-			message;
+		// Same shared role-instruction as the other node-driven drivers (agent/reply-contract.ts).
+		const enrichedMessage = buildReplyInstruction(message);
 
 		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
 		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.

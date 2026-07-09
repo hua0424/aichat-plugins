@@ -5,6 +5,7 @@ import { deriveWorkspaceDir, type OpencodeChatContext } from './workspace.js';
 import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
+import { buildReplyInstruction } from '../reply-contract.js';
 
 /** Parsed `"providerID/modelID"` model override. */
 interface ParsedModel {
@@ -251,20 +252,9 @@ class OpencodeSession implements AgentSession {
 			return false;
 		};
 
-		// REQ-010 S1: prepend a role-instruction so the agent treats its text output as
-		// thinking/analysis (NOT shown to the user) and replies ONLY by running the
-		// `aichat send-message --content "<reply>"` command in bash (per the aichat skill). The
-		// command is bound to THIS chat's room+identity automatically — the agent must NEVER pass
-		// any room/identity (anti-spoofing). If it does not run the command, no reply is sent and
-		// the turn simply ends. Plain string prefix, no [SYSTEM] markers (those get filtered by
-		// gateway security hardening).
-		const enrichedMessage =
-			'说明：你的正文输出是分析/思考过程，不会直接发给用户。' +
-			'要回复用户时，请在 bash 中运行命令 `aichat send-message --content "<你的回复>"`（参见 aichat 技能）。' +
-			'当前会话已自动绑定本聊天的房间与身份，绝不要也无法传 room 或任何身份信息（由系统绑定）。' +
-			'若本轮无需回复（如纯客套、无实质内容），不运行该命令即可——本轮自然结束，不会发送任何消息。\n\n' +
-			'--- 用户消息如下 ---\n' +
-			message;
+		// REQ-010 S1: prepend the shared role-instruction (agent/reply-contract.ts): text output is thinking,
+		// reply ONLY via `aichat send-message` in bash, room/identity auto-bound, no reply -> run nothing.
+		const enrichedMessage = buildReplyInstruction(message);
 
 		// Drive the SDK: subscribe first (avoid the race), then prompt, then pump events.
 		void (async () => {
