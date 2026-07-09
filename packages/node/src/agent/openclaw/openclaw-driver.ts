@@ -792,6 +792,12 @@ export class OpenclawDriver implements AgentDriver {
 	/**
 	 * aichatoverview#166: the abandoned-run backstop fired — the gateway never sent this run's terminal.
 	 * Finish the sink with an error (wake any parked consumer) if still open, then reclaim the three maps.
+	 *
+	 * Window-race safety (#74 review P2): a normal terminal that lands in the SAME tick the timer fires
+	 * clears it via cleanupChatByRunId, so expireChat only runs when the run is genuinely abandoned. If a
+	 * late terminal still races in, `findChatByRequestId` may return undefined (already cleaned) → the sink
+	 * block is skipped; `chat.done` guards a double-finish; and cleanupChat is idempotent (delete-if-present
+	 * on all three maps). So expireChat is safe to run even against a partially/fully cleaned chat.
 	 */
 	private expireChat(requestId: string): void {
 		const chat = this.findChatByRequestId(requestId);
