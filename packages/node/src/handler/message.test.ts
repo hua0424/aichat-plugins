@@ -318,7 +318,7 @@ describe('MessageHandler per-room isolation', () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
 		// 短 debounce，便于测试
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'msg-room-1', 1) } as never);
 		handler.handle({ type: 'receiveMessage', data: humanMessage(2, 200, 'msg-room-2', 2) } as never);
@@ -338,7 +338,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('does not let room A pending queue leak into room B', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		// room 1 第一条 → 触发 thinking（adapter.chat 不结束，session 保持 active）
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'A1', 1) } as never);
@@ -371,7 +371,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('ignores own messages and non-text messages', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		// 自己发的消息
 		handler.handle({
@@ -392,7 +392,7 @@ describe('MessageHandler per-room isolation', () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
 		// 长 debounce，确保消息停在 buffer 里还没 flush
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10000, maxWaitMs: 10000 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10000, maxWaitMs: 10000 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'buffered', 1) } as never);
 		// 此刻消息在 debouncer buffer 中，尚未触发 chat
@@ -412,7 +412,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('normal turn (thinking + done) → THINKING_END complete, content, NO skipReason', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -432,7 +432,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('empty thinking turn → THINKING_END complete, empty content, NO skipReason', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -453,7 +453,7 @@ describe('MessageHandler per-room isolation', () => {
 		const { ws } = fakeWs();
 		const sendMessage = vi.fn(async () => ({ msgId: 1 }));
 		const apiClient = { sendMessage } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -469,7 +469,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('S4: onThinkingDelta accumulates chunks but NEVER sends a THINKING_DELTA frame', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -485,7 +485,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('S4: THINKING_END carries the full accumulated content', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -505,7 +505,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('S4: error path → END has status error AND content === accumulated (partial)', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -527,7 +527,7 @@ describe('MessageHandler per-room isolation', () => {
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws, sent } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 
 			handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 			// flush debouncer → triggerAgentLoop → adapter.chat called
@@ -553,7 +553,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('S4: thinkingId still backfills from thinkingStart broadcast → END carries it', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -577,7 +577,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('REQ-008 #75: thinkingEnd broadcast finalize closes the agentSession (best-effort) and removes the session', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		// 私聊触发 → 建立 active thinking session（fake adapter 不结束 → session 保持 active）
 		handler.handle({ type: 'receiveMessage', data: humanMessage(5, 100, 'hi', 1) } as never);
@@ -605,7 +605,7 @@ describe('MessageHandler per-room isolation', () => {
 		const MAX_BYTES = 256 * 1024;
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -637,7 +637,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('S4: content under the 256KB cap passes through unchanged', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -655,7 +655,7 @@ describe('MessageHandler per-room isolation', () => {
 	it('evicts idle room channel after thinking ends with empty pending', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(7, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -673,7 +673,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('group + mention_required + @bot → triggers the agent loop', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({
@@ -691,7 +691,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
 		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true, workspaceDir: '/srv/proj', account: '888888' });
 
 		handler.handle({
@@ -712,7 +712,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
 		const getMemberInfo = vi.fn(async () => ({ uid: SELF_UID, name: 'CCTestAI', account: 'cctest' }));
 		const apiClient = { getMemberInfo } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -732,7 +732,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
 		const getMemberInfo = vi.fn(async () => ({ name: 'CCTestAI' }));
 		const apiClient = { getMemberInfo } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -750,7 +750,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		const SIGNED = 'http://minio/tmp/chat/55_pic.png?X-Amz-Signature=short-lived-secret';
 		const signDownload = vi.fn(async () => ({ url: SIGNED, expiresIn: 300 }));
 		const apiClient = { signDownload } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -792,7 +792,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 			throw new Error('HuLa API error: 403 forbidden');
 		});
 		const apiClient = { signDownload } as unknown as import('../api/hula-api.js').HulaApiClient;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -820,7 +820,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('group + mention_required + NO @bot → NOT triggered, message accumulated', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({
@@ -837,7 +837,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('group + mention_required + atUidList=[0] (@所有人) → NOT triggered BUT accumulated', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({
@@ -853,7 +853,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('cap: 51 un-@ messages → buffer holds 50, oldest dropped', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		for (let i = 0; i < 51; i++) {
@@ -875,7 +875,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('private (roomType=2) → always triggers, no @ needed; not accumulated', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({
 			type: 'receiveMessage',
@@ -890,7 +890,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('group + mention_required=0 (cached config) → every message triggers', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: false });
 
 		handler.handle({
@@ -909,7 +909,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('annotation format is exactly [name(uid)]: content', async () => {
 		const { adapter } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({
@@ -924,7 +924,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('injection: accumulate N un-@ messages, then @bot → adapter message includes accumulated history (prepended) and buffer cleared', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// 2 条未点名 → 积累
@@ -951,7 +951,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('TIMING: with thinking ACTIVE, un-@ group message is accumulated, NOT queued to pendingMessages, and does NOT trigger after thinking ends', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// 点名机器人 → 触发 thinking（adapter.chat 不结束，session 保持 active）
@@ -974,7 +974,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('P1-a: triggerAgentLoop early-return (session already active for sessionKey) does NOT clear accumulated buffer (context preserved)', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// 1 条未点名 → 积累，并建立 lastCtx（首条点名提供 msgId）
@@ -1003,7 +1003,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 
 			const guard = getGuard(handler);
@@ -1036,7 +1036,7 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('regression: self / autoReply / non-text / AI(respondToAi=false) are neither accumulated nor triggered', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true, respondToAi: false });
 
 		// self
@@ -1091,7 +1091,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 			const guard = getGuard(handler);
 
@@ -1122,7 +1122,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 
 			const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -1165,7 +1165,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 			const guard = getGuard(handler);
 
@@ -1209,7 +1209,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 
 			handler.handle({ type: 'receiveMessage', data: aiMessage(1, 200, 'ai-1', 1) } as never);
@@ -1230,7 +1230,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		// 守卫只对「触发的」（@到 / eligible）对端 AI 消息累加 aiRoundCount。
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		// 需点名群，且允许响应 AI（排除 respondToAi=false 提前短路，确保是 @ 闸门拦下而非 AI 开关）
 		setGroupConfig(handler, 1, { mentionRequired: true, respondToAi: true });
 		const guard = getGuard(handler);
@@ -1260,7 +1260,7 @@ describe('MessageHandler S8-7: anti-loop guard at triggerAgentLoop chokepoint (i
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 			const guard = getGuard(handler);
 
@@ -1364,7 +1364,7 @@ describe('real-shape (server contract) regression', () => {
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 			const guard = getGuard(handler);
 
@@ -1398,7 +1398,7 @@ describe('real-shape (server contract) regression', () => {
 	it('respondToAi=false skips a real-shape AICLAW message (chat NOT called)', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		// 不需点名（排除 @ 闸门），但 respondToAi=false → AI 消息应被第二层开关拦下
 		setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: false });
 
@@ -1416,7 +1416,7 @@ describe('real-shape (server contract) regression', () => {
 		try {
 			const { adapter, calls } = fakeAdapter();
 			const { ws } = fakeWs();
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 1, maxWaitMs: 1 }, () => {});
 			setGroupConfig(handler, 1, { mentionRequired: false, respondToAi: true });
 			const guard = getGuard(handler);
 
@@ -1476,7 +1476,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 			{ roomId: 10, mentionRequired: 0, respondToAi: 1, rateLimitPerMinute: 5, dailyLimit: 100 },
 			{ roomId: 20, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 3, dailyLimit: 50 },
 		]);
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
 
 		await handler.prewarmGroupConfigs();
 
@@ -1502,7 +1502,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 			{ roomId: 10, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100, workspaceDir: '/srv/proj', account: '888888' },
 			{ roomId: 20, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100 },
 		]);
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
 
 		await handler.prewarmGroupConfigs();
 
@@ -1522,7 +1522,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		const { apiClient, listSelfGroupConfigs } = fakeApiClient(async () => [
 			{ roomId: 10, mentionRequired: 1, respondToAi: 0, rateLimitPerMinute: 5, dailyLimit: 100 },
 		]);
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
 
 		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
 		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
@@ -1546,7 +1546,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 			if (shouldThrow) throw new Error('nacos re-register window');
 			return [{ roomId: 42, mentionRequired: 1, respondToAi: 1, rateLimitPerMinute: 5, dailyLimit: 100 }];
 		});
-		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
 
 		// 另经 groupConfigChange 预置一条已有 cache（不同写路径，一并验证不被清空）。
 		setGroupConfig(handler, 7, { mentionRequired: false, rateLimitPerMinute: 9 });
@@ -1572,7 +1572,7 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 	it('prewarmNoApiClientIsNoop: apiClient 为 null 时不抛、cache 空', async () => {
 		const { adapter } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, undefined, () => {});
 
 		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
 
@@ -1580,14 +1580,13 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 	});
 });
 
-// ─── REQ-011 S2: cc is now node-driven (drivesTurns=true) → the STANDARD supervised path ───
+// ─── REQ-011 S2: cc is now node-driven → the STANDARD supervised path ───
 
 describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', () => {
-	/** A cc-typed adapter that (like CcHeadlessDriver) drivesTurns=true → standard path applies. */
+	/** A cc-typed adapter (like CcHeadlessDriver) → standard node-driven path applies. */
 	function ccHeadlessAdapter() {
 		const { adapter, calls } = fakeAdapter();
 		(adapter as unknown as { type: string }).type = 'cc';
-		(adapter as unknown as { drivesTurns: boolean }).drivesTurns = true;
 		return { adapter, calls };
 	}
 
@@ -1595,7 +1594,7 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 		const { adapter, calls } = ccHeadlessAdapter();
 		const { ws, sent } = fakeWs();
 		// NOTE: the constructor no longer accepts a channelPush arg — cc uses the standard path.
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -1608,7 +1607,7 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 	it('a cc turn streams thinking (bridged) + done → THINKING_END complete, exactly like the other drivers', async () => {
 		const { adapter, calls } = ccHeadlessAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -1628,11 +1627,10 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 // ─── REQ-011 S3: sender attribution wiring + data-routing + group @-parity ───
 
 describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + group @-parity', () => {
-	/** A cc-typed fake adapter (drivesTurns=true) — the STANDARD path applies, like CcHeadlessDriver. */
+	/** A cc-typed fake adapter — the STANDARD node-driven path applies, like CcHeadlessDriver. */
 	function ccAdapter() {
 		const { adapter, calls } = fakeAdapter();
 		(adapter as unknown as { type: string }).type = 'cc';
-		(adapter as unknown as { drivesTurns: boolean }).drivesTurns = true;
 		return { adapter, calls };
 	}
 	const openSessionOf = (adapter: unknown) => (adapter as { openSession: ReturnType<typeof vi.fn> }).openSession;
@@ -1641,7 +1639,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		const { adapter, calls } = ccAdapter();
 		const openSession = openSessionOf(adapter);
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// two un-@ messages accumulate (un-@ group context)
@@ -1664,7 +1662,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 	it('AC2: a NON-cc driver gets the SAME unified envelope (no cc-vs-others ternary anymore)', async () => {
 		const { adapter, calls } = fakeAdapter(); // type 'fake' (not cc)
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'first', 1, { name: 'alice' }) } as never);
@@ -1680,7 +1678,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 	it('AC5: DM → the unified `[HuLa 私聊]` envelope carries the sender`s [name(uid)] line', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		// a direct message (roomType=2) always triggers, no @ needed.
 		handler.handle({ type: 'receiveMessage', data: dmMessage(9, 100, '你好', 1, { name: '小明' }) } as never);
@@ -1694,7 +1692,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		const { ws } = fakeWs();
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 		try {
-			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 			handler.handle({ type: 'receiveMessage', data: dmMessage(9, 100, '你好', 1, { name: '小明' }) } as never);
 			await waitFor(() => logSpy.mock.calls.some((c) => String(c[0]).includes('envelope→driver')));
 
@@ -1711,7 +1709,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 	it('parity: a cc un-@ group message is accumulated and does NOT trigger (guard inherited, no bypass)', async () => {
 		const { adapter, calls } = ccAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'just chatting', 1, { name: 'alice' }) } as never);
@@ -1726,7 +1724,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		const { adapter, calls } = ccAdapter();
 		const openSession = openSessionOf(adapter);
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID], name: 'dave' }) } as never);
@@ -1740,7 +1738,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 	it('parity: cc skip-self is inherited (own message neither triggers nor accumulates)', async () => {
 		const { adapter, calls } = ccAdapter();
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// a message FROM self (uid === SELF_UID) — dropped at step 3 before any @-gate / accumulate.
@@ -1796,7 +1794,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 			killGraceMs: 20,
 		});
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 5, maxWaitMs: 30 });
+		const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 5, maxWaitMs: 30 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// one un-@ accumulates, then an @-message triggers the real spawn.
@@ -1823,7 +1821,7 @@ describe('MessageHandler REQ-029 (#29): >2^53 roomId precision', () => {
 	it('inbound roomId > 2^53 → THINKING_START carries the EXACT string (untruncated, not Number()d)', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		// Number('9007199254740993') === 9007199254740992 — a Number()d roomId would corrupt routing.
 		const bigRoom = '9007199254740993';

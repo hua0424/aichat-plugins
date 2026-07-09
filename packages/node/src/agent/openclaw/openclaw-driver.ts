@@ -233,7 +233,6 @@ interface ChatSink {
  */
 interface PendingChat {
 	sink: ChatSink;
-	fullContent: string;
 	done: boolean;
 	startTime: number; // REQ-004: 用于计算 thinking durationMs
 }
@@ -435,7 +434,6 @@ export class OpenclawDriver implements AgentDriver {
 		this.requestToRunId.set(requestId, '');
 		this.activeChats.set(`req:${requestId}`, {
 			sink,
-			fullContent: '',
 			done: false,
 			startTime: Date.now(),
 		});
@@ -607,7 +605,6 @@ export class OpenclawDriver implements AgentDriver {
 		if (evt.stream === 'assistant') {
 			const delta = evt.data.delta as string | undefined;
 			if (delta) {
-				chat.fullContent += delta;
 				chat.sink.push({ type: 'thinking', text: delta });
 			}
 		}

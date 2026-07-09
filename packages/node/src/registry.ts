@@ -8,8 +8,8 @@ import { AICHAT_HOME, type AichatConfig, type AichatCredentials } from './config
  * 每项描述一个 aiclaw 身份（激活 token + 工具后端），监督器据此拉起一条完整身份链路。
  */
 export interface AgentEntry {
-	/** 工具后端；本切片仅接线 'openclaw'，其余（如 'opencode'）凭证解析相同但 driver 构建可能尚不支持。 */
-	tool: 'openclaw' | 'opencode' | string;
+	/** 工具后端（'openclaw' | 'opencode' | 'codex' | 'cc'）；凭证解析与 tool 无关，driver 构建按 tool 分派。 */
+	tool: string;
 	/** aiclaw **激活** token（必填）。 */
 	token: string;
 	/** opencode 项目根目录（本切片未用，透传）。 */

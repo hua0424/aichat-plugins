@@ -17,7 +17,7 @@ import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
-import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
+import { loadAgentRegistry, resolveAgentCredential, type AgentEntry } from '../registry.js';
 import { Supervisor } from '../supervisor.js';
 import { getMachineCode } from '../auth/machine.js';
 import {
@@ -50,14 +50,13 @@ export async function start(): Promise<void> {
 		process.exit(1);
 	}
 
-	await startMultiIdentity(config);
+	await startMultiIdentity(config, registry);
 }
 
 /**
  * REQ-008 #76 多身份路径：用真实 deps 构建 Supervisor 并拉起 N 条身份链路（per-agent 隔离）。
  */
-async function startMultiIdentity(config: AichatConfig): Promise<void> {
-	const registry = loadAgentRegistry(config);
+async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]): Promise<void> {
 	const serverUrl = getServerUrl(config);
 	const clawConfig = detectClawConfig(config);
 	// 与 activate.ts 同源：ws://host:port/api/ws/ws → http://host:port/api
@@ -132,7 +131,7 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 			}
 			if (entry.tool === 'cc') {
 				// REQ-011 S2: claude-code is NODE-DRIVEN headless. CcHeadlessDriver spawns `claude -p`
-				// (stream-json) per inbound turn (drivesTurns=true → standard supervised path). The reply
+				// (stream-json) per inbound turn on the standard supervised path. The reply
 				// still goes out-of-band via the `aichat send-message` CLI; thinking is sourced from CC's
 				// hooks (POSTing to the CcBroker) and bridged into the turn's AgentEvent stream via the
 				// shared per-room registry. session_id is persisted for cross-turn/restart --resume.

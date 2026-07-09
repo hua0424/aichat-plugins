@@ -23,23 +23,14 @@ export interface AgentDriver {
 	readonly type: string;
 	connect(): Promise<void>;
 	/**
-	 * `chatContext` is a generic per-turn bag (a driver reads only the keys it cares about). Beyond the
-	 * REQ-008/#85 workspace keys it also carries REQ-011 S3's `fromName` + `accumulated` (the current
-	 * sender's name + the un-@ group-context lines) — read ONLY by the cc driver for per-sender
-	 * attribution; other drivers ignore them (behaviour unchanged).
+	 * `chatContext` is a generic per-turn bag (a driver reads only the keys it cares about): the
+	 * REQ-008/#85 workspace keys (roomType/roomId/counterpartUid/isOwner/workspaceDir/account) plus
+	 * #132's `selfName` (this aiclaw's own display name, threaded in cc-only for identity anchoring).
+	 * Per-sender attribution is NOT carried here — it's assembled at the handler layer into the unified
+	 * inbound envelope (REQ-013 S1, ./handler/envelope.ts) before the message reaches the driver.
 	 */
 	openSession(o: { aiclawUid: string; roomId: string; chatContext: Record<string, unknown> }): Promise<AgentSession>;
 	disconnect(): Promise<void>;
-	/**
-	 * REQ-010 S7: whether NODE drives this identity's turns on inbound messages.
-	 *
-	 * Default semantics (undefined === true): the MessageHandler triggers the agent loop
-	 * (openSession().send()) on an inbound trigger-eligible message — the model for openclaw /
-	 * opencode / codex. The CC driver sets this `false`: claude-code has NO server, the OWNER drives
-	 * the TUI by hand, so node must NOT trigger a turn on inbound messages. A cc identity's thinking
-	 * comes ONLY from its side-channel broker (external-thinking), never from an inbound-triggered loop.
-	 */
-	readonly drivesTurns?: boolean;
 	/**
 	 * REQ-010 S1: resolve an agent-session-scoped key back to the bound HuLa identity+room.
 	 * Used by the loopback capability endpoint to look up where an `aichat send-message`
