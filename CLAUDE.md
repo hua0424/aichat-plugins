@@ -51,7 +51,7 @@ Tests run with vitest: `pnpm test` (node ~521 + claw ~18). Runtime verification 
 
 Defines the bidirectional message protocol between aichat-node and HuLa-Server:
 
-- Plugin → Server: `HEARTBEAT(2)`, `ACK(15)`, `STREAM_START(17)`, `STREAM_DELTA(18)`, `STREAM_END(19)`, `THINKING_START(20)`, `THINKING_DELTA(21)`, `THINKING_END(22)`
+- Plugin → Server: `HEARTBEAT(2)`, `ACK(15)`, `THINKING_START(20)`, `THINKING_DELTA(21)`, `THINKING_END(22)` (frame numbers 17-19 = retired `STREAM_START/DELTA/END`, reserved-not-reused since aichatoverview#164)
 - Server → Plugin: `receiveMessage`, `thinkingStart`, `thinkingDelta`, `thinkingEnd`, `groupConfigChange`, `tokenExpired`, `aiclawAuthRequest`
 
 Key invariant: THINKING_START sends `triggerMsgId`; the server broadcasts back `thinkingId` in `thinkingStart`. All subsequent `THINKING_DELTA` must include `thinkingId`. The handler buffers deltas until `thinkingId` is backfilled (`packages/node/src/handler/message.ts:handleThinkingStartBroadcast`).

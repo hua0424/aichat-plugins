@@ -204,7 +204,7 @@ describe('REQ-008 #75 golden behavior (MessageHandler WS send sequence)', () => 
 		it(script.name, async () => {
 			const { driver, calls } = fakeDriver();
 			const { ws, sent } = fakeWs();
-			const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 });
+			const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 			const roomId = 1;
 			handler.handle({ type: 'receiveMessage', data: humanMessage(roomId, 100, 'hello', i + 1) } as never);

@@ -1,7 +1,7 @@
 {
   "name": "aichat-claw",
   "version": "0.1.0",
-  "description": "aichat-claw：openclaw Channel Plugin（HuLa Channel + Agent Tools）",
+  "description": "aichat-claw：openclaw Channel Plugin（HuLa Channel + resolve_exec_env 绑定钩子）",
   "type": "module",
   "main": "dist/index.js",
   "openclaw": {
@@ -12,9 +12,6 @@
     "lint": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run"
-  },
-  "dependencies": {
-    "@sinclair/typebox": "^0.34.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",

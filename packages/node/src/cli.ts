@@ -65,23 +65,20 @@ switch (command) {
 }
 
 async function handleActivate(args: string[]): Promise<void> {
-	let backend = '';
 	let token = '';
 
 	for (let i = 0; i < args.length; i++) {
-		if (args[i] === '--backend' && args[i + 1]) {
-			backend = args[++i];
-		} else if (args[i] === '--token' && args[i + 1]) {
+		if (args[i] === '--token' && args[i + 1]) {
 			token = args[++i];
 		}
 	}
 
 	if (!token) {
-		console.error('Usage: aichat activate --backend openclaw --token <activation-token>');
+		console.error('Usage: aichat activate --token <activation-token>');
 		process.exit(1);
 	}
 
-	await activate(token, backend || 'openclaw');
+	await activate(token);
 }
 
 function printHelp(): void {
@@ -89,7 +86,7 @@ function printHelp(): void {
 aichat - HuLa AI Assistant Plugin
 
 Commands:
-  activate --backend <backend> --token <token>   Activate with server token
+  activate --token <token>                       Activate with server token
   start                                          Connect and run
   send-message --content <text>                  Reply to the current chat
                                                  (room + identity are bound automatically
@@ -109,7 +106,7 @@ Commands:
   group-config --room <roomId> [options...]      Update group config
 
 Examples:
-  aichat activate --backend openclaw --token eyJ...
+  aichat activate --token eyJ...
   aichat start
   aichat send-message --content "Hello"
   aichat member-info 12345

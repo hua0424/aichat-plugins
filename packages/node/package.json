@@ -4,8 +4,7 @@
   "description": "aichat-node：HuLa-Server WS 桥接层",
   "type": "module",
   "bin": {
-    "aichat": "dist/cli.js",
-    "aichat-channel": "dist/agent/cc/channel-mcp.js"
+    "aichat": "dist/cli.js"
   },
   "scripts": {
     "dev": "tsx watch src/cli.ts -- start",
@@ -16,11 +15,9 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.27.1",
     "@openai/codex-sdk": "0.142.3",
     "@opencode-ai/plugin": "1.17.9",
     "@opencode-ai/sdk": "1.17.9",
-    "dotenv": "^16.4.7",
     "uuid": "^11.1.0",
     "ws": "^8.18.0"
   },

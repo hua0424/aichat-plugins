@@ -5,9 +5,7 @@
 export enum WSReqType {
 	HEARTBEAT = 2,
 	ACK = 15,
-	STREAM_START = 17,
-	STREAM_DELTA = 18,
-	STREAM_END = 19,
+	// 17/18/19 = 线上曾用的 STREAM_START/DELTA/END，现已废弃、不再发送；帧号保留不复用。
 	// REQ-004: THINKING 协议
 	THINKING_START = 20,
 	THINKING_DELTA = 21, // 21: S4 起废弃，不再发送、不复用
@@ -20,13 +18,8 @@ export enum WSReqType {
  */
 export type WSRespType =
 	| 'receiveMessage'
-	| 'streamStart'
-	| 'streamDelta'
-	| 'streamEnd'
 	| 'aiclawAuthRequest'
 	| 'tokenExpired'
-	| 'online'
-	| 'offline'
 	// REQ-004: THINKING 协议 + 群配置更新
 	| 'thinkingStart'
 	| 'thinkingEnd'
@@ -124,30 +117,6 @@ export interface ReceivedMessage {
 }
 
 // ─── REQ-004: THINKING Payload 类型 ───
-
-/** plugin → server: THINKING_START (20) */
-export interface ThinkingStartPayload {
-	fromUid: string | number;
-	roomId: string | number;
-	triggerMsgId: string;
-}
-
-/** plugin → server: THINKING_END (22) */
-export interface ThinkingEndPayload {
-	thinkingId?: string;
-	durationMs: number;
-	status: 'complete' | 'error';
-	error?: string;
-	roomId?: string | number;
-	/** REQ-004 S4: 完整累计的 thinking 文本（替代逐帧 THINKING_DELTA） */
-	content: string;
-	/**
-	 * REQ-004 S3: 本轮以 skip 终结时的原因（显式 hula_skip_reply 的 reason，
-	 * 或 agent 未调用任何终结动作工具时的兜底 'agent_no_terminal_tool'）。
-	 * 以 send 终结时不带此字段；附加字段，不破坏既有 status/thinkingId/durationMs。
-	 */
-	skipReason?: string;
-}
 
 /** server → client: thinkingStart 广播 */
 export interface ThinkingStartDTO {

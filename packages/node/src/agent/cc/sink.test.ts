@@ -6,9 +6,9 @@ import { InMemoryBindTokenStore } from '../bind-token-store.js';
 import { CcSessionRegistry, buildCcBridgeSink, type CcEventPush } from './sink.js';
 import type { AgentEvent } from '../events.js';
 
-// REQ-011 S3 (§5): the channel push path is DEAD in the runtime (S2 removed it). The channel-endpoint /
-// channel-mcp files stay (kept in git, unwired). Guard: no live `channelPush` reference in the runtime
-// message/registry path, so an accidental re-wire is caught.
+// REQ-011 S3 (§5): the CC channel-push subsystem is DEAD (S2 removed the runtime wiring; the dead
+// endpoint/MCP files were deleted in aichatoverview#164). Guard: no live `channelPush` reference in the
+// runtime message/registry path, so an accidental re-wire is caught.
 describe('REQ-011 S3 — channel dead-path stays unwired (no live channelPush)', () => {
 	const runtimeFiles = [
 		'../../handler/message.ts',

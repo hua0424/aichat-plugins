@@ -12,8 +12,8 @@ import type { BindTokenStore } from '../bind-token-store.js';
  * REQ-011 S2 — CcHeadlessDriver: claude-code as the FOURTH node-driven AgentDriver (after openclaw,
  * opencode, codex). The channel approach was abandoned; CC now runs HEADLESS, spawned per inbound turn.
  *
- * A deliberate HYBRID: `drivesTurns=true` (node drives the turn, like the other three), but the reply
- * exit is UNCHANGED from the owner-driven model:
+ * A deliberate HYBRID: node drives the turn (like the other three), but the reply exit is UNCHANGED
+ * from the owner-driven model:
  *   - REPLY    = CC itself runs `aichat send-message` (the #102 capability CLI, out-of-band). NOT parsed
  *                from stdout.
  *   - THINKING = sourced from the STDOUT TEE (`teeOutput`): each assistant `text`/`thinking` content
@@ -113,8 +113,6 @@ const MAX_TOOL_INPUT_CHARS = 2000;
 
 export class CcHeadlessDriver implements AgentDriver {
 	readonly type = 'cc';
-	/** Node DRIVES cc turns now (headless, spawn-per-turn) — the standard supervised path applies. */
-	readonly drivesTurns = true;
 
 	private readonly claudeBin: string;
 	private readonly workspaceBase: string;

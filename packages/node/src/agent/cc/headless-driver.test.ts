@@ -225,10 +225,9 @@ function stdinText(fs: ReturnType<typeof fakeSpawn>): string {
 }
 
 describe('CcHeadlessDriver — shape', () => {
-	it('type=cc, drivesTurns=true (node drives cc turns now)', () => {
+	it('type=cc (node drives cc turns now, standard supervised path)', () => {
 		const { driver } = makeDriver();
 		expect(driver.type).toBe('cc');
-		expect(driver.drivesTurns).toBe(true);
 	});
 
 	it('resolveSession is an opaque-token STORE LOOKUP (BL-014 #141), not a plaintext parse', async () => {

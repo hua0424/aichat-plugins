@@ -2,7 +2,9 @@
  * REQ-004 M3: aichat-cli group-config 命令
  */
 
-import { loadConfig, loadCredentials, getServerUrl } from '../config.js';
+import { loadConfig, getServerUrl, type AichatCredentials } from '../config.js';
+import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
+import { getMachineCode } from '../auth/machine.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
 export async function handleGroupConfig(args: string[]): Promise<void> {
@@ -24,14 +26,30 @@ export async function handleGroupConfig(args: string[]): Promise<void> {
 		process.exit(1);
 	}
 
-	const credentials = loadCredentials();
-	if (!credentials) {
-		console.error('Not activated. Run: aichat activate');
+	const config = loadConfig();
+	const registry = loadAgentRegistry(config);
+	if (registry.length === 0) {
+		console.error('No agents configured in ~/.aichat/config.jsonc. Run: aichat activate --token <token> and add it to the "agents" registry.');
 		process.exit(1);
 	}
 
-	const config = loadConfig();
-	const restBaseUrl = restBaseUrlFromWsUrl(getServerUrl(config));
+	// ponytail: group-config is a single-identity admin CLI; resolve the first registered identity's
+	// cached credential (per-token cache, no re-activation). Add a --token selector if multi-identity
+	// group-config is ever actually needed.
+	const serverUrl = getServerUrl(config);
+	const httpBase = serverUrl
+		.replace('ws://', 'http://')
+		.replace('wss://', 'https://')
+		.replace(/\/ws\/ws$/, '');
+	let credentials: AichatCredentials;
+	try {
+		credentials = await resolveAgentCredential(registry[0], { machineCode: getMachineCode(), httpBase });
+	} catch (err) {
+		console.error(`Credential resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+		process.exit(1);
+	}
+
+	const restBaseUrl = restBaseUrlFromWsUrl(serverUrl);
 	const api = new HulaApiClient(restBaseUrl, credentials.connectionToken);
 
 	if (Object.keys(updates).length === 0) {
