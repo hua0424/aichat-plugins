@@ -12,7 +12,7 @@ export class AgentRouter {
 	 */
 	register(adapter: AgentDriver): void {
 		if (this.adapters.has(adapter.type)) {
-			throw new Error(`ClawAdapter type "${adapter.type}" already registered`);
+			throw new Error(`AgentDriver type "${adapter.type}" already registered`);
 		}
 		this.adapters.set(adapter.type, adapter);
 	}

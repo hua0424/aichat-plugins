@@ -3,7 +3,7 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
 import { reduceThinking } from '../agent/thinking-map.js';
-import { filterOpenclawThinking } from '../agent/openclaw-driver.js';
+import { filterOpenclawThinking } from '../agent/openclaw/openclaw-driver.js';
 import { MessageDebouncer } from '../utils/debounce.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
