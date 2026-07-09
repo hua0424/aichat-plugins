@@ -57,4 +57,9 @@ export class FileSessionStore implements SessionStore {
 	findKeyBySessionID(sessionID: string): string | undefined {
 		return this.store.findKey((v) => v.sessionID === sessionID);
 	}
+
+	/** aichatoverview#166: await the async persist chain (tests / graceful shutdown). */
+	whenPersisted(): Promise<void> {
+		return this.store.whenPersisted();
+	}
 }

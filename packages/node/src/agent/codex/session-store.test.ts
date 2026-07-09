@@ -40,10 +40,12 @@ describe('FileCodexSessionStore', () => {
 		expect(store.findKeyByThreadId('thread_aaa')).toBeUndefined();
 	});
 
-	it('persists across instances on the same path', () => {
+	it('persists across instances on the same path', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'aichat-codex-sess-'));
 		const path = join(dir, 'sessions.json');
-		new FileCodexSessionStore(path).set('aiclaw-1-room-2', { threadId: 'thread_persist' });
+		const store = new FileCodexSessionStore(path);
+		store.set('aiclaw-1-room-2', { threadId: 'thread_persist' });
+		await store.whenPersisted(); // #166: persist is async now
 		const reloaded = new FileCodexSessionStore(path);
 		expect(reloaded.get('aiclaw-1-room-2')).toEqual({ threadId: 'thread_persist' });
 		expect(reloaded.findKeyByThreadId('thread_persist')).toBe('aiclaw-1-room-2');

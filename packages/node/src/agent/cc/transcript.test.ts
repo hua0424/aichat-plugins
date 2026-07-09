@@ -32,34 +32,38 @@ function readRecords(dir: string, binding: string): CcTranscriptRecord[] {
 }
 
 describe('FileCcTranscriptWriter', () => {
-	it('append writes one JSONL record per call, under a per-binding file', () => {
+	it('append writes one JSONL record per call, under a per-binding file', async () => {
 		const dir = freshDir();
 		const w = new FileCcTranscriptWriter(dir);
 		w.append(BINDING, { ts: 1, kind: 'inbound', session_id: 'sid-1', text: '[HuLa 私聊]\n[u(100)]: hi' });
+		await w.whenWritten(); // #166: append is async now
 
 		const recs = readRecords(dir, BINDING);
 		expect(recs).toHaveLength(1);
 		expect(recs[0]).toEqual({ ts: 1, kind: 'inbound', session_id: 'sid-1', text: '[HuLa 私聊]\n[u(100)]: hi' });
 	});
 
-	it('appends (never overwrites) across calls — the owner sees the full session, persisted', () => {
+	it('appends (never overwrites) across calls — the owner sees the full session, persisted', async () => {
 		const dir = freshDir();
 		const w = new FileCcTranscriptWriter(dir);
 		w.append(BINDING, { ts: 1, kind: 'inbound', session_id: 'sid-1', text: 'turn-1 in' });
 		w.append(BINDING, { ts: 2, kind: 'assistant', session_id: 'sid-1', text: 'turn-1 out' });
+		await w.whenWritten(); // #166: land the first writer's appends before the "restart" instance
 		// a later turn (new writer instance = simulates a restart) appends, does not truncate
 		const w2 = new FileCcTranscriptWriter(dir);
 		w2.append(BINDING, { ts: 3, kind: 'inbound', session_id: 'sid-1', text: 'turn-2 in' });
+		await w2.whenWritten();
 
 		const recs = readRecords(dir, BINDING);
 		expect(recs.map((r) => r.text)).toEqual(['turn-1 in', 'turn-1 out', 'turn-2 in']);
 	});
 
-	it('separates rooms into separate files', () => {
+	it('separates rooms into separate files', async () => {
 		const dir = freshDir();
 		const w = new FileCcTranscriptWriter(dir);
 		w.append('aiclaw-5-room-9', { ts: 1, kind: 'inbound', text: 'room9' });
 		w.append('aiclaw-5-room-10', { ts: 1, kind: 'inbound', text: 'room10' });
+		await w.whenWritten(); // #166: append is async now
 		expect(readRecords(dir, 'aiclaw-5-room-9').map((r) => r.text)).toEqual(['room9']);
 		expect(readRecords(dir, 'aiclaw-5-room-10').map((r) => r.text)).toEqual(['room10']);
 	});

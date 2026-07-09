@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
-import { readJsonMap, writeJsonMap } from './file-map-store.js';
+import { readJsonMap, AsyncJsonWriter } from './file-map-store.js';
 
 /**
  * BL-014 (#141) — opaque agent-facing binding token.
@@ -110,10 +110,14 @@ export class InMemoryBindTokenStore implements BindTokenStore {
  */
 export class FileBindTokenStore extends InMemoryBindTokenStore {
 	private readonly path: string;
+	// aichatoverview#166: async + serialized + mkdir-once (0600). mint is already low-frequency (only a NEW
+	// (uid,room) persists), so this mainly removes the per-persist sync mkdir + write off the event loop.
+	private readonly writer: AsyncJsonWriter;
 
 	constructor(path: string = DEFAULT_BIND_TOKENS_PATH, genToken?: () => string) {
 		super(genToken);
 		this.path = path;
+		this.writer = new AsyncJsonWriter(path, 0o600);
 		this.load();
 	}
 
@@ -143,7 +147,12 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 	private persist(): void {
 		const obj: Record<string, Bound> = {};
 		for (const [token, val] of this.forward) obj[token] = val;
-		// SECURITY (BL-014): the token file grants capability identity — lock it to owner-only rw (0600).
-		writeJsonMap(this.path, obj, 0o600);
+		// SECURITY (BL-014): the token file grants capability identity — locked to owner-only rw (0600) by the writer.
+		this.writer.write(obj);
+	}
+
+	/** Resolve when all queued async persists have drained (tests / graceful shutdown). */
+	whenPersisted(): Promise<void> {
+		return this.writer.whenWritten();
 	}
 }

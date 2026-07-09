@@ -75,10 +75,11 @@ describe('BindTokenStore — case-insensitive (openclaw lowercases the sessionKe
 });
 
 describe('FileBindTokenStore — persistence + reload', () => {
-	it('persists mints; a fresh instance on the same path reloads (token still resolves, mint still stable)', () => {
+	it('persists mints; a fresh instance on the same path reloads (token still resolves, mint still stable)', async () => {
 		const path = freshFile();
 		const first = new FileBindTokenStore(path, counterGen());
 		const token = first.mint('5', '9');
+		await first.whenPersisted(); // #166: persist is async now
 		expect(existsSync(path)).toBe(true);
 
 		// A fresh instance loads from disk. Its own genToken should NOT be needed for the reloaded pair.
@@ -88,10 +89,11 @@ describe('FileBindTokenStore — persistence + reload', () => {
 		expect(reloaded.mint('5', '9')).toBe(token);
 	});
 
-	it('the persisted token file is chmod 0600 (sensitive credential)', () => {
+	it('the persisted token file is chmod 0600 (sensitive credential)', async () => {
 		const path = freshFile();
 		const store = new FileBindTokenStore(path, counterGen());
 		store.mint('5', '9');
+		await store.whenPersisted(); // #166: persist is async now
 		expect(statSync(path).mode & 0o777).toBe(0o600);
 	});
 
