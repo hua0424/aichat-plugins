@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, loadCredentials, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
+import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
@@ -16,12 +16,10 @@ import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.j
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
-import { AgentRouter } from '../router.js';
 import { HulaApiClient, restBaseUrlFromWsUrl } from '../api/hula-api.js';
 import { loadAgentRegistry, resolveAgentCredential } from '../registry.js';
 import { Supervisor } from '../supervisor.js';
 import { getMachineCode } from '../auth/machine.js';
-import { retryAsync } from '../util/retry.js';
 import {
 	CapabilityRegistry,
 	sendMessageCapability,
@@ -38,18 +36,21 @@ import { installSkill } from '../capability/skill.js';
 
 /**
  * aichat start — 读取本地配置自动连接。
- * REQ-008 #76: 若 config.agents 非空 → 多身份监督器路径；否则回退既有单身份路径（不回归）。
+ * 单一构建路径：加载 registry；为空则打印带迁移示例的错误并非零退出，否则走多身份监督器路径。
+ * （单身份只是长度为 1 的 registry —— 旧的单身份回退分支已在 aichatoverview#163 删除。）
  */
 export async function start(): Promise<void> {
 	const config = loadConfig();
 	const registry = loadAgentRegistry(config);
 
-	if (registry.length > 0) {
-		await startMultiIdentity(config);
-		return;
+	if (registry.length === 0) {
+		console.error(
+			'[start] No agents configured. Add an "agents" array to ~/.aichat/config.jsonc, e.g. { "agents": [{ "tool": "openclaw", "token": "<激活 token>" }] } — single-identity is just a one-element registry.',
+		);
+		process.exit(1);
 	}
 
-	await startSingleIdentity(config);
+	await startMultiIdentity(config);
 }
 
 /**
@@ -229,80 +230,6 @@ async function startMultiIdentity(config: AichatConfig): Promise<void> {
 		await ccBroker?.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
-		process.exit(0);
-	};
-	process.on('SIGINT', shutdown);
-	process.on('SIGTERM', shutdown);
-}
-
-/**
- * 既有单身份路径（保持行为不变，含 tokenExpired → process.exit(1)）。
- */
-async function startSingleIdentity(config: AichatConfig): Promise<void> {
-	const credentials = loadCredentials();
-
-	if (!credentials) {
-		console.error('[start] No credentials found. Run "aichat activate" first.');
-		process.exit(1);
-	}
-
-	const serverUrl = getServerUrl(config);
-	const clawConfig = detectClawConfig(config);
-
-	console.log(`[start] UID: ${credentials.uid}`);
-	console.log(`[start] Server: ${serverUrl}`);
-	console.log(`[start] Claw Gateway: ${clawConfig.gatewayUrl}`);
-	console.log(`[start] Machine: ${credentials.machineCode}`);
-
-	// 创建路由器并注册驱动（OpenclawDriver 自带 openclaw gateway WS 引擎）
-	// BL-014 (#141): single-identity is openclaw-only (no cc broker); still needs its own bind-token store
-	// so the agent-facing OPENCLAW_BIND is an opaque token and resolveSession is a store lookup.
-	const router = new AgentRouter();
-	router.register(
-		new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, new FileBindTokenStore()),
-	);
-
-	// 连接所有驱动
-	await router.connectAll();
-
-	// 获取默认驱动
-	const driver = router.getDefault()!;
-
-	// REQ-004 M3: 内嵌轻量 HulaApiClient（autoReply / CLI 使用）
-	const restBaseUrl = restBaseUrlFromWsUrl(serverUrl);
-	const internalApiClient = new HulaApiClient(restBaseUrl, credentials.connectionToken);
-	console.log(`[start] REST API: ${restBaseUrl}`);
-
-	// 创建 HuLa WS 客户端
-	let handler: MessageHandler;
-
-	const ws = new HulaWSClient({
-		url: serverUrl,
-		token: credentials.connectionToken,
-		clientId: credentials.machineCode,
-		onMessage: (msg) => handler.handle(msg),
-		onConnected: () => {
-			console.log('[start] Connected! Ready to receive messages.');
-			// REQ #26 / BL-015 #140: 首连 + 每次重连都主动拉一次全量群配置预热内存 cache。
-			// Nacos 重注册窗口内会失败 → retryAsync 有界退避重试自愈（fire-and-forget，永不 reject）。
-			void retryAsync(() => handler.prewarmGroupConfigs(), { label: 'prewarm' });
-			// REQ-009 #83 / BL-015 #140: 上报 agent 类型（legacy 单身份路径恒为 openclaw；带退避重试）。
-			void retryAsync(() => internalApiClient.reportAgentType('openclaw'), { label: 'reportAgentType' });
-		},
-		onDisconnected: () => {
-			console.log('[start] Disconnected, will auto-reconnect...');
-		},
-	});
-
-	handler = new MessageHandler(ws, driver, credentials.uid, internalApiClient);
-
-	ws.connect();
-
-	// 优雅退出
-	const shutdown = () => {
-		console.log('\n[start] Shutting down...');
-		router.disconnectAll().catch(() => {});
-		ws.close();
 		process.exit(0);
 	};
 	process.on('SIGINT', shutdown);
