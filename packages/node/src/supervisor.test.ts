@@ -21,7 +21,11 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		// capture each handler's destroy() so teardown tests can assert it was called
 		destroyByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 		// REQ-008 #76 P2: capture the ws hooks per uid so tests can drive reconnect transitions
-		hooksByUid: new Map<number, { onConnected: () => void; onDisconnected: () => void }>(),
+		// #184: also capture onAuthError so the handshake-circuit → degrade wiring is testable.
+		hooksByUid: new Map<
+			number,
+			{ onConnected: () => void; onDisconnected: () => void; onAuthError: () => Promise<boolean> }
+		>(),
 		// REQ-009 #83: capture each api client's reportAgentType per uid so the test can assert
 		// onConnected reports the agent type.
 		reportAgentTypeByUid: new Map<number, ReturnType<typeof vi.fn>>(),
@@ -53,7 +57,14 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 			return { reportAgentType } as unknown as HulaApiClient;
 		}),
 		buildWs: vi.fn(
-			(cred: AichatCredentials, hooks: { onConnected: () => void; onDisconnected: () => void }): HulaWSClient => {
+			(
+				cred: AichatCredentials,
+				hooks: {
+					onConnected: () => void;
+					onDisconnected: () => void;
+					onAuthError: () => Promise<boolean>;
+				},
+			): HulaWSClient => {
 				const connect = vi.fn();
 				const close = vi.fn();
 				built.wsList.push({ uid: cred.uid, connect, close });
@@ -363,6 +374,36 @@ describe('Supervisor reconnect status (REQ-008 #76 P2)', () => {
 		expect(agent2.status).toBe('offline');
 		hooks.onConnected();
 		expect(agent2.status).toBe('offline');
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('Supervisor handshake-circuit degrade (#184)', () => {
+	it('firing onAuthError (permanent handshake) degrades only the target agent; returns false; no process.exit', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		// fire the onAuthError captured for uid=2 (HulaWSClient calls it on a 200+{code:406} circuit)
+		const fire = built.hooksByUid.get(2)!.onAuthError;
+		expect(fire).toBeTypeOf('function');
+		const canRetry = await fire();
+
+		// supervisor's wiring returns false → HulaWSClient will not schedule a post-circuit reconnect
+		expect(canRetry).toBe(false);
+
+		const agent2 = sup.agents.find((a) => a.uid === 2)!;
+		expect(agent2.status).toBe('offline');
+		// degrade tore down this identity's ws + driver
+		const ws2 = built.wsList.find((w) => w.uid === 2)!;
+		expect(ws2.close).toHaveBeenCalledOnce();
+		const driver2 = built.drivers.find((d) => d.entry.token === 'tok-2')!;
+		expect(driver2.disconnect).toHaveBeenCalledOnce();
+
+		// others stay online and untouched
+		for (const a of sup.agents.filter((a) => a.uid !== 2)) {
+			expect(a.status).toBe('online');
+		}
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

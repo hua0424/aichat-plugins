@@ -153,9 +153,11 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				url: serverUrl,
 				token: cred.connectionToken,
 				clientId: cred.machineCode,
+				uid: cred.uid,
 				onMessage: hooks.onMessage,
 				onConnected: hooks.onConnected,
 				onDisconnected: hooks.onDisconnected,
+				onAuthError: hooks.onAuthError,
 			}),
 		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
