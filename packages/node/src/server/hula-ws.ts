@@ -179,7 +179,7 @@ export class HulaWSClient {
 			if (classified) return;
 			classified = true;
 			const bodyText = Buffer.concat(chunks).toString('utf8');
-			void this.classifyHandshakeFailure(statusCode, bodyText).catch((e) =>
+			void this.classifyHandshakeFailure(statusCode, bodyText, res).catch((e) =>
 				console.error('[hula-ws] classifyHandshakeFailure failed:', e),
 			);
 		};
@@ -190,11 +190,21 @@ export class HulaWSClient {
 	}
 
 	/**
-	 * #184 分类握手失败：body 是业务错误 JSON（success===false 或 code>=400）或 statusCode 属于
-	 * AUTH_FATAL（401/403/406）→ permanent：停重连 + WARN 上报（带 uid/http/bizCode/msg）+ 触发
-	 * onAuthError。否则 transient：计数++，达阈值告警，依赖既有 backoff 重连（网关真故障应可恢复）。
+	 * #184 分类握手失败。#184(b) P1 改白名单：仅当 statusCode∈{401,403,406} 或
+	 * body.code∈{401,403,406,40001,100000004,100000005} 才判 permanent（身份真的失效）；
+	 * 其余一律 transient——包括 success===false 但 code=-1（gateway 默认异常包装）/ code=502 /
+	 * code=503（网关瞬态、启动空窗）。旧宽判定 `success===false || code>=400` 把网关瞬态熔断成
+	 * 永久离线，是 #152 事故复活，已删。
+	 *
+	 * #184(b) P2:读完 body、分类后调 res.socket?.destroy() 释放底层 socket（防泄漏）；
+	 * transient 分支显式调 onDisconnected?.()——握手失败瞬态窗口里 supervisor 不能虚报 online。
+	 * permanent 分支走 onAuthError→degrade 不受影响。
 	 */
-	private async classifyHandshakeFailure(statusCode: number, bodyText: string): Promise<void> {
+	private async classifyHandshakeFailure(
+		statusCode: number,
+		bodyText: string,
+		res: IncomingMessage,
+	): Promise<void> {
 		const uid = this.options.uid ?? '?';
 		// 分类一旦落定，解除 'close' 的 pending 闸门。
 		this.handshakeFailurePending = false;
@@ -211,14 +221,24 @@ export class HulaWSClient {
 				// 非 JSON body（如网关 rewarm 时的 HTML/纯文本）→ 落到 transient 分支
 			}
 		}
-		const isBizError =
-			biz !== null && (biz.success === false || (typeof biz.code === 'number' && biz.code >= 400));
-		// AUTH_FATAL_CODES 保留旧 #152 行为：401/403/406 即使无 body 也判定为 permanent。
-		const AUTH_FATAL_CODES = ['401', '403', '406'];
-		const permanent = isBizError || AUTH_FATAL_CODES.includes(String(statusCode));
+		// #184(b) P1:permanent 白名单。gateway WebFluxGlobalExceptionHandler 对一切异常
+		// setStatusCode(OK)，且 handleResponseStatusException 把原始 HTTP 状态码当业务 code，
+		// 导致启动空窗 503 被包成 200+{code:503}、默认异常 200+{code:-1}；旧宽判定
+		// (success===false || code>=400) 把它们全熔断成永久离线（#152 复活）。现在只在身份真的
+		// 失效的 code 上才 permanent，其余一律 transient 让 backoff 自愈。
+		const PERMANENT_HTTP_STATUSES = new Set(['401', '403', '406']);
+		const PERMANENT_BIZ_CODES = new Set([401, 403, 406, 40001, 100000004, 100000005]);
+		const bodyBizCode = biz !== null && typeof biz.code === 'number' ? biz.code : null;
+		const permanent =
+			PERMANENT_HTTP_STATUSES.has(String(statusCode)) ||
+			(bodyBizCode !== null && PERMANENT_BIZ_CODES.has(bodyBizCode));
+
+		// #184(b) P2a:body 已读完、分类已定，释放底层 socket（防泄漏）。res 是 IncomingMessage，
+		// socket 可选链；body 已收完，destroy 不影响分类。
+		res.socket?.destroy();
 
 		if (permanent) {
-			const bizCode = biz && typeof biz.code === 'number' ? String(biz.code) : '';
+			const bizCode = bodyBizCode !== null ? String(bodyBizCode) : '';
 			const bizMsg = biz && typeof biz.msg === 'string' ? biz.msg : '';
 			const bodySnip = bodyText.slice(0, 200);
 			// manager 裁决：WARN 级以上上报，含身份 uid + http status + 业务 code + msg（静默 43 分钟的教训）。
@@ -250,7 +270,8 @@ export class HulaWSClient {
 			return;
 		}
 
-		// transient：非 JSON / 空 body / 502/503 等。计数++，达阈值告警，但不永久停。
+		// transient：非 JSON / 空 body / 默认异常 code=-1 / 网关瞬态 502/503（含被包成 200+{code:503}）等。
+		// 计数++，达阈值告警，但不永久停——白名单外的 code 一律让 backoff 自愈。
 		this.transientHandshakeCount += 1;
 		const count = this.transientHandshakeCount;
 		const threshold = HulaWSClient.TRANSIENT_HANDSHAKE_WARN_THRESHOLD;
@@ -266,6 +287,10 @@ export class HulaWSClient {
 					'suspected gateway-side outage (still retrying, not permanent)',
 			);
 		}
+		// #184(b) P2b:transient 路径显式通知 supervisor 离线——握手失败的 socket 已废，不能让
+		// supervisor 在 backoff 窗口里仍认为该身份 online（虚报）。'close' 也会触发 onDisconnected，
+		// supervisor 对重复调用需幂等。
+		this.options.onDisconnected?.();
 		// 依赖后续 'close'(1006) → scheduleReconnect backoff。若 'close' 已在 body 读取期间触发，
 		// 它因 handshakeFailurePending 已 return，故此处兜底调度一次（scheduleReconnect 幂等）。
 		this.scheduleReconnect();

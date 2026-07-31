@@ -55,13 +55,17 @@ type MockWs = InstanceType<typeof hoisted.MockWebSocket>;
  */
 interface MockRes {
 	statusCode: number;
+	/** #184(b) P2a:res.socket?.destroy() is called after classification — mock tracks it. */
+	socket?: { destroy: ReturnType<typeof vi.fn> };
 	on(event: 'data' | 'end' | 'error', cb: (...a: unknown[]) => void): MockRes;
 	fire(): void;
 }
 function mockRes(statusCode: number, body: string): MockRes {
 	const handlers: Record<string, Array<(...a: unknown[]) => void>> = {};
+	const socket = { destroy: vi.fn() };
 	return {
 		statusCode,
+		socket,
 		on(event, cb) {
 			(handlers[event] ||= []).push(cb);
 			return this;
@@ -622,5 +626,266 @@ describe('HulaWSClient handshake 200 circuit breaker (#184)', () => {
 		await vi.runAllTimersAsync();
 		vi.advanceTimersByTime(60000);
 		expect(hoisted.instances.length).toBe(before);
+	});
+});
+
+// #184(b) P1+P2+P3: gateway real-shape whitelist.
+//
+// Root cause (P1): gateway WebFluxGlobalExceptionHandler.writeResponse sets statusCode=OK for ALL
+// exceptions, and handleResponseStatusException echoes the original HTTP status as the body code.
+// So startup-window 503 becomes 200+{code:503}, default exception 200+{code:-1}, bad-gateway
+// 200+{code:502}, etc. The old broad classifier (success===false || code>=400) circuit-broke ALL
+// of these into permanent offline — exactly the #152 incident revived. The fix is a whitelist:
+// only identity-really-invalidated codes (401/403/406/40001/100000004/100000005) are permanent;
+// everything else stays transient and backoffs self-heal.
+//
+// P2a: after classifying, res.socket?.destroy() releases the underlying socket.
+// P2b: transient branch explicitly fires onDisconnected so supervisor drops online status.
+describe('HulaWSClient handshake whitelist (#184b P1 — gateway real shapes)', () => {
+	beforeEach(() => {
+		hoisted.instances.length = 0;
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	// --- transient: gateway transient shapes the old broad classifier wrongly circuit-broke ---
+
+	it('200 + {success:false,code:-1,msg:"系统异常"} (default exception wrap) → transient', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: -1, msg: '系统异常' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+		ws.emit('close', 1006, Buffer.from('default-exc'));
+
+		// core regression: success===false but code=-1 is NOT in the whitelist → must stay retryable
+		expect(client.closed).toBe(false);
+		expect(onAuthError).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	// THE #52-revival regression: gateway boot window 503 wrapped as 200+{code:503}. Old broad
+	// classifier (code>=400) circuit-broke this — silent permanent offline during gateway restart.
+	it('200 + {success:false,code:503,...} (startup-window 503 wrap) → transient [regression]', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 503, msg: '服务未就绪' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+		ws.emit('close', 1006, Buffer.from('boot-503'));
+
+		expect(client.closed).toBe(false);
+		expect(onAuthError).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	it('200 + {success:false,code:502,...} → transient', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client, ws } = makeClient();
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 502, msg: 'bad gateway' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+		ws.emit('close', 1006, Buffer.from('502'));
+
+		expect(client.closed).toBe(false);
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	// sanity: a non-whitelaved large code stays transient
+	it('200 + {success:false,code:50000} (unknown biz code) → transient', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client, ws } = makeClient();
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 50000 }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+		ws.emit('close', 1006, Buffer.from('unknown'));
+
+		expect(client.closed).toBe(false);
+		vi.advanceTimersByTime(1000);
+		expect(hoisted.instances.length).toBe(before + 1);
+	});
+
+	// --- permanent: whitelist members ---
+
+	it('200 + {success:false,code:406,msg:"token已过期"} → permanent (whitelist)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client, ws } = makeClient({ onAuthError });
+		ws.emit('open');
+		const before = hoisted.instances.length;
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 406, msg: 'token已过期' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+		// permanent → no reconnect even after long backoff window
+		ws.emit('close', 1006, Buffer.from('circuit'));
+		vi.advanceTimersByTime(60000);
+		expect(hoisted.instances.length).toBe(before);
+	});
+
+	it('200 + {success:false,code:40001,msg:"aiclaw disabled"} → permanent (whitelist)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[hoisted.instances.length - 1] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 40001, msg: 'aiclaw disabled' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+	});
+
+	it('200 + {success:false,code:100000004,...} → permanent (whitelist)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[hoisted.instances.length - 1] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 100000004, msg: 'identity deactivated' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+	});
+
+	it('200 + {success:false,code:100000005,...} → permanent (whitelist)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[hoisted.instances.length - 1] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 100000005 }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+	});
+
+	it('real HTTP 401 (statusCode=401, no body) → permanent (AUTH_FATAL statusCode preserved)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[hoisted.instances.length - 1] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(401, '');
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+	});
+
+	it('real HTTP 403 (statusCode=403, no body) → permanent (AUTH_FATAL statusCode preserved)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[hoisted.instances.length - 1] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(403, '');
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+	});
+
+	// --- P2a: socket destroy ---
+
+	it('P2a: classifyHandshakeFailure destroys the underlying socket after classifying', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { ws } = makeClient();
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: -1 }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		// socket destroyed once classification landed (frees the dead handshake socket)
+		expect(res.socket?.destroy).toHaveBeenCalledTimes(1);
+	});
+
+	// --- P2b: transient branch notifies supervisor of offline ---
+
+	it('P2b: transient handshake failure fires onDisconnected (supervisor not stuck online)', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { ws, onDisconnected } = makeClient();
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: -1, msg: 'x' }));
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		// transient classification explicitly fires onDisconnected — supervisor learns the identity is down
+		// (no close emitted in this test; the assertion is the classify-time notification)
+		expect(onDisconnected).toHaveBeenCalled();
+	});
+
+	it('P2b: permanent handshake failure does NOT rely on transient onDisconnected path (onAuthError→degrade)', async () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { ws, onDisconnected } = makeClient({ onAuthError });
+		ws.emit('open');
+
+		const res = mockRes(401, '');
+		ws.emit('unexpected-response', {}, res);
+		res.fire();
+
+		// permanent path triggers onAuthError (degrade), not the transient onDisconnected notify
+		await vi.runAllTimersAsync();
+		expect(onAuthError).toHaveBeenCalledTimes(1);
+		// onDisconnected may fire later via 'close', but the classify-time permanent branch itself
+		// does not call it (contrast with the transient branch, which does)
+		ws.emit('close', 1006, Buffer.from('auth-fatal'));
+		expect(onDisconnected).toHaveBeenCalled(); // fires once via the close handler, not from classify
 	});
 });
