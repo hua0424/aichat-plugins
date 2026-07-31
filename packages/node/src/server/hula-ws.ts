@@ -1,3 +1,4 @@
+import { type IncomingMessage } from 'http';
 import WebSocket from 'ws';
 import { WSReqType, type WSResponse, buildRequest } from '../stream/protocol.js';
 
@@ -10,6 +11,12 @@ export interface HulaWSClientOptions {
 	onDisconnected?: () => void;
 	/** 认证失败时回调（如 token 过期 401/406），返回 true 表示已刷新可重连 */
 	onAuthError?: () => Promise<boolean>;
+	/**
+	 * #184 身份标识（仅用于日志上报）。HuLa-Server gateway 会把 aiclaw token 校验失败包装成
+	 * HTTP 200 + JSON body {success:false,code:406,…}；为避免 43 分钟级静默重试，permanent 分支
+	 * 必须 WARN 上报，且日志里要带身份 uid 才分得清是哪条身份出问题。
+	 */
+	uid?: string;
 	/**
 	 * #152 半开检测看门狗：每隔多久发一次 ws ping 帧并检查存活（默认 30s）。
 	 * 与应用层 25s HEARTBEAT 是两回事——后者防服务端踢，本 ping 只探本端 socket 是否半开。
@@ -36,6 +43,17 @@ export class HulaWSClient {
 	private lastAliveAt = 0;
 	private readonly pingIntervalMs: number;
 	private readonly deadAfterMs: number;
+	/**
+	 * #184 握手失败分析进行中标记。ws 在 'unexpected-response' 之后仍会 emit 'close'(1006)；
+	 * 但响应体（含决定 permanent/transient 的业务 code）要异步读完。该标记让 'close' handler
+	 * 在分类未定之前先不 scheduleReconnect，由 classify 统一收口（避免 permanent 时被 'close'
+	 * 抢先重连、也避免 transient 时双重 timer——scheduleReconnect 自带幂等兜底）。
+	 */
+	private handshakeFailurePending = false;
+	/** #184 连续 transient 握手失败计数；'open' 成功即重置。达阈值即 WARN 告警。 */
+	private transientHandshakeCount = 0;
+	/** #184 连续 transient 握手失败告警阈值（manager 裁决：不永久停，只告警）。 */
+	private static readonly TRANSIENT_HANDSHAKE_WARN_THRESHOLD = 10;
 
 	constructor(options: HulaWSClientOptions) {
 		this.options = options;
@@ -79,10 +97,21 @@ export class HulaWSClient {
 		this.ws.on('open', () => {
 			console.log('[hula-ws] Connected');
 			this.reconnectDelay = 1000;
+			// #184 a successful connect resets the transient-handshake counter so a later burst
+			// after recovery does not false-alarm the threshold WARN.
+			this.transientHandshakeCount = 0;
 			this.lastAliveAt = Date.now();
 			this.startHeartbeat();
 			this.startWatchdog();
 			this.options.onConnected?.();
+		});
+
+		// #184 ws emits 'unexpected-response'(req, res) when the upgrade is answered with a
+		// non-101 status. Registering this listener suppresses ws's fallback 'error' emit for
+		// handshake failures (ws@8.19 verified), so ALL handshake classification lives here now.
+		// res is the http.IncomingMessage — statusCode is sync; body chunks arrive via 'data'/'end'.
+		this.ws.on('unexpected-response', (_req, res) => {
+			this.handleHandshakeFailure(res);
 		});
 
 		// #152 ws 协议层 pong（对我们主动 ping 的回应）证明本端 socket 仍活
@@ -106,57 +135,140 @@ export class HulaWSClient {
 			this.stopHeartbeat();
 			this.stopWatchdog();
 			this.options.onDisconnected?.();
-			if (!this.closed) {
-				this.scheduleReconnect();
-			}
+			if (this.closed) return;
+			// #184 a handshake failure is being analyzed (body still being read) — defer the
+			// reconnect decision to classifyHandshakeFailure so a permanent 200+body result is
+			// not raced into a reconnect by this 'close'. classify will scheduleReconnect for
+			// transient (idempotent) or set this.closed for permanent.
+			if (this.handshakeFailurePending) return;
+			this.scheduleReconnect();
 		});
 
-		this.ws.on('error', async (err) => {
+		this.ws.on('error', (err) => {
 			console.error('[hula-ws] Error:', err.message);
-			// P1-2: any WS error means this connection is going down — stop the liveness
-			// timers up front so no interval survives on a dead/erroring socket. This
-			// covers the non-auth error paths too (previously only the auth branch stopped
-			// them). The auth-error reconnect semantics below are unchanged.
+			// P1-2 + #184: any WS error means this connection is going down — stop the liveness
+			// timers so no interval survives on a dead/erroring socket. Handshake (non-101) failures
+			// are now handled by 'unexpected-response' (registering that listener suppresses ws's
+			// fallback 'error' for handshakes in ws@8.19+), so this handler only sees transport-level
+			// errors (ECONNRESET/ECONNREFUSED/etc.). The follow-up 'close'(1006) drives scheduleReconnect.
 			this.stopHeartbeat();
 			this.stopWatchdog();
-			// 检测 WS 握手失败（非 101 响应）
-			// #152 rewarm fix: only a genuine auth rejection is fatal. The gateway can answer a reconnect
-			// upgrade with a transient non-101 (e.g. HTTP 200 while ws routes warm up after a restart) —
-			// treating that as auth-fatal permanently strands the node. Everything non-auth stays retryable
-			// via the existing 'close' → scheduleReconnect backoff.
-			const AUTH_FATAL_CODES = ['401', '403', '406'];
-			if (err.message.includes('Unexpected server response')) {
-				const statusCode = err.message.match(/(\d{3})/)?.[1];
-				if (statusCode && AUTH_FATAL_CODES.includes(statusCode)) {
-					console.warn(`[hula-ws] Auth failed with HTTP ${statusCode}, stopping reconnect`);
-					this.closed = true;
-					if (this.reconnectTimer) {
-						clearTimeout(this.reconnectTimer);
-						this.reconnectTimer = null;
+		});
+	}
+
+	/**
+	 * #184 收到 ws 'unexpected-response'(非 101 握手失败)。同步取 statusCode 后异步读完响应体，
+	 * 再交 classifyHandshakeFailure 分类。body 读取期间置 handshakeFailurePending，让 'close'
+	 * handler 不要抢先 scheduleReconnect（permanent 时会被误重连、transient 时会重复 timer）。
+	 *
+	 * HuLa-Server gateway 的 TokenContextFilter 故意把 aiclaw token 校验失败包装成
+	 * HTTP 200 + JSON body {success:false,code:406,msg:"token已过期"}；旧实现只从 'error' 的
+	 * err.message 解析 "Unexpected server response: 200"，把 200 当 transient rewarm 无限重试
+	 * （生产 codex 静默重试 43 分钟）。这里读 body 拿业务 code 来区分 permanent / transient。
+	 */
+	private handleHandshakeFailure(res: IncomingMessage): void {
+		const statusCode = res.statusCode ?? 0;
+		// 握手失败的 socket 已废，立刻停活性定时器（与 'close' 路径一致）。
+		this.stopHeartbeat();
+		this.stopWatchdog();
+		this.handshakeFailurePending = true;
+
+		const chunks: Buffer[] = [];
+		let classified = false;
+		const classifyOnce = (): void => {
+			if (classified) return;
+			classified = true;
+			const bodyText = Buffer.concat(chunks).toString('utf8');
+			void this.classifyHandshakeFailure(statusCode, bodyText).catch((e) =>
+				console.error('[hula-ws] classifyHandshakeFailure failed:', e),
+			);
+		};
+		res.on('data', (c: Buffer) => chunks.push(c));
+		res.on('end', classifyOnce);
+		// 响应体读取异常（截断等）→ 用已收到的部分（可能为空）按 transient 分类，不阻塞重连。
+		res.on('error', classifyOnce);
+	}
+
+	/**
+	 * #184 分类握手失败：body 是业务错误 JSON（success===false 或 code>=400）或 statusCode 属于
+	 * AUTH_FATAL（401/403/406）→ permanent：停重连 + WARN 上报（带 uid/http/bizCode/msg）+ 触发
+	 * onAuthError。否则 transient：计数++，达阈值告警，依赖既有 backoff 重连（网关真故障应可恢复）。
+	 */
+	private async classifyHandshakeFailure(statusCode: number, bodyText: string): Promise<void> {
+		const uid = this.options.uid ?? '?';
+		// 分类一旦落定，解除 'close' 的 pending 闸门。
+		this.handshakeFailurePending = false;
+
+		// 尝试解析业务错误 JSON（gateway 包装：{success:false,code:406,msg:"token已过期"}）。
+		// Note: 用具名类型而非 `as typeof biz` —— 后者会被控制流分析窄化成 `null`。
+		type BizError = { success?: unknown; code?: unknown; msg?: unknown };
+		let biz: BizError | null = null;
+		if (bodyText) {
+			try {
+				const p = JSON.parse(bodyText);
+				if (p && typeof p === 'object') biz = p as BizError;
+			} catch {
+				// 非 JSON body（如网关 rewarm 时的 HTML/纯文本）→ 落到 transient 分支
+			}
+		}
+		const isBizError =
+			biz !== null && (biz.success === false || (typeof biz.code === 'number' && biz.code >= 400));
+		// AUTH_FATAL_CODES 保留旧 #152 行为：401/403/406 即使无 body 也判定为 permanent。
+		const AUTH_FATAL_CODES = ['401', '403', '406'];
+		const permanent = isBizError || AUTH_FATAL_CODES.includes(String(statusCode));
+
+		if (permanent) {
+			const bizCode = biz && typeof biz.code === 'number' ? String(biz.code) : '';
+			const bizMsg = biz && typeof biz.msg === 'string' ? biz.msg : '';
+			const bodySnip = bodyText.slice(0, 200);
+			// manager 裁决：WARN 级以上上报，含身份 uid + http status + 业务 code + msg（静默 43 分钟的教训）。
+			console.warn(
+				`[hula-ws] Permanent handshake failure uid=${uid} http=${statusCode}` +
+					(bizCode ? ` bizCode=${bizCode}` : '') +
+					(bizMsg ? ` msg=${bizMsg}` : '') +
+					(bodyText ? ` body=${bodySnip}` : '') +
+					' — circuit broken, stopping reconnect',
+			);
+			this.closed = true;
+			this.transientHandshakeCount = 0;
+			if (this.reconnectTimer) {
+				clearTimeout(this.reconnectTimer);
+				this.reconnectTimer = null;
+			}
+			if (this.options.onAuthError) {
+				try {
+					const canRetry = await this.options.onAuthError();
+					if (canRetry) {
+						// 上层刷新了凭据 → 解除断路、回到 backoff 重连（保留旧 401+refresh 语义）。
+						this.closed = false;
+						this.scheduleReconnect();
 					}
-					if (this.options.onAuthError) {
-						try {
-							const canRetry = await this.options.onAuthError();
-							if (canRetry) {
-								this.closed = false;
-								this.scheduleReconnect();
-							}
-						} catch (e) {
-							console.error('[hula-ws] onAuthError failed:', e);
-						}
-					}
-				} else if (statusCode) {
-					// transient non-101 (e.g. 200 during gateway rewarm) — NOT auth-fatal.
-					// Do NOT set this.closed and do NOT touch reconnectTimer: the ws lib emits
-					// 'close' (code 1006) right after this 'error' on a failed handshake (verified
-					// against ws 8.19 emitErrorAndClose), and that 'close' drives scheduleReconnect
-					// via the existing backoff. Scheduling here too would be redundant.
-					console.warn(
-						`[hula-ws] Handshake got HTTP ${statusCode} (transient, e.g. gateway rewarm); will retry via backoff`,
-					);
+				} catch (e) {
+					console.error('[hula-ws] onAuthError failed:', e);
 				}
 			}
-		});
+			return;
+		}
+
+		// transient：非 JSON / 空 body / 502/503 等。计数++，达阈值告警，但不永久停。
+		this.transientHandshakeCount += 1;
+		const count = this.transientHandshakeCount;
+		const threshold = HulaWSClient.TRANSIENT_HANDSHAKE_WARN_THRESHOLD;
+		console.warn(
+			`[hula-ws] Transient handshake failure uid=${uid} http=${statusCode}` +
+				` count=${count}/${threshold}` +
+				(bodyText ? ` body=${bodyText.slice(0, 120)}` : ' body=<empty>') +
+				' — will retry via backoff',
+		);
+		if (count >= threshold) {
+			console.warn(
+				`[hula-ws] uid=${uid} hit ${count} consecutive transient ws handshake failures — ` +
+					'suspected gateway-side outage (still retrying, not permanent)',
+			);
+		}
+		// 依赖后续 'close'(1006) → scheduleReconnect backoff。若 'close' 已在 body 读取期间触发，
+		// 它因 handshakeFailurePending 已 return，故此处兜底调度一次（scheduleReconnect 幂等）。
+		this.scheduleReconnect();
 	}
 
 	send(type: WSReqType, data: Record<string, unknown>): void {

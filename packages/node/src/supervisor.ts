@@ -18,7 +18,17 @@ export interface SupervisorDeps {
 	buildApiClient: (cred: AichatCredentials) => HulaApiClient;
 	buildWs: (
 		cred: AichatCredentials,
-		hooks: { onMessage: (m: unknown) => void; onConnected: () => void; onDisconnected: () => void },
+		hooks: {
+			onMessage: (m: unknown) => void;
+			onConnected: () => void;
+			onDisconnected: () => void;
+			/**
+			 * #184 HuLa WS 握手遭遇 permanent 失败（如 gateway 把 token 过期包装成 HTTP 200+{code:406}）
+			 * 时由 HulaWSClient 调用。返回 true = 已刷新凭据、可重连；false = 放弃重连。supervisor 的
+			 * 生产实现：degrade 该身份（terminal offline）并返回 false（断路，不再重连）。
+			 */
+			onAuthError: () => Promise<boolean>;
+		},
 	) => HulaWSClient;
 	buildHandler: (
 		ws: HulaWSClient,
@@ -172,6 +182,13 @@ export class Supervisor {
 				// 同样 offline-terminal 守卫：降级身份不进入 reconnecting。
 				this.markReconnecting(cred.uid);
 				console.log(`[supervisor] agent uid=${cred.uid} disconnected, will auto-reconnect...`);
+			},
+			onAuthError: async () => {
+				// #184 permanent WS 握手失败（如 gateway 包装的 token 过期 200+{code:406}）。
+				// 与 onTokenExpired 同构：degrade 该身份（terminal offline），返回 false 让
+				// HulaWSClient 解除断路后的 backoff 也不重连。degrade 自身对已 offline 身份是 no-op。
+				this.degrade(cred.uid, 'handshake auth failure (circuit broken)');
+				return false;
 			},
 		});
 
