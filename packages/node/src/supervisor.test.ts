@@ -32,6 +32,8 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		// REQ #26 / BL-015 #140: capture each handler's prewarmGroupConfigs per uid so the test can
 		// assert onConnected also prewarms group configs (not just reportAgentType).
 		prewarmByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// #188: same capture for prewarmPersona (人设缓存预热，与群配置预热同点触发)。
+		prewarmPersonaByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -79,9 +81,12 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				built.destroyByUid.set(uid, destroy);
 				const prewarmGroupConfigs = vi.fn().mockResolvedValue(undefined);
 				built.prewarmByUid.set(uid, prewarmGroupConfigs);
+				const prewarmPersona = vi.fn().mockResolvedValue(undefined);
+				built.prewarmPersonaByUid.set(uid, prewarmPersona);
 				return {
 					handle: vi.fn(),
 					prewarmGroupConfigs,
+					prewarmPersona,
 					destroy,
 				} as unknown as MessageHandler;
 			},
@@ -427,6 +432,20 @@ describe('Supervisor reportAgentType + prewarm on connect (REQ-009 #83 / REQ #26
 		// the first `await fn()`, so `fn` (reportAgentType / prewarmGroupConfigs) is invoked synchronously.
 		expect(report).toHaveBeenCalledWith('openclaw');
 		expect(prewarm).toHaveBeenCalledTimes(1);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('#188: firing onConnected also prewarms the persona cache for that identity', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		const prewarmPersona = built.prewarmPersonaByUid.get(2)!;
+		expect(prewarmPersona).toBeTypeOf('function');
+
+		built.hooksByUid.get(2)!.onConnected();
+
+		expect(prewarmPersona).toHaveBeenCalledTimes(1);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

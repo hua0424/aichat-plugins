@@ -23,7 +23,9 @@ export type WSRespType =
 	// REQ-004: THINKING 协议 + 群配置更新
 	| 'thinkingStart'
 	| 'thinkingEnd'
-	| 'groupConfigChange';
+	| 'groupConfigChange'
+	// #188: 人设变更失效帧（低延迟优化；正确性基础是连接/重连 prewarm 拉取）
+	| 'aiclawPersonaChanged';
 
 /**
  * WS 请求消息格式
@@ -152,6 +154,15 @@ export interface GroupConfigChangeDTO {
 		/** REQ-009 #85: owner-configured absolute host workspace path (empty/absent → derive default). */
 		workspaceDir?: string;
 	};
+}
+
+/**
+ * #188: server → plugin: aiclaw 人设变更失效通知。收到后按 uid 匹配重拉
+ * GET /api/im/aiclaw/self/persona 刷新缓存；丢失由重连 prewarm 兜底。
+ */
+export interface AiclawPersonaChangeDTO {
+	// 与 GroupConfigChangeDTO 同约：server serializes Long as string; handler String()-normalizes.
+	aiclawUid: string | number;
 }
 
 /**

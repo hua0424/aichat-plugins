@@ -1,4 +1,4 @@
-import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO } from '../stream/protocol.js';
+import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO, AiclawPersonaChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
@@ -192,6 +192,13 @@ export class MessageHandler {
 	// #132: this aiclaw's own display name, resolved once + cached, for the cc system-prompt identity anchor.
 	private selfName: string | undefined;
 
+	/**
+	 * #188: 本 aiclaw 的人设缓存（owner 配置的 publicPersona）。唯一写入点：prewarmPersona（连接/重连
+	 * 预热，正确性基础）与 handleAiclawPersonaChange（server 失效帧重拉，低延迟优化）。null = 无人设
+	 * → buildAgentEnvelope 不注入（行为与人设功能引入前逐字节一致）。
+	 */
+	private persona: string | null = null;
+
 	/** debounce 配置（可注入，便于测试） */
 	private readonly debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number };
 
@@ -331,6 +338,13 @@ export class MessageHandler {
 				break;
 			case 'groupConfigChange':
 				this.handleGroupConfigChange(msg.data as GroupConfigChangeDTO);
+				break;
+			case 'aiclawPersonaChanged':
+				// #188: fire-and-forget（对齐 receiveMessage 的异步调用风格）——重拉是低延迟优化，
+				// 失败只 console.warn 保留旧缓存，绝不让一帧失效通知打断 WS 帧循环。
+				this.handleAiclawPersonaChange(msg.data as AiclawPersonaChangeDTO).catch((err) => {
+					console.error('[handler] handleAiclawPersonaChange error:', errMsg(err));
+				});
 				break;
 			case 'thinkingEnd':
 				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
@@ -559,6 +573,9 @@ export class MessageHandler {
 			fromUid,
 			accumulated,
 			message,
+			// #188: 人设统一注入点 —— 四类 driver 共用此公共层，缓存为空（null）时传 undefined
+			// → envelope 与人设功能引入前逐字节一致。人设改动无需重激活，下一轮对话即生效。
+			persona: this.persona ?? undefined,
 		});
 
 		// REQ-013 S1 / AC5: single observability point for the assembled envelope (BL-018-aligned). Log the
@@ -743,6 +760,37 @@ export class MessageHandler {
 			});
 		}
 		console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
+	}
+
+	/**
+	 * #188: 启动连上 / 每次重连后主动拉一次本 aiclaw 的人设预热内存缓存。语义对齐
+	 * prewarmGroupConfigs（BL-015 / #140）：apiClient 为 null 时 noop；拉取失败**抛出**，
+	 * 交给调用方 retryAsync 有界退避重试；persona 仅在成功返回后写入 → 抛出时旧值天然保留。
+	 * server 端人设被清空（null/空白）时同样写入 null —— 重连即回到「无人设」基线，无需重激活。
+	 */
+	async prewarmPersona(): Promise<void> {
+		if (!this.apiClient) return;
+		const persona = await this.apiClient.getSelfPersona();
+		this.persona = persona;
+		console.log(`[persona] prewarmed for aiclaw ${this.selfUid}: ${persona === null ? '(none)' : `${persona.length} chars`}`);
+	}
+
+	/**
+	 * #188: server 的 aiclawPersonaChanged 失效帧 —— uid 匹配本身份则重拉人设刷新缓存。
+	 * 语义与 handleGroupConfigChange 对齐（String() 归一后比对 uid，不匹配直接忽略）；
+	 * 与 prewarm 的差异：这里失败**不抛**（帧处理 fire-and-forget），console.warn 保留旧缓存，
+	 * 正确性由下次连接/重连的 prewarmPersona 兜底。
+	 */
+	private async handleAiclawPersonaChange(data: AiclawPersonaChangeDTO): Promise<void> {
+		if (String(data.aiclawUid) !== this.selfUid) return;
+		if (!this.apiClient) return;
+		try {
+			const persona = await this.apiClient.getSelfPersona();
+			this.persona = persona;
+			console.log(`[persona] refreshed after aiclawPersonaChanged for aiclaw ${this.selfUid}: ${persona === null ? '(none)' : `${persona.length} chars`}`);
+		} catch (err) {
+			console.warn(`[persona] refetch failed for aiclaw ${this.selfUid}, keeping old cache:`, errMsg(err));
+		}
 	}
 
 	/** M3: 群配置变更通知处理 */

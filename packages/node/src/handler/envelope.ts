@@ -10,6 +10,11 @@
  * lines the handler consumed for this turn. A naturally-attributed chat transcript (not bare/imperative
  * text) is load-bearing for CC's anti-prompt-injection defence; the other three drivers simply gain a
  * consistent, attributed envelope. This is pure — no I/O, no side effects.
+ *
+ * #188: optional `persona` (the aiclaw's owner-configured 人设). When non-blank it is prepended as a
+ * delimited block BEFORE the room header; the rest of the envelope stays byte-identical:
+ *   `[HuLa 人设开始]\n<persona verbatim>\n[HuLa 人设结束]\n` + original envelope.
+ * Absent / empty / whitespace-only persona → output byte-identical to the pre-feature format (AC6).
  */
 export function buildAgentEnvelope(o: {
 	roomType: number;
@@ -17,9 +22,12 @@ export function buildAgentEnvelope(o: {
 	fromUid: string;
 	accumulated: string[];
 	message: string;
+	persona?: string;
 }): string {
 	const room = o.roomType === 2 ? '[HuLa 私聊]' : '[HuLa 群聊]';
 	const currentLine = `[${o.fromName}(${o.fromUid})]: ${o.message}`;
 	const lines = o.accumulated.length > 0 ? [...o.accumulated, currentLine] : [currentLine];
-	return `${room}\n${lines.join('\n')}`;
+	const envelope = `${room}\n${lines.join('\n')}`;
+	if (o.persona === undefined || o.persona.trim() === '') return envelope;
+	return `[HuLa 人设开始]\n${o.persona}\n[HuLa 人设结束]\n${envelope}`;
 }
