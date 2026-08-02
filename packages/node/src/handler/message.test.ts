@@ -247,6 +247,18 @@ function getCachedConfig(
 	return handler.groupConfigCache.get(SELF_UID, String(roomId));
 }
 
+/** #188: 读取本 aiclaw 的人设缓存（白盒断言用） */
+function getPersona(handler: MessageHandler): string | null {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.persona;
+}
+
+/** #188: 直接写入人设缓存（白盒布置用） */
+function setPersona(handler: MessageHandler, persona: string | null): void {
+	// @ts-expect-error 访问私有字段做白盒布置
+	handler.persona = persona;
+}
+
 /** 向 handler 注入一条群配置（mentionRequired 等） */
 function setGroupConfig(
 	handler: MessageHandler,
@@ -1581,6 +1593,153 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
 
 		expect(getCachedConfig(handler, 10)).toBeUndefined();
+	});
+});
+
+describe('MessageHandler.prewarmPersona (#188)', () => {
+	function fakePersonaApi(impl: () => Promise<string | null>) {
+		const getSelfPersona = vi.fn(impl);
+		const apiClient = { getSelfPersona } as unknown as import('../api/hula-api.js').HulaApiClient & {
+			getSelfPersona: ReturnType<typeof vi.fn>;
+		};
+		return { apiClient, getSelfPersona };
+	}
+
+	it('成功拉取写入人设缓存', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, getSelfPersona } = fakePersonaApi(async () => '你是一个暴躁的猫娘');
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+
+		await handler.prewarmPersona();
+
+		expect(getSelfPersona).toHaveBeenCalledTimes(1);
+		expect(getPersona(handler)).toBe('你是一个暴躁的猫娘');
+	});
+
+	it('拉取失败 REJECT（交 retryAsync 兜底）且旧缓存天然保留', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		let shouldThrow = false;
+		const { apiClient } = fakePersonaApi(async () => {
+			if (shouldThrow) throw new Error('nacos re-register window');
+			return '旧人设';
+		});
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+
+		await handler.prewarmPersona();
+		expect(getPersona(handler)).toBe('旧人设');
+
+		shouldThrow = true;
+		await expect(handler.prewarmPersona()).rejects.toThrow('nacos re-register window');
+		expect(getPersona(handler)).toBe('旧人设');
+	});
+
+	it('server 返回 null/空白 → 缓存归一为 null（人设被清空后重连即生效）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakePersonaApi(async () => null);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setPersona(handler, '旧人设');
+
+		await handler.prewarmPersona();
+
+		expect(getPersona(handler)).toBeNull();
+	});
+
+	it('apiClient 为 null 时 noop（不抛、缓存不变）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, undefined, () => {});
+
+		await expect(handler.prewarmPersona()).resolves.toBeUndefined();
+		expect(getPersona(handler)).toBeNull();
+	});
+});
+
+describe('MessageHandler aiclawPersonaChanged 失效帧重拉 (#188)', () => {
+	function fakePersonaApi(impl: () => Promise<string | null>) {
+		const getSelfPersona = vi.fn(impl);
+		const apiClient = { getSelfPersona } as unknown as import('../api/hula-api.js').HulaApiClient & {
+			getSelfPersona: ReturnType<typeof vi.fn>;
+		};
+		return { apiClient, getSelfPersona };
+	}
+
+	it('匹配 selfUid（数字 uid 经 String 归一）→ 重拉并更新缓存', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, getSelfPersona } = fakePersonaApi(async () => '新人设');
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setPersona(handler, '旧人设');
+
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: 999 } } as never);
+
+		await waitFor(() => getPersona(handler) === '新人设');
+		expect(getSelfPersona).toHaveBeenCalledTimes(1);
+	});
+
+	it('不匹配 selfUid → 忽略（不发 api 调用，缓存不变）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, getSelfPersona } = fakePersonaApi(async () => '新人设');
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setPersona(handler, '旧人设');
+
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: '12345' } } as never);
+		await new Promise((r) => setTimeout(r, 20));
+
+		expect(getSelfPersona).not.toHaveBeenCalled();
+		expect(getPersona(handler)).toBe('旧人设');
+	});
+
+	it('重拉失败 → console.warn 且保留旧缓存（不抛回 WS 帧循环）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { apiClient } = fakePersonaApi(async () => {
+			throw new Error('boom');
+		});
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setPersona(handler, '旧人设');
+
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: SELF_UID } } as never);
+
+		await waitFor(() => warnSpy.mock.calls.length > 0);
+		expect(getPersona(handler)).toBe('旧人设');
+	});
+});
+
+describe('MessageHandler persona → envelope 接线 (#188)', () => {
+	// envelope 在 handler 公共层组装（triggerAgentLoop），先于任何 driver 分发 —— driver.type 在
+	// message.ts 里只影响日志，故用既有 fake adapter 参数化四类 driver.type 即覆盖全场景。
+	it.each(['openclaw', 'opencode', 'codex', 'cc'])(
+		'driver.type=%s：缓存有人设时 driver 收到的 envelope 含人设块',
+		async (driverType) => {
+			const { adapter, calls } = fakeAdapter();
+			(adapter as unknown as { type: string }).type = driverType;
+			const { ws } = fakeWs();
+			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+			setPersona(handler, '你是一个暴躁的猫娘');
+
+			handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
+			await waitFor(() => calls.length >= 1);
+
+			expect(calls[0].message).toBe(
+				'[HuLa 人设开始]\n你是一个暴躁的猫娘\n[HuLa 人设结束]\n[HuLa 私聊]\n[user(100)]: hello',
+			);
+		},
+	);
+
+	it('缓存为空 → driver 收到的 envelope 与人设功能引入前逐字节一致（AC6）', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+
+		handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hello');
 	});
 });
 

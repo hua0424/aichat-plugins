@@ -42,6 +42,43 @@ describe('buildAgentEnvelope — unified inbound-attribution envelope (REQ-013 S
 		).toBe('[HuLa 私聊]\n[unknown(7)]: m');
 	});
 
+	it('#188: persona injected BEFORE the room header, original envelope byte-identical after it', () => {
+		expect(
+			buildAgentEnvelope({
+				roomType: 2,
+				fromName: '小明',
+				fromUid: '100',
+				accumulated: [],
+				message: '你好',
+				persona: '你是一个暴躁的猫娘',
+			}),
+		).toBe('[HuLa 人设开始]\n你是一个暴躁的猫娘\n[HuLa 人设结束]\n[HuLa 私聊]\n[小明(100)]: 你好');
+	});
+
+	it('#188: group with persona + accumulated → persona block first, transcript unchanged after', () => {
+		const accumulated = ['[alice(100)]: first', '[bob(101)]: second'];
+		expect(
+			buildAgentEnvelope({
+				roomType: 1,
+				fromName: 'dave',
+				fromUid: '102',
+				accumulated,
+				message: 'hey bot',
+				persona: '多行\n人设\n原文',
+			}),
+		).toBe(
+			'[HuLa 人设开始]\n多行\n人设\n原文\n[HuLa 人设结束]\n[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot',
+		);
+	});
+
+	it('#188 (AC6): persona undefined / empty / whitespace-only → output BYTE-IDENTICAL to no persona', () => {
+		const base = { roomType: 1, fromName: 'dave', fromUid: '102', accumulated: ['[alice(100)]: first'], message: 'hey' };
+		const without = buildAgentEnvelope(base);
+		expect(buildAgentEnvelope({ ...base, persona: undefined })).toBe(without);
+		expect(buildAgentEnvelope({ ...base, persona: '' })).toBe(without);
+		expect(buildAgentEnvelope({ ...base, persona: '   \n\t  ' })).toBe(without);
+	});
+
 	it('REQ-029: a >2^53 fromUid is rendered as its EXACT string (never Number())', () => {
 		expect(
 			buildAgentEnvelope({

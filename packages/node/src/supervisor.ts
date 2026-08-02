@@ -173,6 +173,9 @@ export class Supervisor {
 				// （给 retryAsync 传 AbortSignal），当前 YAGNI 不做。
 				// label 带 uid：多身份模式下日志才分得清是哪条身份在重试/放弃。
 				void retryAsync(() => ref.handler!.prewarmGroupConfigs(), { label: `prewarm uid=${cred.uid}` });
+				// #188: 人设缓存预热 —— 与群配置预热同点触发（首连 + 每次重连）。连接/重连拉取是正确性
+				// 基础；server 的 aiclawPersonaChanged 推送只是低延迟优化，丢失由这里的重连拉取兜底。
+				void retryAsync(() => ref.handler!.prewarmPersona(), { label: `prewarmPersona uid=${cred.uid}` });
 				// REQ-009 #83 / BL-015 #140: 连接成功后上报 agent 类型。每次连接（含重连）都报，
 				// server upsert 幂等；同样带退避重试熬过 Nacos 重注册窗口。
 				void retryAsync(() => api.reportAgentType(entry.tool), { label: `reportAgentType uid=${cred.uid}` });

@@ -194,6 +194,19 @@ export class HulaApiClient {
 	}
 
 	/**
+	 * #188: 拉取本 aiclaw（按 token 认证身份）的人设（publicPersona），用于启动/重连预热 + 失效帧重拉。
+	 * 无 query 参数；server 返回 `{ data: { publicPersona: string | null } }`。
+	 * 归一：data 缺失 / null / 纯空白串 → null（缓存不存空白，下游注入以非空白为准）。
+	 */
+	async getSelfPersona(): Promise<string | null> {
+		const resp = await this.get('/api/im/aiclaw/self/persona');
+		const data = resp.data as { publicPersona?: unknown } | undefined;
+		const persona = data?.publicPersona;
+		if (typeof persona !== 'string' || persona.trim() === '') return null;
+		return persona;
+	}
+
+	/**
 	 * 更新 aiclaw 群配置
 	 */
 	async updateGroupConfig(

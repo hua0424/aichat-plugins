@@ -348,6 +348,43 @@ describe('HulaApiClient.signDownload (REQ-146 #146)', () => {
 	});
 });
 
+describe('HulaApiClient.getSelfPersona (#188)', () => {
+	it('GET /api/im/aiclaw/self/persona (no query), token via header, unwraps data.publicPersona', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: { publicPersona: '你是一个暴躁的猫娘' } }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		const out = await client.getSelfPersona();
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/aiclaw/self/persona');
+		expect((init as RequestInit).method).toBe('GET');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(out).toBe('你是一个暴躁的猫娘');
+	});
+
+	it('data 缺失 / publicPersona 为 null → null', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0 }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getSelfPersona()).resolves.toBeNull();
+
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: { publicPersona: null } }),
+		);
+		await expect(client.getSelfPersona()).resolves.toBeNull();
+	});
+
+	it('空白串人设归一为 null（不注入语义在下游，但缓存不存空白）', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: { publicPersona: '   \n\t ' } }),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getSelfPersona()).resolves.toBeNull();
+	});
+});
+
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
