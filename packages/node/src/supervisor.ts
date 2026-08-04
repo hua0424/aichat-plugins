@@ -6,6 +6,7 @@ import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
 import { retryAsync, expoBackoffMs, defaultDelay } from './util/retry.js';
 import { errMsg } from './util/err.js';
+import { collectHostInfo } from './host-info.js';
 
 /**
  * REQ-008 #76 — 监督器依赖注入面。
@@ -53,6 +54,11 @@ export interface SupervisorDeps {
 	 * 可覆盖的瞬态错误分类器。缺省按错误消息正则匹配（gateway starting / unavailable / 超时 等）。
 	 */
 	isTransientConnectError?: (err: unknown) => boolean;
+	/**
+	 * #193：按身份给出其 workspace 根（opencode/codex/cc 有；openclaw 无 → 返回 undefined，
+	 * 上报 payload 自然省略 workspaceBase）。缺省 = 一律 undefined（不带 workspaceBase）。
+	 */
+	workspaceBaseFor?: (entry: AgentEntry) => string | undefined;
 }
 
 /** 生产缺省：指数退避，封顶 8s。第 1 次失败等 1s、第 2 次 2s、第 3 次 4s、第 4+ 次 8s（曲线单源自 util/retry）。 */
@@ -179,6 +185,11 @@ export class Supervisor {
 				// REQ-009 #83 / BL-015 #140: 连接成功后上报 agent 类型。每次连接（含重连）都报，
 				// server upsert 幂等；同样带退避重试熬过 Nacos 重注册窗口。
 				void retryAsync(() => api.reportAgentType(entry.tool), { label: `reportAgentType uid=${cred.uid}` });
+				// #193: 首连 + 每次重连上报主机信息（hostname/ip/workspaceBase，openclaw 不带 base），
+				// server 端按字段合并、blank 保留旧值；与 reportAgentType 同点、同 retryAsync 语义。
+				void retryAsync(() => api.reportHostInfo(collectHostInfo(this.deps.workspaceBaseFor?.(entry))), {
+					label: `reportHostInfo uid=${cred.uid}`,
+				});
 			},
 			onDisconnected: () => {
 				// REQ-008 #76 P2: 掉线 → reconnecting（瞬态，HulaWSClient 自行重连）。

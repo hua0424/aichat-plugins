@@ -148,6 +148,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			throw new Error('unsupported agent tool: ' + entry.tool);
 		},
 		buildApiClient: (cred) => new HulaApiClient(restBaseUrl, cred.connectionToken),
+		// #193: 上报主机信息时的 workspace 根按 tool 取舍——opencode/codex/cc 各有 workspace base，
+		// openclaw 无 workspace 概念 → undefined（payload 省略 workspaceBase 字段）。
+		workspaceBaseFor: (entry) =>
+			entry.tool === 'opencode'
+				? opencodeWorkspaceBase
+				: entry.tool === 'codex'
+					? codexWorkspaceBase
+					: entry.tool === 'cc'
+						? ccWorkspaceBase
+						: undefined,
 		buildWs: (cred, hooks) =>
 			new HulaWSClient({
 				url: serverUrl,

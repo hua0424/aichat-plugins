@@ -34,6 +34,9 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		prewarmByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 		// #188: same capture for prewarmPersona (人设缓存预热，与群配置预热同点触发)。
 		prewarmPersonaByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// #193: capture each api client's reportHostInfo per uid so the test can assert
+		// onConnected reports host info (hostname/ip/workspaceBase).
+		reportHostInfoByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -56,7 +59,9 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		buildApiClient: vi.fn((cred: AichatCredentials): HulaApiClient => {
 			const reportAgentType = vi.fn().mockResolvedValue(undefined);
 			built.reportAgentTypeByUid.set(cred.uid, reportAgentType);
-			return { reportAgentType } as unknown as HulaApiClient;
+			const reportHostInfo = vi.fn().mockResolvedValue(undefined);
+			built.reportHostInfoByUid.set(cred.uid, reportHostInfo);
+			return { reportAgentType, reportHostInfo } as unknown as HulaApiClient;
 		}),
 		buildWs: vi.fn(
 			(
@@ -446,6 +451,77 @@ describe('Supervisor reportAgentType + prewarm on connect (REQ-009 #83 / REQ #26
 		built.hooksByUid.get(2)!.onConnected();
 
 		expect(prewarmPersona).toHaveBeenCalledTimes(1);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('Supervisor reportHostInfo on connect (#193)', () => {
+	const mixedEntries: AgentEntry[] = [
+		{ tool: 'openclaw', token: 'tok-1' },
+		{ tool: 'opencode', token: 'tok-2' },
+		{ tool: 'codex', token: 'tok-3' },
+		{ tool: 'cc', token: 'tok-4' },
+	];
+	const workspaceBaseFor = (entry: AgentEntry): string | undefined =>
+		entry.tool === 'opencode'
+			? '/base/opencode'
+			: entry.tool === 'codex'
+				? '/base/codex'
+				: entry.tool === 'cc'
+					? '/base/cc'
+					: undefined;
+
+	it('onConnected reports host info; opencode/codex/cc carry workspaceBase, openclaw omits it', async () => {
+		const { deps, built } = makeDeps({ workspaceBaseFor });
+		const sup = new Supervisor(deps);
+		await sup.start(mixedEntries);
+
+		for (const uid of [1, 2, 3, 4]) {
+			built.hooksByUid.get(uid)!.onConnected();
+			expect(built.reportHostInfoByUid.get(uid)).toHaveBeenCalledTimes(1);
+		}
+
+		const openclawPayload = built.reportHostInfoByUid.get(1)!.mock.calls[0][0] as Record<string, unknown>;
+		expect(openclawPayload.hostname).toBeTypeOf('string');
+		expect((openclawPayload.hostname as string).length).toBeGreaterThan(0);
+		// openclaw 不带 workspaceBase（workspaceBaseFor 返回 undefined → 字段省略）
+		expect('workspaceBase' in openclawPayload).toBe(false);
+
+		expect(built.reportHostInfoByUid.get(2)!.mock.calls[0][0]).toMatchObject({
+			workspaceBase: '/base/opencode',
+		});
+		expect(built.reportHostInfoByUid.get(3)!.mock.calls[0][0]).toMatchObject({
+			workspaceBase: '/base/codex',
+		});
+		expect(built.reportHostInfoByUid.get(4)!.mock.calls[0][0]).toMatchObject({
+			workspaceBase: '/base/cc',
+		});
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('重连（onConnected 二次触发）→ 再次上报', async () => {
+		const { deps, built } = makeDeps({ workspaceBaseFor });
+		const sup = new Supervisor(deps);
+		await sup.start(mixedEntries);
+
+		const hooks = built.hooksByUid.get(2)!;
+		hooks.onConnected();
+		hooks.onDisconnected();
+		hooks.onConnected();
+
+		expect(built.reportHostInfoByUid.get(2)).toHaveBeenCalledTimes(2);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('workspaceBaseFor 缺省时四类身份统一不带 workspaceBase（可选 dep）', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(mixedEntries);
+
+		built.hooksByUid.get(2)!.onConnected();
+		const payload = built.reportHostInfoByUid.get(2)!.mock.calls[0][0] as Record<string, unknown>;
+		expect(payload.hostname).toBeTypeOf('string');
+		expect('workspaceBase' in payload).toBe(false);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

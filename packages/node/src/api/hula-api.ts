@@ -2,6 +2,7 @@
  * REQ-004 M3: aichat-node 内嵌轻量 HulaApiClient
  * 仅用于 autoReply 发送和 CLI 命令，不替代 aichat-claw 的 Tool 路径
  */
+import type { HostInfo } from '../host-info.js';
 
 interface ApiResponse {
 	success: boolean;
@@ -224,6 +225,15 @@ export class HulaApiClient {
 	 */
 	async reportAgentType(agentType: string): Promise<void> {
 		await this.post('/api/im/aiclaw/report-agent-type', { agentType });
+	}
+
+	/**
+	 * #193：连接成功（首连 + 每次重连）后上报本机主机信息（hostname / ip / workspaceBase），
+	 * 供 server 展示 aiclaw 实际运行的宿主机与 workspace 根。自作用域：uid 取 connectionToken
+	 * 身份，body 只带主机字段；可选字段省略 = server 端保留旧值（按字段合并）。
+	 */
+	async reportHostInfo(info: HostInfo): Promise<void> {
+		await this.post('/api/im/aiclaw/report-host-info', info);
 	}
 
 	// ─── HTTP helpers ───
