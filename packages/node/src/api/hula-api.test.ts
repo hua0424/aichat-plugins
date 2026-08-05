@@ -402,3 +402,41 @@ describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 		expect(JSON.parse((init as RequestInit).body as string)).toEqual({ agentType: 'opencode' });
 	});
 });
+
+describe('HulaApiClient.reportHostInfo (#193)', () => {
+	it('POST /api/im/aiclaw/report-host-info，body 原样透传，token 走 header', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0 }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		await client.reportHostInfo({
+			hostname: 'my-host',
+			ip: '10.38.10.20',
+			workspaceBase: '/data/aichat/cc/workspace',
+		});
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/aiclaw/report-host-info');
+		expect((init as RequestInit).method).toBe('POST');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+			hostname: 'my-host',
+			ip: '10.38.10.20',
+			workspaceBase: '/data/aichat/cc/workspace',
+		});
+	});
+
+	it('openclaw 形态：仅 hostname（可选字段省略时不出现在 body）', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0 }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		await client.reportHostInfo({ hostname: 'my-host' });
+
+		const [, init] = fetchSpy.mock.calls[0];
+		expect(JSON.parse((init as RequestInit).body as string)).toEqual({ hostname: 'my-host' });
+	});
+});
