@@ -256,12 +256,10 @@ export class OpenclawDriver implements AgentDriver {
 	private readonly bindTokens: BindTokenStore;
 	private readonly wsFactory: OpenclawSocketFactory;
 	/**
-	 * REQ-018: openclaw workspace path where the rendered system prompt AGENTS.md is written.
-	 * `adapter_config`-configurable (future) / `~/.openclaw` convention. **.83 real-env confirmation
-	 * point (R1): openclaw's actual read directory + instruction filename must be verified on the test
-	 * host — if it does not read AGENTS.md, write the file it actually reads.** Also note the
-	 * multi-identity caveat (a shared AGENTS.md may clobber across openclaw aiclaws until R1 confirms
-	 * the layout).
+	 * REQ-018 R1（真机已确认）: openclaw 实际读取的工作区是 `~/.openclaw/workspace/`，会话启动时把其中的
+	 * AGENTS.md / SOUL.md / USER.md 等语义文件注入上下文 —— 所以渲染后的 system prompt 必须写进
+	 * `~/.openclaw/workspace/AGENTS.md`。workspace 是全局单目录，多个 openclaw 身份共享一份 AGENTS.md
+	 * 会互踩（aichatoverview#219）；单身份下无互踩，不阻塞。
 	 */
 	private readonly workspaceDir: string;
 	private closed = false;
@@ -301,14 +299,14 @@ export class OpenclawDriver implements AgentDriver {
 		token: string,
 		bindTokens: BindTokenStore,
 		wsFactory: OpenclawSocketFactory = defaultOpenclawSocketFactory,
-		// REQ-018: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw).
+		// REQ-018 R1: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw/workspace).
 		workspaceDir?: string,
 	) {
 		this.url = url;
 		this.token = token;
 		this.bindTokens = bindTokens;
 		this.wsFactory = wsFactory;
-		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw');
+		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw', 'workspace');
 	}
 
 	/**
