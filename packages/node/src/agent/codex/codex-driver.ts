@@ -1,10 +1,12 @@
 import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Codex, Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapCodexEvent } from './events.js';
 import type { CodexSessionStore } from './session-store.js';
-import { buildReplyInstruction } from '../reply-contract.js';
+import { buildSystemPrompt } from '../prompt-templates.js';
+import { syncAgentsMdFile } from '../agents-md.js';
 import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 import { errMsg } from '../../util/err.js';
 
@@ -100,6 +102,23 @@ export class CodexDriver implements AgentDriver {
 		// deriveWorkspaceDir — it already handles group/dm + the `~` expansion).
 		const workingDirectory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
 		await mkdir(workingDirectory, { recursive: true });
+
+		// REQ-018: render the unified system prompt once per (per-turn) session and write it into the
+		// workspace AGENTS.md marked block. codex exec re-reads workspace AGENTS.md each turn, so the
+		// identity anchor + persona + reply contract live THERE — the per-turn user message stays pure.
+		// hash-compare (syncAgentsMdFile) skips the write when unchanged. A write failure degrades to
+		// "no system prompt this turn" (warn, don't fail the turn).
+		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.templates
+			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
+			: undefined;
+		if (systemPrompt) {
+			try {
+				await syncAgentsMdFile(join(workingDirectory, 'AGENTS.md'), systemPrompt);
+			} catch (err) {
+				console.warn(`[codex] AGENTS.md write failed (degrading: no system prompt this turn): ${errMsg(err)}`);
+			}
+		}
 
 		const key = bindingKey(o.aiclawUid, o.roomId);
 
@@ -263,13 +282,12 @@ class CodexSession implements AgentSession {
 			return false;
 		};
 
-		// Same shared role-instruction as the other node-driven drivers (agent/reply-contract.ts).
-		const enrichedMessage = buildReplyInstruction(message);
-
+		// REQ-018: the per-turn message is PURE user text — the reply contract + identity anchor + persona
+		// live in the workspace AGENTS.md (written by openSession); codex exec re-reads it each turn.
 		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
 		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.
 		const consume = async (thread: Thread): Promise<void> => {
-			const { events } = await thread.runStreamed(enrichedMessage);
+			const { events } = await thread.runStreamed(message);
 			const iter = (events as AsyncIterable<unknown>)[Symbol.asyncIterator]();
 			if (!installIter(iter)) return; // already closed → installIter terminated the iter
 			while (true) {

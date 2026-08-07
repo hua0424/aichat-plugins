@@ -3,6 +3,8 @@
  * 仅用于 autoReply 发送和 CLI 命令，不替代 aichat-claw 的 Tool 路径
  */
 import type { HostInfo } from '../host-info.js';
+import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
+import { errMsg } from '../util/err.js';
 
 interface ApiResponse {
 	success: boolean;
@@ -205,6 +207,44 @@ export class HulaApiClient {
 		const persona = data?.publicPersona;
 		if (typeof persona !== 'string' || persona.trim() === '') return null;
 		return persona;
+	}
+
+	/**
+	 * REQ-018 — 拉取本 aiclaw（按 token 认证身份）的 agent prompt 模板（人设块 + 回复契约 + 身份锚的原稿）。
+	 * GET /api/im/aiclaw/self/prompts → server 返回 `R<Map<String,String>>`，`data` 是 LinkedHashMap，
+	 * key 为三个**全 key**：`agent.prompt.reply_contract` / `agent.prompt.identity_anchor` /
+	 * `agent.prompt.persona_section`（value 为模板原文，占位符 **未渲染**；{displayName}/{uid}/{persona}/{reply_command}
+	 * 由各 driver 在 per-turn session open 时经 agent/prompt-templates.ts buildSystemPrompt 替换）。
+	 *
+	 * 失败语义（fail-fast，supervisor 在 buildAgent 里调用）：
+	 *   - 404（server 未升级、没这个端点）→ 重抛「请先升级 server 再部署 plugins」——该身份**不得上线**；
+	 *   - 任一 key 缺失 / null / 纯空白 → 抛 `agent prompt config missing: <configKey>`（用全 key 名）。
+	 * 三者齐备才返回原稿模板。
+	 */
+	async getAgentPromptTemplates(): Promise<AgentPromptTemplates> {
+		let resp: ApiResponse;
+		try {
+			resp = await this.get('/api/im/aiclaw/self/prompts');
+		} catch (err) {
+			// private get() 的 parseResponse 对 !ok 抛 `HuLa API error: 404 ...`。404 = server 未升级。
+			if (errMsg(err).startsWith('HuLa API error: 404')) {
+				throw new Error('agent prompt config unavailable: server 未升级（404）：请先升级 server 再部署 plugins');
+			}
+			throw err;
+		}
+		const data = (resp.data ?? {}) as Record<string, unknown>;
+		const nonBlank = (configKey: string): string => {
+			const v = data[configKey];
+			if (typeof v !== 'string' || v.trim() === '') {
+				throw new Error(`agent prompt config missing: ${configKey}`);
+			}
+			return v;
+		};
+		return {
+			replyContract: nonBlank('agent.prompt.reply_contract'),
+			identityAnchor: nonBlank('agent.prompt.identity_anchor'),
+			personaSection: nonBlank('agent.prompt.persona_section'),
+		};
 	}
 
 	/**

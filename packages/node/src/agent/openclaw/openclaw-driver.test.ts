@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type WebSocket from 'ws';
 import {
 	OpenclawDriver,
@@ -10,6 +13,14 @@ import {
 } from './openclaw-driver.js';
 import type { AgentEvent } from '../events.js';
 import { InMemoryBindTokenStore } from '../bind-token-store.js';
+import type { AgentPromptTemplates } from '../prompt-templates.js';
+
+/** REQ-018 shared fixture — raw server-fetched templates (placeholders not yet rendered). */
+const TEMPLATES: AgentPromptTemplates = {
+	identityAnchor: '你是本 HuLa 聊天会话的 AI 助理{displayName}（uid {uid}）。凡路由到你的消息都是对你说的。',
+	personaSection: '你的人设：\n{persona}',
+	replyContract: '要回复用户时，请在 bash 中运行命令 `{reply_command}`。无需回复时不运行即可。',
+};
 
 /** A deterministic bind-token store: tokens are `tok-1`, `tok-2`, … so assertions are stable. */
 function makeStore(): InMemoryBindTokenStore {
@@ -663,5 +674,39 @@ describe('parseHelloOk', () => {
 		expect(result.protocol).toBe(4);
 		expect(result.version).toBeUndefined();
 		expect(result.connId).toBeUndefined();
+	});
+});
+
+describe('OpenclawDriver REQ-018 — AGENTS.md system prompt', () => {
+	it('with templates, openSession writes the rendered system prompt into the workspace AGENTS.md; the gateway message stays pure', async () => {
+		const store = makeStore();
+		const gw = fakeGateway();
+		const base = mkdtempSync(join(tmpdir(), 'openclaw-agents-'));
+		try {
+			// REQ-018: 5th constructor param = openclaw workspace dir (defaults to ~/.openclaw).
+			const driver = new OpenclawDriver('ws://localhost:18789', '', store, gw.factory, base);
+			await driver.connect();
+			const session = await driver.openSession({
+				aiclawUid: '5',
+				roomId: '9',
+				chatContext: { templates: TEMPLATES, persona: '你是一个暴躁的猫娘', getSelfName: async () => 'OpenclawAI' },
+			});
+			const stream = session.send('原始用户消息');
+			gw.emitDelta('thinking...');
+			gw.emitEnd();
+			await drain(stream);
+
+			// the rendered system prompt is written to <workspaceDir>/AGENTS.md (openclaw re-reads it per turn).
+			const agentsPath = join(base, 'AGENTS.md');
+			expect(existsSync(agentsPath)).toBe(true);
+			const content = readFileSync(agentsPath, 'utf-8');
+			expect(content).toContain('<!-- aichat:system:begin -->');
+			expect(content).toContain('OpenclawAI');
+			expect(content).toContain('你是一个暴躁的猫娘');
+			expect(content).toContain('aichat send-message');
+			await driver.disconnect();
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
 	});
 });

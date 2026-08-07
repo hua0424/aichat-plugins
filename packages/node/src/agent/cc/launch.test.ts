@@ -2,13 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
-import {
-	buildCcHooksSettings,
-	buildCcSettings,
-	writeCcSettings,
-	CC_REPLY_CONTRACT,
-	buildCcSystemPrompt,
-} from './launch.js';
+import { buildCcHooksSettings, buildCcSettings, writeCcSettings } from './launch.js';
 
 /** The events chunk-2 must wire (the broker dispatches by hook_event_name). #120: MessageDisplay is NOT
  * wired — thinking is teed from the driver's stdout, not sourced from a hook. */
@@ -127,44 +121,6 @@ describe('writeCcSettings', () => {
 	});
 });
 
-describe('CC_REPLY_CONTRACT (REQ-010 #102 — skill≠sent enforcement)', () => {
-	it('mandates actually running the send-message bash command', () => {
-		expect(CC_REPLY_CONTRACT).toContain('aichat send-message');
-	});
-
-	it('warns that invoking the skill / claiming "已发送" does NOT send', () => {
-		expect(CC_REPLY_CONTRACT).toContain('aichat-reply');
-		expect(CC_REPLY_CONTRACT).toContain('不会发送');
-	});
-
-	it('forbids passing room/identity args (AICHAT_BIND auto-binds)', () => {
-		expect(CC_REPLY_CONTRACT).toContain('AICHAT_BIND');
-		expect(CC_REPLY_CONTRACT).toContain('绝不要传 --room');
-	});
-
-	it('forbids claiming sent before actually running the command', () => {
-		expect(CC_REPLY_CONTRACT).toContain('在你真正运行过该命令之前，绝不要声称已发送');
-	});
-});
-
-describe('buildCcSystemPrompt (#132 — identity anchor)', () => {
-	it('anchors both the display name and uid, then appends the reply-contract body', () => {
-		const out = buildCcSystemPrompt({ displayName: 'CCTestAI', uid: '177189908388352' });
-		expect(out).toContain('CCTestAI');
-		expect(out).toContain('177189908388352');
-		// mentions the @-name so the model recognises a group @-mention of itself
-		expect(out).toContain('@CCTestAI');
-		// the full #102 reply contract body is preserved unchanged
-		expect(out).toContain('aichat send-message');
-		expect(out).toContain(CC_REPLY_CONTRACT);
-	});
-
-	it('without a display name still pins the uid + contract, and emits no `undefined` literal', () => {
-		const out = buildCcSystemPrompt({ uid: '123' });
-		expect(out).toContain('123');
-		expect(out).toContain('aichat send-message');
-		expect(out).toContain(CC_REPLY_CONTRACT);
-		expect(out).not.toContain('undefined');
-		expect(out).not.toContain('@');
-	});
-});
+// REQ-018: CC_REPLY_CONTRACT + buildCcSystemPrompt are RETIRED — the cc reply contract + identity
+// anchor are now server-fetched templates rendered into --append-system-prompt by the headless driver
+// (see agent/prompt-templates.ts buildSystemPrompt). launch.ts only generates hooks/settings now.

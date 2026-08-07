@@ -2,7 +2,8 @@ import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
-import { buildCcSettings, writeCcSettings, buildCcSystemPrompt } from './launch.js';
+import { buildCcSettings, writeCcSettings } from './launch.js';
+import { buildSystemPrompt } from '../prompt-templates.js';
 import type { CcHeadlessSessionStore } from './headless-session-store.js';
 import type { CcSessionRegistry } from './sink.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
@@ -199,10 +200,14 @@ export class CcHeadlessDriver implements AgentDriver {
 			this.settingsPathByDir.set(workspaceDir, settingsPath);
 		}
 
-		// #132: the display name of THIS aiclaw, resolved LAZILY via chatContext.getSelfName (cc-only — no
-		// other driver calls it, so no needless member-info fetch). Optional — an unresolved name still
-		// anchors the uid in the system prompt.
-		const selfName = await ctx.getSelfName?.();
+		// REQ-018: render the unified system prompt once per (per-turn) session from the handler-supplied
+		// templates + persona + resolved display name. The display name of THIS aiclaw is resolved LAZILY
+		// via chatContext.getSelfName (now shared by all four drivers; a driver calls it only when templates
+		// are present). Optional — an unresolved name still anchors the uid in the system prompt.
+		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.templates
+			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
+			: undefined;
 		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
 		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
 		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).
@@ -216,7 +221,7 @@ export class CcHeadlessDriver implements AgentDriver {
 			settingsPath,
 			claudeBin: this.claudeBin,
 			aiclawUid: o.aiclawUid,
-			selfName,
+			systemPrompt,
 			sessionStore: this.sessionStore,
 			registry: this.registry,
 			transcript: this.transcript,
@@ -243,10 +248,14 @@ interface CcHeadlessSessionDeps {
 	workspaceDir: string;
 	settingsPath: string;
 	claudeBin: string;
-	/** #132: this aiclaw's own uid, pinned into the cc system-prompt identity anchor. */
+	/** this aiclaw's own uid, pinned into the cc system-prompt identity anchor (REQ-018). */
 	aiclawUid: string;
-	/** #132: this aiclaw's display name for the anchor; optional — may be unresolved. */
-	selfName?: string;
+	/**
+	 * REQ-018: the fully-rendered unified system prompt (identity anchor + persona + reply contract),
+	 * delivered via `claude --append-system-prompt`. Optional — a turn without templates has none
+	 * (argv simply omits the flag; the stdin envelope is the pure attributed text).
+	 */
+	systemPrompt?: string;
 	sessionStore: CcHeadlessSessionStore;
 	registry: CcSessionRegistry;
 	transcript: CcTranscriptWriter;
@@ -500,14 +509,15 @@ class CcHeadlessSession implements AgentSession {
 			'Bash(aichat:*)',
 			'--settings',
 			this.d.settingsPath,
-			// REQ-011 S2: deliver the #102 reply contract at the SYSTEM level once per spawned turn
-			// (--append-system-prompt, PR #43's proven method) — NOT prepended to each stdin user message
-			// (which would pollute the content). Each headless turn is a fresh process, so it's per-turn.
-			// #132: prefixed with an identity anchor (self name + uid) so the model recognises a group
-			// @-mention of its own name as addressed to it (else it silently declines to reply).
-			'--append-system-prompt',
-			buildCcSystemPrompt({ displayName: this.d.selfName, uid: this.d.aiclawUid }),
 		];
+		// REQ-018: deliver the unified system prompt at the SYSTEM level once per spawned turn
+		// (--append-system-prompt, PR #43's proven method) — rendered from server-fetched templates
+		// (identity anchor + persona + reply contract). NOT prepended to each stdin user message (which
+		// would pollute the content). Each headless turn is a fresh process, so it's per-turn. A turn
+		// without templates simply omits the flag (no system layer → degrade gracefully).
+		if (this.d.systemPrompt) {
+			argv.push('--append-system-prompt', this.d.systemPrompt);
+		}
 		const stored = this.d.sessionStore.get(this.key);
 		if (stored?.sessionId) {
 			argv.push('--resume', stored.sessionId);

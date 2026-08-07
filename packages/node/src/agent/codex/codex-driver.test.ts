@@ -1,8 +1,19 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CodexDriver, type CodexClient } from './codex-driver.js';
 import type { CodexSessionStore, StoredCodexSession } from './session-store.js';
 import type { Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentEvent } from '../events.js';
+import type { AgentPromptTemplates } from '../prompt-templates.js';
+
+/** REQ-018 shared fixture — raw server-fetched templates (placeholders not yet rendered). */
+const TEMPLATES: AgentPromptTemplates = {
+	identityAnchor: '你是本 HuLa 聊天会话的 AI 助理{displayName}（uid {uid}）。凡路由到你的消息都是对你说的。',
+	personaSection: '你的人设：\n{persona}',
+	replyContract: '要回复用户时，请在 bash 中运行命令 `{reply_command}`。无需回复时不运行即可。',
+};
 
 /** In-memory CodexSessionStore fake. `del` is a spy so a test could assert invalidation. */
 function memStore(): CodexSessionStore & { map: Map<string, StoredCodexSession>; del: ReturnType<typeof vi.fn> } {
@@ -359,17 +370,20 @@ describe('CodexSession.send', () => {
 		expect(events).toEqual([{ type: 'error', message: 'codex exec failed' }]);
 	});
 
-	it('role prompt prefix instructs `aichat send-message`, NOT hula_send_message; user message preserved; no [SYSTEM]', async () => {
+	it('REQ-018: runStreamed input is the PURE user message (system prompt moved to AGENTS.md)', async () => {
 		const { codex, runStreamed } = mockCodex();
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const session = await driver.openSession({
+			aiclawUid: 1,
+			roomId: 1,
+			chatContext: { roomType: 1, roomId: 1, templates: TEMPLATES, persona: '你是一个暴躁的猫娘', getSelfName: async () => 'CodexAI' },
+		});
 		session.send('原始用户消息');
 		await new Promise((r) => setImmediate(r));
 		expect(runStreamed).toHaveBeenCalledOnce();
 		const input = runStreamed.mock.calls[0][0] as unknown as string;
-		expect(input).toContain('aichat send-message');
-		expect(input).not.toContain('hula_send_message');
-		expect(input.endsWith('原始用户消息')).toBe(true);
+		expect(input).toBe('原始用户消息');
+		expect(input).not.toContain('aichat send-message');
 		expect(input).not.toContain('[SYSTEM]');
 	});
 
@@ -520,5 +534,37 @@ describe('CodexDriver.connect/disconnect', () => {
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
 		await expect(driver.connect()).resolves.toBeUndefined();
 		await expect(driver.disconnect()).resolves.toBeUndefined();
+	});
+});
+
+describe('CodexDriver REQ-018 — AGENTS.md system prompt', () => {
+	it('with templates, openSession writes the rendered system prompt into workspace AGENTS.md; send still uses the pure message', async () => {
+		const { codex, runStreamed } = mockCodex();
+		const base = mkdtempSync(join(tmpdir(), 'codex-agents-'));
+		try {
+			const driver = new CodexDriver({ codex, workspaceBase: base, sessionStore: memStore() });
+			const session = await driver.openSession({
+				aiclawUid: 5,
+				roomId: 9,
+				chatContext: { roomType: 1, roomId: 9, templates: TEMPLATES, persona: '你是一个暴躁的猫娘', getSelfName: async () => 'CodexAI' },
+			});
+			session.send('原始用户消息');
+			await new Promise((r) => setImmediate(r));
+
+			// codex exec re-reads workspace AGENTS.md each turn → the rendered system prompt lives there.
+			const agentsPath = join(base, '5', 'group', '9', 'AGENTS.md');
+			expect(existsSync(agentsPath)).toBe(true);
+			const content = readFileSync(agentsPath, 'utf-8');
+			expect(content).toContain('<!-- aichat:system:begin -->');
+			expect(content).toContain('CodexAI');
+			expect(content).toContain('你是一个暴躁的猫娘');
+			expect(content).toContain('aichat send-message');
+			// runStreamed still receives the PURE user message (system prompt went to AGENTS.md, not here).
+			expect(runStreamed).toHaveBeenCalledOnce();
+			const input = runStreamed.mock.calls[0][0] as unknown as string;
+			expect(input).toBe('原始用户消息');
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
 	});
 });

@@ -156,8 +156,11 @@ export class Supervisor {
 	private async buildAgent(entry: AgentEntry): Promise<SupervisedAgent> {
 		// resolveCredential 的失败（如「已激活」不可恢复）**不是瞬态**，绝不重试 → 直接冒泡降级。
 		const cred = await this.deps.resolveCredential(entry);
-		const driver = await this.connectWithRetry(entry);
+		// REQ-018: API client 在 driver connect 之前构建，模板 fail-fast 拉取 —— server 404（未升级）或缺 key
+		// 时该身份**不得上线**（无 system 层 = 人设/回复契约缺失），由 start() 的 per-agent 隔离跳过。
 		const api = this.deps.buildApiClient(cred);
+		const templates = await api.getAgentPromptTemplates();
+		const driver = await this.connectWithRetry(entry);
 
 		// 显式持有 handler，避免 ws hooks 闭包引用尚未赋值的绑定（移除时序耦合）。
 		// onMessage/onConnected 只在 ws.connect() 之后才会触发，此时 ref.handler 必已就绪。
@@ -182,6 +185,9 @@ export class Supervisor {
 				// #188: 人设缓存预热 —— 与群配置预热同点触发（首连 + 每次重连）。连接/重连拉取是正确性
 				// 基础；server 的 aiclawPersonaChanged 推送只是低延迟优化，丢失由这里的重连拉取兜底。
 				void retryAsync(() => ref.handler!.prewarmPersona(), { label: `prewarmPersona uid=${cred.uid}` });
+				// REQ-018: prompt 模板缓存预热 —— 与 prewarmPersona 同点触发（首连 + 每次重连）。buildAgent
+				// 的 fail-fast 种子保证上线必有；这里是模板被 server 更新后重连追平，失败交 retryAsync 兜底。
+				void retryAsync(() => ref.handler!.prewarmPromptTemplates(), { label: `prewarmPromptTemplates uid=${cred.uid}` });
 				// REQ-009 #83 / BL-015 #140: 连接成功后上报 agent 类型。每次连接（含重连）都报，
 				// server upsert 幂等；同样带退避重试熬过 Nacos 重注册窗口。
 				void retryAsync(() => api.reportAgentType(entry.tool), { label: `reportAgentType uid=${cred.uid}` });
@@ -209,6 +215,8 @@ export class Supervisor {
 		ref.handler = this.deps.buildHandler(ws, driver, cred.uid, api, () =>
 			this.degrade(cred.uid, 'token expired'),
 		);
+		// REQ-018: 把 fail-fast 拉取的模板注入 handler 缓存，供每次 openSession 的 chatContext.templates 读取。
+		ref.handler.setPromptTemplates(templates);
 
 		ws.connect();
 

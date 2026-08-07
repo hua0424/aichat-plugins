@@ -4,12 +4,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from './headless-driver.js';
 import type { CcTranscriptRecord } from './transcript.js';
-import { CC_REPLY_CONTRACT } from './launch.js';
 import { CcSessionRegistry, buildCcBridgeSink } from './sink.js';
 import { CcBroker } from './broker.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from './headless-session-store.js';
 import type { AgentEvent } from '../events.js';
 import { InMemoryBindTokenStore } from '../bind-token-store.js';
+import type { AgentPromptTemplates } from '../prompt-templates.js';
+
+/** REQ-018 shared fixture — raw server-fetched templates (placeholders not yet rendered). */
+const TEMPLATES: AgentPromptTemplates = {
+	identityAnchor: '你是本 HuLa 聊天会话的 AI 助理{displayName}（uid {uid}）。凡路由到你的消息都是对你说的。',
+	personaSection: '你的人设：\n{persona}',
+	replyContract: '要回复用户时，请在 bash 中运行命令 `{reply_command}`。无需回复时不运行即可。',
+};
 
 /** A deterministic bind-token store (tokens `tok-1`, `tok-2`, …) so AICHAT_BIND assertions are stable. */
 function makeBindTokens(): InMemoryBindTokenStore {
@@ -264,11 +271,19 @@ describe('CcHeadlessDriver — shape', () => {
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
-		// #132: chatContext exposes a lazy getSelfName → resolved name threaded into the system-prompt anchor.
+		// REQ-018: chatContext exposes templates + persona + a lazy getSelfName → the driver renders the
+		// unified system prompt (identity_anchor → persona_section → reply_contract) ONCE per turn into
+		// --append-system-prompt; the stdin envelope stays PURE attributed text.
 		const session = await driver.openSession({
 			aiclawUid: '5',
 			roomId: '9',
-			chatContext: { roomType: 2, roomId: '9', getSelfName: async () => 'CCTestAI' },
+			chatContext: {
+				roomType: 2,
+				roomId: '9',
+				getSelfName: async () => 'CCTestAI',
+				templates: TEMPLATES,
+				persona: '你是一个暴躁的猫娘',
+			},
 		});
 		// REQ-013 S1: the message arriving at send() is ALREADY the unified attribution envelope (built at
 		// the handler common layer). The driver forwards it verbatim — no per-driver envelope building.
@@ -289,18 +304,20 @@ describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
 			'--settings',
 			expect.stringContaining('settings.json'),
 			'--append-system-prompt',
-			// #132: identity anchor (self name + uid) prefixed to the #102 reply contract body.
+			// REQ-018: the rendered unified system prompt (identity anchor + persona + reply contract).
 			expect.stringContaining('CCTestAI'),
 		]);
 		// no stored session → no --resume
 		expect(call.args).not.toContain('--resume');
-		// #132: the --append-system-prompt value carries BOTH the self display name and this aiclaw's uid,
-		// AND the full #102 reply contract body (delivered at the SYSTEM level, once per turn).
+		// REQ-018: the --append-system-prompt value carries the self display name, this aiclaw's uid, the
+		// persona, and the reply contract — rendered from the server-fetched templates (delivered at the
+		// SYSTEM level, once per turn).
 		const systemPrompt = call.args[call.args.indexOf('--append-system-prompt') + 1];
 		expect(systemPrompt).toContain('CCTestAI');
 		expect(systemPrompt).toContain('5'); // aiclaw uid
-		expect(systemPrompt).toContain(CC_REPLY_CONTRACT);
+		expect(systemPrompt).toContain('你是一个暴躁的猫娘');
 		expect(systemPrompt).toContain('aichat send-message');
+		expect(systemPrompt).not.toContain('undefined');
 
 		const env = call.options.env as NodeJS.ProcessEnv;
 		// BL-014 (#141): AICHAT_BIND is the OPAQUE minted token (tok-1), NOT the guessable plaintext binding.
