@@ -33,9 +33,22 @@ export interface SystemPromptContext {
  * trimmed, and non-empty parts joined with '\n'.
  */
 export function buildSystemPrompt(templates: AgentPromptTemplates, ctx: SystemPromptContext): string {
-	const anchor = templates.identityAnchor
-		.replaceAll('{displayName}', ctx.displayName ?? '')
-		.replaceAll('{uid}', ctx.uid);
+	const displayName = ctx.displayName ?? '';
+	// REQ-018 review #2 — empty displayName must not leave a bare `@` or `（）` residue. Replace `@{displayName}`
+	// (the group @-mention segment) BEFORE the bare `{displayName}`: doing the bare one first would turn
+	// `（@{displayName}）` into `（@）`. When displayName is empty we strip the whole @-mention segment (and the
+	// empty parens `（）` it leaves behind); when non-empty we render it as `（@名字）`. `{uid}` is order-independent.
+	const anchor =
+		displayName.trim() === ''
+			? templates.identityAnchor
+					.replaceAll('@{displayName}', '')
+					.replaceAll('（）', '')
+					.replaceAll('{displayName}', '')
+					.replaceAll('{uid}', ctx.uid)
+			: templates.identityAnchor
+					.replaceAll('@{displayName}', `@${displayName}`)
+					.replaceAll('{displayName}', displayName)
+					.replaceAll('{uid}', ctx.uid);
 	const personaBlock =
 		ctx.persona !== undefined && ctx.persona !== null && ctx.persona.trim() !== ''
 			? templates.personaSection.replaceAll('{persona}', ctx.persona)

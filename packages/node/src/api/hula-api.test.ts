@@ -450,6 +450,23 @@ describe('HulaApiClient.getAgentPromptTemplates (REQ-018)', () => {
 			'agent prompt config missing: agent.prompt.reply_contract',
 		);
 	});
+
+	it('success:false（server BizException 真实路径）→ rejects 且错误含 key 名', async () => {
+		// review #1：server 缺 key 的真实路径不是 success:true + 残缺 data（那是本方法的防御性死分支），而是
+		// BizException → HTTP 200 + { success:false, msg:'agent prompt config missing: <key>' }，parseResponse
+		// 在 !json.success 时即抛 `HuLa API failed: <msg>`。mock 真实路径，断言错误包含 key 名。
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: false,
+				code: 1,
+				msg: 'agent prompt config missing: agent.prompt.identity_anchor',
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getAgentPromptTemplates()).rejects.toThrow(
+			/agent prompt config missing: agent.prompt.identity_anchor/,
+		);
+	});
 });
 
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
