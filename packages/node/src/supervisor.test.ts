@@ -37,6 +37,12 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 		// #193: capture each api client's reportHostInfo per uid so the test can assert
 		// onConnected reports host info (hostname/ip/workspaceBase).
 		reportHostInfoByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// REQ-018: capture each api client's getAgentPromptTemplates (fetched fail-fast in buildAgent).
+		getAgentPromptTemplatesByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		// REQ-018: capture each handler's setPromptTemplates (seeded after build) + prewarmPromptTemplates
+		// (fired on onConnected, same point as prewarmPersona).
+		setPromptTemplatesByUid: new Map<number, ReturnType<typeof vi.fn>>(),
+		prewarmPromptTemplatesByUid: new Map<number, ReturnType<typeof vi.fn>>(),
 	};
 
 	const deps: SupervisorDeps = {
@@ -61,7 +67,12 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 			built.reportAgentTypeByUid.set(cred.uid, reportAgentType);
 			const reportHostInfo = vi.fn().mockResolvedValue(undefined);
 			built.reportHostInfoByUid.set(cred.uid, reportHostInfo);
-			return { reportAgentType, reportHostInfo } as unknown as HulaApiClient;
+			// REQ-018: templates fetched fail-fast in buildAgent (before driver connect).
+			const getAgentPromptTemplates = vi
+				.fn()
+				.mockResolvedValue({ replyContract: 'rc', identityAnchor: 'ia', personaSection: 'ps' });
+			built.getAgentPromptTemplatesByUid.set(cred.uid, getAgentPromptTemplates);
+			return { reportAgentType, reportHostInfo, getAgentPromptTemplates } as unknown as HulaApiClient;
 		}),
 		buildWs: vi.fn(
 			(
@@ -88,10 +99,17 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				built.prewarmByUid.set(uid, prewarmGroupConfigs);
 				const prewarmPersona = vi.fn().mockResolvedValue(undefined);
 				built.prewarmPersonaByUid.set(uid, prewarmPersona);
+				// REQ-018: templates seeded after build (setPromptTemplates) + prewarmed on reconnect.
+				const setPromptTemplates = vi.fn();
+				built.setPromptTemplatesByUid.set(uid, setPromptTemplates);
+				const prewarmPromptTemplates = vi.fn().mockResolvedValue(undefined);
+				built.prewarmPromptTemplatesByUid.set(uid, prewarmPromptTemplates);
 				return {
 					handle: vi.fn(),
 					prewarmGroupConfigs,
 					prewarmPersona,
+					setPromptTemplates,
+					prewarmPromptTemplates,
 					destroy,
 				} as unknown as MessageHandler;
 			},
@@ -451,6 +469,54 @@ describe('Supervisor reportAgentType + prewarm on connect (REQ-009 #83 / REQ #26
 		built.hooksByUid.get(2)!.onConnected();
 
 		expect(prewarmPersona).toHaveBeenCalledTimes(1);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('Supervisor REQ-018 — fail-fast prompt templates', () => {
+	it('getAgentPromptTemplates rejects for one identity → start isolates it (agents=[1,3]), no process.exit', async () => {
+		const { deps } = makeDeps({
+			buildApiClient: vi.fn((cred: AichatCredentials): HulaApiClient => {
+				const getAgentPromptTemplates = vi.fn().mockImplementation(async () => {
+					if (cred.uid === 2) throw new Error('agent prompt config unavailable: server 未升级（404）');
+					return { replyContract: 'rc', identityAnchor: 'ia', personaSection: 'ps' };
+				});
+				return { getAgentPromptTemplates } as unknown as HulaApiClient;
+			}),
+		});
+		const sup = new Supervisor(deps);
+
+		// must not throw; the 2nd identity is skipped (templates unfetchable → must NOT come online).
+		await expect(sup.start(entries)).resolves.toBeUndefined();
+
+		expect(sup.agents.map((a) => a.uid).sort()).toEqual([1, 3]);
+		expect(sup.agents.every((a) => a.status === 'online')).toBe(true);
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('each online identity has its handler seeded with the fetched templates (setPromptTemplates)', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		for (const uid of [1, 2, 3]) {
+			expect(built.setPromptTemplatesByUid.get(uid)).toHaveBeenCalledWith({
+				replyContract: 'rc',
+				identityAnchor: 'ia',
+				personaSection: 'ps',
+			});
+		}
+		expect(exitSpy).not.toHaveBeenCalled();
+	});
+
+	it('firing onConnected also calls prewarmPromptTemplates for that identity', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+
+		built.hooksByUid.get(2)!.onConnected();
+
+		expect(built.prewarmPromptTemplatesByUid.get(2)).toHaveBeenCalledTimes(1);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 });

@@ -10,6 +10,7 @@ import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { buildAgentInjection } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
+import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
 
 /**
@@ -194,10 +195,18 @@ export class MessageHandler {
 
 	/**
 	 * #188: 本 aiclaw 的人设缓存（owner 配置的 publicPersona）。唯一写入点：prewarmPersona（连接/重连
-	 * 预热，正确性基础）与 handleAiclawPersonaChange（server 失效帧重拉，低延迟优化）。null = 无人设
-	 * → buildAgentEnvelope 不注入（行为与人设功能引入前逐字节一致）。
+	 * 预热，正确性基础）与 handleAiclawPersonaChange（server 失效帧重拉，低延迟优化）。null = 无人设。
+	 * REQ-018: 人设不再注入 envelope —— 经 openSession chatContext.persona 进各 driver 的 system 层。
 	 */
 	private persona: string | null = null;
+
+	/**
+	 * REQ-018: 本 aiclaw 的 agent prompt 模板缓存（身份锚 + 人设段 + 回复契约的原稿，server 下发）。
+	 * 播种点：supervisor buildAgent fail-fast 拉取后经 setPromptTemplates 注入（上线前必有，缺失即不上线）；
+	 * 刷新点：onConnected 的 prewarmPromptTemplates（首连 + 每次重连，与 prewarmPersona 同点）。
+	 * null = 未拉取/拉取失败 → chatContext.templates 为 undefined → driver 不渲染 system 层（降级）。
+	 */
+	private templates: AgentPromptTemplates | null = null;
 
 	/** debounce 配置（可注入，便于测试） */
 	private readonly debounceOptions?: { waitMs?: number; maxCount?: number; maxWaitMs?: number };
@@ -227,8 +236,10 @@ export class MessageHandler {
 	}
 
 	/**
-	 * #132: this aiclaw's own display name, resolved once + cached, for the cc system-prompt identity anchor.
-	 * cc-only — the model needs to know it IS <name> to recognize @<name> in group chat as itself.
+	 * REQ-018: this aiclaw's own display name, resolved once + cached, feeding the system-prompt
+	 * identity anchor of ALL FOUR drivers (opencode/codex/openclaw/cc). A driver calls it (via
+	 * chatContext.getSelfName) only when templates are present, so turns without templates pay nothing.
+	 * The model needs to know it IS <name> to recognize @<name> in group chat as itself.
 	 */
 	private async resolveSelfName(): Promise<string | undefined> {
 		if (this.selfName !== undefined) return this.selfName;
@@ -567,15 +578,15 @@ export class MessageHandler {
 		// REQ-013 S1: build the ONE unified inbound-attribution envelope for ALL FOUR drivers at this
 		// common layer (see ./envelope.ts). openclaw/opencode/codex/cc all now receive the identical
 		// `[HuLa 群聊]/[HuLa 私聊]\n[name(uid)]: ...` transcript instead of each inventing its own format.
+		// REQ-018: buildAgentEnvelope is now PURE attributed text (room header + [name(uid)] lines).
+		// The 人设 block is RETIRED from the per-turn message — persona + templates travel via
+		// chatContext and each driver renders them into its SYSTEM layer at session open.
 		const agentEnvelope = buildAgentEnvelope({
 			roomType,
 			fromName: channel.lastCtx.fromName,
 			fromUid,
 			accumulated,
 			message,
-			// #188: 人设统一注入点 —— 四类 driver 共用此公共层，缓存为空（null）时传 undefined
-			// → envelope 与人设功能引入前逐字节一致。人设改动无需重激活，下一轮对话即生效。
-			persona: this.persona ?? undefined,
 		});
 
 		// REQ-013 S1 / AC5: single observability point for the assembled envelope (BL-018-aligned). Log the
@@ -643,9 +654,13 @@ export class MessageHandler {
 				isOwner,
 				workspaceDir: cfg?.workspaceDir,
 				account: cfg?.account,
-				// #132: LAZY self-name resolver (cached). cc's system-prompt anchors identity on it; other
-				// drivers never call it -> no needless member-info fetch, and the handler needs no per-driver branch.
+				// REQ-018: LAZY self-name resolver (cached), now feeding the system-prompt identity anchor of
+				// ALL FOUR drivers (opencode/codex/openclaw/cc). Called only when templates are present.
 				getSelfName: () => this.resolveSelfName(),
+				// REQ-018: persona + templates ride in chatContext; each driver renders its system layer
+				// from them. templates null (unprewarmed/failed) → undefined → driver degrades (no system prompt).
+				persona: this.persona,
+				templates: this.templates ?? undefined,
 			},
 		});
 		session.agentSession = agentSession;
@@ -773,6 +788,30 @@ export class MessageHandler {
 		const persona = await this.apiClient.getSelfPersona();
 		this.persona = persona;
 		console.log(`[persona] prewarmed for aiclaw ${this.selfUid}: ${persona === null ? '(none)' : `${persona.length} chars`}`);
+	}
+
+	/**
+	 * REQ-018: supervisor buildAgent fail-fast 拉取到模板后注入缓存（上线前必有；拉取失败该身份根本不上线）。
+	 * 之后每次 openSession 的 chatContext.templates 都从这里取值。此方法与 prewarmPromptTemplates 的差异：
+	 * 这里直接赋值、不抛错（buildAgent 已保证值合法）。
+	 */
+	setPromptTemplates(templates: AgentPromptTemplates): void {
+		this.templates = templates;
+	}
+
+	/**
+	 * REQ-018: 启动连上 / 每次重连后主动拉一次 agent prompt 模板刷新内存缓存。语义对齐 prewarmPersona
+	 * （BL-015 / #140）：apiClient 为 null 时 noop；拉取失败**抛出**，交给调用方 retryAsync 有界退避重试；
+	 * templates 仅在成功返回后写入 → 抛出时旧值天然保留（与 supervisor 的 fail-fast 种子互补：种子保证上线
+	 * 必有，这里是模板被 server 更新后重连追平）。
+	 */
+	async prewarmPromptTemplates(): Promise<void> {
+		if (!this.apiClient) return;
+		const t = await this.apiClient.getAgentPromptTemplates();
+		this.templates = t;
+		console.log(
+			`[prompts] prewarmed for aiclaw ${this.selfUid}: identityAnchor=${t.identityAnchor.length} personaSection=${t.personaSection.length} replyContract=${t.replyContract.length}`,
+		);
 	}
 
 	/**

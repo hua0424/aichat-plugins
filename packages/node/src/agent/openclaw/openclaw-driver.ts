@@ -1,12 +1,13 @@
 import WebSocket from 'ws';
 import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
-import { buildReplyInstruction } from '../reply-contract.js';
 import type { ChatContext } from '../workspace.js';
+import { buildSystemPrompt } from '../prompt-templates.js';
+import { syncAgentsMdFile } from '../agents-md.js';
 import { errMsg } from '../../util/err.js';
 
 /**
@@ -254,6 +255,15 @@ export class OpenclawDriver implements AgentDriver {
 	private token: string;
 	private readonly bindTokens: BindTokenStore;
 	private readonly wsFactory: OpenclawSocketFactory;
+	/**
+	 * REQ-018: openclaw workspace path where the rendered system prompt AGENTS.md is written.
+	 * `adapter_config`-configurable (future) / `~/.openclaw` convention. **.83 real-env confirmation
+	 * point (R1): openclaw's actual read directory + instruction filename must be verified on the test
+	 * host — if it does not read AGENTS.md, write the file it actually reads.** Also note the
+	 * multi-identity caveat (a shared AGENTS.md may clobber across openclaw aiclaws until R1 confirms
+	 * the layout).
+	 */
+	private readonly workspaceDir: string;
 	private closed = false;
 	private connected = false;
 	private reconnectDelay = 1000;
@@ -291,11 +301,14 @@ export class OpenclawDriver implements AgentDriver {
 		token: string,
 		bindTokens: BindTokenStore,
 		wsFactory: OpenclawSocketFactory = defaultOpenclawSocketFactory,
+		// REQ-018: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw).
+		workspaceDir?: string,
 	) {
 		this.url = url;
 		this.token = token;
 		this.bindTokens = bindTokens;
 		this.wsFactory = wsFactory;
+		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw');
 	}
 
 	/**
@@ -354,6 +367,27 @@ export class OpenclawDriver implements AgentDriver {
 		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
 		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
 		const sessionKey = `${token}:${bindingKey(o.aiclawUid, o.roomId)}`;
+
+		// REQ-018: render the unified system prompt once per (per-turn) session and write it into the
+		// openclaw workspace AGENTS.md marked block (openclaw re-reads it per turn). The identity anchor +
+		// persona + reply contract live THERE — the per-turn gateway message stays pure. hash-compare
+		// (syncAgentsMdFile) skips the write when unchanged; a write failure degrades (warn, don't fail).
+		const selfName = o.chatContext.templates ? await o.chatContext.getSelfName?.() : undefined;
+		const systemPrompt = o.chatContext.templates
+			? buildSystemPrompt(o.chatContext.templates, {
+					displayName: selfName,
+					uid: o.aiclawUid,
+					persona: o.chatContext.persona ?? null,
+				})
+			: undefined;
+		if (systemPrompt) {
+			try {
+				await syncAgentsMdFile(join(this.workspaceDir, 'AGENTS.md'), systemPrompt);
+			} catch (err) {
+				console.warn(`[openclaw] AGENTS.md write failed (degrading: no system prompt this turn): ${errMsg(err)}`);
+			}
+		}
+
 		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink));
 	}
 
@@ -398,10 +432,10 @@ export class OpenclawDriver implements AgentDriver {
 
 		// aichatoverview#161：回复统一走 CLI（`aichat send-message`），不再引导已退役的
 		// hula_send_message / hula_skip_reply 工具。房间/身份由 exec-env 的 OPENCLAW_BIND 绑定。
-		const enrichedMessage = buildReplyInstruction(message);
-
+		// REQ-018：per-turn message 是纯用户文本 —— 回复契约 + 身份锚 + 人设已渲染进 openSession 写入的
+		// workspace AGENTS.md（openclaw 每轮重读），不再逐轮给 gateway message 加前缀。
 		const params = {
-			message: enrichedMessage,
+			message,
 			sessionKey,
 			idempotencyKey,
 		};

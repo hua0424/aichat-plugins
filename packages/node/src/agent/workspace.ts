@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import type { AgentPromptTemplates } from './prompt-templates.js';
 
 /**
  * REQ-010 S3: expand a leading `~` to the host home dir. An owner-configured `workspaceDir` of the
@@ -42,11 +43,25 @@ export interface ChatContext {
 	 */
 	account?: string | number;
 	/**
-	 * #132: LAZY resolver for this aiclaw's own display name (resolved once + cached at the handler).
-	 * cc-only — the cc system-prompt anchors identity on it; other drivers never call it, so no needless
-	 * member-info fetch. Kept a thunk (not an eager `selfName` field) so the cost is pay-per-use.
+	 * REQ-018: LAZY resolver for this aiclaw's own display name (resolved once + cached at the handler).
+	 * Now used by ALL FOUR drivers — the unified system-prompt identity anchor renders `{displayName}`
+	 * from it (cc #132 was the original consumer; opencode/codex/openclaw joined in REQ-018). A driver
+	 * only calls it when templates are present, so drivers/turns without templates still pay nothing.
+	 * Kept a thunk (not an eager `selfName` field) so the cost is pay-per-use.
 	 */
 	getSelfName?: () => Promise<string | undefined>;
+	/**
+	 * REQ-018: owner-configured 人设 (publicPersona), cached at the handler. Rendered into the system
+	 * layer's persona_section by each driver (non-blank only). NOT injected into the inbound envelope
+	 * anymore (#188 → REQ-018: the persona block retired from the per-turn message).
+	 */
+	persona?: string | null;
+	/**
+	 * REQ-018: server-fetched agent prompt templates (identity anchor + persona section + reply
+	 * contract). Present iff the supervisor fetched them fail-fast (buildAgent) / the handler prewarmed
+	 * them (onConnected). When undefined the driver renders NO system prompt (degrades gracefully).
+	 */
+	templates?: AgentPromptTemplates;
 }
 
 /**

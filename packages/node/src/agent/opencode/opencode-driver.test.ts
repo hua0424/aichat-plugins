@@ -4,6 +4,14 @@ import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore, StoredSession } from './session-store.js';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentEvent } from '../events.js';
+import type { AgentPromptTemplates } from '../prompt-templates.js';
+
+/** REQ-018 shared fixture — raw server-fetched templates (placeholders not yet rendered). */
+const TEMPLATES: AgentPromptTemplates = {
+	identityAnchor: '你是本 HuLa 聊天会话的 AI 助理{displayName}（uid {uid}）。凡路由到你的消息都是对你说的。',
+	personaSection: '你的人设：\n{persona}',
+	replyContract: '要回复用户时，请在 bash 中运行命令 `{reply_command}`。无需回复时不运行即可。',
+};
 
 /** In-memory SessionStore fake. `del` is a spy so tests can assert lazy-rebuild invalidation. */
 function memStore(): SessionStore & { map: Map<string, StoredSession>; del: ReturnType<typeof vi.fn> } {
@@ -375,23 +383,37 @@ describe('OpencodeSession.send', () => {
 		expect(spied.returnSpy).toHaveBeenCalled();
 	});
 
-	// REQ-010 S1 — the role-instruction prefix now points at the `aichat send-message` capability,
-	// NOT the retired hula_send_message tool.
-	it('role prompt prefix instructs `aichat send-message`, NOT hula_send_message (user message preserved)', async () => {
+	// REQ-018 — the reply contract + identity anchor + persona are rendered into the prompt body's
+	// `system` field (server-fetched templates); the user message part is PURE text now.
+	it('REQ-018: user message part is pure; system carries identity + persona + reply contract', async () => {
 		const { client, prompt } = mockClient();
 		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
-		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const session = await driver.openSession({
+			aiclawUid: 1,
+			roomId: 1,
+			chatContext: {
+				roomType: 1,
+				roomId: 1,
+				templates: TEMPLATES,
+				persona: '你是一个暴躁的猫娘',
+				getSelfName: async () => 'OCAI',
+			},
+		});
 		session.send('原始用户消息');
 		await new Promise((r) => setImmediate(r));
 		expect(prompt).toHaveBeenCalledOnce();
-		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body;
-		const text = body.parts[0].text;
-		expect(text).toContain('aichat send-message');
-		expect(text).not.toContain('hula_send_message');
-		expect(text).not.toContain('hula_skip_reply');
-		expect(text.endsWith('原始用户消息')).toBe(true);
+		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }>; system?: string } }).body;
+		// the per-turn message is the PURE user text (no reply-instruction envelope anymore)
+		expect(body.parts[0].text).toBe('原始用户消息');
+		expect(body.parts[0].text).not.toContain('aichat send-message');
+		// the system layer carries identity anchor + persona + reply contract
+		expect(body.system).toBeDefined();
+		expect(body.system).toContain('OCAI');
+		expect(body.system).toContain('你是一个暴躁的猫娘');
+		expect(body.system).toContain('aichat send-message');
+		expect(body.system).not.toContain('undefined');
 		// no [SYSTEM] markers (gateway security hardening)
-		expect(text).not.toContain('[SYSTEM]');
+		expect(body.parts[0].text).not.toContain('[SYSTEM]');
 	});
 
 	// REQ-008 #78 P2③ — onSessionError invalidates the store entry on a send error.

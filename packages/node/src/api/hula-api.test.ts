@@ -385,6 +385,73 @@ describe('HulaApiClient.getSelfPersona (#188)', () => {
 	});
 });
 
+describe('HulaApiClient.getAgentPromptTemplates (REQ-018)', () => {
+	// server 返回 `R<Map<String,String>>`：data 按三个**全 key** 存模板原文（#217 对齐）。
+	const OK = {
+		'agent.prompt.reply_contract': 'rc',
+		'agent.prompt.identity_anchor': 'ia',
+		'agent.prompt.persona_section': 'ps',
+	};
+
+	it('GET /api/im/aiclaw/self/prompts (no query), token via header, unwraps the 3 templates by full config keys', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({ success: true, code: 0, data: OK }),
+		);
+		const client = new HulaApiClient('http://host:8080/', 'tok-abc');
+
+		const out = await client.getAgentPromptTemplates();
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/aiclaw/self/prompts');
+		expect((init as RequestInit).method).toBe('GET');
+		expect((init as RequestInit).headers).toMatchObject({ token: 'tok-abc' });
+		expect(out).toEqual({ replyContract: 'rc', identityAnchor: 'ia', personaSection: 'ps' });
+	});
+
+	it('404 (server 未升级) → rejects with a server-upgrade hint', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+			ok: false,
+			status: 404,
+			text: async () => 'Not Found',
+		} as unknown as Response);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getAgentPromptTemplates()).rejects.toThrow('server 未升级');
+	});
+
+	it('missing key → rejects with agent prompt config missing (full key name)', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: { 'agent.prompt.reply_contract': 'rc', 'agent.prompt.persona_section': 'ps' },
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getAgentPromptTemplates()).rejects.toThrow(
+			'agent prompt config missing: agent.prompt.identity_anchor',
+		);
+	});
+
+	it('whitespace-only value → same missing-key throw (full key name)', async () => {
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			okResponse({
+				success: true,
+				code: 0,
+				data: {
+					'agent.prompt.reply_contract': '   ',
+					'agent.prompt.identity_anchor': 'ia',
+					'agent.prompt.persona_section': 'ps',
+				},
+			}),
+		);
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await expect(client.getAgentPromptTemplates()).rejects.toThrow(
+			'agent prompt config missing: agent.prompt.reply_contract',
+		);
+	});
+});
+
 describe('HulaApiClient.reportAgentType (REQ-009 #83)', () => {
 	it('POST /api/im/aiclaw/report-agent-type with body { agentType }, token via header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(

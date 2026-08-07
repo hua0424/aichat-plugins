@@ -13,6 +13,7 @@ import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
 import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 import type { CcTranscriptRecord } from '../agent/cc/transcript.js';
+import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 
 const THINKING_END = WSReqType.THINKING_END;
 const THINKING_DELTA = WSReqType.THINKING_DELTA;
@@ -251,6 +252,12 @@ function getCachedConfig(
 function getPersona(handler: MessageHandler): string | null {
 	// @ts-expect-error 访问私有字段做白盒断言
 	return handler.persona;
+}
+
+/** REQ-018: 读取本 aiclaw 的 prompt 模板缓存（白盒断言用） */
+function getTemplates(handler: MessageHandler): AgentPromptTemplates | null {
+	// @ts-expect-error 访问私有字段做白盒断言
+	return handler.templates;
 }
 
 /** #188: 直接写入人设缓存（白盒布置用） */
@@ -1657,6 +1664,76 @@ describe('MessageHandler.prewarmPersona (#188)', () => {
 	});
 });
 
+describe('MessageHandler.prewarmPromptTemplates + setPromptTemplates (REQ-018)', () => {
+	/** 极简模板对象（种子/断言用）。 */
+	const TEMPLATES: AgentPromptTemplates = {
+		replyContract: 'rc',
+		identityAnchor: 'ia',
+		personaSection: 'ps',
+	};
+
+	function fakeTemplatesApi(impl: () => Promise<AgentPromptTemplates>) {
+		const getAgentPromptTemplates = vi.fn(impl);
+		const apiClient = { getAgentPromptTemplates } as unknown as import('../api/hula-api.js').HulaApiClient & {
+			getAgentPromptTemplates: ReturnType<typeof vi.fn>;
+		};
+		return { apiClient, getAgentPromptTemplates };
+	}
+
+	it('成功拉取写入模板缓存', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, getAgentPromptTemplates } = fakeTemplatesApi(async () => TEMPLATES);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+
+		await handler.prewarmPromptTemplates();
+
+		expect(getAgentPromptTemplates).toHaveBeenCalledTimes(1);
+		expect(getTemplates(handler)).toEqual(TEMPLATES);
+	});
+
+	it('拉取失败 REJECT（交 retryAsync 兜底）且旧缓存天然保留', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		let shouldThrow = false;
+		const { apiClient } = fakeTemplatesApi(async () => {
+			if (shouldThrow) throw new Error('nacos re-register window');
+			return TEMPLATES;
+		});
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		handler.setPromptTemplates(TEMPLATES);
+
+		shouldThrow = true;
+		await expect(handler.prewarmPromptTemplates()).rejects.toThrow('nacos re-register window');
+		expect(getTemplates(handler)).toEqual(TEMPLATES); // 旧值保留
+	});
+
+	it('apiClient 为 null 时 noop（不抛、缓存不变）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, undefined, () => {});
+
+		await expect(handler.prewarmPromptTemplates()).resolves.toBeUndefined();
+		expect(getTemplates(handler)).toBeNull();
+	});
+
+	it('setPromptTemplates 播种缓存，且种子模板流入下一次 openSession chatContext', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws } = fakeWs();
+		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+
+		handler.setPromptTemplates(TEMPLATES);
+		expect(getTemplates(handler)).toEqual(TEMPLATES);
+
+		handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+
+		const ctx = openSession.mock.calls[0][0].chatContext as { templates?: AgentPromptTemplates };
+		expect(ctx.templates).toEqual(TEMPLATES);
+	});
+});
+
 describe('MessageHandler aiclawPersonaChanged 失效帧重拉 (#188)', () => {
 	function fakePersonaApi(impl: () => Promise<string | null>) {
 		const getSelfPersona = vi.fn(impl);
@@ -1710,36 +1787,44 @@ describe('MessageHandler aiclawPersonaChanged 失效帧重拉 (#188)', () => {
 	});
 });
 
-describe('MessageHandler persona → envelope 接线 (#188)', () => {
-	// envelope 在 handler 公共层组装（triggerAgentLoop），先于任何 driver 分发 —— driver.type 在
-	// message.ts 里只影响日志，故用既有 fake adapter 参数化四类 driver.type 即覆盖全场景。
+describe('MessageHandler persona → chatContext 接线 (REQ-018)', () => {
+	// REQ-018: envelope 在 handler 公共层组装（triggerAgentLoop），现在只含纯属性文本（房间头 + 发言者标注），
+	// 人设不再注入 envelope —— 而是作为 persona 字段进入 openSession 的 chatContext，由各 driver 渲染进
+	// system 层。driver.type 在 message.ts 里只影响日志，故用既有 fake adapter 参数化四类 driver.type 即覆盖全场景。
 	it.each(['openclaw', 'opencode', 'codex', 'cc'])(
-		'driver.type=%s：缓存有人设时 driver 收到的 envelope 含人设块',
+		'driver.type=%s：缓存有人设时 driver 收到的 envelope 是纯文本，persona 进 chatContext',
 		async (driverType) => {
 			const { adapter, calls } = fakeAdapter();
 			(adapter as unknown as { type: string }).type = driverType;
 			const { ws } = fakeWs();
+			const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
 			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 			setPersona(handler, '你是一个暴躁的猫娘');
 
 			handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
 			await waitFor(() => calls.length >= 1);
 
-			expect(calls[0].message).toBe(
-				'[HuLa 人设开始]\n你是一个暴躁的猫娘\n[HuLa 人设结束]\n[HuLa 私聊]\n[user(100)]: hello',
-			);
+			// 纯 envelope —— 人设块已退役，绝不出现 '人设'
+			expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hello');
+			expect(calls[0].message).not.toContain('人设');
+			// persona 经 chatContext 进 system 层
+			const ctx = openSession.mock.calls[0][0].chatContext as { persona?: string | null };
+			expect(ctx.persona).toBe('你是一个暴躁的猫娘');
 		},
 	);
 
-	it('缓存为空 → driver 收到的 envelope 与人设功能引入前逐字节一致（AC6）', async () => {
+	it('缓存为空 → chatContext.persona 为 null（不注入语义）', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
+		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
 		await waitFor(() => calls.length >= 1);
 
 		expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hello');
+		const ctx = openSession.mock.calls[0][0].chatContext as { persona?: string | null };
+		expect(ctx.persona).toBeNull();
 	});
 });
 

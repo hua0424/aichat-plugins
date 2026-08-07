@@ -5,7 +5,7 @@ import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore } from './session-store.js';
-import { buildReplyInstruction } from '../reply-contract.js';
+import { buildSystemPrompt } from '../prompt-templates.js';
 import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 import { errMsg } from '../../util/err.js';
 
@@ -141,7 +141,15 @@ export class OpencodeDriver implements AgentDriver {
 			});
 		};
 
-		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), onSessionError);
+		// REQ-018: render the unified system prompt once per (per-turn) session from the handler-supplied
+		// templates + persona + resolved display name. The display name is resolved LAZILY via
+		// chatContext.getSelfName (all four drivers share it; called only when templates are present).
+		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.templates
+			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
+			: undefined;
+
+		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), systemPrompt, onSessionError);
 	}
 }
 
@@ -163,6 +171,12 @@ class OpencodeSession implements AgentSession {
 		private readonly sessionID: string,
 		private readonly directory: string,
 		private readonly model: ParsedModel | undefined,
+		/**
+		 * REQ-018: the fully-rendered unified system prompt (identity anchor + persona + reply
+		 * contract) sent as the prompt body's `system` field. Optional — a turn without templates
+		 * has none (body.system omitted; the user part is the pure message).
+		 */
+		private readonly systemPrompt: string | undefined,
 		/**
 		 * REQ-008 #78 P2③: invoked once when send()'s subscribe/prompt throws (server/session
 		 * gone), AFTER the terminal error has been emitted. The driver wires this to drop the
@@ -257,10 +271,9 @@ class OpencodeSession implements AgentSession {
 			return false;
 		};
 
-		// REQ-010 S1: prepend the shared role-instruction (agent/reply-contract.ts): text output is thinking,
-		// reply ONLY via `aichat send-message` in bash, room/identity auto-bound, no reply -> run nothing.
-		const enrichedMessage = buildReplyInstruction(message);
-
+		// REQ-018: the per-turn message is PURE user text — the reply contract + identity anchor + persona
+		// now live in the prompt body's `system` field (rendered from server-fetched templates once per
+		// session). No per-turn role-instruction prefix anymore.
 		// Drive the SDK: subscribe first (avoid the race), then prompt, then pump events.
 		void (async () => {
 			try {
@@ -272,7 +285,8 @@ class OpencodeSession implements AgentSession {
 					path: { id: this.sessionID },
 					query: { directory: this.directory },
 					body: {
-						parts: [{ type: 'text', text: enrichedMessage }],
+						parts: [{ type: 'text', text: message }],
+						...(this.systemPrompt ? { system: this.systemPrompt } : {}),
 						...(this.model ? { model: this.model } : {}),
 					},
 				});
