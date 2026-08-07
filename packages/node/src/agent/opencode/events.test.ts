@@ -2,38 +2,67 @@ import { describe, it, expect } from 'vitest';
 import { mapOpencodeEvent } from './events.js';
 
 const SID = 'ses_abc';
+/** Assistant message ids the caller whitelisted from `message.updated` events. */
+const ASSISTANT = new Set(['msg_asst']);
 
 describe('mapOpencodeEvent', () => {
 	it('text part with delta → thinking (prefers delta)', () => {
 		const evt = {
 			type: 'message.part.updated',
-			properties: { part: { type: 'text', sessionID: SID, text: 'full text' }, delta: 'chunk' },
+			properties: { part: { type: 'text', sessionID: SID, messageID: 'msg_asst', text: 'full text' }, delta: 'chunk' },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'thinking', text: 'chunk' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'thinking', text: 'chunk' });
 	});
 
 	it('text part without delta → thinking falls back to part.text', () => {
 		const evt = {
 			type: 'message.part.updated',
-			properties: { part: { type: 'text', sessionID: SID, text: 'hello' } },
+			properties: { part: { type: 'text', sessionID: SID, messageID: 'msg_asst', text: 'hello' } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'thinking', text: 'hello' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'thinking', text: 'hello' });
 	});
 
 	it('reasoning part → thinking', () => {
 		const evt = {
 			type: 'message.part.updated',
-			properties: { part: { type: 'reasoning', sessionID: SID, text: 'thinking aloud' } },
+			properties: { part: { type: 'reasoning', sessionID: SID, messageID: 'msg_asst', text: 'thinking aloud' } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'thinking', text: 'thinking aloud' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'thinking', text: 'thinking aloud' });
 	});
 
-	it('tool part running → tool start', () => {
+	// opencode emits a `text` part for the USER message too (the prompt we sent, including the
+	// reply-instruction envelope). Parts carry no role — only sessionID/messageID — so a text
+	// part whose messageID was NOT whitelisted as an assistant message must NOT become thinking.
+	it('text part of a USER message (messageID not whitelisted) → null (no prompt leak)', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'text', sessionID: SID, messageID: 'msg_user', text: 'the full prompt' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
+	it('text part with NO messageID → null (cannot prove assistant origin)', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'text', sessionID: SID, text: 'orphan text' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
+	it('reasoning part of a USER message (messageID not whitelisted) → null', () => {
+		const evt = {
+			type: 'message.part.updated',
+			properties: { part: { type: 'reasoning', sessionID: SID, messageID: 'msg_user', text: 'x' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
+	it('tool part running → tool start (no messageID gate: user messages never carry tool parts)', () => {
 		const evt = {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'running' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'bash', phase: 'start' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'bash', phase: 'start' });
 	});
 
 	it('tool part pending → tool start', () => {
@@ -41,7 +70,7 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'read', callID: 'c2', state: { status: 'pending' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'read', phase: 'start' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'read', phase: 'start' });
 	});
 
 	it('tool part completed → tool end', () => {
@@ -49,7 +78,7 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'completed' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'bash', phase: 'end' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'bash', phase: 'end' });
 	});
 
 	it('tool part error → tool end', () => {
@@ -57,7 +86,7 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'error' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'bash', phase: 'end' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'bash', phase: 'end' });
 	});
 
 	// REQ-010 S1: the terminal-tool reply path is retired. The agent replies out-of-band via
@@ -68,7 +97,7 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'read', callID: 'c1', state: { status: 'completed', input: { content: 'not a reply' } } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'read', phase: 'end' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'read', phase: 'end' });
 	});
 
 	it('a running bash tool → tool start (generic mapping intact)', () => {
@@ -76,12 +105,12 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c9', state: { status: 'running' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'tool', name: 'bash', phase: 'start' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'tool', name: 'bash', phase: 'start' });
 	});
 
 	it('session.idle for matching session → done with durationMs:0 (session fills real value)', () => {
 		const evt = { type: 'session.idle', properties: { sessionID: SID } };
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'done', durationMs: 0 });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'done', durationMs: 0 });
 	});
 
 	it('session.error → error (stringified)', () => {
@@ -89,29 +118,37 @@ describe('mapOpencodeEvent', () => {
 			type: 'session.error',
 			properties: { sessionID: SID, error: { name: 'UnknownError', data: { message: 'boom' } } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'error', message: 'UnknownError: boom' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'UnknownError: boom' });
 	});
 
 	it('session.error with no sessionID still maps (id absent → not filtered)', () => {
 		const evt = { type: 'session.error', properties: { error: 'plain string error' } };
-		expect(mapOpencodeEvent(evt, SID)).toEqual({ type: 'error', message: 'plain string error' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'plain string error' });
 	});
 
 	it('event for a DIFFERENT sessionID → null', () => {
 		const evt = {
 			type: 'message.part.updated',
-			properties: { part: { type: 'text', sessionID: 'other_session', text: 'x' } },
+			properties: { part: { type: 'text', sessionID: 'other_session', messageID: 'msg_asst', text: 'x' } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toBeNull();
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
 	it('session.idle for a different session → null', () => {
 		const evt = { type: 'session.idle', properties: { sessionID: 'other_session' } };
-		expect(mapOpencodeEvent(evt, SID)).toBeNull();
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
 	it('unrelated event type → null', () => {
-		expect(mapOpencodeEvent({ type: 'file.edited', properties: {} }, SID)).toBeNull();
+		expect(mapOpencodeEvent({ type: 'file.edited', properties: {} }, SID, ASSISTANT)).toBeNull();
+	});
+
+	it('message.updated events fall through to null (the CALLER whitelists from them)', () => {
+		const evt = {
+			type: 'message.updated',
+			properties: { info: { id: 'msg_asst', sessionID: SID, role: 'assistant' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
 	it('ignored part types (step-start/snapshot/...) → null', () => {
@@ -119,12 +156,12 @@ describe('mapOpencodeEvent', () => {
 			type: 'message.part.updated',
 			properties: { part: { type: 'step-start', sessionID: SID } },
 		};
-		expect(mapOpencodeEvent(evt, SID)).toBeNull();
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
 	it('non-object / malformed input → null', () => {
-		expect(mapOpencodeEvent(null, SID)).toBeNull();
-		expect(mapOpencodeEvent(undefined, SID)).toBeNull();
-		expect(mapOpencodeEvent({ noType: true }, SID)).toBeNull();
+		expect(mapOpencodeEvent(null, SID, ASSISTANT)).toBeNull();
+		expect(mapOpencodeEvent(undefined, SID, ASSISTANT)).toBeNull();
+		expect(mapOpencodeEvent({ noType: true }, SID, ASSISTANT)).toBeNull();
 	});
 });
