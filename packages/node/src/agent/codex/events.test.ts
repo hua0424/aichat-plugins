@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mapCodexEvent, mapCodexItem } from './events.js';
 
 describe('mapCodexItem', () => {
@@ -39,8 +39,15 @@ describe('mapCodexItem', () => {
 		});
 	});
 
-	it('error item → error', () => {
-		expect(mapCodexItem({ id: 'e1', type: 'error', message: 'boom' })).toEqual({ type: 'error', message: 'boom' });
+	it('error item → null (NON-fatal; logged via console.warn) — codex item-level errors are warnings/metadata notes, the turn continues', () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			expect(mapCodexItem({ id: 'e1', type: 'error', message: 'Model metadata for deepseek-v4-flash not found. Defaulting to fallback metadata...' })).toBeNull();
+			expect(warn).toHaveBeenCalledOnce();
+			expect(warn.mock.calls[0].join(' ')).toContain('Model metadata for deepseek-v4-flash not found');
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it('ignored item types → null', () => {

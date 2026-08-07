@@ -18,7 +18,9 @@ import type { AgentEvent } from '../events.js';
  *  - reasoning              → thinking (the agent's reasoning text)
  *  - agent_message          → thinking (the model's text is analysis, NOT the user-facing reply)
  *  - command_execution      → tool (in_progress→start; completed/failed→end)  [item-level shell run]
- *  - error (item)           → error
+ *  - error (item)           → null (NON-fatal — logged via console.warn; codex item-level errors are
+ *                                warnings/metadata notes, e.g. "Model metadata for X not found.
+ *                                Defaulting to fallback metadata..." — the turn CONTINUES)
  *  - turn.completed         → done
  *  - turn.failed / error    → error (fatal)
  *  - everything else        → null (ignored)
@@ -85,7 +87,12 @@ export function mapCodexItem(item: unknown): AgentEvent | null {
 		}
 
 		case 'error':
-			return { type: 'error', message: stringifyMessage(it.message, 'codex item error') };
+			// Item-level errors are warning/metadata-note semantics, NOT fatal: codex emits them and the
+			// turn continues (live evidence: "Model metadata for deepseek-v4-flash not found. Defaulting
+			// to fallback metadata..."). Fatal errors remain turn.failed / the top-level error ThreadEvent
+			// in mapCodexEvent. Log and drop.
+			console.warn('[codex] item error (non-fatal):', stringifyMessage(it.message, 'codex item error'));
+			return null;
 
 		// file_change / mcp_tool_call / web_search / todo_list → ignore (no AgentEvent vocabulary).
 		default:

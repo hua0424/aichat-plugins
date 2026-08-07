@@ -325,6 +325,32 @@ describe('CodexSession.send', () => {
 		expect(events).toEqual([{ type: 'error', message: 'unrecoverable' }]);
 	});
 
+	it('item-level error is NON-fatal: no error event, turn continues to done', async () => {
+		// Live evidence: codex switched to deepseek emits a metadata-warning item error and the turn
+		// continues — the driver must NOT treat it as stream-terminal.
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const { codex, ctl } = mockCodex();
+			const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
+			const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+			const stream = session.send('m');
+			await new Promise((r) => setImmediate(r));
+			ctl.emit({
+				type: 'item.completed',
+				item: { id: 'e1', type: 'error', message: 'Model metadata for deepseek-v4-flash not found. Defaulting to fallback metadata...' },
+			});
+			ctl.emit({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'still going' } });
+			ctl.emit({ type: 'turn.completed', usage: {} });
+			const events = await drain(stream);
+			expect(events.some((e) => e.type === 'error')).toBe(false);
+			expect(events).toContainEqual({ type: 'thinking', text: 'still going' });
+			expect(events[events.length - 1].type).toBe('done');
+			expect(warn).toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it('runStreamed rejection surfaces as a terminal error', async () => {
 		const { codex } = mockCodex({ rejectRun: new Error('codex exec failed') });
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
@@ -420,6 +446,37 @@ describe('CodexSession.send — resume-or-create resilience (REQ-010 #101)', () 
 		// captureThreadStarted stored the NEW id (resolveSession follows it)
 		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_fresh');
 		expect(driver.resolveSession('thread_fresh')).toEqual({ aiclawUid: '5', roomId: '9' });
+	});
+
+	it('model-mismatch resume failure also self-heals: discard old binding, fresh thread streams to done', async () => {
+		// Live evidence: after the user switches codex's model (config.toml → deepseek), resuming a
+		// thread recorded with the OLD model rejects with
+		//   `This session was recorded with model "gpt-5.1-codex-mini" which is not available...`
+		// That is a resume failure → same self-heal as a missing rollout.
+		const { codex, startThread, startCtl } = mockCodexSplit({
+			resumeRun: () =>
+				Promise.reject(new Error('This session was recorded with model "gpt-5.1-codex-mini" which is not available...')),
+		});
+		const store = memStore();
+		store.set('aiclaw-5-room-9', { threadId: 'thread_oldmodel' });
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+
+		const session = await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 1, roomId: 9 } });
+		const stream = session.send('hi');
+		await new Promise((r) => setImmediate(r));
+
+		startCtl.emit({ type: 'thread.started', thread_id: 'thread_fresh' });
+		startCtl.emit({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'recovered' } });
+		startCtl.emit({ type: 'turn.completed', usage: {} });
+
+		const events = await drain(stream);
+
+		expect(store.del).toHaveBeenCalledWith('aiclaw-5-room-9');
+		expect(startThread).toHaveBeenCalledOnce();
+		expect(events.some((e) => e.type === 'error')).toBe(false);
+		expect(events).toContainEqual({ type: 'thinking', text: 'recovered' });
+		expect(events[events.length - 1].type).toBe('done');
+		expect(store.map.get('aiclaw-5-room-9')?.threadId).toBe('thread_fresh');
 	});
 
 	it('non-resume error → NO fallback: single error event, startThread not called', async () => {

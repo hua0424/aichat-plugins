@@ -332,15 +332,18 @@ class CodexSession implements AgentSession {
 }
 
 /**
- * True when a `runStreamed` rejection is a "resumed thread no longer exists" failure — i.e. the codex
- * rollout for the stored threadId is gone (container recreate wiped runtime rollouts, or the thread
- * expired/was cleaned). The real error text is e.g.:
+ * True when a `runStreamed` rejection is a "resumed thread no longer exists / is no longer usable"
+ * failure — i.e. the codex rollout for the stored threadId is gone (container recreate wiped runtime
+ * rollouts, or the thread expired/was cleaned), OR the stored thread was recorded with a DIFFERENT
+ * model than codex is now configured with (model-mismatch resume rejection). Real error texts:
  *   `thread/resume failed: no rollout found for thread id <id> (code -32600)`
- * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry.
+ *   `This session was recorded with model "gpt-5.1-codex-mini" which is not available...`
+ * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry:
+ * discard the old binding and run the turn on a FRESH thread.
  */
 export function isResumeFailure(err: unknown): boolean {
 	const msg = errMsg(err);
-	return /no rollout found|thread\/resume failed|-32600/i.test(msg);
+	return /no rollout found|thread\/resume failed|-32600|this session was recorded with model/i.test(msg);
 }
 
 /** Pull the codex item id out of a raw item.* ThreadEvent, for tool start/end de-dup. */
