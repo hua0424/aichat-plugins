@@ -79,7 +79,7 @@ WebSocket RPC frame types: `req`/`res`/`event`. After connect handshake (`connec
 
 - Agent chat: send `agent` req with `{ message, sessionKey, idempotencyKey }`
 - Streamed via `event` frames: `assistant` stream = thinking deltas; `lifecycle` stream with `phase=end/error` = completion
-- The message is prefixed with a role-instruction telling the agent to reply by running `aichat send-message --content "…"` in bash (plain text, NOT `[SYSTEM]` markers — filtered by openclaw security). Built by the shared `buildReplyInstruction` (`packages/node/src/agent/reply-contract.ts` — single source for openclaw/opencode/codex; cc wraps the same base, since aichatoverview#165).
+- The reply contract / persona / identity anchor live in the agents' SYSTEM layer, not in the per-turn user message (moved in REQ-018, aichatoverview#218; `buildReplyInstruction` in `packages/node/src/agent/reply-contract.ts` is RETIRED). Templates are fetched from server base_config and rendered by `buildSystemPrompt` (`packages/node/src/agent/prompt-templates.ts` — single source for openclaw/opencode/codex/cc). openclaw injection = write the marked block (`<!-- aichat:system:begin/end -->`) into the workspace `~/.openclaw/workspace/AGENTS.md`, idempotent upsert via `packages/node/src/agent/agents-md.ts`; openclaw injects workspace AGENTS.md/SOUL.md/USER.md at each agent run — the context is recompiled per prompt (trajectory `context.compiled` per prompt, real-env confirmed, aichatoverview#218 R1). The `agent` req message itself stays pure user text.
 
 ### aichat-claw Plugin (`packages/claw/src/index.ts`)
 
@@ -105,9 +105,10 @@ Config files (JSONC with `//` comment support):
 
 ## Key Invariants
 
-1. **Message prefix:** Must NOT use `[SYSTEM]`, `[System Message]`, or similar markers — filtered by openclaw security hardening.
+1. **Message prefix:** Must NOT use `[SYSTEM]`, `[System Message]`, or similar markers — filtered by openclaw security hardening. The reply contract is no longer prefixed into the per-turn user message (REQ-018, aichatoverview#218 — moved to the drivers' system layer).
 2. **Compound sessionKey (openclaw):** `OpenclawDriver.openSession` builds `<token>:aiclaw-{uid}-room-{roomId}` — opaque token FIRST, then a literal `:`, then the plaintext binding LAST. exec-env's `buildOpenclawExecEnv` extracts the token PREFIX → `OPENCLAW_BIND`; the node's CapabilityEndpoint keys on the BARE token alone (never split the compound — a compound arriving at the endpoint = forgery → store miss). This format is preserved (openclaw gateway-side session isolation); only the retired tools' tail-parsing consumer was removed.
 3. **Thinking session lifecycle:** `THINKING_START` → (buffer deltas) → `thinkingId` backfilled → flush buffered deltas → `THINKING_DELTA` stream → `THINKING_END`. Always guard against double-finalization with `session.finalized`.
 4. **AutoReply extra field:** Messages sent with `extra: { autoReply: true }` are skipped by the handler to prevent self-trigger loops.
 5. **AI-to-AI backoff:** After 5 consecutive AI-to-AI rounds, exponential delay kicks in (5s → 15s → 30s). Human messages reset the counter.
 6. **Plugin manifest `configSchema` is mandatory:** openclaw 2026.6.5's gateway **refuses to start** if a configured plugin's `openclaw.plugin.json` lacks a `configSchema` (`Gateway failed to start: plugin manifest requires configSchema`), taking the whole container down. It must be a non-empty object schema (`{type:"object", properties:{…}}`) — `{}` and a bare `{type:"object"}` are both rejected. Keep it even though aichat-claw consumes no config (guarded by `packaging.test.ts`).
+7. **codex AGENTS.md injection is resume-frozen:** codex bakes the workspace AGENTS.md marked block into the thread at START — a resumed old thread does NOT re-read AGENTS.md (the system layer is frozen at thread creation), so persona/contract changes take effect for codex only on NEW sessions (a fresh thread after `reset-session` reads the latest content). cc/opencode/openclaw re-inject per turn / per spawn and take effect on the next turn. (aichatoverview#218 AC6, real-env verified.)
