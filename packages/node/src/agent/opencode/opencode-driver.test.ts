@@ -229,12 +229,14 @@ describe('OpencodeSession.send', () => {
 		expect(subscribe).toHaveBeenCalledOnce();
 		expect(prompt).toHaveBeenCalledOnce();
 
-		// emit a turn: two text deltas, a tool that goes running→running(dup)→completed, then idle
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'A' }, delta: 'A' } });
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'B' }, delta: 'B' } });
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'running' } } } });
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'running' } } } }); // dup start
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, tool: 'bash', callID: 'c1', state: { status: 'completed' } } } });
+		// emit a turn: assistant message M1 is announced first (message.updated), then two text
+		// deltas, a tool that goes running→running(dup)→completed, then idle
+		ctl.emit({ type: 'message.updated', properties: { info: { id: 'M1', sessionID: SID, role: 'assistant' } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'M1', text: 'A' }, delta: 'A' } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'M1', text: 'B' }, delta: 'B' } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, messageID: 'M1', tool: 'bash', callID: 'c1', state: { status: 'running' } } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, messageID: 'M1', tool: 'bash', callID: 'c1', state: { status: 'running' } } } }); // dup start
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: SID, messageID: 'M1', tool: 'bash', callID: 'c1', state: { status: 'completed' } } } });
 		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
 
 		const events = await drain(stream);
@@ -258,11 +260,38 @@ describe('OpencodeSession.send', () => {
 		const stream = session.send('m');
 		await new Promise((r) => setImmediate(r));
 		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: 'OTHER', text: 'x' }, delta: 'x' } });
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'mine' }, delta: 'mine' } });
+		ctl.emit({ type: 'message.updated', properties: { info: { id: 'M1', sessionID: SID, role: 'assistant' } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'M1', text: 'mine' }, delta: 'mine' } });
 		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
 		const events = await drain(stream);
 		const thinking = events.filter((e) => e.type === 'thinking');
 		expect(thinking).toEqual([{ type: 'thinking', text: 'mine' }]);
+	});
+
+	// opencode emits a `text` part for the USER message (the prompt we sent, reply-instruction
+	// envelope included). The driver whitelists assistant message ids from `message.updated`
+	// events, so the user prompt must never reach the consumer as thinking.
+	it('user-message parts never reach the consumer as thinking (no prompt leak)', async () => {
+		const { client, ctl } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
+		const stream = session.send('m');
+		await new Promise((r) => setImmediate(r));
+
+		// Realistic opencode order: message.updated precedes that message's parts.
+		ctl.emit({ type: 'message.updated', properties: { info: { id: 'U1', sessionID: SID, role: 'user' } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'U1', text: 'FULL PROMPT WITH REPLY INSTRUCTION' }, delta: 'FULL PROMPT WITH REPLY INSTRUCTION' } });
+		ctl.emit({ type: 'message.updated', properties: { info: { id: 'A1', sessionID: SID, role: 'assistant' } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'A1', text: 'assistant reply' }, delta: 'assistant reply' } });
+		ctl.emit({ type: 'session.idle', properties: { sessionID: SID } });
+
+		const events = await drain(stream);
+		expect(events).toEqual([
+			{ type: 'thinking', text: 'assistant reply' },
+			expect.objectContaining({ type: 'done' }),
+		]);
+		// the user prompt (incl. the reply-instruction envelope) never leaks into thinking
+		expect(events.some((e) => e.type === 'thinking' && e.text.includes('FULL PROMPT'))).toBe(false);
 	});
 
 	it('session.error → error event then ends', async () => {
@@ -271,7 +300,8 @@ describe('OpencodeSession.send', () => {
 		const session = await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
 		const stream = session.send('m');
 		await new Promise((r) => setImmediate(r));
-		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, text: 'partial' }, delta: 'partial' } });
+		ctl.emit({ type: 'message.updated', properties: { info: { id: 'M1', sessionID: SID, role: 'assistant' } } });
+		ctl.emit({ type: 'message.part.updated', properties: { part: { type: 'text', sessionID: SID, messageID: 'M1', text: 'partial' }, delta: 'partial' } });
 		ctl.emit({ type: 'session.error', properties: { sessionID: SID, error: { name: 'UnknownError', data: { message: 'kaboom' } } } });
 		const events = await drain(stream);
 		expect(events).toEqual([

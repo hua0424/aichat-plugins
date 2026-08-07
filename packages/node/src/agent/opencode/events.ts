@@ -14,8 +14,20 @@ import type { AgentEvent } from '../events.js';
  * Always filtered by the caller's `sessionID`: an event for a different session
  * (or a session.idle/error for another id) → null, so a shared per-directory
  * subscription never leaks another session's events into this turn.
+ *
+ * `assistantMessageIDs`: opencode parts carry NO role — only sessionID/messageID — and
+ * opencode also emits a `text` part for the USER message (the prompt we sent, reply
+ * instruction envelope included). The CALLER whitelists message ids whose `message.updated`
+ * event reported `role: 'assistant'` (opencode emits message.updated before that message's
+ * parts on the same in-order SSE bus) and passes the set in; text/reasoning parts whose
+ * messageID is not whitelisted are dropped so the user prompt never leaks into thinking.
+ * Tool parts are not gated (user messages never carry tool parts).
  */
-export function mapOpencodeEvent(evt: unknown, sessionID: string): AgentEvent | null {
+export function mapOpencodeEvent(
+	evt: unknown,
+	sessionID: string,
+	assistantMessageIDs: ReadonlySet<string>,
+): AgentEvent | null {
 	if (!evt || typeof evt !== 'object') return null;
 	const e = evt as { type?: unknown; properties?: unknown };
 	if (typeof e.type !== 'string') return null;
@@ -27,6 +39,7 @@ export function mapOpencodeEvent(evt: unknown, sessionID: string): AgentEvent | 
 				| {
 						type?: string;
 						sessionID?: string;
+						messageID?: string;
 						text?: string;
 						tool?: string;
 						state?: { status?: string; input?: Record<string, unknown> };
@@ -36,6 +49,9 @@ export function mapOpencodeEvent(evt: unknown, sessionID: string): AgentEvent | 
 			const delta = typeof props.delta === 'string' ? props.delta : undefined;
 
 			if (part.type === 'text' || part.type === 'reasoning') {
+				// Parts carry no role; only assistant-whitelisted messages may stream thinking,
+				// otherwise the USER prompt (a text part too) would leak into thinking.
+				if (typeof part.messageID !== 'string' || !assistantMessageIDs.has(part.messageID)) return null;
 				// prefer the streaming delta; fall back to the accumulated part text.
 				const text = delta ?? (typeof part.text === 'string' ? part.text : '');
 				return { type: 'thinking', text };

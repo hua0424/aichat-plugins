@@ -181,6 +181,11 @@ class OpencodeSession implements AgentSession {
 		// mapOpencodeEvent is stateless per-event; we collapse repeats here.
 		const toolStarted = new Set<string>();
 		const toolEnded = new Set<string>();
+		// opencode parts carry no role, and the USER message's text part (our prompt, reply
+		// instruction included) streams on the same bus — whitelist assistant message ids from
+		// `message.updated` events (emitted before that message's parts) so mapOpencodeEvent
+		// can drop user-message parts from the thinking stream.
+		const assistantMessageIDs = new Set<string>();
 
 		// Manual async-iterator handle on the SSE stream so we can close it externally even
 		// while a consumer is PARKED on iter.next() (a `for await` can't be interrupted).
@@ -224,7 +229,9 @@ class OpencodeSession implements AgentSession {
 		// Map a raw SSE event → at most one buffered AgentEvent, applying tool de-dup and
 		// filling the real durationMs on done. Returns true if the stream should end.
 		const handleRaw = (raw: unknown): boolean => {
-			const ev = mapOpencodeEvent(raw, this.sessionID);
+			const assistantMsgID = extractAssistantMessageID(raw, this.sessionID);
+			if (assistantMsgID) assistantMessageIDs.add(assistantMsgID);
+			const ev = mapOpencodeEvent(raw, this.sessionID, assistantMessageIDs);
 			if (!ev) return false;
 
 			if (ev.type === 'tool') {
@@ -340,4 +347,20 @@ function extractCallID(raw: unknown): string | undefined {
 	const props = (raw as { properties?: unknown }).properties as { part?: unknown } | undefined;
 	const part = props?.part as { callID?: unknown } | undefined;
 	return typeof part?.callID === 'string' ? part.callID : undefined;
+}
+
+/**
+ * Pull the message id out of a `message.updated` raw event for THIS session when it announces
+ * an ASSISTANT message (parts carry no role, so this is the only role source). Returns
+ * undefined for user messages, other sessions, and non-message.updated events.
+ */
+function extractAssistantMessageID(raw: unknown, sessionID: string): string | undefined {
+	if (!raw || typeof raw !== 'object') return undefined;
+	const e = raw as { type?: unknown; properties?: unknown };
+	if (e.type !== 'message.updated') return undefined;
+	const info = (e.properties as { info?: unknown } | undefined)?.info as
+		| { id?: unknown; sessionID?: unknown; role?: unknown }
+		| undefined;
+	if (info?.sessionID !== sessionID || info.role !== 'assistant') return undefined;
+	return typeof info.id === 'string' ? info.id : undefined;
 }
