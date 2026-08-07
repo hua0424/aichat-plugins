@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type WebSocket from 'ws';
 import {
 	OpenclawDriver,
@@ -678,6 +678,15 @@ describe('parseHelloOk', () => {
 });
 
 describe('OpenclawDriver REQ-018 — AGENTS.md system prompt', () => {
+	it('REQ-018 R1: default workspaceDir (no 5th param) is ~/.openclaw/workspace', () => {
+		// R1 real-env confirmation: openclaw actually reads ~/.openclaw/workspace/AGENTS.md (injected at
+		// session startup), so the constructor default must point there — NOT ~/.openclaw. Build with
+		// homedir() so the assertion is portable (no /root hardcode).
+		const driver = new OpenclawDriver('ws://localhost:18789', '', makeStore());
+		const dir = (driver as unknown as { workspaceDir: string }).workspaceDir;
+		expect(dir).toBe(resolve(homedir(), '.openclaw', 'workspace'));
+	});
+
 	it('with templates, openSession writes the rendered system prompt into the workspace AGENTS.md; the gateway message stays pure', async () => {
 		const store = makeStore();
 		const gw = fakeGateway();
