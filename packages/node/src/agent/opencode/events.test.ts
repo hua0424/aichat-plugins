@@ -180,25 +180,25 @@ describe('mapOpencodeEvent', () => {
 	// permission (e.g. external_directory for out-of-workspace access). Headless deploy has nobody to
 	// approve, so the session stalls until the handler's 300s timeout — surface it as a TERMINAL error
 	// instead. (In-workspace actions are auto-allowed in the deployed mode, so only real asks fire.)
-	// Golden fixture = upstream v1.18.16 schema shape {permission, patterns, always, tool.messageID}
-	// (confirmed via packages/schema/src/v1/permission.ts + SDK v2 gen); reconcile with tester's real
-	// captured frame when it lands.
-	it('permission.asked (golden, v1.18.16) → error with permission + patterns', () => {
+	// Golden fixture = TESTER-CAPTURED real frame (Windows 11 + opencode 1.18.16, verbatim;
+	// full stream at tests/desktop/reports/opencode-258-sse-permission.log), sessionID → SID.
+	it('permission.asked (golden, tester-captured v1.18.16) → error with permission + target path', () => {
 		const evt = {
+			id: 'evt_ff1bd4e85001PI06sc3sJs49TI',
 			type: 'permission.asked',
 			properties: {
-				id: 'req_1',
+				id: 'per_ff1bd4e84001NJrR6iITdxbb0R',
 				sessionID: SID,
 				permission: 'external_directory',
-				patterns: ['/home/user'],
-				metadata: {},
-				always: [],
-				tool: { messageID: 'msg_asst', callID: 'call_1' },
+				patterns: ['C:\\Windows\\*'],
+				metadata: { filepath: 'C:\\Windows\\win.ini', parentDir: 'C:\\Windows' },
+				always: ['C:\\Windows\\*'],
+				tool: { messageID: 'msg_ff1bd24040015BwUocAvOUD9nK', callID: 'call_00_Y2jUEQdUWj8loODiVsjI6413' },
 			},
 		};
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
 			type: 'error',
-			message: 'opencode requested permission: external_directory (/home/user) — headless cannot approve',
+			message: 'opencode requested permission: external_directory (C:\\Windows\\win.ini) — headless cannot approve',
 		});
 	});
 
