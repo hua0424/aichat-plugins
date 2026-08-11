@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
 import { readJsonBody } from '../util/http-body.js';
 import { unlinkSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { dirname, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
 import type { CapabilityRegistry, CapabilityContext } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
@@ -270,7 +270,9 @@ export function capabilitySocketPath(opts?: {
 		const hex = createHash('sha256').update(home).digest('hex').slice(0, 16);
 		return `\\\\.\\pipe\\aichat-capability-${hex}`;
 	}
-	return join(home, 'capability.sock');
+	// posix.join (not join): the non-win32 branch must be host-independent — on a win32 HOST the
+	// platform `join` would emit backslashes, which is only reachable here via the DI `platform` seam.
+	return posix.join(home, 'capability.sock');
 }
 
 /**

@@ -161,7 +161,7 @@ describe('CodexDriver.openSession', () => {
 		expect(opts.sandboxMode).toBe('danger-full-access');
 		expect(opts.approvalPolicy).toBe('never');
 		expect(opts.skipGitRepoCheck).toBe(true);
-		expect(opts.workingDirectory).toContain('/group/9');
+		expect(opts.workingDirectory).toContain(join('group', '9'));
 		// no model override → no model key
 		expect('model' in opts).toBe(false);
 	});
@@ -171,7 +171,7 @@ describe('CodexDriver.openSession', () => {
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
 		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 2, roomId: 9, counterpartUid: 1234 } });
 		const opts = startThread.mock.calls[0][0] as ThreadOptions;
-		expect(opts.workingDirectory).toContain('/dm/1234');
+		expect(opts.workingDirectory).toContain(join('dm', '1234'));
 	});
 
 	it('RESUMES when the store already has a threadId for the key', async () => {
