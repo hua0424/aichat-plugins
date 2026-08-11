@@ -33,6 +33,7 @@ import {
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
 import { resolveBoundSession } from '../capability/session-key.js';
 import { installSkill } from '../capability/skill.js';
+import { ensureAichatOnPath } from '../util/path-inject.js';
 
 /**
  * aichat start — 读取本地配置自动连接。
@@ -40,6 +41,12 @@ import { installSkill } from '../capability/skill.js';
  * （单身份只是长度为 1 的 registry —— 旧的单身份回退分支已在 aichatoverview#163 删除。）
  */
 export async function start(): Promise<void> {
+	// aichatoverview#257 — 手册方案 A（`node packages/node/dist/cli.js start`，不 npm link）启动时
+	// `aichat` 不在 agent 的 PATH 上，skill 的裸命令 `aichat send-message` 无法解析、回复链路断。
+	// 把自身 CLI 的 launcher 目录注入 PATH（start 一次，spawn 的 serve/codex/cc 子进程全部继承）。
+	const pathBin = ensureAichatOnPath();
+	if (pathBin) console.log(`[start] PATH += ${pathBin} (aichat launcher)`);
+
 	const config = loadConfig();
 	const registry = loadAgentRegistry(config);
 
