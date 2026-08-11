@@ -86,6 +86,23 @@ export function mapOpencodeEvent(
 			return { type: 'error', message: stringifyError(props.error) };
 		}
 
+		case 'session.status': {
+			// aichatoverview#256 — serve reports provider rate-limit/backoff as
+			// `{type:"retry", attempt, message, next}` (reason field present on some versions).
+			// Map it to a TERMINAL error carrying the serve reason instead of letting the turn
+			// ride the handler's 300s timeout into a generic thinking_session_timeout — backoffs
+			// are hours long (free-tier limit), so waiting is pointless. busy = still working
+			// (ignore); idle is already handled by session.idle.
+			if (props.sessionID !== sessionID) return null;
+			const status = props.status as
+				| { type?: string; message?: string; reason?: string }
+				| undefined;
+			if (status?.type !== 'retry') return null;
+			const text = typeof status.message === 'string' && status.message.length > 0 ? status.message : 'rate limited';
+			const reason = typeof status.reason === 'string' && status.reason.length > 0 ? ` (${status.reason})` : '';
+			return { type: 'error', message: `opencode retry: ${text}${reason}` };
+		}
+
 		default:
 			return null;
 	}

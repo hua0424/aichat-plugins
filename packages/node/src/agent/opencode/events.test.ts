@@ -126,6 +126,56 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'plain string error' });
 	});
 
+	// aichatoverview#256 — serve reports provider rate-limit/backoff via session.status=retry
+	// (e.g. `{type:"retry", attempt:1, message:"Free usage exceeded", reason:"free_tier_limit"}`).
+	// It MUST become a terminal error carrying the serve reason, not fall to default (null) —
+	// otherwise the driver waits forever and the handler's 300s timeout masks the real cause.
+	it('session.status retry → error with serve message + reason', () => {
+		const evt = {
+			type: 'session.status',
+			properties: {
+				sessionID: SID,
+				status: { type: 'retry', attempt: 1, message: 'Free usage exceeded', next: 30_000, reason: 'free_tier_limit' },
+			},
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode retry: Free usage exceeded (free_tier_limit)',
+		});
+	});
+
+	it('session.status retry with message only → error carries it', () => {
+		const evt = {
+			type: 'session.status',
+			properties: { sessionID: SID, status: { type: 'retry', attempt: 2, message: 'provider rate limit', next: 60_000 } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'opencode retry: provider rate limit' });
+	});
+
+	it('session.status retry with no message/reason → error with generic reason', () => {
+		const evt = {
+			type: 'session.status',
+			properties: { sessionID: SID, status: { type: 'retry', attempt: 1, next: 30_000 } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'opencode retry: rate limited' });
+	});
+
+	it('session.status busy → null (still working, ignore)', () => {
+		const evt = {
+			type: 'session.status',
+			properties: { sessionID: SID, status: { type: 'busy' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
+	it('session.status retry for a DIFFERENT session → null', () => {
+		const evt = {
+			type: 'session.status',
+			properties: { sessionID: 'other_session', status: { type: 'retry', attempt: 1, message: 'x', next: 30_000 } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
 	it('event for a DIFFERENT sessionID → null', () => {
 		const evt = {
 			type: 'message.part.updated',
