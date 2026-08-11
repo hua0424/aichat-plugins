@@ -142,8 +142,17 @@ function pickString(obj: Record<string, unknown>, keys: string[]): string | unde
 	return undefined;
 }
 
-/** Human-readable ask target: new `patterns` array → legacy `pattern` → legacy `title`. */
+/** Human-readable ask target: metadata.filepath/parentDir (v1.18.16) → `patterns` → legacy `pattern` → `title`. */
 function permissionAskDetail(props: Record<string, unknown>): string | undefined {
+	// v1.18.16 asks carry metadata with the CONCRETE target (e.g. the file being read) — most specific.
+	const metadata = props.metadata;
+	if (metadata && typeof metadata === 'object') {
+		const meta = metadata as Record<string, unknown>;
+		for (const key of ['filepath', 'parentDir']) {
+			const v = meta[key];
+			if (typeof v === 'string' && v.length > 0) return v;
+		}
+	}
 	for (const key of ['patterns', 'pattern']) {
 		const v = props[key];
 		if (Array.isArray(v)) {
