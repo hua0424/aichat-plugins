@@ -1,8 +1,14 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, statSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CapabilityEndpoint, maskSessionKey, sanitizeLogField } from './endpoint.js';
+import {
+	CapabilityEndpoint,
+	capabilitySocketPath,
+	maskSessionKey,
+	prepareSocketPath,
+	sanitizeLogField,
+} from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 
@@ -10,7 +16,7 @@ import type { HulaApiClient } from '../api/hula-api.js';
  * Build an endpoint wired to a real registry (send-message) + a controllable resolve. The fake
  * apiClient's sendMessage is the observable seam: we assert which roomId it received.
  */
-function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: number }) {
+function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: number; platform?: NodeJS.Platform }) {
 	const sendMessage = vi.fn(async () => ({ msgId: 1 }));
 	const apiClient = { sendMessage } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
@@ -23,6 +29,7 @@ function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: numbe
 		registry,
 		resolve,
 		idempotencyCap: opts?.idempotencyCap,
+		platform: opts?.platform,
 	});
 	return { endpoint, sendMessage, resolve };
 }
@@ -238,6 +245,64 @@ describe('endpoint log-sanitizer helpers', () => {
 	});
 });
 
+describe('capabilitySocketPath (platform-aware)', () => {
+	it('win32 → valid named-pipe path hashed from home, with NO colon', () => {
+		const p = capabilitySocketPath({ platform: 'win32', home: 'C:\\Users\\bob\\.aichat' });
+		expect(p).toMatch(/^\\\\\.\\pipe\\aichat-capability-[0-9a-f]{16}$/);
+		expect(p).not.toContain(':');
+	});
+
+	it('deterministic: same home twice → identical path', () => {
+		const a = capabilitySocketPath({ platform: 'win32', home: 'C:\\Users\\bob\\.aichat' });
+		const b = capabilitySocketPath({ platform: 'win32', home: 'C:\\Users\\bob\\.aichat' });
+		expect(a).toBe(b);
+	});
+
+	it('per-user: two different homes → different pipes (named pipes are machine-wide)', () => {
+		const a = capabilitySocketPath({ platform: 'win32', home: 'C:\\Users\\alice\\.aichat' });
+		const b = capabilitySocketPath({ platform: 'win32', home: 'C:\\Users\\bob\\.aichat' });
+		expect(a).not.toBe(b);
+	});
+
+	it('linux → <home>/capability.sock (unchanged regression)', () => {
+		expect(capabilitySocketPath({ platform: 'linux', home: '/home/bob/.aichat' })).toBe(
+			'/home/bob/.aichat/capability.sock',
+		);
+	});
+
+	it('env override wins on win32, returned verbatim', () => {
+		expect(
+			capabilitySocketPath({
+				platform: 'win32',
+				env: { AICHAT_CAPABILITY_SOCK: '\\\\.\\pipe\\custom' },
+				home: 'C:\\Users\\bob\\.aichat',
+			}),
+		).toBe('\\\\.\\pipe\\custom');
+	});
+});
+
+describe('prepareSocketPath (platform-aware)', () => {
+	const dirs: string[] = [];
+
+	afterEach(() => {
+		for (const d of dirs.splice(0)) {
+			rmSync(d, { recursive: true, force: true });
+		}
+	});
+
+	it('win32 → NO-OP: parent dir of a missing path is NOT created', () => {
+		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
+		dirs.push(base);
+		const missingDir = join(base, 'does-not-exist');
+		const socketPath = join(missingDir, 'capability.sock');
+
+		prepareSocketPath(socketPath, 'win32');
+
+		// Nothing touched on disk: no mkdir, no dir chmod, no stale unlink.
+		expect(existsSync(missingDir)).toBe(false);
+	});
+});
+
 describe('CapabilityEndpoint.listen socket permissions', () => {
 	const dirs: string[] = [];
 	let endpoint: CapabilityEndpoint | null = null;
@@ -266,5 +331,19 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		// On Linux the mode bits are honored; mask to the permission bits only.
 		expect(statSync(socketPath).mode & 0o777).toBe(0o600);
 		expect(statSync(dir).mode & 0o777).toBe(0o700);
+	});
+
+	it('win32 deps → resolves and the socket chmod 0600 is SKIPPED (named pipe, no fs chmod)', async () => {
+		const { endpoint: ep } = build({ resolveRoom: 42, platform: 'win32' });
+		endpoint = ep;
+		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
+		dirs.push(base);
+		const socketPath = join(base, 'capability.sock');
+
+		await endpoint.listen(socketPath);
+
+		// On win32 the chmod is a POSIX-only anti-spoofing guard → skipped, so the file keeps its
+		// default (non-0600) mode. (close() also skips unlink on win32 → rmSync in afterEach cleans up.)
+		expect(statSync(socketPath).mode & 0o777).not.toBe(0o600);
 	});
 });
