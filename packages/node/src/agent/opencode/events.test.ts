@@ -126,22 +126,31 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'plain string error' });
 	});
 
-	// aichatoverview#256 — serve reports provider rate-limit/backoff via session.status=retry
-	// (e.g. `{type:"retry", attempt:1, message:"Free usage exceeded", reason:"free_tier_limit"}`).
+	// aichatoverview#256 — serve reports provider rate-limit/backoff via session.status=retry.
 	// It MUST become a terminal error carrying the serve reason, not fall to default (null) —
 	// otherwise the driver waits forever and the handler's 300s timeout masks the real cause.
-	it('session.status retry → error with serve message + reason', () => {
+	// Golden shape = tester-captured v1.18.16 (aichatoverview#259): reason lives at
+	// status.action.reason (NOT status.reason). Full stream at tests/desktop/reports/opencode-256-replay.mjs.
+	it('session.status retry with action.reason (golden, tester-captured) → error with reason suffix', () => {
 		const evt = {
 			type: 'session.status',
 			properties: {
 				sessionID: SID,
-				status: { type: 'retry', attempt: 1, message: 'Free usage exceeded', next: 30_000, reason: 'free_tier_limit' },
+				status: { type: 'retry', attempt: 1, message: 'Free usage exceeded', next: 30_000, action: { reason: 'free_tier_limit' } },
 			},
 		};
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
 			type: 'error',
 			message: 'opencode retry: Free usage exceeded (free_tier_limit)',
 		});
+	});
+
+	it('session.status retry with legacy status.reason → still maps (compat)', () => {
+		const evt = {
+			type: 'session.status',
+			properties: { sessionID: SID, status: { type: 'retry', attempt: 1, message: 'x', next: 30_000, reason: 'free_tier_limit' } },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'opencode retry: x (free_tier_limit)' });
 	});
 
 	it('session.status retry with message only → error carries it', () => {
