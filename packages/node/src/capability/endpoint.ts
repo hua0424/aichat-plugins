@@ -158,7 +158,8 @@ export class CapabilityEndpoint {
 		// Anti-spoofing: on POSIX keep the socket private — the PARENT dir must be 0700 so no other
 		// user can place/replace the socket, the explicit chmod defends against the process umask
 		// masking the mkdir mode bits, and the socket itself is locked to 0600 after listen(). On
-		// win32 there is no fs file/dir — the per-user hashed pipe name IS the ownership guarantee.
+		// win32 there is no fs file/dir — ownership relies on the named pipe's DEFAULT SECURITY
+		// DESCRIPTOR (creator + SYSTEM + Administrators only), not on the predictable pipe name.
 		prepareSocketPath(socketPath, this.platform);
 		this.socketPath = socketPath;
 		this.server = createServer((req, res) => {
@@ -247,10 +248,14 @@ export function maskSessionKey(sessionKey: string): string {
  *
  * On win32 the loopback transport is a NAMED PIPE, not a unix socket: libuv passes the path verbatim
  * to CreateNamedPipeW, so a path like `C:\…\capability.sock` (colon/backslashes) is an invalid pipe
- * name and `listen` fails EACCES. Named pipes are per-MACHINE, so the per-user AICHAT_HOME is hashed
- * into the pipe name — two users on one box land on different pipes, which IS the ownership guarantee
- * on Windows (there is no 0700-dir anti-spoofing as on POSIX). The hash is deterministic so the
- * `aichat start` server and every `aichat send-message` CLI process agree on the name.
+ * name and `listen` fails EACCES. The pipe NAME is a deterministic hash of the per-user AICHAT_HOME
+ * so two users on one machine land on different pipes (collision-avoidance) and the `aichat start`
+ * server agrees with every `aichat send-message` CLI process. The hash is NOT a secret and provides
+ * no anti-spoofing by itself — ownership comes from the named pipe's DEFAULT SECURITY DESCRIPTOR
+ * (CreateNamedPipeW defaults to creator + SYSTEM + Administrators only, writable/controllable by no
+ * one else). Residual risk: the name is predictable, so another local user could pre-bind it and make
+ * `aichat start` fail to bind (startup DoS). Hardening — a random per-run suffix shared with the CLI
+ * via a file inside AICHAT_HOME — is recorded as a future direction, not scheduled.
  */
 export function capabilitySocketPath(opts?: {
 	platform?: NodeJS.Platform;
