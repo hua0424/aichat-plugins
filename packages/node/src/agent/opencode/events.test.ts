@@ -176,6 +176,48 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
+	// aichatoverview#258 — serve emits permission.updated when a tool asks for a permission
+	// (e.g. external_directory for out-of-workspace access). Headless deploy has nobody to approve,
+	// so the session stalls until the handler's 300s timeout — surface it as a TERMINAL error
+	// instead. (In-workspace actions are auto-allowed in the deployed mode, so only real asks fire.)
+	it('permission.updated for matching session → error with permission type+title', () => {
+		const evt = {
+			type: 'permission.updated',
+			properties: {
+				id: 'perm_1',
+				type: 'external_directory',
+				pattern: '/home/user',
+				sessionID: SID,
+				messageID: 'msg_asst',
+				title: 'Access outside workspace',
+				time: { created: 0 },
+			},
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode requested permission: external_directory (Access outside workspace) — headless cannot approve',
+		});
+	});
+
+	it('permission.updated with no title → error with type only', () => {
+		const evt = {
+			type: 'permission.updated',
+			properties: { id: 'p', type: 'web', sessionID: SID, messageID: 'm', title: '' },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode requested permission: web — headless cannot approve',
+		});
+	});
+
+	it('permission.updated for a DIFFERENT session → null', () => {
+		const evt = {
+			type: 'permission.updated',
+			properties: { id: 'p', type: 'web', sessionID: 'other_session', messageID: 'm', title: 'x' },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
 	it('event for a DIFFERENT sessionID → null', () => {
 		const evt = {
 			type: 'message.part.updated',

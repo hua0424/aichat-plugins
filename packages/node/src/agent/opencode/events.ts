@@ -103,6 +103,19 @@ export function mapOpencodeEvent(
 			return { type: 'error', message: `opencode retry: ${text}${reason}` };
 		}
 
+		case 'permission.updated': {
+			// aichatoverview#258 — serve emits this when a tool asks for a permission
+			// (e.g. external_directory for out-of-workspace access). Headless deploy has nobody to
+			// approve, so the session would stall until the handler's 300s timeout; surface it as a
+			// TERMINAL error instead. In-workspace actions are auto-allowed in the deployed mode
+			// (normal replies work today), so only real asks that would stall reach here.
+			if (props.sessionID !== sessionID) return null;
+			const perm = props as { type?: string; title?: string };
+			const ptype = typeof perm.type === 'string' && perm.type.length > 0 ? perm.type : 'permission';
+			const title = typeof perm.title === 'string' && perm.title.length > 0 ? ` (${perm.title})` : '';
+			return { type: 'error', message: `opencode requested permission: ${ptype}${title} — headless cannot approve` };
+		}
+
 		default:
 			return null;
 	}
