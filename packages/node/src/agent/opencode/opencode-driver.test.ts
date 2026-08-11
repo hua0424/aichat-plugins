@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { join } from 'node:path';
 import { OpencodeDriver } from './opencode-driver.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import type { SessionStore, StoredSession } from './session-store.js';
@@ -156,10 +157,10 @@ describe('OpencodeDriver.openSession', () => {
 
 		expect(create).toHaveBeenCalledOnce();
 		const arg = create.mock.calls[0][0] as { query: { directory: string }; body: { title: string } };
-		expect(arg.query.directory).toContain('/group/9');
+		expect(arg.query.directory).toContain(join('group', '9'));
 		const stored = store.map.get('aiclaw-5-room-9');
 		expect(stored?.sessionID).toBe(SID);
-		expect(stored?.directory).toContain('/group/9');
+		expect(stored?.directory).toContain(join('group', '9'));
 	});
 
 	it('dm context → dm/<counterpartUid> dir', async () => {
@@ -167,7 +168,7 @@ describe('OpencodeDriver.openSession', () => {
 		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
 		await driver.openSession({ aiclawUid: 5, roomId: 9, chatContext: { roomType: 2, roomId: 9, counterpartUid: 1234 } });
 		const arg = create.mock.calls[0][0] as { query: { directory: string } };
-		expect(arg.query.directory).toContain('/dm/1234');
+		expect(arg.query.directory).toContain(join('dm', '1234'));
 	});
 
 	it('REUSES a persisted session for the same key+directory (no 2nd create)', async () => {

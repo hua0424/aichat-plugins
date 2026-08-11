@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { join } from 'node:path';
 
 const writes: Array<{ path: string; content: string }> = [];
 let throwForPath: ((path: string) => boolean) | null = null;
@@ -19,9 +20,9 @@ vi.mock('node:os', () => ({
 import { installSkill } from './skill.js';
 
 const ROOTS = [
-	'/home/test/.config/opencode/skills',
-	'/home/test/.claude/skills',
-	'/home/test/.agents/skills',
+	join('/home/test', '.config', 'opencode', 'skills'),
+	join('/home/test', '.claude', 'skills'),
+	join('/home/test', '.agents', 'skills'),
 ];
 
 describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)', () => {
@@ -37,8 +38,8 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 		expect(writes).toHaveLength(6);
 
 		for (const root of ROOTS) {
-			const replyPath = `${root}/aichat-reply/SKILL.md`;
-			const queryPath = `${root}/aichat-query/SKILL.md`;
+			const replyPath = join(root, 'aichat-reply', 'SKILL.md');
+			const queryPath = join(root, 'aichat-query', 'SKILL.md');
 			expect(writes.some((w) => w.path === replyPath)).toBe(true);
 			expect(writes.some((w) => w.path === queryPath)).toBe(true);
 			expect(result).toContain(replyPath);
@@ -48,7 +49,7 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 
 	it('aichat-query content documents the id-based --groupid usage', () => {
 		installSkill();
-		const query = writes.find((w) => w.path.endsWith('aichat-query/SKILL.md'));
+		const query = writes.find((w) => w.path.endsWith(join('aichat-query', 'SKILL.md')));
 		expect(query).toBeDefined();
 		const md = query!.content;
 		expect(md).toContain('name: aichat-query');
@@ -59,7 +60,7 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 
 	it('aichat-reply content is unchanged (still send-message based)', () => {
 		installSkill();
-		const reply = writes.find((w) => w.path.endsWith('aichat-reply/SKILL.md'));
+		const reply = writes.find((w) => w.path.endsWith(join('aichat-reply', 'SKILL.md')));
 		expect(reply).toBeDefined();
 		expect(reply!.content).toContain('name: aichat-reply');
 		expect(reply!.content).toContain('aichat send-message --content');
@@ -68,7 +69,7 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 	// REQ-010 #102 — make "invoking the skill ≠ sent" unambiguous in the skill itself.
 	it('aichat-reply warns that invoking/reading the skill does NOT send', () => {
 		installSkill();
-		const reply = writes.find((w) => w.path.endsWith('aichat-reply/SKILL.md'));
+		const reply = writes.find((w) => w.path.endsWith(join('aichat-reply', 'SKILL.md')));
 		expect(reply).toBeDefined();
 		const md = reply!.content;
 		expect(md).toContain('does NOT send anything');
@@ -78,10 +79,10 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 	});
 
 	it('best-effort: a root that throws is skipped, others still written, no throw', () => {
-		throwForPath = (p) => p.startsWith('/home/test/.claude/skills');
+		throwForPath = (p) => p.startsWith(join('/home/test', '.claude', 'skills'));
 		const result = installSkill();
 		// 2 remaining roots × 2 skills = 4 successful writes
 		expect(result).toHaveLength(4);
-		expect(result.every((p) => !p.startsWith('/home/test/.claude/skills'))).toBe(true);
+		expect(result.every((p) => !p.startsWith(join('/home/test', '.claude', 'skills')))).toBe(true);
 	});
 });

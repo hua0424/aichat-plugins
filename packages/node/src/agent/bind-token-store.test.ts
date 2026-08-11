@@ -89,7 +89,7 @@ describe('FileBindTokenStore — persistence + reload', () => {
 		expect(reloaded.mint('5', '9')).toBe(token);
 	});
 
-	it('the persisted token file is chmod 0600 (sensitive credential)', async () => {
+	it.runIf(process.platform !== 'win32')('the persisted token file is chmod 0600 (sensitive credential)', async () => {
 		const path = freshFile();
 		const store = new FileBindTokenStore(path, counterGen());
 		store.mint('5', '9');

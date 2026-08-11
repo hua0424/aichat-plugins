@@ -6,6 +6,20 @@ import { join } from 'node:path';
 import { postCapability } from './client.js';
 
 /**
+ * A bindable loopback path: named pipe on win32 (a tmpdir fs path → EACCES, the pipe is passed
+ * verbatim to CreateNamedPipeW), unix socket elsewhere. Named pipes are machine-wide, so
+ * pid+module-counter keeps the name unique; `server.close()` in afterEach frees the pipe.
+ */
+let hungSeq = 0;
+function hungSocketPath(base: string): string {
+	if (process.platform === 'win32') {
+		hungSeq += 1;
+		return `\\\\.\\pipe\\aichat-cap-test-${process.pid}-${hungSeq}`;
+	}
+	return join(base, 'hung.sock');
+}
+
+/**
  * REQ-010 S1: the default timeout must be env-configurable (AICHAT_CAPABILITY_TIMEOUT_MS) with a
  * 30s fallback. We assert the behavior through the real public seam: with NO injected timeout and a
  * tiny env override, a silent endpoint must reject ~promptly; an injected opts.timeoutMs still wins.
@@ -28,7 +42,7 @@ describe('postCapability default timeout (env-configurable)', () => {
 	async function hungSocket(): Promise<string> {
 		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-env-'));
 		dirs.push(base);
-		const socketPath = join(base, 'hung.sock');
+		const socketPath = hungSocketPath(base);
 		server = createServer((_req, _res) => {
 			/* never responds */
 		});
@@ -70,7 +84,7 @@ describe('postCapability timeout', () => {
 	it('rejects with a timeout when the endpoint accepts the connection but never responds', async () => {
 		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-client-'));
 		dirs.push(base);
-		const socketPath = join(base, 'hung.sock');
+		const socketPath = hungSocketPath(base);
 
 		// A server that accepts the request but NEVER calls res.end → the client must time out.
 		server = createServer((_req, _res) => {

@@ -317,7 +317,7 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		}
 	});
 
-	it('binds the socket 0600 inside a 0700 parent dir (anti-spoofing)', async () => {
+	it.runIf(process.platform !== 'win32')('binds the socket 0600 inside a 0700 parent dir (anti-spoofing)', async () => {
 		const { endpoint: ep } = build({ resolveRoom: 42 });
 		endpoint = ep;
 		// nest a private subdir so the parent dir mode assertion is meaningful (mkdirSync creates it)
@@ -333,7 +333,7 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		expect(statSync(dir).mode & 0o777).toBe(0o700);
 	});
 
-	it('win32 deps → resolves and the socket chmod 0600 is SKIPPED (named pipe, no fs chmod)', async () => {
+	it.runIf(process.platform !== 'win32')('win32 deps → resolves and the socket chmod 0600 is SKIPPED (named pipe, no fs chmod)', async () => {
 		const { endpoint: ep } = build({ resolveRoom: 42, platform: 'win32' });
 		endpoint = ep;
 		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
