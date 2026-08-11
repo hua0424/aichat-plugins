@@ -176,6 +176,64 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
+	// aichatoverview#258 — serve emits permission.asked (runtime v1.18.16) when a tool asks for a
+	// permission (e.g. external_directory for out-of-workspace access). Headless deploy has nobody to
+	// approve, so the session stalls until the handler's 300s timeout — surface it as a TERMINAL error
+	// instead. (In-workspace actions are auto-allowed in the deployed mode, so only real asks fire.)
+	// Golden fixture = upstream v1.18.16 schema shape {permission, patterns, always, tool.messageID}
+	// (confirmed via packages/schema/src/v1/permission.ts + SDK v2 gen); reconcile with tester's real
+	// captured frame when it lands.
+	it('permission.asked (golden, v1.18.16) → error with permission + patterns', () => {
+		const evt = {
+			type: 'permission.asked',
+			properties: {
+				id: 'req_1',
+				sessionID: SID,
+				permission: 'external_directory',
+				patterns: ['/home/user'],
+				metadata: {},
+				always: [],
+				tool: { messageID: 'msg_asst', callID: 'call_1' },
+			},
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode requested permission: external_directory (/home/user) — headless cannot approve',
+		});
+	});
+
+	it('permission.asked with empty patterns → error with permission only', () => {
+		const evt = {
+			type: 'permission.asked',
+			properties: { id: 'req_2', sessionID: SID, permission: 'web', patterns: [], metadata: {}, always: [] },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode requested permission: web — headless cannot approve',
+		});
+	});
+
+	it('permission.asked for a DIFFERENT session → null', () => {
+		const evt = {
+			type: 'permission.asked',
+			properties: { id: 'req_3', sessionID: 'other_session', permission: 'web', patterns: [], metadata: {}, always: [] },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
+	});
+
+	// legacy 1.17.9 serve emits permission.updated with the OLD shape {type, pattern, title} — keep
+	// dual-name matching (same defensive posture as #256) and fall back to the old field names.
+	it('legacy permission.updated → error via old shape (type/pattern/title)', () => {
+		const evt = {
+			type: 'permission.updated',
+			properties: { id: 'perm_1', type: 'external_directory', pattern: '/home/user', sessionID: SID, messageID: 'm', title: 'Access outside workspace' },
+		};
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({
+			type: 'error',
+			message: 'opencode requested permission: external_directory (/home/user) — headless cannot approve',
+		});
+	});
+
 	it('event for a DIFFERENT sessionID → null', () => {
 		const evt = {
 			type: 'message.part.updated',
