@@ -103,22 +103,56 @@ export function mapOpencodeEvent(
 			return { type: 'error', message: `opencode retry: ${text}${reason}` };
 		}
 
+		case 'permission.asked':
 		case 'permission.updated': {
-			// aichatoverview#258 — serve emits this when a tool asks for a permission
-			// (e.g. external_directory for out-of-workspace access). Headless deploy has nobody to
-			// approve, so the session would stall until the handler's 300s timeout; surface it as a
-			// TERMINAL error instead. In-workspace actions are auto-allowed in the deployed mode
-			// (normal replies work today), so only real asks that would stall reach here.
+			// aichatoverview#258 — serve emits permission.asked (runtime v1.18.16; legacy 1.17.9 used
+			// permission.updated) when a tool asks for a permission, e.g. external_directory for
+			// out-of-workspace access. Headless deploy has nobody to approve, so the session would
+			// stall until the handler's 300s timeout; surface it as a TERMINAL error instead.
+			// In-workspace actions are auto-allowed in the deployed mode (normal replies work today),
+			// so only real asks that would stall reach here. Dual-name match keeps both runtimes mapped.
 			if (props.sessionID !== sessionID) return null;
-			const perm = props as { type?: string; title?: string };
-			const ptype = typeof perm.type === 'string' && perm.type.length > 0 ? perm.type : 'permission';
-			const title = typeof perm.title === 'string' && perm.title.length > 0 ? ` (${perm.title})` : '';
-			return { type: 'error', message: `opencode requested permission: ${ptype}${title} — headless cannot approve` };
+			return { type: 'error', message: stringifyPermissionAsk(props) };
 		}
 
 		default:
 			return null;
 	}
+}
+
+/**
+ * aichatoverview#258 — build the permission-ask error message. The v1.18.16 payload is
+ * {permission, patterns[], always[], tool:{messageID}} (no title); legacy 1.17.9 is
+ * {type, pattern, title}. Read the NEW field names first, fall back to the old ones so both
+ * runtime versions surface the specific permission kind + target.
+ */
+function stringifyPermissionAsk(props: Record<string, unknown>): string {
+	const kind = pickString(props, ['permission', 'type']) ?? 'permission';
+	const detail = permissionAskDetail(props);
+	const suffix = detail ? ` (${detail})` : '';
+	return `opencode requested permission: ${kind}${suffix} — headless cannot approve`;
+}
+
+/** First non-empty string among the given keys. */
+function pickString(obj: Record<string, unknown>, keys: string[]): string | undefined {
+	for (const key of keys) {
+		const v = obj[key];
+		if (typeof v === 'string' && v.length > 0) return v;
+	}
+	return undefined;
+}
+
+/** Human-readable ask target: new `patterns` array → legacy `pattern` → legacy `title`. */
+function permissionAskDetail(props: Record<string, unknown>): string | undefined {
+	for (const key of ['patterns', 'pattern']) {
+		const v = props[key];
+		if (Array.isArray(v)) {
+			const strings = v.filter((x): x is string => typeof x === 'string');
+			if (strings.length > 0) return strings.join(', ');
+		}
+		if (typeof v === 'string' && v.length > 0) return v;
+	}
+	return pickString(props, ['title']);
 }
 
 /** Best-effort stringify of an opencode error payload into a human-readable message. */
