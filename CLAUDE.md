@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件说明 plugins 构建、架构与协议。跨组件质量判据见伞仓 `../docs/agents/verification.md`。
 
 ## Overview
 
@@ -43,7 +43,7 @@ pnpm -r --filter @aichat/node exec aichat send-message --room <id> --content <te
 pnpm -r --filter @aichat/node exec aichat group-config --room <id>
 ```
 
-Tests run with vitest: `pnpm test` (node ~521 + claw ~18). Runtime verification is via CLI + logs on the deployed host.
+Tests run with vitest: `pnpm test` (test scope and counts come from the current checkout and execution output). Runtime verification is via CLI + logs on the deployed host.
 
 ## Architecture
 
