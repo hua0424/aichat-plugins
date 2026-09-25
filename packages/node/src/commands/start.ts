@@ -94,10 +94,9 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 
-	// REQ-011 S2: claude-code is now NODE-DRIVEN headless (CcHeadlessDriver). One shared per-room bridge
-	// routes CC hooks (via the CcBroker) into the active CcHeadlessSession's AgentEvent stream, so cc goes
-	// through the STANDARD supervised path. Built once here and shared by every cc identity's driver + the
-	// broker sink (below). The session store persists (uid,room)→session_id for cross-turn/restart --resume.
+	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
+	// their matching headless turn. Every CC identity's driver and the broker share this registry.
+	// The session store persists (uid,room)→session_id for cross-turn/restart --resume.
 	const ccRegistry = new CcSessionRegistry();
 	const ccWorkspaceBase = join(AICHAT_HOME, 'cc', 'workspace');
 	// REQ-011 S3 (AC5/AC9): one shared per-room transcript writer (inbound + teed CC output), so the owner
@@ -143,9 +142,9 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			if (entry.tool === 'cc') {
 				// REQ-011 S2: claude-code is NODE-DRIVEN headless. CcHeadlessDriver spawns `claude -p`
 				// (stream-json) per inbound turn on the standard supervised path. The reply
-				// still goes out-of-band via the `aichat send-message` CLI; thinking is sourced from CC's
-				// hooks (POSTing to the CcBroker) and bridged into the turn's AgentEvent stream via the
-				// shared per-room registry. session_id is persisted for cross-turn/restart --resume.
+				// still goes out-of-band via `aichat send-message`; thinking is teed from stdout,
+				// while tool hooks reach the matching turn through the shared registry.
+				// session_id is persisted for cross-turn/restart --resume.
 				return new CcHeadlessDriver({
 					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
@@ -220,8 +219,8 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
 
 	// REQ-011 S2: if any cc identity is registered, start the CC hook broker. CC's headless hooks POST
-	// here; the bridge sink routes each resolved hook into the active CcHeadlessSession's AgentEvent
-	// stream via the shared ccRegistry, so the standard node-driven path renders the panel. BL-014 (#141):
+	// here; the bridge sink routes each resolved hook to its original identity/room/spawn only
+	// via the shared ccRegistry. Stdout, not hooks, supplies panel thinking. BL-014 (#141):
 	// resolve() = the shared opaque bind-token store lookup (CC's hook Authorization: Bearer <token> carries
 	// the same AICHAT_BIND token, so the broker resolves it exactly like CcHeadlessDriver.resolveSession).
 	// Only bound when a cc identity exists (don't bind 9100 otherwise). Closed on shutdown.
