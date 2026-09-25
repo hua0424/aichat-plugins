@@ -214,6 +214,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
 		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
+		serverNamespace: restBaseUrl,
 	});
 	await endpoint.listen(capabilitySocketPath());
 	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);

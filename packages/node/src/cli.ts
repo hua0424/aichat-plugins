@@ -88,10 +88,10 @@ aichat - HuLa AI Assistant Plugin
 Commands:
   activate --token <token>                       Activate with server token
   start                                          Connect and run
-  send-message --content <text>                  Reply to the current chat
+  send-message --content <text> [--request-id <id>] Reply to the current chat
                                                  (room + identity are bound automatically
                                                   from your agent session — never passed in)
-  reset-session                                  Reset this room's agent session (fresh next msg)
+  reset-session [--request-id <id>]              Reset this room's agent session (fresh next msg)
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
   find-friend <keyword>                          Search users by keyword (substring match)

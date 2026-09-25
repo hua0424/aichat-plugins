@@ -13,7 +13,7 @@ import {
 import type { HulaApiClient } from '../api/hula-api.js';
 
 function fakeCtx(roomId: number) {
-	const sendMessage = vi.fn(async () => ({ msgId: 42 }));
+	const sendMessage = vi.fn(async () => ({ msgId: '42' }));
 	const apiClient = { sendMessage } as unknown as HulaApiClient;
 	const ctx: CapabilityContext = { aiclawUid: 7, roomId, apiClient };
 	return { ctx, sendMessage };
@@ -25,7 +25,7 @@ describe('sendMessageCapability', () => {
 		const cap = sendMessageCapability();
 		const result = await cap(ctx, { content: 'hello' });
 		expect(sendMessage).toHaveBeenCalledWith(42, 'hello');
-		expect(result).toEqual({ msgId: 42, roomId: 42 });
+		expect(result).toEqual({ msgId: '42', roomId: 42 });
 	});
 
 	it('room comes from ctx, NEVER from args (args.room ignored)', async () => {

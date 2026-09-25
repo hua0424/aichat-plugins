@@ -16,13 +16,15 @@ export interface CapabilityEndpointDeps {
 	registry: CapabilityRegistry;
 	/** Map an agent session key → bound identity/room/api, or undefined if unknown. */
 	resolve: (sessionKey: string) => Resolved | undefined;
-	/** Max idempotency cache entries before FIFO-evicting the oldest (default 1000). */
+	/** Max completed write receipts retained locally (default 1000; pending/unknown entries are never evicted). */
 	idempotencyCap?: number;
+	/** Namespaces request IDs to this configured server, not another backend. */
+	serverNamespace?: string;
 	/** Test seam: force win32 behavior (named pipe, skip POSIX chmod/cleanup) on any host. */
 	platform?: NodeJS.Platform;
 }
 
-/** Default cap on the idempotency cache; evict oldest (FIFO) past this in a long-lived daemon. */
+/** Default cap on completed write receipts in a long-lived daemon. */
 const DEFAULT_IDEMPOTENCY_CAP = 1000;
 
 /** A parsed capability request body. */
@@ -30,7 +32,7 @@ interface CapabilityRequest {
 	sessionKey: string;
 	command: string;
 	args: Record<string, unknown>;
-	idempotencyKey: string;
+	requestId?: string;
 }
 
 /** The handle() result: an HTTP status + JSON payload. */
@@ -55,10 +57,13 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 export class CapabilityEndpoint {
 	private readonly registry: CapabilityRegistry;
 	private readonly resolve: (sessionKey: string) => Resolved | undefined;
-	/** (sessionKey idempotencyKey) → the prior response, so a repeat never re-invokes. */
-	private readonly idempotency = new Map<string, CapabilityResponse>();
-	/** FIFO cap on `idempotency`: every call uses a fresh idempotencyKey, so the Map would leak forever. */
+	/** In-flight writes remain registered until resolution, even when completed receipts reach the cap. */
+	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
+	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
+	/** An unknown result must never be evicted as if the write had not happened. */
+	private readonly unknown = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
 	private readonly idempotencyCap: number;
+	private readonly serverNamespace: string;
 	/** POSIX fs guards (dir/socket chmod, stale unlink) apply only on non-win32. */
 	private readonly platform: NodeJS.Platform;
 	private server: Server | null = null;
@@ -68,6 +73,7 @@ export class CapabilityEndpoint {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
 		this.idempotencyCap = deps.idempotencyCap ?? DEFAULT_IDEMPOTENCY_CAP;
+		this.serverNamespace = deps.serverNamespace ?? '';
 		this.platform = deps.platform ?? process.platform;
 	}
 
@@ -95,12 +101,7 @@ export class CapabilityEndpoint {
 			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
 		}
 
-		// Idempotency: a repeat of (sessionKey, idempotencyKey) returns the prior response verbatim,
-		// WITHOUT re-invoking the capability.
-		const cacheKey = `${parsed.sessionKey} ${parsed.idempotencyKey}`;
-		const cached = this.idempotency.get(cacheKey);
-		if (cached) return cached;
-
+		// Resolve on EVERY call: revoked bindings must not retrieve a previous receipt.
 		const resolved = this.resolve(parsed.sessionKey);
 		if (!resolved) {
 			// not cached — an unresolved session is transient (could resolve next time)
@@ -124,33 +125,66 @@ export class CapabilityEndpoint {
 			roomId: resolved.roomId,
 			apiClient: resolved.apiClient,
 		};
+		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
+		if (write && !parsed.requestId) {
+			return { status: 400, json: { ok: false, error: 'requestId required for write' } };
+		}
+		if (parsed.command === 'send-message' &&
+			(typeof parsed.args.content !== 'string' || !parsed.args.content.trim())) {
+			return { status: 400, json: { ok: false, error: 'send-message: `content` is required and must be a non-empty string' } };
+		}
+		// Key is the configured server + resolved identity, never a caller-supplied identity/room.
+		if (parsed.command === 'send-message') parsed.args.content = (parsed.args.content as string).trim();
+		const key = write ? JSON.stringify([this.serverNamespace, resolved.aiclawUid, parsed.requestId]) : '';
+		const fingerprint = write ? createHash('sha256').update(JSON.stringify([
+			parsed.sessionKey, parsed.command, resolved.roomId, canonical(parsed.args),
+		])).digest('hex') : '';
+		if (write) {
+			const prior = this.inFlight.get(key) ?? this.completed.get(key) ?? this.unknown.get(key);
+			if (prior) {
+				if (prior.fingerprint !== fingerprint) {
+					return { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } };
+				}
+				return prior.result;
+			}
+		}
 
-		// One structured line per real resolution+invocation outcome (REQ-013 style: one line, key
-		// locating fields, content truncated). No args (may hold message content), no idempotencyKey,
-		// masked sessionKey, truncated error text — no credential/token leak.
-		// command is whitelist-validated here (registry.has passed), but sanitize anyway for consistency.
+		// No args (may contain message content), requestId or unmasked sessionKey in logs.
 		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
-		let response: CapabilityResponse;
-		try {
-			const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
-			response = { status: 200, json: { ok: true, result } };
-			console.log(`${loc} ok`);
-		} catch (err) {
-			const msg = errMsg(err);
-			response = { status: 500, json: { ok: false, error: msg } };
-			// capability error text is untrusted (may contain CR/LF) → sanitize + truncate.
-			console.log(`${loc} err=${sanitizeLogField(msg)}`);
-		}
+		const execute = async (): Promise<CapabilityResponse> => {
+			try {
+				const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
+				console.log(`${loc} ok`);
+				return { status: 200, json: { ok: true, result } };
+			} catch (err) {
+				const msg = errMsg(err);
+				console.log(`${loc} err=${sanitizeLogField(msg)}`);
+				// Once a write starts, transport failures cannot establish whether the server committed it.
+				return write
+					? { status: 503, json: { ok: false, code: 'DELIVERY_UNKNOWN', error: 'write result unknown; confirm with the same requestId', requestId: parsed.requestId } }
+					: { status: 500, json: { ok: false, error: msg } };
+			}
+		};
+		if (!write) return execute(); // Queries never consult or populate the write cache.
 
-		// Cache the resolved outcome (success OR failure) so a retried idempotencyKey is stable.
-		// FIFO-evict the oldest past the cap: a Map preserves insertion order, so .keys().next()
-		// is the oldest entry. Without this the cache leaks forever in a long-lived `aichat start`.
-		this.idempotency.set(cacheKey, response);
-		if (this.idempotency.size > this.idempotencyCap) {
-			const oldest = this.idempotency.keys().next().value;
-			if (oldest !== undefined) this.idempotency.delete(oldest);
-		}
-		return response;
+		// Promise is registered synchronously BEFORE the first external side effect.
+		const result = Promise.resolve().then(execute);
+		this.inFlight.set(key, { fingerprint, result });
+		void result.then((response) => {
+			this.inFlight.delete(key);
+			if (response.status === 503) {
+				// ponytail: unknown tombstones live until daemon restart; durable receipts belong to T15/T16.
+				this.unknown.set(key, { fingerprint, result: response });
+				return;
+			}
+			this.completed.set(key, { fingerprint, result: response });
+			if (this.completed.size > this.idempotencyCap) {
+				// ponytail: bounded completed receipts; persistent dedupe across eviction belongs to T15/T16.
+				const oldest = this.completed.keys().next().value;
+				if (oldest !== undefined) this.completed.delete(oldest);
+			}
+		});
+		return result;
 	}
 
 	/** Wire node:http over a UNIX domain socket (or named pipe on win32) → handle(). */
@@ -209,9 +243,20 @@ function parseBody(body: unknown): CapabilityRequest | undefined {
 	const b = body as Record<string, unknown>;
 	if (typeof b.sessionKey !== 'string' || b.sessionKey.length === 0) return undefined;
 	if (typeof b.command !== 'string' || b.command.length === 0) return undefined;
-	if (typeof b.idempotencyKey !== 'string' || b.idempotencyKey.length === 0) return undefined;
-	const args = b.args && typeof b.args === 'object' ? (b.args as Record<string, unknown>) : {};
-	return { sessionKey: b.sessionKey, command: b.command, args, idempotencyKey: b.idempotencyKey };
+	if (b.requestId !== undefined && (typeof b.requestId !== 'string' || !b.requestId.trim() || b.requestId.length > 128)) return undefined;
+	if (b.idempotencyKey !== undefined && (typeof b.idempotencyKey !== 'string' || !b.idempotencyKey.trim() || b.idempotencyKey.length > 128)) return undefined;
+	if (b.requestId && b.idempotencyKey && b.requestId !== b.idempotencyKey) return undefined;
+	if (b.args !== undefined && (b.args === null || typeof b.args !== 'object' || Array.isArray(b.args))) return undefined;
+	return { sessionKey: b.sessionKey, command: b.command, args: (b.args ?? {}) as Record<string, unknown>, requestId: (b.requestId ?? b.idempotencyKey) as string | undefined };
+}
+
+/** Canonical JSON representation: object key order is irrelevant, array order is not. */
+function canonical(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonical);
+	if (value !== null && typeof value === 'object') {
+		return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)]));
+	}
+	return value;
 }
 
 /**

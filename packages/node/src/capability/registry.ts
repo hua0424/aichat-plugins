@@ -52,6 +52,7 @@ export function sendMessageCapability(): Capability {
 		}
 		const content = raw.trim();
 		const { msgId } = await ctx.apiClient.sendMessage(ctx.roomId, content);
+		if (typeof msgId !== 'string' || !msgId.trim()) throw new Error('send-message: missing committed msgId');
 		return { msgId, roomId: ctx.roomId };
 	};
 }

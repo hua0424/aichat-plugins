@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { resolveAgentSessionKey } from './send-message.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { resolveAgentSessionKey, handleSendMessage } from './send-message.js';
+import { handleResetSession } from './reset-session.js';
+import { postCapability } from '../capability/client.js';
+
+vi.mock('../capability/client.js', () => ({ postCapability: vi.fn() }));
 
 /**
  * REQ-010 S6 Phase-2 — resolveAgentSessionKey now also recognizes OPENCLAW_BIND.
@@ -61,5 +65,49 @@ describe('resolveAgentSessionKey', () => {
 
 	it('none set → undefined', () => {
 		expect(resolveAgentSessionKey()).toBeUndefined();
+	});
+});
+
+describe('CLI write request ID', () => {
+	const originalBind = process.env.AICHAT_BIND;
+	beforeEach(() => {
+		delete process.env.OPENCODE_SESSION_ID;
+		delete process.env.CODEX_THREAD_ID;
+		delete process.env.OPENCLAW_BIND;
+		process.env.AICHAT_BIND = 'opaque-token';
+	});
+	afterEach(() => {
+		if (originalBind === undefined) delete process.env.AICHAT_BIND;
+		else process.env.AICHAT_BIND = originalBind;
+		vi.restoreAllMocks();
+	});
+
+	it('sends an explicit requestId without changing default success output', async () => {
+		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: { ok: true, result: { msgId: '91' } } });
+		const out = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleSendMessage(['--content', ' hi ', '--request-id', 'retry-id']);
+		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({
+			sessionKey: 'cc:opaque-token', command: 'send-message', requestId: 'retry-id', args: { content: 'hi' },
+		});
+		expect(out).toHaveBeenCalledWith('Message sent: {"msgId":"91"}');
+	});
+
+	it('generates IDs for writes, but honors an explicit reset ID', async () => {
+		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: { ok: true, result: { reset: false, driverType: 'cc' } } });
+		vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleSendMessage(['--content', 'first']);
+		const id = (vi.mocked(postCapability).mock.calls.at(-1)?.[1] as { requestId: string }).requestId;
+		expect(id).toMatch(/^[\da-f-]{36}$/);
+		await handleResetSession(['--request-id', 'reset-1']);
+		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({ command: 'reset-session', requestId: 'reset-1' });
+	});
+
+	it('transport errors report the reusable ID rather than silently generating another request', async () => {
+		vi.mocked(postCapability).mockRejectedValue(new Error('timeout'));
+		const out = vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
+		await expect(handleSendMessage(['--content', 'hi', '--request-id', 'retry-id'])).rejects.toThrow('exit');
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('DELIVERY_UNKNOWN'));
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('--request-id retry-id'));
 	});
 });
