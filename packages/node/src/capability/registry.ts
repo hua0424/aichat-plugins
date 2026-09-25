@@ -16,6 +16,8 @@ export interface CapabilityContext {
 	apiClient: HulaApiClient;
 }
 
+export class CapabilityRejectedError extends Error {}
+
 /** A node-local capability: pure-ish, gets a bound context + opaque args, returns a JSON result. */
 export type Capability = (ctx: CapabilityContext, args: Record<string, unknown>) => Promise<unknown>;
 
@@ -52,6 +54,7 @@ export function sendMessageCapability(): Capability {
 		}
 		const content = raw.trim();
 		const { msgId } = await ctx.apiClient.sendMessage(ctx.roomId, content);
+		if (typeof msgId !== 'string' || !msgId.trim()) throw new Error('send-message: missing committed msgId');
 		return { msgId, roomId: ctx.roomId };
 	};
 }
@@ -67,7 +70,7 @@ export function resetSessionCapability(
 ): Capability {
 	return async (ctx) => {
 		const r = resetFor(ctx.aiclawUid, ctx.roomId);
-		if (!r) throw new Error('reset-session: no live agent for this identity');
+		if (!r) throw new CapabilityRejectedError('reset-session: no live agent for this identity');
 		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset };
 	};
 }

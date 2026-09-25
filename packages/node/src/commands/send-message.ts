@@ -1,7 +1,7 @@
 /**
  * REQ-010 S1 — `aichat send-message` CLI.
  *
- * A THIN client run BY the agent inside its session. It accepts ONLY `--content`; the target
+ * A THIN client run BY the agent inside its session. It accepts `--content` and `--request-id`; the target
  * room + identity are NEVER passed on the command line — node resolves them from the agent's
  * session env var (anti-spoofing). The command POSTs to the node-local loopback capability
  * socket, which looks up the bound room/identity and sends the reply.
@@ -13,12 +13,21 @@ import { postCapability } from '../capability/client.js';
 
 export async function handleSendMessage(args: string[]): Promise<void> {
 	let content = '';
+	let requestId: string = randomUUID();
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === '--content' && args[i + 1]) content = args[++i];
+		else if (args[i] === '--request-id') {
+			const id = args[++i];
+			if (!id || id.startsWith('--') || id.length > 128 || !id.trim()) {
+				console.error('Error: --request-id requires a non-empty value (max 128 characters)');
+				process.exit(1);
+			}
+			requestId = id;
+		}
 	}
 
 	if (!content.trim()) {
-		console.error('Usage: aichat send-message --content "<text>"');
+		console.error('Usage: aichat send-message --content "<text>" [--request-id <id>]');
 		console.error('       (room and identity are bound automatically from your agent session)');
 		process.exit(1);
 	}
@@ -29,12 +38,19 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 		process.exit(1);
 	}
 
-	const res = await postCapability(capabilitySocketPath(), {
-		sessionKey,
-		command: 'send-message',
-		args: { content: content.trim() },
-		idempotencyKey: randomUUID(),
-	});
+	let res: Awaited<ReturnType<typeof postCapability>>;
+	try {
+		res = await postCapability(capabilitySocketPath(), {
+			sessionKey,
+			command: 'send-message',
+			args: { content: content.trim() },
+			requestId,
+		});
+	} catch {
+		console.error(`Error: send-message result unknown (DELIVERY_UNKNOWN); retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically`);
+		process.exit(1);
+	}
+
 
 	const ok = res.status === 200 && (res.body as { ok?: boolean })?.ok === true;
 	if (ok) {
@@ -44,7 +60,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 	}
 
 	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
-	console.error(`Error: send-message failed: ${error}`);
+	console.error(`Error: send-message failed: ${error}${(res.body as { code?: string })?.code === 'DELIVERY_UNKNOWN' ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically)` : ''}`);
 	process.exit(1);
 }
 

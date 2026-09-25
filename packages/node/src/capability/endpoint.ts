@@ -4,8 +4,8 @@ import { readJsonBody } from '../util/http-body.js';
 import { unlinkSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { dirname, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
-import type { CapabilityRegistry, CapabilityContext } from './registry.js';
-import type { HulaApiClient } from '../api/hula-api.js';
+import { CapabilityRejectedError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
+import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
 import { errMsg } from '../util/err.js';
 
@@ -16,21 +16,20 @@ export interface CapabilityEndpointDeps {
 	registry: CapabilityRegistry;
 	/** Map an agent session key → bound identity/room/api, or undefined if unknown. */
 	resolve: (sessionKey: string) => Resolved | undefined;
-	/** Max idempotency cache entries before FIFO-evicting the oldest (default 1000). */
-	idempotencyCap?: number;
+	/** Namespaces request IDs to this configured server, not another backend. */
+	serverNamespace?: string;
+	/** Maximum admitted local write IDs; reject NEW IDs when full rather than evict safely recorded ones. */
+	maxWriteIds?: number;
 	/** Test seam: force win32 behavior (named pipe, skip POSIX chmod/cleanup) on any host. */
 	platform?: NodeJS.Platform;
 }
-
-/** Default cap on the idempotency cache; evict oldest (FIFO) past this in a long-lived daemon. */
-const DEFAULT_IDEMPOTENCY_CAP = 1000;
 
 /** A parsed capability request body. */
 interface CapabilityRequest {
 	sessionKey: string;
 	command: string;
 	args: Record<string, unknown>;
-	idempotencyKey: string;
+	requestId?: string;
 }
 
 /** The handle() result: an HTTP status + JSON payload. */
@@ -45,8 +44,8 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 /**
  * REQ-010 S1 — node-local capability endpoint (Flow2).
  *
- * `handle()` is the pure-ish, unit-testable core: it holds the idempotency cache and applies the
- * local-only guard / resolve / dedup / dispatch rules. `listen()`/`close()` are a thin node:http
+ * `handle()` is the unit-testable core: it registers write promises before dispatch, retains
+ * local receipts, and applies the loopback guard / resolve / dedup / dispatch rules. `listen()`/`close()` are a thin node:http
  * wrapper over a UNIX domain socket that feeds bodies into `handle()`.
  *
  * Anti-spoofing: the room/identity are taken ONLY from `resolve(sessionKey)` — never from the
@@ -55,10 +54,16 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 export class CapabilityEndpoint {
 	private readonly registry: CapabilityRegistry;
 	private readonly resolve: (sessionKey: string) => Resolved | undefined;
-	/** (sessionKey idempotencyKey) → the prior response, so a repeat never re-invokes. */
-	private readonly idempotency = new Map<string, CapabilityResponse>();
-	/** FIFO cap on `idempotency`: every call uses a fresh idempotencyKey, so the Map would leak forever. */
-	private readonly idempotencyCap: number;
+	/** In-flight writes remain registered until resolution, even when completed receipts reach the cap. */
+	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
+	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
+	/** An unknown result must never be evicted as if the write had not happened. */
+	private readonly unknown = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
+	/** Minimal reset receipt survives its own removal of the bound native session. */
+	private readonly resetReceipts = new Map<string, Promise<CapabilityResponse>>();
+	private readonly roomGeneration = new Map<string, number>();
+	private readonly serverNamespace: string;
+	private readonly maxWriteIds: number;
 	/** POSIX fs guards (dir/socket chmod, stale unlink) apply only on non-win32. */
 	private readonly platform: NodeJS.Platform;
 	private server: Server | null = null;
@@ -67,7 +72,9 @@ export class CapabilityEndpoint {
 	constructor(deps: CapabilityEndpointDeps) {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
-		this.idempotencyCap = deps.idempotencyCap ?? DEFAULT_IDEMPOTENCY_CAP;
+		this.serverNamespace = deps.serverNamespace ?? '';
+		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
+		if (!Number.isSafeInteger(this.maxWriteIds) || this.maxWriteIds < 1) throw new Error('maxWriteIds must be a positive integer');
 		this.platform = deps.platform ?? process.platform;
 	}
 
@@ -95,12 +102,16 @@ export class CapabilityEndpoint {
 			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
 		}
 
-		// Idempotency: a repeat of (sessionKey, idempotencyKey) returns the prior response verbatim,
-		// WITHOUT re-invoking the capability.
-		const cacheKey = `${parsed.sessionKey} ${parsed.idempotencyKey}`;
-		const cached = this.idempotency.get(cacheKey);
-		if (cached) return cached;
-
+		// A reset invalidates its own native session key. The same key may retrieve ONLY that
+		// reset's minimal receipt; no other write/query bypasses live binding resolution.
+		const resetReceiptKey = parsed.command === 'reset-session' && parsed.requestId
+			? JSON.stringify([parsed.sessionKey, parsed.requestId]) : undefined;
+		if (resetReceiptKey) {
+			const receipt = this.resetReceipts.get(resetReceiptKey);
+			if (receipt) return Object.keys(parsed.args).length
+				? { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } }
+				: receipt;
+		}
 		const resolved = this.resolve(parsed.sessionKey);
 		if (!resolved) {
 			// not cached — an unresolved session is transient (could resolve next time)
@@ -124,33 +135,82 @@ export class CapabilityEndpoint {
 			roomId: resolved.roomId,
 			apiClient: resolved.apiClient,
 		};
+		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
+		if (write && !parsed.requestId) {
+			return { status: 400, json: { ok: false, error: 'requestId required for write' } };
+		}
+		// Key is the configured server + resolved identity, never a caller-supplied identity/room.
+		if (parsed.command === 'send-message' && typeof parsed.args.content === 'string') parsed.args.content = parsed.args.content.trim();
+		const key = write ? JSON.stringify([this.serverNamespace, resolved.aiclawUid, parsed.requestId]) : '';
+		const roomKey = JSON.stringify([this.serverNamespace, resolved.aiclawUid, resolved.roomId]);
+		// Only effective business args: never hash bearer/session tokens or ignored caller padding.
+		const fingerprint = write ? createHash('sha256').update(JSON.stringify([
+			parsed.command, resolved.roomId, this.roomGeneration.get(roomKey) ?? 0,
+			typeof parsed.args.content === 'string' ? parsed.args.content : null,
+		])).digest('hex') : '';
+		if (write) {
+			const prior = this.inFlight.get(key) ?? this.completed.get(key) ?? this.unknown.get(key);
+			if (prior) {
+				if (prior.fingerprint !== fingerprint) {
+					return { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } };
+				}
+				return prior.result;
+			}
+		}
+		if (parsed.command === 'send-message' &&
+			(typeof parsed.args.content !== 'string' || !parsed.args.content)) {
+			return { status: 400, json: { ok: false, error: 'send-message: `content` is required and must be a non-empty string' } };
+		}
+		if (parsed.command === 'reset-session' && Object.keys(parsed.args).length) {
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'reset-session takes no args' } };
+		}
+		if (write && this.inFlight.size + this.completed.size + this.unknown.size >= this.maxWriteIds) {
+			// ponytail: fail closed at receipt capacity; T15/T16 durable receipts permit safe eviction.
+			return { status: 507, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'local write receipt capacity exhausted; no write started' } };
+		}
 
-		// One structured line per real resolution+invocation outcome (REQ-013 style: one line, key
-		// locating fields, content truncated). No args (may hold message content), no idempotencyKey,
-		// masked sessionKey, truncated error text — no credential/token leak.
-		// command is whitelist-validated here (registry.has passed), but sanitize anyway for consistency.
+		// No args (may contain message content), requestId or unmasked sessionKey in logs.
 		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
-		let response: CapabilityResponse;
-		try {
-			const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
-			response = { status: 200, json: { ok: true, result } };
-			console.log(`${loc} ok`);
-		} catch (err) {
-			const msg = errMsg(err);
-			response = { status: 500, json: { ok: false, error: msg } };
-			// capability error text is untrusted (may contain CR/LF) → sanitize + truncate.
-			console.log(`${loc} err=${sanitizeLogField(msg)}`);
-		}
+		const execute = async (): Promise<CapabilityResponse> => {
+			try {
+				const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
+				if (parsed.command === 'reset-session' && (result as { reset?: boolean })?.reset) {
+					// Local generation changes only on a confirmed reset of this room.
+					this.roomGeneration.set(roomKey, (this.roomGeneration.get(roomKey) ?? 0) + 1);
+				}
+				console.log(`${loc} ok`);
+				return { status: 200, json: { ok: true, result } };
+			} catch (err) {
+				const msg = errMsg(err);
+				console.log(`${loc} err=${sanitizeLogField(msg)}`);
+				if (write && (err instanceof CapabilityRejectedError || err instanceof HulaApiRejectedError)) {
+					const code = err instanceof HulaApiRejectedError ? err.code : 'IDENTITY_UNAVAILABLE';
+					return { status: code === 'FORBIDDEN' ? 403 : 400, json: { ok: false, code, error: msg } };
+				}
+				// Once a write starts, transport failures cannot establish whether the server committed it.
+				return write
+					? { status: 503, json: { ok: false, code: 'DELIVERY_UNKNOWN', error: 'write result unknown locally; retain requestId and do not resend automatically', requestId: parsed.requestId } }
+					: { status: 500, json: { ok: false, error: msg } };
+			}
+		};
+		if (!write) return execute(); // Queries never consult or populate the write cache.
 
-		// Cache the resolved outcome (success OR failure) so a retried idempotencyKey is stable.
-		// FIFO-evict the oldest past the cap: a Map preserves insertion order, so .keys().next()
-		// is the oldest entry. Without this the cache leaks forever in a long-lived `aichat start`.
-		this.idempotency.set(cacheKey, response);
-		if (this.idempotency.size > this.idempotencyCap) {
-			const oldest = this.idempotency.keys().next().value;
-			if (oldest !== undefined) this.idempotency.delete(oldest);
-		}
-		return response;
+		// Promise is registered synchronously BEFORE the first external side effect.
+		const result = Promise.resolve().then(execute);
+		this.inFlight.set(key, { fingerprint, result });
+		if (resetReceiptKey) this.resetReceipts.set(resetReceiptKey, result);
+		void result.then((response) => {
+			this.inFlight.delete(key);
+			if (response.status === 503) {
+				this.unknown.set(key, { fingerprint, result: response });
+			} else if (response.status === 200) {
+				this.completed.set(key, { fingerprint, result: response });
+			} else if (resetReceiptKey) {
+				this.resetReceipts.delete(resetReceiptKey); // definitive rejection: same ID may be retried after correction
+			}
+			// Receipts remain until daemon restart; admission cap above prevents unsafe eviction/OOM.
+		});
+		return result;
 	}
 
 	/** Wire node:http over a UNIX domain socket (or named pipe on win32) → handle(). */
@@ -209,9 +269,11 @@ function parseBody(body: unknown): CapabilityRequest | undefined {
 	const b = body as Record<string, unknown>;
 	if (typeof b.sessionKey !== 'string' || b.sessionKey.length === 0) return undefined;
 	if (typeof b.command !== 'string' || b.command.length === 0) return undefined;
-	if (typeof b.idempotencyKey !== 'string' || b.idempotencyKey.length === 0) return undefined;
-	const args = b.args && typeof b.args === 'object' ? (b.args as Record<string, unknown>) : {};
-	return { sessionKey: b.sessionKey, command: b.command, args, idempotencyKey: b.idempotencyKey };
+	if (b.requestId !== undefined && (typeof b.requestId !== 'string' || !b.requestId.trim() || b.requestId.length > 128)) return undefined;
+	if (b.idempotencyKey !== undefined && (typeof b.idempotencyKey !== 'string' || !b.idempotencyKey.trim() || b.idempotencyKey.length > 128)) return undefined;
+	if (b.requestId && b.idempotencyKey && b.requestId !== b.idempotencyKey) return undefined;
+	if (b.args !== undefined && (b.args === null || typeof b.args !== 'object' || Array.isArray(b.args))) return undefined;
+	return { sessionKey: b.sessionKey, command: b.command, args: (b.args ?? {}) as Record<string, unknown>, requestId: (b.requestId ?? b.idempotencyKey) as string | undefined };
 }
 
 /**

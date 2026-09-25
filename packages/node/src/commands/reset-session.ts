@@ -14,19 +14,36 @@ import { capabilitySocketPath } from '../capability/endpoint.js';
 import { postCapability } from '../capability/client.js';
 import { resolveAgentSessionKey } from './send-message.js';
 
-export async function handleResetSession(_args: string[]): Promise<void> {
+export async function handleResetSession(args: string[]): Promise<void> {
+	let requestId: string = randomUUID();
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === '--request-id') {
+			const id = args[++i];
+			if (!id || id.startsWith('--') || id.length > 128 || !id.trim()) {
+				console.error('Error: --request-id requires a non-empty value (max 128 characters)');
+				process.exit(1);
+			}
+			requestId = id;
+		}
+	}
 	const sessionKey = resolveAgentSessionKey();
 	if (!sessionKey) {
 		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID / OPENCLAW_BIND / AICHAT_BIND)');
 		process.exit(1);
 	}
 
-	const res = await postCapability(capabilitySocketPath(), {
-		sessionKey,
-		command: 'reset-session',
-		args: {},
-		idempotencyKey: randomUUID(),
-	});
+	let res: Awaited<ReturnType<typeof postCapability>>;
+	try {
+		res = await postCapability(capabilitySocketPath(), {
+			sessionKey,
+			command: 'reset-session',
+			args: {},
+			requestId,
+		});
+	} catch {
+		console.error(`Error: reset-session result unknown (DELIVERY_UNKNOWN); retain --request-id ${requestId}; local node cannot confirm an unknown result, do not reset automatically`);
+		process.exit(1);
+	}
 
 	const ok = res.status === 200 && (res.body as { ok?: boolean })?.ok === true;
 	if (ok) {
@@ -42,6 +59,6 @@ export async function handleResetSession(_args: string[]): Promise<void> {
 	}
 
 	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
-	console.error(`Error: reset-session failed: ${error}`);
+	console.error(`Error: reset-session failed: ${error}${(res.body as { code?: string })?.code === 'DELIVERY_UNKNOWN' ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm an unknown result, do not reset automatically)` : ''}`);
 	process.exit(1);
 }
