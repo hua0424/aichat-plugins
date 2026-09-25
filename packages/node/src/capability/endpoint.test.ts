@@ -19,7 +19,7 @@ import { resetSessionCapability } from './registry.js';
  * Build an endpoint wired to a real registry (send-message) + a controllable resolve. The fake
  * apiClient's sendMessage is the observable seam: we assert which roomId it received.
  */
-function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Platform }) {
+function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Platform; maxWriteIds?: number }) {
 	const sendMessage = vi.fn(async () => ({ msgId: '1' }));
 	const apiClient = { sendMessage } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
@@ -32,6 +32,7 @@ function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Plat
 		registry,
 		resolve,
 		platform: opts?.platform,
+		maxWriteIds: opts?.maxWriteIds,
 	});
 	return { endpoint, sendMessage, resolve };
 }
@@ -131,6 +132,15 @@ describe('CapabilityEndpoint.handle', () => {
 		await endpoint.handle({ body: body({ requestId: 'k0', idempotencyKey: undefined }) });
 		expect(sendMessage).toHaveBeenCalledTimes(1001);
 		log.mockRestore();
+	});
+
+	it('when receipts fill, rejects new IDs without losing an old confirmed result', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42, maxWriteIds: 1 });
+		const first = await endpoint.handle({ body: body({ requestId: 'first', idempotencyKey: undefined }) });
+		const full = await endpoint.handle({ body: body({ requestId: 'new', idempotencyKey: undefined }) });
+		expect(full).toMatchObject({ status: 507, json: { code: 'PERSISTENCE_FAILED' } });
+		expect(await endpoint.handle({ body: body({ requestId: 'first', idempotencyKey: undefined }) })).toEqual(first);
+		expect(sendMessage).toHaveBeenCalledOnce();
 	});
 
 	it('invalid write args → 400, not cached under requestId', async () => {

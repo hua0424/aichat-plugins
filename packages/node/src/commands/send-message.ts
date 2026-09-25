@@ -60,7 +60,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 	}
 
 	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
-	console.error(`Error: send-message failed: ${error}${res.status === 503 ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically)` : ''}`);
+	console.error(`Error: send-message failed: ${error}${(res.body as { code?: string })?.code === 'DELIVERY_UNKNOWN' ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically)` : ''}`);
 	process.exit(1);
 }
 

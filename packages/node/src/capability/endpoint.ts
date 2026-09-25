@@ -18,6 +18,8 @@ export interface CapabilityEndpointDeps {
 	resolve: (sessionKey: string) => Resolved | undefined;
 	/** Namespaces request IDs to this configured server, not another backend. */
 	serverNamespace?: string;
+	/** Maximum admitted local write IDs; reject NEW IDs when full rather than evict safely recorded ones. */
+	maxWriteIds?: number;
 	/** Test seam: force win32 behavior (named pipe, skip POSIX chmod/cleanup) on any host. */
 	platform?: NodeJS.Platform;
 }
@@ -42,8 +44,8 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 /**
  * REQ-010 S1 — node-local capability endpoint (Flow2).
  *
- * `handle()` is the pure-ish, unit-testable core: it holds the idempotency cache and applies the
- * local-only guard / resolve / dedup / dispatch rules. `listen()`/`close()` are a thin node:http
+ * `handle()` is the unit-testable core: it registers write promises before dispatch, retains
+ * local receipts, and applies the loopback guard / resolve / dedup / dispatch rules. `listen()`/`close()` are a thin node:http
  * wrapper over a UNIX domain socket that feeds bodies into `handle()`.
  *
  * Anti-spoofing: the room/identity are taken ONLY from `resolve(sessionKey)` — never from the
@@ -61,6 +63,7 @@ export class CapabilityEndpoint {
 	private readonly resetReceipts = new Map<string, Promise<CapabilityResponse>>();
 	private readonly roomGeneration = new Map<string, number>();
 	private readonly serverNamespace: string;
+	private readonly maxWriteIds: number;
 	/** POSIX fs guards (dir/socket chmod, stale unlink) apply only on non-win32. */
 	private readonly platform: NodeJS.Platform;
 	private server: Server | null = null;
@@ -70,6 +73,8 @@ export class CapabilityEndpoint {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
 		this.serverNamespace = deps.serverNamespace ?? '';
+		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
+		if (!Number.isSafeInteger(this.maxWriteIds) || this.maxWriteIds < 1) throw new Error('maxWriteIds must be a positive integer');
 		this.platform = deps.platform ?? process.platform;
 	}
 
@@ -159,6 +164,10 @@ export class CapabilityEndpoint {
 		if (parsed.command === 'reset-session' && Object.keys(parsed.args).length) {
 			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'reset-session takes no args' } };
 		}
+		if (write && this.inFlight.size + this.completed.size + this.unknown.size >= this.maxWriteIds) {
+			// ponytail: fail closed at receipt capacity; T15/T16 durable receipts permit safe eviction.
+			return { status: 507, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'local write receipt capacity exhausted; no write started' } };
+		}
 
 		// No args (may contain message content), requestId or unmasked sessionKey in logs.
 		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
@@ -199,8 +208,7 @@ export class CapabilityEndpoint {
 			} else if (resetReceiptKey) {
 				this.resetReceipts.delete(resetReceiptKey); // definitive rejection: same ID may be retried after correction
 			}
-			// ponytail: receipts grow with unique writes until daemon restart; T15/T16 must add
-			// durable receipts before bounded eviction can be safe (never turn old IDs into new sends).
+			// Receipts remain until daemon restart; admission cap above prevents unsafe eviction/OOM.
 		});
 		return result;
 	}
