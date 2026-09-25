@@ -1,62 +1,38 @@
 import type { AgentEvent } from '../events.js';
 import type { CcHookSink } from './broker.js';
 
-/**
- * REQ-011 S2 — the CcBroker sink reworked into a per-room session-stream BRIDGE.
- *
- * CC is now node-driven (CcHeadlessDriver): the standard MessageHandler path opens a CcHeadlessSession
- * whose `send()` emits an AgentEvent stream. The reply and turn-completion come from that session
- * (`aichat send-message` CLI + stdout control-plane), and THINKING is teed from the driver's stdout
- * (#120). TOOL activity is sourced from CC's **hooks** (PostToolUse), which POST to the CcBroker. This
- * registry is how a hook (resolved to a room) reaches the active session's event queue:
- *
- *   CC hook → CcBroker.handle → CcHookSink (buildCcBridgeSink) → CcSessionRegistry.push(roomId, ev)
- *          → the active CcHeadlessSession's push → its send() AsyncIterable → the handler's standard path
- *
- * A hook for a room with NO active session (late/racing hook, or a room whose turn already finished) is
- * a safe no-op drop — never a throw.
- */
-
-/** The event-injection function a live CcHeadlessSession registers for its room. */
+/** Deliver hooks only to the exact identity, room and spawned attempt that registered them. */
 export type CcEventPush = (ev: AgentEvent) => void;
 
-/**
- * Per-room registry of the currently-active CcHeadlessSession's push. One node serves one uid, so the
- * roomId is a unique key within the node. `register`/`deregister` are called by the session on send
- * start / finish; `push` is called by the bridge sink as hooks arrive.
- */
 export class CcSessionRegistry {
-	// REQ-029 (#29): roomId key is an opaque string (>2^53-safe).
-	private readonly byRoom = new Map<string, CcEventPush>();
+	private readonly byIdentity = new Map<string, Map<string, { runId: string; push: CcEventPush }>>();
 
-	register(roomId: string, push: CcEventPush): void {
-		this.byRoom.set(roomId, push);
+	register(uid: string, roomId: string, runId: string, push: CcEventPush): () => void {
+		let rooms = this.byIdentity.get(uid);
+		if (!rooms) {
+			rooms = new Map();
+			this.byIdentity.set(uid, rooms);
+		}
+		const entry = { runId, push };
+		rooms.set(roomId, entry);
+		// Old completions and repeated cleanup cannot remove a newer run in the same room.
+		return () => {
+			if (rooms.get(roomId) !== entry) return;
+			rooms.delete(roomId);
+			if (rooms.size === 0) this.byIdentity.delete(uid);
+		};
 	}
 
-	deregister(roomId: string): void {
-		this.byRoom.delete(roomId);
-	}
-
-	/** Route an AgentEvent to the room's active session, or a safe no-op if none is registered. */
-	push(roomId: string, ev: AgentEvent): void {
-		this.byRoom.get(roomId)?.(ev);
+	push(uid: string, roomId: string, runId: string, ev: AgentEvent): void {
+		const entry = this.byIdentity.get(uid)?.get(roomId);
+		if (entry?.runId === runId) entry.push(ev);
 	}
 }
 
-/**
- * Build the CcHookSink that bridges resolved CC hooks into the per-room session stream:
- *   - PostToolUse  → a `{tool}` AgentEvent (name only; reduceThinking ignores tools, exactly like codex)
- *   - Stop         → flush (no-op): the session's `done` comes from the driver's stdout EOF/`result`,
- *                    NOT from the Stop hook.
- * (#120) THINKING is NOT bridged from hooks — it is teed from the driver's stdout (headless-driver.ts
- * teeOutput). SessionStart / UserPromptSubmit lifecycle events are ignored by the broker (the handler's
- * standard path already sends THINKING_START). A push into a room with no active session is a safe no-op.
- */
+/** Stop is intentionally inert: stdout result/EOF, not a hook, ends the turn. */
 export function buildCcBridgeSink(registry: CcSessionRegistry): CcHookSink {
 	return {
-		tool: (roomId, _uid, toolName) => registry.push(roomId, { type: 'tool', name: toolName, phase: 'end' }),
-		flush: () => {
-			/* no-op: the session's `done` comes from stdout EOF; nothing to flush from the Stop hook */
-		},
+		tool: (roomId, uid, runId, toolName) => registry.push(uid, roomId, runId, { type: 'tool', name: toolName, phase: 'end' }),
+		flush: () => {},
 	};
 }

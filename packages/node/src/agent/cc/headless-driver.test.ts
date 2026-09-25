@@ -231,6 +231,10 @@ function stdinText(fs: ReturnType<typeof fakeSpawn>): string {
 	return JSON.parse(fs.stdinWrites[0].trim()).message.content[0].text as string;
 }
 
+function runId(fs: ReturnType<typeof fakeSpawn>): string {
+	return (fs.spawnCall!.options.env as NodeJS.ProcessEnv).AICHAT_CC_RUN!;
+}
+
 describe('CcHeadlessDriver — shape', () => {
 	it('type=cc (node drives cc turns now, standard supervised path)', () => {
 		const { driver } = makeDriver();
@@ -524,7 +528,7 @@ describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 t
 
 		// #120: MessageDisplay no longer produces a thinking event (thinking is teed from stdout instead).
 		await broker.handle({ authToken: token, body: { hook_event_name: 'MessageDisplay', content: 'ignored now' } });
-		await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
+		await broker.handle({ authToken: token, runId: runId(fs), body: { hook_event_name: 'PostToolUse', tool_name: 'Bash', tool_input: { cmd: 'ls' } } });
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 
 		const events = await drain(stream);
@@ -542,7 +546,7 @@ describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 t
 		// stdout says the turn is complete FIRST (starts the drain window)...
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		// ...then a final tool hook lands DURING the drain (the race the drain protects against).
-		await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Grep' } });
+		await broker.handle({ authToken: token, runId: runId(fs), body: { hook_event_name: 'PostToolUse', tool_name: 'Grep' } });
 
 		const events = await drain(stream);
 		const toolIdx = events.findIndex((e) => e.type === 'tool' && e.name === 'Grep');
@@ -557,11 +561,100 @@ describe('CcHeadlessSession.send — hooks bridge (tool via the registry; #120 t
 		const { broker, token } = brokerFor(registry);
 		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
 		const stream = session.send('hi');
+		const oldRunId = runId(fs);
 		fs.emitStdout(`${JSON.stringify({ type: 'result' })}\n`);
 		await drain(stream); // session finished → deregistered from the room
 
-		const res = await broker.handle({ authToken: token, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
+		const res = await broker.handle({ authToken: token, runId: oldRunId, body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
 		expect(res.status).toBe(200); // resolved fine; the bridge just drops it
+	});
+});
+
+describe('CC multi-identity hook isolation (aichatoverview#293)', () => {
+	it('two CC identities in one room and another room keep their hook, stdout terminal and CLI bind distinct', async () => {
+		const multi = fakeMultiSpawn();
+		const registry = new CcSessionRegistry();
+		const bindTokens = makeBindTokens();
+		const { driver } = makeDriver({ spawn: multi.spawn, registry, bindTokens });
+		const { driver: driverB } = makeDriver({ spawn: multi.spawn, registry, bindTokens });
+		const broker = new CcBroker({ resolve: (t) => bindTokens.resolve(t), sink: buildCcBridgeSink(registry) });
+		const a = await driver.openSession({ aiclawUid: 'A', roomId: '9', chatContext: BASE_CTX });
+		const b = await driverB.openSession({ aiclawUid: 'B', roomId: '9', chatContext: BASE_CTX });
+		const other = await driver.openSession({ aiclawUid: 'A', roomId: '10', chatContext: { ...BASE_CTX, roomId: '10' } });
+		const streams = [a.send('A/9'), b.send('B/9'), other.send('A/10')];
+		const [envA, envB, envOther] = multi.calls.map((call) => call.options.env as NodeJS.ProcessEnv);
+		const hook = (env: NodeJS.ProcessEnv, tool: string) => broker.handle({
+			authToken: env.AICHAT_BIND, runId: env.AICHAT_CC_RUN,
+			body: { hook_event_name: 'PostToolUse', tool_name: tool },
+		});
+		await hook(envA, 'A-tool');
+		await hook(envB, 'B-tool');
+		await hook(envOther, 'other-tool');
+		multi.calls[0].emitStdout('{"type":"result"}\n');
+		const gotA = await drain(streams[0]);
+		await hook(envB, 'B-after-A-finish');
+		await hook(envA, 'A-late');
+		multi.calls[1].emitStdout('{"type":"result"}\n');
+		multi.calls[2].emitStdout('{"type":"result"}\n');
+		const gotB = await drain(streams[1]), gotOther = await drain(streams[2]);
+		expect(gotA.filter((e) => e.type === 'tool').map((e) => e.name)).toEqual(['A-tool']);
+		expect(gotB.filter((e) => e.type === 'tool').map((e) => e.name)).toEqual(['B-tool', 'B-after-A-finish']);
+		expect(gotOther.filter((e) => e.type === 'tool').map((e) => e.name)).toEqual(['other-tool']);
+		for (const events of [gotA, gotB, gotOther]) expect(events.filter((e) => e.type === 'done')).toHaveLength(1);
+		expect(new Set([envA.AICHAT_CC_RUN, envB.AICHAT_CC_RUN, envOther.AICHAT_CC_RUN]).size).toBe(3);
+		expect(new Set([envA.AICHAT_BIND, envB.AICHAT_BIND, envOther.AICHAT_BIND]).size).toBe(3);
+	});
+
+	it('old run hooks cannot reach a new turn even with the same stable CLI binding; retry gets a fresh correlation', async () => {
+		const multi = fakeMultiSpawn();
+		const registry = new CcSessionRegistry(), store = memStore(), bindTokens = makeBindTokens();
+		const { driver } = makeDriver({ spawn: multi.spawn, registry, sessionStore: store, bindTokens });
+		const broker = new CcBroker({ resolve: (t) => bindTokens.resolve(t), sink: buildCcBridgeSink(registry) });
+		const old = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const oldStream = old.send('old');
+		const oldEnv = multi.calls[0].options.env as NodeJS.ProcessEnv;
+		multi.calls[0].emitStdout('{"type":"result"}\n');
+		await drain(oldStream);
+		const next = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const nextStream = next.send('new');
+		const nextEnv = multi.calls[1].options.env as NodeJS.ProcessEnv;
+		expect(nextEnv.AICHAT_BIND).toBe(oldEnv.AICHAT_BIND); // CLI conversation remains stable
+		expect(nextEnv.AICHAT_CC_RUN).not.toBe(oldEnv.AICHAT_CC_RUN);
+		const post = (env: NodeJS.ProcessEnv, name: string) => broker.handle({ authToken: env.AICHAT_BIND, runId: env.AICHAT_CC_RUN, body: { hook_event_name: 'PostToolUse', tool_name: name } });
+		await post(oldEnv, 'late');
+		await post(nextEnv, 'current');
+		multi.calls[1].emitStdout('{"type":"result"}\n');
+		expect((await drain(nextStream)).filter((e) => e.type === 'tool').map((e) => e.name)).toEqual(['current']);
+		store.set(KEY, { sessionId: 'dead' });
+		const retry = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const retryStream = retry.send('retry');
+		const failedEnv = multi.calls[2].options.env as NodeJS.ProcessEnv;
+		multi.calls[2].emitExit(1);
+		const freshEnv = multi.calls[3].options.env as NodeJS.ProcessEnv;
+		expect(freshEnv.AICHAT_CC_RUN).not.toBe(failedEnv.AICHAT_CC_RUN);
+		await post(failedEnv, 'old-attempt');
+		await post(freshEnv, 'fresh-attempt');
+		multi.calls[3].emitStdout('{"type":"result"}\n');
+		expect((await drain(retryStream)).filter((e) => e.type === 'tool').map((e) => e.name)).toEqual(['fresh-attempt']);
+	});
+
+	it('CC spawn strips inherited Codex/OpenCode/OpenClaw/unified contexts without mutating the parent', async () => {
+		const keys = ['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_CONTEXT_KEY'] as const;
+		const old = keys.map((key) => process.env[key]);
+		try {
+			keys.forEach((key) => { process.env[key] = `other-agent-${key}`; });
+			const { driver, fs } = makeDriver();
+			const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+			const stream = session.send('reply via CLI');
+			const env = fs.spawnCall!.options.env as NodeJS.ProcessEnv;
+			keys.forEach((key) => { expect(env[key]).toBeUndefined(); expect(process.env[key]).toBe(`other-agent-${key}`); });
+			expect(env.AICHAT_BIND).toBe('tok-1');
+			expect(env.AICHAT_CC_RUN).toMatch(/^[0-9a-f-]{36}$/);
+			fs.emitStdout('{"type":"result"}\n');
+			await drain(stream);
+		} finally {
+			keys.forEach((key, i) => { if (old[i] === undefined) delete process.env[key]; else process.env[key] = old[i]; });
+		}
 	});
 });
 
