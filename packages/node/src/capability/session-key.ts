@@ -71,6 +71,7 @@ export function resolveBoundSession(
 	const parsed = parseSessionKey(sessionKey);
 	if (!parsed) return undefined;
 
+	// ponytail: scan same-type drivers and their small JSON maps; use a core native-alias index if scale warrants it.
 	let match: BoundSession | undefined;
 	for (const agent of agents) {
 		if (agent.driver.type !== parsed.agentType || !agent.driver.resolveSession) continue;

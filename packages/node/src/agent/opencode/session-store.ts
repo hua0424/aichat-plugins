@@ -39,6 +39,7 @@ export class FileSessionStore implements SessionStore {
 		this.store = new FileJsonMapStore(
 			path,
 			(v) => typeof v.sessionID === 'string' && typeof v.directory === 'string',
+			(v) => v.sessionID,
 		);
 	}
 

@@ -248,6 +248,17 @@ describe('CcHeadlessDriver — shape', () => {
 		expect(driver.resolveSession('garbage')).toBeUndefined();
 	});
 
+	it('reports a native alias registration conflict as a turn error, not an uncaught stdout exception', async () => {
+		const store = memStore();
+		store.set = () => { throw new Error('Duplicate native session id'); };
+		const { driver, fs, kill } = makeDriver({ sessionStore: store });
+		const session = await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: BASE_CTX });
+		const events = drain(session.send('hi'));
+		expect(() => fs.emitStdout('{"type":"system","subtype":"init","session_id":"duplicate"}\n')).not.toThrow();
+		expect(await events).toContainEqual(expect.objectContaining({ type: 'error', message: expect.stringContaining('Duplicate native session id') }));
+		expect(kill).toHaveBeenCalledWith(-4242, 'SIGTERM');
+	});
+
 	it('connect/disconnect resolve; openSession returns a session', async () => {
 		const { driver } = makeDriver();
 		await expect(driver.connect()).resolves.toBeUndefined();

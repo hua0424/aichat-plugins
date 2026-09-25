@@ -37,7 +37,7 @@ export class FileCcHeadlessSessionStore implements CcHeadlessSessionStore {
 	private readonly store: FileJsonMapStore<StoredCcHeadlessSession>;
 
 	constructor(path: string = DEFAULT_CC_SESSIONS_PATH) {
-		this.store = new FileJsonMapStore(path, (v) => typeof v.sessionId === 'string');
+		this.store = new FileJsonMapStore(path, (v) => typeof v.sessionId === 'string', (v) => v.sessionId);
 	}
 
 	get(key: string): StoredCcHeadlessSession | undefined {

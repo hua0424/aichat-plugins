@@ -7,7 +7,7 @@ import { parseBindingKey } from '../bind-token-store.js';
 import type { BindableAgent } from '../../capability/session-key.js';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 
 /** A fresh file-backed store under a throwaway temp dir (no shared on-disk state). */
 function freshStore(): FileCodexSessionStore {
@@ -30,11 +30,18 @@ describe('FileCodexSessionStore', () => {
 		expect(store.findKeyByThreadId('thread_bbb')).toBe('aiclaw-7-room-3');
 	});
 
-	it('does not route a duplicate native thread to the first room', () => {
+	it('rejects a duplicate native thread without changing the original room', () => {
 		const store = freshStore();
 		store.set('aiclaw-5-room-9', { threadId: 'same' });
-		store.set('aiclaw-7-room-3', { threadId: 'same' });
-		expect(store.findKeyByThreadId('same')).toBeUndefined();
+		expect(() => store.set('aiclaw-7-room-3', { threadId: 'same' })).toThrow('Duplicate native session id');
+		expect(store.findKeyByThreadId('same')).toBe('aiclaw-5-room-9');
+		expect(store.get('aiclaw-7-room-3')).toBeUndefined();
+	});
+
+	it('refuses ambiguous native aliases found during legacy file recovery', () => {
+		const path = join(mkdtempSync(join(tmpdir(), 'aichat-codex-duplicate-')), 'sessions.json');
+		writeFileSync(path, JSON.stringify({ a: { threadId: 'same' }, b: { threadId: 'same' } }));
+		expect(() => new FileCodexSessionStore(path)).toThrow('Duplicate native session id');
 	});
 
 	it('findKeyByThreadId → undefined for an unknown / empty store', () => {

@@ -25,6 +25,7 @@ export class AsyncJsonWriter {
 
 	constructor(private readonly path: string, private readonly mode?: number) {}
 
+	// ponytail: legacy sync store API reports async disk errors via log/whenWritten; T07 can await binding commit before exposing it.
 	write(obj: unknown): void {
 		const data = JSON.stringify(obj, null, 2);
 		this.chain = this.chain.then(async () => {
@@ -65,8 +66,21 @@ export class FileJsonMapStore<V> {
 	private map: Record<string, V>;
 	private readonly writer: AsyncJsonWriter;
 
-	constructor(path: string, private readonly validate: (v: V) => boolean) {
+	constructor(
+		path: string,
+		private readonly validate: (v: V) => boolean,
+		private readonly nativeId?: (v: V) => string,
+	) {
 		this.map = readJsonMap<V>(path);
+		const seen = new Set<string>();
+		for (const [key, value] of Object.entries(this.map)) {
+			if (value == null || !validate(value)) throw new Error(`Invalid JSON map entry (${key}): ${path}`);
+			if (nativeId) {
+				const id = nativeId(value);
+				if (seen.has(id)) throw new Error(`Duplicate native session id in ${path}`);
+				seen.add(id);
+			}
+		}
 		this.writer = new AsyncJsonWriter(path);
 	}
 
@@ -77,6 +91,12 @@ export class FileJsonMapStore<V> {
 
 	set(key: string, val: V): void {
 		if (key in this.map && sameJson(this.map[key], val)) return;
+		if (this.nativeId) {
+			const id = this.nativeId(val);
+			for (const [otherKey, other] of Object.entries(this.map)) {
+				if (otherKey !== key && this.nativeId(other) === id) throw new Error('Duplicate native session id');
+			}
+		}
 		this.map[key] = val;
 		this.writer.write(this.map);
 	}

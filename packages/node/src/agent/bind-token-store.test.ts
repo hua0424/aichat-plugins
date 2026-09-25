@@ -112,13 +112,11 @@ describe('FileBindTokenStore — persistence + reload', () => {
 		expect(store.mint('7', '42')).toBe('abcdef123');
 	});
 
-	it('a corrupt/unparseable file degrades to an empty store (never crashes)', () => {
+	it('rejects corrupt or malformed existing bindings without erasing old tokens', () => {
 		const path = freshFile();
-		// write garbage via a store, then hand a broken file — but simplest: FileBindTokenStore on a
-		// non-JSON file. Emulate by writing then corrupting is overkill; a missing file already loads empty.
-		const store = new FileBindTokenStore(path, counterGen());
-		expect(store.resolve('anything')).toBeUndefined();
-		const token = store.mint('1', '2');
-		expect(store.resolve(token)).toEqual({ aiclawUid: '1', roomId: '2' });
+		writeFileSync(path, '{ invalid');
+		expect(() => new FileBindTokenStore(path)).toThrow();
+		writeFileSync(path, JSON.stringify({ token: { aiclawUid: '1' } }));
+		expect(() => new FileBindTokenStore(path)).toThrow();
 	});
 });

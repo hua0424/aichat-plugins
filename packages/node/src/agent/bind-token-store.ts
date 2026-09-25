@@ -124,18 +124,15 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 		// Shared read primitive ({} only on missing, throws on corruption); the dual-map + normalization below is
 		// bind-specific (a distinct security path, NOT the session stores' copy).
 		for (const [token, val] of Object.entries(readJsonMap<unknown>(this.path))) {
-			if (val && typeof val === 'object') {
-				const b = val as Record<string, unknown>;
-				// REQ-029 (#29): uid/room are opaque strings — accept only string fields.
-				if (typeof b.aiclawUid === 'string' && typeof b.roomId === 'string') {
-					// #161 P1: a token file written before the lowercase-normalization stored the token
-					// key raw (mixed case). resolve()/mint() operate in lowercase, so normalize the key
-					// on load — otherwise resolve(token.toLowerCase()) would miss the mixed-case entry.
-					const key = token.toLowerCase();
-					this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
-					this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
-				}
+			if (!val || typeof val !== 'object') throw new Error(`Invalid bind token entry: ${this.path}`);
+			const b = val as Record<string, unknown>;
+			if (typeof b.aiclawUid !== 'string' || typeof b.roomId !== 'string') {
+				throw new Error(`Invalid bind token entry: ${this.path}`);
 			}
+			// Legacy mixed-case tokens are normalized for OpenClaw's lowercased session key.
+			const key = token.toLowerCase();
+			this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
+			this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
 		}
 	}
 

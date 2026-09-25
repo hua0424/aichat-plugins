@@ -39,7 +39,7 @@ export class FileCodexSessionStore implements CodexSessionStore {
 	private readonly store: FileJsonMapStore<StoredCodexSession>;
 
 	constructor(path: string = DEFAULT_CODEX_SESSIONS_PATH) {
-		this.store = new FileJsonMapStore(path, (v) => typeof v.threadId === 'string');
+		this.store = new FileJsonMapStore(path, (v) => typeof v.threadId === 'string', (v) => v.threadId);
 	}
 
 	get(key: string): StoredCodexSession | undefined {

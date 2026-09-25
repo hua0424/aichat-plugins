@@ -1,8 +1,14 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AsyncJsonWriter, FileJsonMapStore } from './file-map-store.js';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+	const fs = await importOriginal<typeof import('node:fs/promises')>();
+	return { ...fs, rename: vi.fn(fs.rename) };
+});
 
 describe('shared JSON persistence', () => {
 	it('keeps the legacy object format across serialized atomic replacements', async () => {
@@ -23,14 +29,22 @@ describe('shared JSON persistence', () => {
 		const dir = mkdtempSync(join(tmpdir(), 'aichat-map-error-'));
 		const path = join(dir, 'sessions.json');
 		writeFileSync(path, '{"original":true}');
-		// A directory at the target path cannot be atomically replaced by a file.
-		const blocked = join(dir, 'blocked');
-		mkdirSync(blocked);
-		const failingWriter = new AsyncJsonWriter(blocked);
-		failingWriter.write({ next: true });
-		await expect(failingWriter.whenWritten()).rejects.toThrow();
+		vi.mocked(rename).mockRejectedValueOnce(new Error('injected rename failure'));
+		const writer = new AsyncJsonWriter(path);
+		writer.write({ next: true });
+		await expect(writer.whenWritten()).rejects.toThrow('injected rename failure');
 		expect(readFileSync(path, 'utf8')).toBe('{"original":true}');
-		expect(readdirSync(dir).sort()).toEqual(['blocked', 'sessions.json']);
+		expect(readdirSync(dir)).toEqual(['sessions.json']);
+		writer.write({ next: true }); // after a failure, the next serialized commit can recover
+		await writer.whenWritten();
+		expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ next: true });
+	});
+
+	it('refuses a malformed legacy entry instead of silently losing its native reference', () => {
+		const path = join(mkdtempSync(join(tmpdir(), 'aichat-map-invalid-')), 'sessions.json');
+		writeFileSync(path, JSON.stringify({ 'aiclaw-1-room-2': { wrong: 'value' } }));
+		expect(() => new FileJsonMapStore<{ threadId: string }>(path, (v) => typeof v.threadId === 'string')).toThrow();
+		expect(readFileSync(path, 'utf8')).toContain('wrong');
 	});
 
 	it('rejects corrupt existing JSON instead of overwriting it with an empty map', () => {

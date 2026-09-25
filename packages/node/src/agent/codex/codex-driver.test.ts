@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexDriver, type CodexClient } from './codex-driver.js';
-import type { CodexSessionStore, StoredCodexSession } from './session-store.js';
+import { FileCodexSessionStore, type CodexSessionStore, type StoredCodexSession } from './session-store.js';
 import type { Thread, ThreadOptions } from '@openai/codex-sdk';
 import type { AgentEvent } from '../events.js';
 import type { AgentPromptTemplates } from '../prompt-templates.js';
@@ -193,6 +193,51 @@ describe('CodexDriver.openSession', () => {
 		await driver.openSession({ aiclawUid: 1, roomId: 1, chatContext: { roomType: 1, roomId: 1 } });
 		const opts = startThread.mock.calls[0][0] as ThreadOptions;
 		expect(opts.model).toBe('gpt-5-codex');
+	});
+});
+
+describe('CodexDriver shared same-type identities', () => {
+	it('runs two identities and two rooms concurrently, persists native threads, then resumes with each workspace', async () => {
+		const path = join(mkdtempSync(join(tmpdir(), 'aichat-two-codex-')), 'sessions.json');
+		const store = new FileCodexSessionStore(path);
+		const controls: Array<{ ctl: ReturnType<typeof controllableStream>; opts: ThreadOptions }> = [];
+		const startThread = vi.fn((opts?: ThreadOptions) => {
+			const ctl = controllableStream();
+			controls.push({ ctl, opts: opts! });
+			return { runStreamed: async () => ({ events: ctl.stream }) } as unknown as Thread;
+		});
+		const resumeThread = vi.fn((_id: string, _opts?: ThreadOptions) => ({ runStreamed: async () => ({ events: [] }) }) as unknown as Thread);
+		const codex: CodexClient = { startThread, resumeThread };
+		const workspaceBase = join(mkdtempSync(join(tmpdir(), 'aichat-codex-workspace-')), 'workspace');
+		const first = new CodexDriver({ codex, workspaceBase, sessionStore: store });
+		const second = new CodexDriver({ codex, workspaceBase, sessionStore: store });
+		const rooms = [
+			{ driver: first, uid: '1', room: '10' },
+			{ driver: second, uid: '2', room: '20' },
+			{ driver: first, uid: '1', room: '30' },
+		];
+		const sessions = await Promise.all(rooms.map(({ driver, uid, room }) => driver.openSession({
+			aiclawUid: uid, roomId: room, chatContext: { roomType: 1, roomId: room },
+		})));
+		const turns = sessions.map((session) => drain(session.send('actual turn, not a blank session')));
+		await new Promise((r) => setImmediate(r));
+		controls.forEach(({ ctl, opts }) => {
+			const room = opts.workingDirectory!.split(/[\\/]/).at(-1)!;
+			ctl.emit({ type: 'thread.started', thread_id: `native-${room}` });
+			ctl.emit({ type: 'turn.completed', usage: {} });
+		});
+		await Promise.all(turns);
+		await store.whenPersisted();
+		const reloaded = new FileCodexSessionStore(path);
+		const resumed = new CodexDriver({ codex, workspaceBase, sessionStore: reloaded });
+		for (const { uid, room } of rooms) {
+			expect(reloaded.get(`aiclaw-${uid}-room-${room}`)?.threadId).toBe(`native-${room}`);
+			expect(resumed.resolveSession(`native-${room}`)).toEqual({ aiclawUid: uid, roomId: room });
+			const opts = controls.find(({ opts }) => opts.workingDirectory?.endsWith(join('group', room)))!.opts;
+			expect(opts.workingDirectory).toContain(join(uid, 'group', room));
+			await resumed.openSession({ aiclawUid: uid, roomId: room, chatContext: { roomType: 1, roomId: room } });
+			expect(resumeThread).toHaveBeenLastCalledWith(`native-${room}`, expect.objectContaining({ workingDirectory: opts.workingDirectory }));
+		}
 	});
 });
 
