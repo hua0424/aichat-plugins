@@ -51,6 +51,8 @@ describe('CcBroker.listen / close — real TCP loopback', () => {
 			const url = `http://127.0.0.1:${h.broker.address()!.port}/hook`;
 			const body = JSON.stringify({ hook_event_name: 'PostToolUse', tool_name: 'Bash' });
 			const headers = { Authorization: `Bearer ${BIND}`, 'Content-Type': 'application/json' };
+			expect((await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Aichat-Run': RUN }, body })).status).toBe(401);
+			expect(h.sink.tool).not.toHaveBeenCalled();
 			expect((await fetch(url, { method: 'POST', headers, body })).status).toBe(400);
 			expect(h.sink.tool).not.toHaveBeenCalled();
 			expect((await fetch(url, { method: 'POST', headers: { ...headers, 'X-Aichat-Run': RUN }, body })).status).toBe(200);
