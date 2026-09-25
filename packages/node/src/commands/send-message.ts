@@ -27,7 +27,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 	}
 
 	if (!content.trim()) {
-		console.error('Usage: aichat send-message --content "<text>"');
+		console.error('Usage: aichat send-message --content "<text>" [--request-id <id>]');
 		console.error('       (room and identity are bound automatically from your agent session)');
 		process.exit(1);
 	}
@@ -47,7 +47,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 			requestId,
 		});
 	} catch {
-		console.error(`Error: send-message result unknown (DELIVERY_UNKNOWN); confirm using --request-id ${requestId}, do not resend with a new ID`);
+		console.error(`Error: send-message result unknown (DELIVERY_UNKNOWN); retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically`);
 		process.exit(1);
 	}
 
@@ -60,7 +60,7 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 	}
 
 	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
-	console.error(`Error: send-message failed: ${error}${res.status === 503 ? ` (DELIVERY_UNKNOWN; confirm using --request-id ${requestId}, do not resend with a new ID)` : ''}`);
+	console.error(`Error: send-message failed: ${error}${res.status === 503 ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm delivery, do not resend automatically)` : ''}`);
 	process.exit(1);
 }
 

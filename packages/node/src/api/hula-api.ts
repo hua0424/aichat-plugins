@@ -6,6 +6,12 @@ import type { HostInfo } from '../host-info.js';
 import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
 
+export class HulaApiRejectedError extends Error {
+	constructor(message: string, readonly code: 'FORBIDDEN' | 'INVALID_ARGUMENT' = 'INVALID_ARGUMENT') {
+		super(message);
+	}
+}
+
 interface ApiResponse {
 	success: boolean;
 	data?: unknown;
@@ -319,11 +325,12 @@ export class HulaApiClient {
 	private async parseResponse(resp: Response): Promise<ApiResponse> {
 		if (!resp.ok) {
 			const text = await resp.text().catch(() => '');
-			throw new Error(`HuLa API error: ${resp.status} ${text.substring(0, 200)}`);
+			const message = `HuLa API error: ${resp.status} ${text.substring(0, 200)}`;
+			throw resp.status < 500 ? new HulaApiRejectedError(message, resp.status === 403 ? 'FORBIDDEN' : 'INVALID_ARGUMENT') : new Error(message);
 		}
 		const json = (await resp.json()) as ApiResponse;
 		if (!json.success) {
-			throw new Error(`HuLa API failed: ${json.msg || 'unknown error'}`);
+			throw new HulaApiRejectedError(`HuLa API failed: ${json.msg || 'unknown error'}`);
 		}
 		return json;
 	}

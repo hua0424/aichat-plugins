@@ -12,13 +12,14 @@ import {
 	sanitizeLogField,
 } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
-import type { HulaApiClient } from '../api/hula-api.js';
+import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
+import { resetSessionCapability } from './registry.js';
 
 /**
  * Build an endpoint wired to a real registry (send-message) + a controllable resolve. The fake
  * apiClient's sendMessage is the observable seam: we assert which roomId it received.
  */
-function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: number; platform?: NodeJS.Platform }) {
+function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Platform }) {
 	const sendMessage = vi.fn(async () => ({ msgId: '1' }));
 	const apiClient = { sendMessage } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
@@ -30,7 +31,6 @@ function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: numbe
 	const endpoint = new CapabilityEndpoint({
 		registry,
 		resolve,
-		idempotencyCap: opts?.idempotencyCap,
 		platform: opts?.platform,
 	});
 	return { endpoint, sendMessage, resolve };
@@ -122,26 +122,24 @@ describe('CapabilityEndpoint.handle', () => {
 		expect(sendMessage).toHaveBeenCalledOnce();
 	});
 
-	it('idempotency cache is FIFO-bounded: oldest key is evicted once the cap is exceeded', async () => {
-		// cap=3: after driving 4 distinct keys, the first ('k0') must have been evicted.
-		const { endpoint, sendMessage } = build({ resolveRoom: 42, idempotencyCap: 3 });
-		for (let i = 0; i < 4; i++) {
-			await endpoint.handle({ body: body({ idempotencyKey: `k${i}` }) });
+	it('old request IDs remain protected after more than the former 1000-entry cache limit', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		for (let i = 0; i < 1001; i++) {
+			await endpoint.handle({ body: body({ requestId: `k${i}`, idempotencyKey: undefined }) });
 		}
-		expect(sendMessage).toHaveBeenCalledTimes(4);
-		// Re-sending the evicted 'k0' re-invokes (proving it was dropped, i.e. the Map stays bounded).
-		await endpoint.handle({ body: body({ idempotencyKey: 'k0' }) });
-		expect(sendMessage).toHaveBeenCalledTimes(5);
-		// A still-cached key ('k3', the newest) is NOT re-invoked.
-		await endpoint.handle({ body: body({ idempotencyKey: 'k3' }) });
-		expect(sendMessage).toHaveBeenCalledTimes(5);
+		await endpoint.handle({ body: body({ requestId: 'k0', idempotencyKey: undefined }) });
+		expect(sendMessage).toHaveBeenCalledTimes(1001);
+		log.mockRestore();
 	});
 
 	it('invalid write args → 400, not cached under requestId', async () => {
-		const { endpoint } = build({ resolveRoom: 42 });
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
 		const res = await endpoint.handle({ body: body({ args: { content: '' } }) });
 		expect(res.status).toBe(400);
 		expect((res.json as { ok: boolean }).ok).toBe(false);
+		expect((await endpoint.handle({ body: body() })).status).toBe(200);
+		expect(sendMessage).toHaveBeenCalledOnce();
 	});
 });
 
@@ -180,7 +178,7 @@ describe('local write requestId', () => {
 		expect(await endpoint.handle({ body: request })).toEqual(first);
 	});
 
-	it('conflicts on different payload, room, command or generation, but not object property order', async () => {
+	it('conflicts on changed payload, room or command, but not ignored padding/token rotation', async () => {
 		const { endpoint, sendMessage, complete } = setup();
 		const sameId = { requestId: 'one', idempotencyKey: undefined };
 		const first = endpoint.handle({ body: body({ ...sameId, args: { content: 'hi', metadata: { a: 1, b: 2 } } }) });
@@ -189,12 +187,13 @@ describe('local write requestId', () => {
 		for (const mismatch of [
 			{ args: { content: 'changed' } },
 			{ sessionKey: 'cc:room2' },
-			{ sessionKey: 'opencode:new-generation' },
 			{ command: 'reset-session' },
 		]) {
 			expect((await endpoint.handle({ body: body({ ...sameId, ...mismatch }) })).status).toBe(409);
 		}
+		const otherToken = endpoint.handle({ body: body({ ...sameId, sessionKey: 'opencode:rotated', args: { content: 'hi' } }) });
 		complete('102');
+		expect(await otherToken).toEqual(await first);
 		expect(await reordered).toEqual(await first);
 		expect(sendMessage).toHaveBeenCalledTimes(1);
 	});
@@ -224,6 +223,57 @@ describe('local write requestId', () => {
 		expect(await endpoint.handle({ body: request })).toEqual(first);
 		expect(sendMessage).toHaveBeenCalledTimes(1);
 		expect((await endpoint.handle({ body: body({ ...request, sessionKey: 'opencode:revoked' }) })).status).toBe(404);
+	});
+
+	it('reset receipt remains available only for its old key and exact ID after reset revokes the binding', async () => {
+		let active = true;
+		const registry = new CapabilityRegistry();
+		const reset = vi.fn(() => { active = false; return { driverType: 'codex', reset: true }; });
+		registry.register('reset-session', resetSessionCapability(reset));
+		const endpoint = new CapabilityEndpoint({
+			registry,
+			resolve: () => active ? { aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient } : undefined,
+		});
+		const request = body({ command: 'reset-session', args: {}, requestId: 'reset-id', idempotencyKey: undefined });
+		const first = await endpoint.handle({ body: request });
+		expect(first).toMatchObject({ status: 200, json: { result: { reset: true } } });
+		expect(await endpoint.handle({ body: request })).toEqual(first);
+		expect(reset).toHaveBeenCalledOnce();
+		expect((await endpoint.handle({ body: body({ command: 'list-friends', requestId: 'reset-id', idempotencyKey: undefined }) })).status).toBe(404);
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'other', idempotencyKey: undefined }) })).status).toBe(404);
+	});
+
+	it('confirmed reset advances the same room generation so old send IDs cannot be replayed', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const request = body({ requestId: 'pre-reset', idempotencyKey: undefined });
+		const pending = endpoint.handle({ body: request });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+		complete('108');
+		await pending;
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'reset', idempotencyKey: undefined }) })).status).toBe(200);
+		// setup() registers a reset capability, but only its reset:true result advances generation.
+		expect((await endpoint.handle({ body: request })).status).toBe(409);
+		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+
+	it('definitive server rejection does not poison an ID; a later corrected retry may execute', async () => {
+		const { endpoint, sendMessage } = setup();
+		sendMessage.mockRejectedValueOnce(new HulaApiRejectedError('forbidden', 'FORBIDDEN')).mockResolvedValueOnce({ msgId: '106' });
+		const request = body({ requestId: 'rejected', idempotencyKey: undefined });
+		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 403, json: { code: 'FORBIDDEN' } });
+		expect((await endpoint.handle({ body: request })).status).toBe(200);
+		expect(sendMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it('ignored deep padding cannot recursively crash a valid write', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		let padding: unknown = null;
+		for (let i = 0; i < 3000; i++) padding = { padding };
+		const request = body({ requestId: 'deep', idempotencyKey: undefined, args: { content: 'hi', padding } });
+		const first = endpoint.handle({ body: request });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+		complete('107');
+		expect((await first).status).toBe(200);
 	});
 
 	it('HTTP named-pipe requests with the same explicit ID share one backend write', async () => {

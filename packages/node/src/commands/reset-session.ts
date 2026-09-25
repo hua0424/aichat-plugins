@@ -41,7 +41,7 @@ export async function handleResetSession(args: string[]): Promise<void> {
 			requestId,
 		});
 	} catch {
-		console.error(`Error: reset-session result unknown (DELIVERY_UNKNOWN); confirm using --request-id ${requestId}, do not reset with a new ID`);
+		console.error(`Error: reset-session result unknown (DELIVERY_UNKNOWN); retain --request-id ${requestId}; local node cannot confirm an unknown result, do not reset automatically`);
 		process.exit(1);
 	}
 
@@ -59,6 +59,6 @@ export async function handleResetSession(args: string[]): Promise<void> {
 	}
 
 	const error = (res.body as { error?: string })?.error ?? `HTTP ${res.status}`;
-	console.error(`Error: reset-session failed: ${error}${res.status === 503 ? ` (DELIVERY_UNKNOWN; confirm using --request-id ${requestId}, do not reset with a new ID)` : ''}`);
+	console.error(`Error: reset-session failed: ${error}${res.status === 503 ? ` (DELIVERY_UNKNOWN; retain --request-id ${requestId}; local node cannot confirm an unknown result, do not reset automatically)` : ''}`);
 	process.exit(1);
 }
