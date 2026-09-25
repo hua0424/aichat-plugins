@@ -6,9 +6,9 @@ import { readJsonBody } from '../../util/http-body.js';
  * REQ-010 S7 / REQ-011 S2 — the claude-code (CC) hook broker.
  *
  * CC has no gateway/server: node sources a CC turn's TOOL activity from claude-code **hooks** that POST
- * to this node-local HTTP broker. Each hook fires in CC's headless (`-p`) run, reads `$AICHAT_BIND` (the
- * binding string placed in CC's launch env), and POSTs to `http://127.0.0.1:<port>/` with
- * `Authorization: Bearer <AICHAT_BIND>` and a JSON hook body.
+ * to this node-local HTTP broker. Each hook fires in CC's headless (`-p`) run, reads the stable
+ * `$AICHAT_BIND` and per-spawn `$AICHAT_CC_RUN`, and POSTs to `http://127.0.0.1:<port>/` with
+ * `Authorization: Bearer <AICHAT_BIND>`, `X-Aichat-Run: <AICHAT_CC_RUN>` and a JSON hook body.
  *
  * (#120) THINKING is NOT sourced here: the original MessageDisplay→broker→panel hook path never delivered
  * content (claude-code's MessageDisplay payload carries the assistant text in a `delta` field, not the
@@ -23,8 +23,8 @@ import { readJsonBody } from '../../util/http-body.js';
  * hook-event → sink mapping). `listen()`/`close()` are a thin node:http wrapper over a 127.0.0.1 TCP
  * port that feeds parsed bodies + the Bearer token into `handle()`.
  *
- * The room/identity come ONLY from `resolve(bindToken)` — never from the hook body. A hook carries
- * only its CC session and the binding token; it can never name a room/identity it isn't bound to.
+ * The room/identity come ONLY from `resolve(bindToken)` — never from the hook body. The run header
+ * is checked against the active registration; a late hook cannot select the next run in that room.
  */
 
 /**
@@ -33,10 +33,10 @@ import { readJsonBody } from '../../util/http-body.js';
  * safe no-op drop inside the sink (never a throw).
  */
 export interface CcHookSink {
-	/** PostToolUse → a `{tool}` AgentEvent for the room (name only; reduceThinking ignores tools). */
-	tool(roomId: string, aiclawUid: string, toolName: string): void;
-	/** Stop → flush any final tool activity; do NOT close — the session's `done` comes from stdout EOF. */
-	flush(roomId: string, aiclawUid: string): void;
+	/** PostToolUse → the exact registered CC attempt; never choose the current room alone. */
+	tool(roomId: string, aiclawUid: string, runId: string, toolName: string): void;
+	/** Stop is not terminal: stdout result/EOF controls completion. */
+	flush(roomId: string, aiclawUid: string, runId: string): void;
 }
 
 /** resolve() result: the bound identity + room for a binding token (REQ-029: opaque strings). */
@@ -71,7 +71,7 @@ export class CcBroker {
 		this.sink = deps.sink;
 	}
 
-	async handle(req: { body: unknown; remoteAddress?: string; authToken?: string }): Promise<CcBrokerResponse> {
+	async handle(req: { body: unknown; remoteAddress?: string; authToken?: string; runId?: string }): Promise<CcBrokerResponse> {
 		// Non-local guard (defense-in-depth; a local TCP connection reports a loopback address).
 		if (req.remoteAddress !== undefined && !LOOPBACK.has(req.remoteAddress)) {
 			return { status: 403, json: { ok: false, error: 'forbidden: non-local connection' } };
@@ -93,6 +93,11 @@ export class CcBroker {
 		}
 
 		const { roomId, aiclawUid } = bound;
+		// The stable AICHAT_BIND identifies a conversation, not a run. Never route a hook without
+		// the fresh per-spawn correlation sent by the hook command in X-Aichat-Run.
+		if ((hook.event === 'PostToolUse' || hook.event === 'Stop') && (!req.runId || req.runId.length > 128)) {
+			return { status: 400, json: { ok: false, error: 'bad request: missing run id' } };
+		}
 		switch (hook.event) {
 			case 'UserPromptSubmit':
 			case 'SessionStart':
@@ -101,7 +106,7 @@ export class CcBroker {
 				break;
 			case 'PostToolUse': {
 				const toolName = typeof hook.body.tool_name === 'string' ? hook.body.tool_name : 'tool';
-				this.sink.tool(roomId, aiclawUid, toolName);
+				this.sink.tool(roomId, aiclawUid, req.runId!, toolName);
 				break;
 			}
 			case 'Stop':
@@ -109,7 +114,7 @@ export class CcBroker {
 				// activity; it does NOT close the session (the session's `done` comes from the driver's
 				// stdout EOF/`result`). (#120) THINKING is no longer sourced from hooks — it is teed from
 				// the driver's stdout (see headless-driver.ts teeOutput), so there is no MessageDisplay case.
-				this.sink.flush(roomId, aiclawUid);
+				this.sink.flush(roomId, aiclawUid, req.runId!);
 				break;
 			default:
 				// A known-but-unmirrored event (or future event): accept it, route nothing.
@@ -126,7 +131,8 @@ export class CcBroker {
 				const body = await readJsonBody(req);
 				const authToken = parseBearer(req.headers['authorization']);
 				const remoteAddress = req.socket.remoteAddress;
-				const out = await this.handle({ body, remoteAddress, authToken });
+				const runId = req.headers['x-aichat-run'];
+				const out = await this.handle({ body, remoteAddress, authToken, runId: typeof runId === 'string' ? runId : undefined });
 				res.writeHead(out.status, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify(out.json));
 			})();

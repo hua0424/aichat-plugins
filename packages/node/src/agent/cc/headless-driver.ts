@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
 import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
 import { buildCcSettings, writeCcSettings } from './launch.js';
@@ -85,7 +86,7 @@ export interface CcHeadlessDriverDeps {
 	 * that overwrites AICHAT_BIND cannot forge another (uid,room). resolveSession looks the token up here.
 	 */
 	bindTokens: BindTokenStore;
-	/** Per-room bridge: hooks routed by the broker land in the active session's stream via this. */
+	/** Per-identity/room/run bridge: hooks routed by the broker land only in their spawning session. */
 	registry: CcSessionRegistry;
 	/**
 	 * REQ-011 S3 (AC5/AC9): per-room append-only transcript sink (inbound + teed CC output). Injectable
@@ -281,6 +282,7 @@ class CcHeadlessSession implements AgentSession {
 	private readonly d: CcHeadlessSessionDeps;
 	private child: CcChild | null = null;
 	private ended = false;
+	private deregisterHook: (() => void) | null = null;
 
 	// push→pull queue state (installed per send()).
 	private buffer: AgentEvent[] = [];
@@ -340,7 +342,8 @@ class CcHeadlessSession implements AgentSession {
 		if (this.drainTimer) clearTimeout(this.drainTimer);
 		this.firstEventTimer = null;
 		this.drainTimer = null;
-		this.d.registry.deregister(this.d.roomId);
+		this.deregisterHook?.();
+		this.deregisterHook = null;
 		this.d.onClosed(this);
 		this.wake();
 	}
@@ -552,9 +555,6 @@ class CcHeadlessSession implements AgentSession {
 			text: attributed,
 		});
 
-		// Register the room bridge BEFORE spawning, so a hook that fires early still routes here.
-		this.d.registry.register(this.d.roomId, (ev) => this.push(ev));
-
 		this.spawnAttempt(attributed);
 		return this.iterable();
 	}
@@ -580,13 +580,22 @@ class CcHeadlessSession implements AgentSession {
 		// so a failure with `--resume` self-heals (clear + fresh retry) while a fresh failure is real.
 		this.attemptUsedResume = !!this.d.sessionStore.get(this.key)?.sessionId;
 
+		// Each actual spawn, including a fresh retry after a failed --resume, has a different hook
+		// correlation. A late hook from the previous child cannot be assigned to the new attempt.
+		const runId = randomUUID();
+		this.deregisterHook?.();
+		this.deregisterHook = this.d.registry.register(this.d.aiclawUid, this.d.roomId, runId, (ev) => this.push(ev));
+		const env: NodeJS.ProcessEnv = { ...process.env, AICHAT_BIND: this.d.bindToken, AICHAT_CC_RUN: runId, CLAUDE_NON_INTERACTIVE: '1' };
+		// Inherited agent contexts would make the reply CLI select the WRONG identity by precedence.
+		delete env.OPENCODE_SESSION_ID;
+		delete env.CODEX_THREAD_ID;
+		delete env.OPENCLAW_BIND;
+		delete env.AICHAT_CONTEXT_KEY;
 		let child: CcChild;
 		try {
 			child = this.d.spawn(this.d.claudeBin, this.buildArgv(), {
 				cwd: this.d.workspaceDir,
-				// BL-014 (#141): AICHAT_BIND carries the OPAQUE token, never the plaintext binding — the CC
-				// hook broker reads it as its `Authorization: Bearer <token>` and the reply CLI emits `cc:<token>`.
-				env: { ...process.env, AICHAT_BIND: this.d.bindToken, CLAUDE_NON_INTERACTIVE: '1' },
+				env,
 				detached: true,
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});

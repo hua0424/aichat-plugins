@@ -51,6 +51,7 @@ describe('buildCcHooksSettings', () => {
 			const cmd = commandFor(hooks, event);
 			expect(cmd).toContain(`http://127.0.0.1:${PORT}/hook`);
 			expect(cmd).toContain('-H "Authorization: Bearer $AICHAT_BIND"');
+			expect(cmd).toContain('-H "X-Aichat-Run: $AICHAT_CC_RUN"');
 			expect(cmd).toContain('--data-binary @-');
 			expect(cmd).toContain('-X POST');
 		}
