@@ -104,9 +104,8 @@ export class InMemoryBindTokenStore implements BindTokenStore {
 
 /**
  * File-backed BindTokenStore. Loads once on construction (rebuilding the reverse index), then persists
- * the whole forward map on every mint. The token file is a SENSITIVE credential — on every persist we
- * mkdir the dir, write, then chmod 0600. Read/parse failures degrade to an empty map (never crash the
- * node). Structure mirrors FileCodexSessionStore / FileCcHeadlessSessionStore.
+ * the whole forward map on every mint. The token file is a SENSITIVE credential — persist by staging
+ * an owner-only (0600) file then atomically replacing the old file. Corrupt existing data fails closed.
  */
 export class FileBindTokenStore extends InMemoryBindTokenStore {
 	private readonly path: string;
@@ -122,7 +121,7 @@ export class FileBindTokenStore extends InMemoryBindTokenStore {
 	}
 
 	private load(): void {
-		// Shared read primitive ({} on missing/parse-fail); the dual-map + normalization below is
+		// Shared read primitive ({} only on missing, throws on corruption); the dual-map + normalization below is
 		// bind-specific (a distinct security path, NOT the session stores' copy).
 		for (const [token, val] of Object.entries(readJsonMap<unknown>(this.path))) {
 			if (val && typeof val === 'object') {

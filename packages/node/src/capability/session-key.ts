@@ -61,11 +61,8 @@ export interface BoundSession {
 /**
  * REQ-010 S5 — prefix-routed session resolution.
  *
- * Parse `sessionKey` for a known prefix, then route ONLY to the agent whose `driver.type` matches the
- * prefix's agent type AND implements `resolveSession`. Ask that driver to resolve the (prefix-stripped)
- * id back to its bound `{ aiclawUid, roomId }`, then map to the OWNER agent's api (the agent whose uid
- * equals the resolved `aiclawUid`). This replaces the old try-every-driver loop: an unprefixed/unknown
- * key, or a prefix with no matching/resolving driver, yields `undefined`.
+ * Query registered drivers of the known type; only the driver registered for the resolved identity
+ * may claim its room. Reject conflicting claims instead of selecting the first same-type driver.
  */
 export function resolveBoundSession(
 	sessionKey: string,
@@ -74,14 +71,13 @@ export function resolveBoundSession(
 	const parsed = parseSessionKey(sessionKey);
 	if (!parsed) return undefined;
 
-	const router = agents.find((a) => a.driver.type === parsed.agentType && a.driver.resolveSession);
-	if (!router) return undefined;
-
-	const resolved = router.driver.resolveSession!(parsed.id);
-	if (!resolved) return undefined;
-
-	const owner = agents.find((a) => a.uid === resolved.aiclawUid);
-	if (!owner) return undefined;
-
-	return { aiclawUid: resolved.aiclawUid, roomId: resolved.roomId, apiClient: owner.api };
+	let match: BoundSession | undefined;
+	for (const agent of agents) {
+		if (agent.driver.type !== parsed.agentType || !agent.driver.resolveSession) continue;
+		const resolved = agent.driver.resolveSession(parsed.id);
+		if (!resolved || resolved.aiclawUid !== agent.uid) continue;
+		if (match) return undefined; // native id must not select among multiple registered identities
+		match = { aiclawUid: agent.uid, roomId: resolved.roomId, apiClient: agent.api };
+	}
+	return match;
 }
