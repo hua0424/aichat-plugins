@@ -68,11 +68,8 @@ export class OpencodeDriver implements AgentDriver {
 	 * stored under (`aiclaw-{uid}-room-{roomId}`) and parses it. Returns undefined if the id is
 	 * unknown or the key is unparseable.
 	 *
-	 * ponytail: this scans THIS driver's in-memory sessionStore. Correct for the PoC's single
-	 * opencode identity. Multiple opencode identities share the sessions.json file on disk but
-	 * have SEPARATE in-memory maps, so a fresh session created by another identity after this
-	 * driver loaded won't resolve here until reload. Upgrade when N>1: a shared session index or a
-	 * per-call reload of the store.
+	 * The node shares one in-memory store across all OpenCode identities; the capability resolver
+	 * checks that the resolved binding belongs to the driver registered for that identity.
 	 */
 	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
 		const key = this.sessionStore.findKeyBySessionID(sessionKey);

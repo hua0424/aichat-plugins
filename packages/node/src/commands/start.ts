@@ -109,6 +109,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// endpoint + CC broker resolve that token back to (uid,room) here. Persisted (0600) so a token minted
 	// before a restart still resolves. codex/opencode keep their own runtime-id stores (already unforgeable).
 	const bindTokenStore = new FileBindTokenStore();
+	// One loaded snapshot/writer per used type, shared across identities and connection retries.
+	let opencodeSessions: FileSessionStore | undefined;
+	let codexSessions: FileCodexSessionStore | undefined;
+	let ccSessions: FileCcHeadlessSessionStore | undefined;
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
@@ -121,7 +125,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new OpencodeDriver({
 					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
 					workspaceBase: opencodeWorkspaceBase,
-					sessionStore: new FileSessionStore(),
+					sessionStore: (opencodeSessions ??= new FileSessionStore()),
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -132,7 +136,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new CodexDriver({
 					codex: new Codex(),
 					workspaceBase: codexWorkspaceBase,
-					sessionStore: new FileCodexSessionStore(),
+					sessionStore: (codexSessions ??= new FileCodexSessionStore()),
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -145,7 +149,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new CcHeadlessDriver({
 					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
-					sessionStore: new FileCcHeadlessSessionStore(),
+					sessionStore: (ccSessions ??= new FileCcHeadlessSessionStore()),
 					bindTokens: bindTokenStore,
 					registry: ccRegistry,
 					transcript: ccTranscript,
@@ -239,7 +243,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		/* best-effort */
 	}
 
+	let shuttingDown = false;
 	const shutdown = async () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
 		console.log('\n[start] Shutting down...');
 		// Stop per-identity supervision first, THEN close the shared opencode server. The
 		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
@@ -248,7 +255,13 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		await ccBroker?.close().catch(() => {});
 		await supervisor.stop().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
-		process.exit(0);
+		const persisted = await Promise.allSettled([
+			opencodeSessions?.whenPersisted(), codexSessions?.whenPersisted(),
+			ccSessions?.whenPersisted(), bindTokenStore.whenPersisted(),
+		]);
+		const failed = persisted.filter((result) => result.status === 'rejected');
+		if (failed.length) console.error('[start] State flush failed:', failed);
+		process.exit(failed.length ? 1 : 0);
 	};
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);

@@ -78,12 +78,18 @@ describe('resolveBoundSession', () => {
 		expect(out).toEqual({ aiclawUid: 7, roomId: 42, apiClient: opencode.api });
 	});
 
-	it('owner api is the agent whose uid the driver resolved to (not the resolving driver)', () => {
-		// opencode driver resolves to uid 9; the api returned must be uid-9's api
-		const opencode = agent({ type: 'opencode', uid: 7, resolve: () => ({ aiclawUid: 9, roomId: 5 }) });
-		const owner = agent({ type: 'openclaw', uid: 9 });
-		const out = resolveBoundSession('opencode:ses_x', [opencode, owner]);
-		expect(out).toEqual({ aiclawUid: 9, roomId: 5, apiClient: owner.api });
+	it('uses the registered identity driver, not another same-type driver or its claimed identity', () => {
+		const first = agent({ type: 'codex', uid: 7, resolve: () => undefined });
+		const second = agent({ type: 'codex', uid: 9, resolve: (id) => id === 'thread_9' ? { aiclawUid: 9, roomId: 5 } : undefined });
+		expect(resolveBoundSession('codex:thread_9', [first, second])).toEqual({ aiclawUid: 9, roomId: 5, apiClient: second.api });
+		const wrong = agent({ type: 'codex', uid: 7, resolve: () => ({ aiclawUid: 9, roomId: 5 }) });
+		expect(resolveBoundSession('codex:thread_9', [wrong])).toBeUndefined();
+	});
+
+	it('rejects ambiguous native IDs registered to two identities', () => {
+		const first = agent({ type: 'codex', uid: 7, resolve: () => ({ aiclawUid: 7, roomId: 2 }) });
+		const second = agent({ type: 'codex', uid: 9, resolve: () => ({ aiclawUid: 9, roomId: 5 }) });
+		expect(resolveBoundSession('codex:duplicate', [first, second])).toBeUndefined();
 	});
 
 	it('codex:<id> with no codex driver present → undefined', () => {

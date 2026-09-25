@@ -409,7 +409,12 @@ class CcHeadlessSession implements AgentSession {
 		const type = obj.type;
 		if (type === 'system' && obj.subtype === 'init' && typeof obj.session_id === 'string' && obj.session_id) {
 			this.sessionId = obj.session_id;
-			this.d.sessionStore.set(this.key, { sessionId: obj.session_id });
+			try {
+				this.d.sessionStore.set(this.key, { sessionId: obj.session_id });
+			} catch (err) {
+				this.killChild();
+				this.fail(`session registration failed: ${errMsg(err)}`);
+			}
 			return;
 		}
 		if (type === 'result') {

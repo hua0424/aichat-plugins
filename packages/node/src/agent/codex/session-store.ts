@@ -33,13 +33,13 @@ export const DEFAULT_CODEX_SESSIONS_PATH = join(AICHAT_HOME, 'codex', 'sessions.
 /**
  * File-backed CodexSessionStore (a tiny JSON object map). Loads once on construction; each set()
  * writes the whole map back (the map is small — one entry per (aiclawUid, roomId) pair).
- * Read/parse/write failures degrade to an empty/no-op store rather than crashing the node.
+ * A broken persisted file fails construction rather than erasing existing history.
  */
 export class FileCodexSessionStore implements CodexSessionStore {
 	private readonly store: FileJsonMapStore<StoredCodexSession>;
 
 	constructor(path: string = DEFAULT_CODEX_SESSIONS_PATH) {
-		this.store = new FileJsonMapStore(path, (v) => typeof v.threadId === 'string');
+		this.store = new FileJsonMapStore(path, (v) => typeof v.threadId === 'string', (v) => v.threadId);
 	}
 
 	get(key: string): StoredCodexSession | undefined {

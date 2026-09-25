@@ -31,13 +31,13 @@ export const DEFAULT_CC_SESSIONS_PATH = join(AICHAT_HOME, 'cc', 'sessions.json')
 /**
  * File-backed CcHeadlessSessionStore (a tiny JSON object map). Loads once on construction; each set()
  * writes the whole map back (the map is small — one entry per (aiclawUid, roomId) pair).
- * Read/parse/write failures degrade to an empty/no-op store rather than crashing the node.
+ * A broken persisted file fails construction rather than erasing existing history.
  */
 export class FileCcHeadlessSessionStore implements CcHeadlessSessionStore {
 	private readonly store: FileJsonMapStore<StoredCcHeadlessSession>;
 
 	constructor(path: string = DEFAULT_CC_SESSIONS_PATH) {
-		this.store = new FileJsonMapStore(path, (v) => typeof v.sessionId === 'string');
+		this.store = new FileJsonMapStore(path, (v) => typeof v.sessionId === 'string', (v) => v.sessionId);
 	}
 
 	get(key: string): StoredCcHeadlessSession | undefined {
