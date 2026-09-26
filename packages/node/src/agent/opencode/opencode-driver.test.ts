@@ -148,6 +148,29 @@ const BASE = '/tmp/oc-ws';
 const SID = 'ses_new';
 
 describe('OpencodeDriver.openSession', () => {
+	it('does not prompt or restart when generation rotates during asynchronous subscription', async () => {
+		const { client, prompt, subscribe } = mockClient({ stream: spyableStream() });
+		const server = noopServer(client);
+		const store = memStore();
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
+		subscribe.mockImplementation(async () => { await pending; return { stream: spyableStream().stream }; });
+		let current = true;
+		const driver = new OpencodeDriver({ server, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', assertRunCurrent: () => { if (!current) throw new Error('stale generation'); } },
+		});
+		const events = drain(session.send('hi'));
+		expect(subscribe).toHaveBeenCalledOnce();
+		current = false;
+		release();
+		expect(await events).toContainEqual({ type: 'error', message: 'stale generation' });
+		expect(prompt).not.toHaveBeenCalled();
+		expect(server.restart).not.toHaveBeenCalled();
+		expect(store.del).not.toHaveBeenCalled();
+	});
+
 	it('group context → group dir; creates + persists a session', async () => {
 		const { client, create } = mockClient();
 		const store = memStore();
@@ -382,6 +405,23 @@ describe('OpencodeSession.send', () => {
 		await Promise.race([consumed, timeout]);
 		// The parked SSE subscription was actively closed, not just abandoned.
 		expect(spied.returnSpy).toHaveBeenCalled();
+	});
+
+	it.each(['prepared {displayName}', ''])('passes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const { client, prompt } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const getSelfName = vi.fn(async () => 'ignored');
+		const session = await driver.openSession({
+			aiclawUid: '1', roomId: '1',
+			chatContext: { roomType: 1, roomId: '1', preparedSystemPrompt, templates: TEMPLATES, getSelfName },
+		});
+		session.send('original');
+		await new Promise((r) => setImmediate(r));
+		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }>; system?: string } }).body;
+		expect(body).toHaveProperty('system', preparedSystemPrompt);
+		expect(body.parts[0].text).toBe('original');
+		expect(getSelfName).not.toHaveBeenCalled();
+		await session.close();
 	});
 
 	// REQ-018 — the reply contract + identity anchor + persona are rendered into the prompt body's

@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
+import { supportsLegacyReset } from '../agent/legacy-run.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
@@ -32,6 +33,7 @@ import { legacyBridges } from '../capability/legacy-bridges.js';
 import type { ContextCandidate } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
 import { ensureAichatOnPath } from '../util/path-inject.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * aichat start — 读取本地配置自动连接。
@@ -180,7 +182,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				onAuthError: hooks.onAuthError,
 			}),
 		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
-			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
+			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
+				if (!conversations) throw new Error('conversation bindings not ready');
+				return conversations;
+			}),
 	});
 
 	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.
@@ -194,15 +199,18 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// REQ-010 S4: group query capabilities (list-groups token-scoped; list-group-members server-validated)
 	registry$.register('list-groups', listGroupsCapability());
 	registry$.register('list-group-members', listGroupMembersCapability());
-	// aichatoverview#124: runtime per-room session reset. Identity+room come from the resolved session
-	// (ctx), never args; the closure dispatches to the owning agent's driver.resetSession.
+	// Reset the authoritative record in one commit; legacy driver stores are views of that record.
+	// Never clear a native file before the generation/key rotation has persisted successfully.
 	registry$.register(
 		'reset-session',
-		resetSessionCapability((aiclawUid, roomId) => {
-			const owner = supervisor.agents.find((a) => a.uid === aiclawUid);
-			if (!owner) return undefined;
-			const reset = owner.driver.resetSession?.(aiclawUid, roomId) ?? false;
-			return { driverType: owner.driver.type, reset };
+		resetSessionCapability((aiclawUid, roomId, requestId, bearer) => {
+			const owner = supervisor.agents.find((a) => a.uid === aiclawUid && a.status !== 'offline');
+			if (!owner || !conversations) return undefined;
+			if (!supportsLegacyReset(owner.driver)) return { driverType: owner.driver.type, reset: false };
+			const cancelRunId = conversations.get(aiclawUid, roomId)?.pendingRuns?.[0]?.runId;
+			const record = conversations.reset(aiclawUid, roomId, requestId, bearer);
+			return { driverType: owner.driver.type, reset: true, generation: record.generation,
+				executionPaused: record.state === 'stop_unconfirmed', cancelRunId };
 		}),
 	);
 	const bound = (record: ReturnType<ConversationStore['resolveCandidate']>) => {
@@ -217,6 +225,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
 			Parameters<ConversationStore['resolveCandidate']>[0])),
 		serverNamespace: restBaseUrl,
+		getResetReceipt: (bearer, id) => conversations?.getResetReceipt(bearer, id),
+		isPaused: (uid, room) => {
+			const state = conversations?.get(uid, room)?.state;
+			return state === 'suspended' || state === 'stop_unconfirmed' || state === 'disabled';
+		},
+		onResetDelivered: (uid, room, oldRunId) => {
+			if (!oldRunId) return; // Do not cancel a newer run that began after reset.
+			const owner = supervisor.agents.find((agent) => agent.uid === uid);
+			void owner?.handler.cancelRun(room, oldRunId).catch((err) => console.error('[reset] cancel failed:', errMsg(err)));
+		},
 		lockHome: AICHAT_HOME,
 	});
 	let ccBroker: CcBroker | null = null;

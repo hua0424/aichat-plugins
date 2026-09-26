@@ -46,7 +46,7 @@ export interface ChatContext {
 	 * REQ-018: LAZY resolver for this aiclaw's own display name (resolved once + cached at the handler).
 	 * Now used by ALL FOUR drivers — the unified system-prompt identity anchor renders `{displayName}`
 	 * from it (cc #132 was the original consumer; opencode/codex/openclaw joined in REQ-018). A driver
-	 * only calls it when templates are present, so drivers/turns without templates still pay nothing.
+	 * only calls it when rendering templates (not when a prepared prompt is supplied).
 	 * Kept a thunk (not an eager `selfName` field) so the cost is pay-per-use.
 	 */
 	getSelfName?: () => Promise<string | undefined>;
@@ -62,6 +62,10 @@ export interface ChatContext {
 	 * them (onConnected). When undefined the driver renders NO system prompt (degrades gracefully).
 	 */
 	templates?: AgentPromptTemplates;
+	/** Fully rendered system prompt from the handler; when supplied, drivers do not render templates. */
+	preparedSystemPrompt?: string;
+	/** Parent-owned generation gate; drivers invoke synchronously immediately before native submit. */
+	assertRunCurrent?: () => void;
 }
 
 /**

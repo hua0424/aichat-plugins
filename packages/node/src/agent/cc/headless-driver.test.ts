@@ -284,6 +284,37 @@ describe('CcHeadlessDriver — shape', () => {
 });
 
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
+	it('blocks a self-heal spawn after reset-like generation rotation', async () => {
+		const multi = fakeMultiSpawn();
+		const { driver, store } = makeDriver({ spawn: multi.spawn });
+		store.set(KEY, { sessionId: 'old' });
+		let current = true;
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { ...BASE_CTX, assertRunCurrent: () => { if (!current) throw new Error('stale generation'); } },
+		});
+		const events = drain(session.send('hi'));
+		expect(multi.calls).toHaveLength(1);
+		current = false;
+		multi.calls[0].emitError(new Error('dead resume'));
+		expect(await events).toContainEqual({ type: 'error', message: 'stale generation' });
+		expect(multi.calls).toHaveLength(1);
+	});
+
+	it.each(['prepared {displayName}', ''])('passes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const { driver, fs } = makeDriver();
+		const getSelfName = vi.fn(async () => 'ignored');
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { ...BASE_CTX, preparedSystemPrompt, templates: TEMPLATES, getSelfName },
+		});
+		session.send('original');
+		const args = fs.spawnCall!.args;
+		expect(args[args.indexOf('--append-system-prompt') + 1]).toBe(preparedSystemPrompt);
+		expect(getSelfName).not.toHaveBeenCalled();
+		expect(stdinText(fs)).toBe('original');
+		await session.close();
+	});
 	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
 		// REQ-018: chatContext exposes templates + persona + a lazy getSelfName → the driver renders the

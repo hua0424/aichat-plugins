@@ -149,6 +149,21 @@ const BASE = '/tmp/codex-ws';
 const TID = 'thread_abc';
 
 describe('CodexDriver.openSession', () => {
+	it('checks the per-run callback at runStreamed rather than only at openSession', async () => {
+		const { codex, runStreamed } = mockCodex();
+		const store = memStore();
+		let current = true;
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', assertRunCurrent: () => { if (!current) throw new Error('stale generation'); } },
+		});
+		current = false;
+		expect(await drain(session.send('hi'))).toContainEqual({ type: 'error', message: 'stale generation' });
+		expect(runStreamed).not.toHaveBeenCalled();
+		expect(store.del).not.toHaveBeenCalled();
+	});
+
 	it('group context → group dir; NEW key → startThread with full threadOpts', async () => {
 		const { codex, startThread, resumeThread } = mockCodex();
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });
@@ -583,6 +598,21 @@ describe('CodexDriver.connect/disconnect', () => {
 });
 
 describe('CodexDriver REQ-018 — AGENTS.md system prompt', () => {
+	it.each(['prepared {displayName}', ''])('writes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const base = mkdtempSync(join(tmpdir(), 'codex-prepared-'));
+		const getSelfName = vi.fn(async () => 'ignored');
+		try {
+			const driver = new CodexDriver({ codex: mockCodex().codex, workspaceBase: base, sessionStore: memStore() });
+			await driver.openSession({
+				aiclawUid: '5', roomId: '9',
+				chatContext: { roomType: 1, roomId: '9', preparedSystemPrompt, templates: TEMPLATES, getSelfName },
+			});
+			expect(readFileSync(join(base, '5', 'group', '9', 'AGENTS.md'), 'utf-8')).toBe(`<!-- aichat:system:begin -->\n${preparedSystemPrompt}\n<!-- aichat:system:end -->\n`);
+			expect(getSelfName).not.toHaveBeenCalled();
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
 	it('with templates, openSession writes the rendered system prompt into workspace AGENTS.md; send still uses the pure message', async () => {
 		const { codex, runStreamed } = mockCodex();
 		const base = mkdtempSync(join(tmpdir(), 'codex-agents-'));

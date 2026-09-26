@@ -14,6 +14,9 @@ export interface CapabilityContext {
 	aiclawUid: string;
 	roomId: string;
 	apiClient: HulaApiClient;
+	/** Endpoint-owned reset receipt correlation; never populated from capability args. */
+	requestId?: string;
+	resetBearer?: string;
 }
 
 export class CapabilityRejectedError extends Error {}
@@ -66,12 +69,16 @@ export function sendMessageCapability(): Capability {
  * was actually reset (false = stateless driver like openclaw, a no-op).
  */
 export function resetSessionCapability(
-	resetFor: (aiclawUid: string, roomId: string) => { driverType: string; reset: boolean } | undefined,
+	resetFor: (aiclawUid: string, roomId: string, requestId?: string, bearer?: string) => { driverType: string; reset: boolean; generation?: number; executionPaused?: boolean; cancelRunId?: string } | undefined,
 ): Capability {
 	return async (ctx) => {
-		const r = resetFor(ctx.aiclawUid, ctx.roomId);
+		const r = ctx.requestId === undefined
+			? resetFor(ctx.aiclawUid, ctx.roomId)
+			: resetFor(ctx.aiclawUid, ctx.roomId, ctx.requestId, ctx.resetBearer);
 		if (!r) throw new CapabilityRejectedError('reset-session: no live agent for this identity');
-		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset };
+		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset,
+			...(r.generation === undefined ? {} : { generation: r.generation, executionPaused: r.executionPaused }),
+			...(r.cancelRunId === undefined ? {} : { cancelRunId: r.cancelRunId }) };
 	};
 }
 

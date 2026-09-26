@@ -3,6 +3,7 @@ import { activate } from './commands/activate.js';
 import { start } from './commands/start.js';
 import { handleSendMessage } from './commands/send-message.js';
 import { handleResetSession } from './commands/reset-session.js';
+import { handleRecoverRun } from './commands/recover-run.js';
 import { handleMemberInfo } from './commands/member-info.js';
 import { handleListFriends } from './commands/list-friends.js';
 import { handleFindFriend } from './commands/find-friend.js';
@@ -28,6 +29,9 @@ switch (command) {
 	// aichatoverview#124: runtime per-room agent session reset
 	case 'reset-session':
 		await handleResetSession(args.slice(1));
+		break;
+	case 'recover-run':
+		await handleRecoverRun(args.slice(1));
 		break;
 	// REQ-010 S3: read-only query subcommands
 	case 'member-info':
@@ -92,6 +96,8 @@ Commands:
                                                  (room + identity are bound automatically
                                                   from your agent session — never passed in)
   reset-session [--request-id <id>]              Reset this room's agent session (fresh next msg)
+  recover-run <runId> --verified-stopped          Offline-only: confirm a manually verified stopped run
+                                                 (stop daemon first; NEVER assume restart proves stopped)
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
   find-friend <keyword>                          Search users by keyword (substring match)

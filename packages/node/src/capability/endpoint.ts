@@ -28,6 +28,12 @@ export interface CapabilityEndpointDeps {
 	serverNamespace?: string;
 	/** Maximum admitted local write IDs; reject NEW IDs when full rather than evict safely recorded ones. */
 	maxWriteIds?: number;
+	/** Durable reset-only receipt lookup before revoked bearer resolution. */
+	getResetReceipt?: (bearer: string, requestId: string) => { reset: true; generation: number; executionPaused: boolean } | undefined;
+	/** Core conversation state, never inferred from a caller-supplied room. */
+	isPaused?: (uid: string, roomId: string) => boolean;
+	/** Stop the old run only after the reset HTTP response has left this process. */
+	onResetDelivered?: (uid: string, roomId: string, previousRunId?: string) => void;
 	/** Test seam: force win32 behavior (named pipe, skip POSIX chmod/cleanup) on any host. */
 	platform?: NodeJS.Platform;
 }
@@ -75,6 +81,10 @@ export class CapabilityEndpoint {
 	private readonly serverNamespace: string;
 	private readonly lockHome?: string;
 	private readonly maxWriteIds: number;
+	private readonly getResetReceipt?: CapabilityEndpointDeps['getResetReceipt'];
+	private readonly isPaused?: (uid: string, roomId: string) => boolean;
+	private readonly onResetDelivered?: CapabilityEndpointDeps['onResetDelivered'];
+	private readonly delivery = new WeakMap<CapabilityResponse, () => void>();
 	/** POSIX fs guards (dir/socket chmod, stale unlink) apply only on non-win32. */
 	private readonly platform: NodeJS.Platform;
 	private server: Server | null = null;
@@ -90,6 +100,9 @@ export class CapabilityEndpoint {
 		this.serverNamespace = deps.serverNamespace ?? '';
 		this.lockHome = deps.lockHome;
 		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
+		this.getResetReceipt = deps.getResetReceipt;
+		this.isPaused = deps.isPaused;
+		this.onResetDelivered = deps.onResetDelivered;
 		if (!Number.isSafeInteger(this.maxWriteIds) || this.maxWriteIds < 1) throw new Error('maxWriteIds must be a positive integer');
 		this.platform = deps.platform ?? process.platform;
 	}
@@ -117,9 +130,12 @@ export class CapabilityEndpoint {
 			? JSON.stringify([parsed.sessionKey ?? parsed.contexts, parsed.requestId]) : undefined;
 		if (resetReceiptKey) {
 			const receipt = this.resetReceipts.get(resetReceiptKey);
-			if (receipt) return Object.keys(parsed.args).length
+			let durable: ReturnType<NonNullable<CapabilityEndpointDeps['getResetReceipt']>>;
+			try { durable = this.getResetReceipt?.(JSON.stringify(parsed.sessionKey ?? parsed.contexts), parsed.requestId!); }
+			catch { return { status: 503, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'reset receipt lookup unavailable' } }; }
+			if (receipt || durable) return Object.keys(parsed.args).length
 				? { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } }
-				: receipt;
+				: receipt ?? { status: 200, json: { ok: true, result: durable } };
 		}
 		let resolved: Resolved | undefined;
 		let generation: number | undefined;
@@ -143,7 +159,10 @@ export class CapabilityEndpoint {
 		}
 		if (!resolved) {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
-			return { status: 404, json: { ok: false, error: 'unknown session' } };
+			return { status: 404, json: { ok: false, code: 'CONTEXT_REVOKED', error: 'unknown session' } };
+		}
+		if (parsed.command === 'send-message' && this.isPaused?.(resolved.aiclawUid, resolved.roomId)) {
+			return { status: 409, json: { ok: false, code: 'STOP_UNCONFIRMED', error: 'conversation execution paused pending stop confirmation' } };
 		}
 
 		if (!this.registry.has(parsed.command)) {
@@ -159,6 +178,10 @@ export class CapabilityEndpoint {
 			aiclawUid: resolved.aiclawUid,
 			roomId: resolved.roomId,
 			apiClient: resolved.apiClient,
+			...(parsed.command === 'reset-session' ? {
+				requestId: parsed.requestId,
+				resetBearer: JSON.stringify(parsed.sessionKey ?? parsed.contexts),
+			} : {}),
 		};
 		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
 		if (write && !parsed.requestId) {
@@ -204,7 +227,20 @@ export class CapabilityEndpoint {
 					this.roomGeneration.set(roomKey, (this.roomGeneration.get(roomKey) ?? 0) + 1);
 				}
 				console.log(`${loc} ok`);
-				return { status: 200, json: { ok: true, result } };
+				// The revoked bearer can replay only this operation's minimal receipt, never another cached result.
+				const receipt = parsed.command === 'reset-session' ? {
+					reset: (result as { reset?: boolean })?.reset === true,
+					...((result as { generation?: number })?.generation === undefined ? {} : {
+						generation: (result as { generation: number }).generation,
+						executionPaused: (result as { executionPaused?: boolean }).executionPaused === true,
+					}),
+				} : result;
+				const response: CapabilityResponse = { status: 200, json: { ok: true, result: receipt } };
+				if (parsed.command === 'reset-session' && (result as { reset?: boolean })?.reset) {
+					this.delivery.set(response, () => this.onResetDelivered?.(resolved.aiclawUid, resolved.roomId,
+						(result as { cancelRunId?: string }).cancelRunId));
+				}
+				return response;
 			} catch (err) {
 				const msg = errMsg(err);
 				console.log(`${loc} err=${sanitizeLogField(msg)}`);
@@ -277,6 +313,10 @@ export class CapabilityEndpoint {
 					const body = await readJsonBody(req);
 					const out = await this.handle({ body, remoteAddress: req.socket.remoteAddress });
 					res.writeHead(out.status, { 'Content-Type': 'application/json' });
+					res.once('finish', () => {
+						const afterDelivery = this.delivery.get(out);
+						if (afterDelivery) { this.delivery.delete(out); afterDelivery(); }
+					});
 					res.end(JSON.stringify(out.json));
 				})();
 			});
