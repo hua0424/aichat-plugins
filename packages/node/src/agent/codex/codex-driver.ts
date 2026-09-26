@@ -146,6 +146,7 @@ export class CodexDriver implements AgentDriver {
 			this.sessionStore,
 			this.codex,
 			threadOpts,
+			ctx.assertRunCurrent,
 		);
 	}
 }
@@ -170,6 +171,7 @@ class CodexSession implements AgentSession {
 		// invalidates the stale store entry and starts a FRESH thread to retry the turn once.
 		private readonly codex: CodexClient,
 		private readonly threadOpts: ThreadOptions,
+		private readonly assertRunCurrent?: () => void,
 	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
@@ -287,6 +289,7 @@ class CodexSession implements AgentSession {
 		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
 		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.
 		const consume = async (thread: Thread): Promise<void> => {
+			this.assertRunCurrent?.();
 			const { events } = await thread.runStreamed(message);
 			const iter = (events as AsyncIterable<unknown>)[Symbol.asyncIterator]();
 			if (!installIter(iter)) return; // already closed → installIter terminated the iter
@@ -308,6 +311,13 @@ class CodexSession implements AgentSession {
 			try {
 				await consume(this.thread);
 			} catch (err) {
+				// A rotated run must never self-heal into a fresh native execution.
+				try {
+					this.assertRunCurrent?.();
+				} catch (stale) {
+					push({ type: 'error', message: errOf(stale) });
+					return;
+				}
 				// Self-heal: a resumed thread whose rollout is gone rejects before any event. Invalidate the
 				// stale store entry and retry the turn ONCE on a FRESH thread; captureThreadStarted then
 				// stores the new id. Guarded by !pushed so we never retry mid-stream / double-emit.

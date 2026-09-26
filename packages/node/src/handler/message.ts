@@ -721,6 +721,7 @@ export class MessageHandler {
 					runId: id, message: agentEnvelope, systemPrompt,
 					conversation: {
 						id: bound.conversationId, generation: bound.generation,
+						assertCurrent: () => bound.assertCurrent(),
 						nativeState: bound.nativeState[this.driver.type as keyof typeof bound.nativeState]
 							? { version: 1, value: bound.nativeState[this.driver.type as keyof typeof bound.nativeState] }
 							: undefined,

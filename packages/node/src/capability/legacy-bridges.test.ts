@@ -72,7 +72,7 @@ describe('legacy driver bridge', () => {
 		const input: PreparedRun = {
 			runId: 'old', message: 'hello', systemPrompt: '', signal: new AbortController().signal,
 			conversation: { id: bound.conversationId, generation: bound.generation, nativeState: undefined,
-				saveNativeState: async () => {}, registerNativeAlias: async () => {} },
+				assertCurrent: () => bound.assertCurrent(), saveNativeState: async () => {}, registerNativeAlias: async () => {} },
 			saveRecovery: async (value) => bound.saveRecovery(value), capabilities: { invoke: async () => undefined },
 		};
 		const bridge = new LegacyDriverBridge(driver, () => ({ aiclawUid: '1', roomId: '42', chatContext: { roomId: '42', roomType: 1 } }), { nativeScope: scope });

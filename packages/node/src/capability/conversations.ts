@@ -29,6 +29,8 @@ export interface BoundConversationRun {
 	readonly generation: number;
 	readonly contextKey: string;
 	readonly nativeState: ConversationRecord['nativeState'];
+	/** Synchronous, side-effect-free gate checked immediately before native submission. */
+	assertCurrent(): void;
 	saveNativeState(provider: Provider, state: Record<string, unknown>): void;
 	registerNativeAlias(provider: Provider, id: string, runtimeScope?: string): void;
 	registerNative(provider: Provider, id: string, state?: Record<string, unknown>, runtimeScope?: string): void;
@@ -179,6 +181,7 @@ export class ConversationStore {
 		};
 		return {
 			conversationId, generation, contextKey: record.contextKey, nativeState: copy(record.nativeState),
+			assertCurrent: () => { current(); },
 			saveNativeState: (provider, state) => {
 				current(); this.assertProvider(provider, identityId);
 				if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid native state');

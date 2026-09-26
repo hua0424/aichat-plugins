@@ -129,6 +129,20 @@ describe('OpenclawDriver — lifecycle', () => {
 });
 
 describe('OpenclawDriver — session keying', () => {
+	it('does not send an agent request when the generation rotates before send', async () => {
+		const { driver, gw } = await connectedDriver();
+		let current = true;
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', assertRunCurrent: () => { if (!current) throw new Error('stale generation'); } },
+		});
+		current = false;
+		expect(() => session.send('hi')).toThrow('stale generation');
+		expect(gw.socket.sent.filter((frame) => (frame as { method?: string }).method === 'agent')).toHaveLength(0);
+		await session.close();
+		await driver.disconnect();
+	});
+
 	it('openSession sends the COMPOUND `<token>:<binding>` to the gateway; resolveSession reverses the BARE token only', async () => {
 		const { driver, gw } = await connectedDriver();
 		const session = await driver.openSession({ aiclawUid: '999', roomId: '7', chatContext: {} });

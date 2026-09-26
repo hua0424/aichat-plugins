@@ -64,6 +64,8 @@ export interface ChatContext {
 	templates?: AgentPromptTemplates;
 	/** Fully rendered system prompt from the handler; when supplied, drivers do not render templates. */
 	preparedSystemPrompt?: string;
+	/** Parent-owned generation gate; drivers invoke synchronously immediately before native submit. */
+	assertRunCurrent?: () => void;
 }
 
 /**

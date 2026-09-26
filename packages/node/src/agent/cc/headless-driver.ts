@@ -227,6 +227,7 @@ export class CcHeadlessDriver implements AgentDriver {
 			registry: this.registry,
 			transcript: this.transcript,
 			spawn: this.spawn,
+			assertRunCurrent: ctx.assertRunCurrent,
 			kill: this.kill,
 			firstEventTimeoutMs: this.firstEventTimeoutMs,
 			drainMs: this.drainMs,
@@ -261,6 +262,7 @@ interface CcHeadlessSessionDeps {
 	registry: CcSessionRegistry;
 	transcript: CcTranscriptWriter;
 	spawn: CcSpawnFn;
+	assertRunCurrent?: () => void;
 	kill: CcKillFn;
 	firstEventTimeoutMs: number;
 	drainMs: number;
@@ -591,6 +593,14 @@ class CcHeadlessSession implements AgentSession {
 		delete env.CODEX_THREAD_ID;
 		delete env.OPENCLAW_BIND;
 		delete env.AICHAT_CONTEXT_KEY;
+		// The same gate covers the first attempt and a synchronous self-heal retry. A stale run
+		// is terminal, not a dead --resume session that should trigger another attempt.
+		try {
+			this.d.assertRunCurrent?.();
+		} catch (err) {
+			this.fail(errMsg(err));
+			return;
+		}
 		let child: CcChild;
 		try {
 			child = this.d.spawn(this.d.claudeBin, this.buildArgv(), {

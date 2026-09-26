@@ -7,7 +7,7 @@ function fixture() {
 	const input: PreparedRun = {
 		runId: 'run-1', message: '[HuLa 群聊]\n[alice]: hi', systemPrompt: '', signal: controller.signal,
 		conversation: {
-			id: 'conversation-1', generation: 1, nativeState: undefined,
+			id: 'conversation-1', generation: 1, nativeState: undefined, assertCurrent: () => {},
 			saveNativeState: async () => {}, registerNativeAlias: async () => {},
 		},
 		saveRecovery: async () => {},
@@ -43,7 +43,7 @@ describe('LegacyDriverBridge', () => {
 		expect(f.openSession).not.toHaveBeenCalled();
 		expect(f.send).not.toHaveBeenCalled();
 		expect(await collect(run.events)).toEqual([{ type: 'thinking', text: 'working' }, { type: 'done', durationMs: 1 }]);
-		expect(f.openSession).toHaveBeenCalledWith({ aiclawUid: 'identity-1', roomId: 'room-1', chatContext: { ...f.context, preparedSystemPrompt: '' } });
+		expect(f.openSession).toHaveBeenCalledWith({ aiclawUid: 'identity-1', roomId: 'room-1', chatContext: { ...f.context, preparedSystemPrompt: '', assertRunCurrent: expect.any(Function) } });
 		expect(f.send).toHaveBeenCalledOnce();
 		expect(f.send).toHaveBeenCalledWith(f.input.message);
 		expect(() => run.events[Symbol.asyncIterator]()).toThrow('only once');
@@ -71,6 +71,20 @@ describe('LegacyDriverBridge', () => {
 		release(g.session);
 		expect(await pending).toEqual([{ type: 'cancelled', reason: 'Cancelled before submission' }]);
 		expect(g.send).not.toHaveBeenCalled();
+	});
+
+	it('rejects a reset generation before submitting after an awaited legacy openSession', async () => {
+		const f = fixture();
+		let release!: (session: AgentSession) => void;
+		f.openSession.mockImplementationOnce(() => new Promise<AgentSession>((resolve) => { release = resolve; }));
+		let revoked = false;
+		f.input.conversation.assertCurrent = () => { if (revoked) throw new Error('STALE_GENERATION'); };
+		const pending = collect(f.bridge.createRun(f.input).events);
+		await vi.waitFor(() => expect(f.openSession).toHaveBeenCalledOnce());
+		revoked = true;
+		release(f.session);
+		expect(await pending).toEqual([{ type: 'error', message: 'STALE_GENERATION' }]);
+		expect(f.send).not.toHaveBeenCalled();
 	});
 
 	it('does not equate close or error/EOF to a confirmed stop', async () => {
@@ -144,7 +158,7 @@ describe('LegacyDriverBridge', () => {
 		const pending = collect(prepared.events);
 		await vi.waitFor(() => expect(f.openSession).toHaveBeenCalledTimes(2));
 		expect(f.openSession).toHaveBeenLastCalledWith({ aiclawUid: 'identity-1', roomId: 'room-1',
-			chatContext: { ...f.context, preparedSystemPrompt: 'rendered exactly once' } });
+			chatContext: { ...f.context, preparedSystemPrompt: 'rendered exactly once', assertRunCurrent: expect.any(Function) } });
 		await pending;
 	});
 });

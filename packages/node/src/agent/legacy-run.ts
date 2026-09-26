@@ -104,6 +104,7 @@ export class LegacyDriverBridge {
 				preparing = true;
 				session = await driver.openSession({ ...binding, chatContext: {
 					...binding.chatContext, preparedSystemPrompt: input.systemPrompt,
+					assertRunCurrent: () => input.conversation.assertCurrent(),
 				} });
 				preparing = false;
 				if (cancelled || disposed || input.signal.aborted) {
@@ -122,6 +123,9 @@ export class LegacyDriverBridge {
 					yield { type: 'cancelled', reason: 'Cancelled before submission' };
 					return;
 				}
+				// No await between the core generation check and synchronous send(). Native drivers
+				// check the same gate again after their own asynchronous pre-submit preparation.
+				input.conversation.assertCurrent();
 				// send() may start native work synchronously. Mark submission before calling it.
 				submitted = true;
 				const stream = session.send(input.message);

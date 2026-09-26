@@ -146,7 +146,7 @@ export class OpencodeDriver implements AgentDriver {
 			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null }) || undefined
 			: undefined);
 
-		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), systemPrompt, onSessionError);
+		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), systemPrompt, onSessionError, ctx.assertRunCurrent);
 	}
 }
 
@@ -180,6 +180,7 @@ class OpencodeSession implements AgentSession {
 		 * stale session binding (lazy rebuild on the next turn) + best-effort restart the server.
 		 */
 		private readonly onSessionError?: () => void,
+		private readonly assertRunCurrent?: () => void,
 	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
@@ -275,7 +276,17 @@ class OpencodeSession implements AgentSession {
 		void (async () => {
 			try {
 				const { stream } = await this.client.event.subscribe({ query: { directory: this.directory } });
+				const iter = stream[Symbol.asyncIterator]();
+				streamIter = iter;
 
+				// Subscription is asynchronous: reset may rotate the parent while it is pending.
+				// A rejected gate is not a broken server/session and must not trigger restart.
+				try {
+					this.assertRunCurrent?.();
+				} catch (err) {
+					push({ type: 'error', message: errMsg(err) });
+					return;
+				}
 				// Fire the prompt AFTER subscribing so no early event is missed. We do not await
 				// its completion to drive the loop — completion arrives via session.idle.
 				const promptPromise = this.client.session.prompt({
@@ -302,8 +313,6 @@ class OpencodeSession implements AgentSession {
 
 				// Iterate the stream MANUALLY (not `for await`) so finish()/close() can call
 				// streamIter.return() to terminate a parked next() and close the subscription.
-				const iter = stream[Symbol.asyncIterator]();
-				streamIter = iter;
 				if (iterReturned) {
 					// finish()/close() already fired before we stored the iterator → honor it.
 					returnIter();

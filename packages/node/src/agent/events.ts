@@ -20,6 +20,8 @@ export interface BoundConversation {
 	readonly id: string;
 	readonly generation: number;
 	readonly nativeState: { version: number; value: unknown } | undefined;
+	/** Core's synchronous generation gate, callable without native or network side effects. */
+	assertCurrent(): void;
 	saveNativeState(value: { version: number; value: unknown }): Promise<void>;
 	registerNativeAlias(alias: { scope: string; id: string }): Promise<void>;
 }

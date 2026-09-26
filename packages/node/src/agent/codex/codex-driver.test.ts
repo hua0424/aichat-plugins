@@ -149,6 +149,21 @@ const BASE = '/tmp/codex-ws';
 const TID = 'thread_abc';
 
 describe('CodexDriver.openSession', () => {
+	it('checks the per-run callback at runStreamed rather than only at openSession', async () => {
+		const { codex, runStreamed } = mockCodex();
+		const store = memStore();
+		let current = true;
+		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: store });
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { roomType: 1, roomId: '9', assertRunCurrent: () => { if (!current) throw new Error('stale generation'); } },
+		});
+		current = false;
+		expect(await drain(session.send('hi'))).toContainEqual({ type: 'error', message: 'stale generation' });
+		expect(runStreamed).not.toHaveBeenCalled();
+		expect(store.del).not.toHaveBeenCalled();
+	});
+
 	it('group context → group dir; NEW key → startThread with full threadOpts', async () => {
 		const { codex, startThread, resumeThread } = mockCodex();
 		const driver = new CodexDriver({ codex, workspaceBase: BASE, sessionStore: memStore() });

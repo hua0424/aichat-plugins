@@ -387,7 +387,7 @@ export class OpenclawDriver implements AgentDriver {
 			}
 		}
 
-		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink));
+		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink), o.chatContext.assertRunCurrent);
 	}
 
 	async connect(): Promise<void> {
@@ -953,7 +953,10 @@ class OpenclawSession implements AgentSession {
 	 * sink send() hands it. The driver builds this closure in openSession (capturing the compound
 	 * sessionKey) so the gateway engine stays encapsulated on the driver.
 	 */
-	constructor(private readonly startChat: (message: string, sink: ChatSink) => void) {}
+	constructor(
+		private readonly startChat: (message: string, sink: ChatSink) => void,
+		private readonly assertRunCurrent?: () => void,
+	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
 		const buffer: AgentEvent[] = [];
@@ -986,6 +989,7 @@ class OpenclawSession implements AgentSession {
 		// REQ-010 S1 / aichatoverview#161: no terminal AgentEvent — the openclaw agent sends its
 		// reply out-of-band by running `aichat send-message` (accounted at the node's
 		// CapabilityEndpoint), so there is no in-stream terminal tool to bridge.
+		this.assertRunCurrent?.();
 		this.startChat(message, { push, finish });
 
 		const isClosed = () => this.closed;
