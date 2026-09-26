@@ -1,8 +1,10 @@
 import { createServer, type Server } from 'node:http';
-import { createHash } from 'node:crypto';
+import { createConnection } from 'node:net';
+import { createHash, randomUUID } from 'node:crypto';
 import { readJsonBody } from '../util/http-body.js';
-import { unlinkSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
-import { dirname, posix } from 'node:path';
+import { unlinkSync, existsSync, mkdirSync, chmodSync, openSync, writeSync, closeSync, readFileSync, lstatSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
 import { CapabilityRejectedError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
 import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
@@ -11,11 +13,17 @@ import { errMsg } from '../util/err.js';
 
 /** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
 type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
+export type ContextCandidate = { key: string } | { provider: string; nativeId: string; runtimeScope?: string };
+export type ResolvedCandidate = Resolved & { conversationId: string; generation: number };
 
 export interface CapabilityEndpointDeps {
 	registry: CapabilityRegistry;
 	/** Map an agent session key → bound identity/room/api, or undefined if unknown. */
 	resolve: (sessionKey: string) => Resolved | undefined;
+	/** Core-owned exact candidate lookup; all V2 candidates must resolve to the same binding. */
+	resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
+	/** All endpoints using the same AICHAT_HOME share one writer lock, even with different socket overrides. */
+	lockHome?: string;
 	/** Namespaces request IDs to this configured server, not another backend. */
 	serverNamespace?: string;
 	/** Maximum admitted local write IDs; reject NEW IDs when full rather than evict safely recorded ones. */
@@ -26,7 +34,8 @@ export interface CapabilityEndpointDeps {
 
 /** A parsed capability request body. */
 interface CapabilityRequest {
-	sessionKey: string;
+	sessionKey?: string;
+	contexts?: ContextCandidate[];
 	command: string;
 	args: Record<string, unknown>;
 	requestId?: string;
@@ -54,6 +63,7 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 export class CapabilityEndpoint {
 	private readonly registry: CapabilityRegistry;
 	private readonly resolve: (sessionKey: string) => Resolved | undefined;
+	private readonly resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
 	/** In-flight writes remain registered until resolution, even when completed receipts reach the cap. */
 	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
 	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
@@ -63,16 +73,22 @@ export class CapabilityEndpoint {
 	private readonly resetReceipts = new Map<string, Promise<CapabilityResponse>>();
 	private readonly roomGeneration = new Map<string, number>();
 	private readonly serverNamespace: string;
+	private readonly lockHome?: string;
 	private readonly maxWriteIds: number;
 	/** POSIX fs guards (dir/socket chmod, stale unlink) apply only on non-win32. */
 	private readonly platform: NodeJS.Platform;
 	private server: Server | null = null;
 	private socketPath: string | null = null;
+	private socketIdentity: { dev: number; ino: number } | null = null;
+	private lockPath: string | null = null;
+	private lockToken: string | null = null;
 
 	constructor(deps: CapabilityEndpointDeps) {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
+		this.resolveCandidate = deps.resolveCandidate;
 		this.serverNamespace = deps.serverNamespace ?? '';
+		this.lockHome = deps.lockHome;
 		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
 		if (!Number.isSafeInteger(this.maxWriteIds) || this.maxWriteIds < 1) throw new Error('maxWriteIds must be a positive integer');
 		this.platform = deps.platform ?? process.platform;
@@ -89,35 +105,44 @@ export class CapabilityEndpoint {
 			return { status: 400, json: { ok: false, error: 'bad request: invalid body' } };
 		}
 
-		// REQ-010 S5: require a KNOWN agent-type prefix BEFORE resolve/idempotency/dispatch. An
-		// unprefixed/unknown key never identifies a driver, so reject it deterministically (400) rather
-		// than letting it fall through to resolve. (A valid prefix that simply has no live driver/session
-		// still returns the existing 404 'unknown session' via resolve → undefined.)
-		if (!parseSessionKey(parsed.sessionKey)) {
-			// parsed.command exists here → cheap "解析失败" observability signal.
-			// command + sessionKey are untrusted request input → sanitize to prevent CRLF log forgery.
-			console.log(
-				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (unresolved) err=unknown session key prefix`,
-			);
+		const logKey = parsed.sessionKey ? maskSessionKey(parsed.sessionKey) : '<v2>';
+		// Legacy callers keep their exact original prefix and resolution contract.
+		if (parsed.sessionKey && !parseSessionKey(parsed.sessionKey)) {
+			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session key prefix`);
 			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
 		}
 
-		// A reset invalidates its own native session key. The same key may retrieve ONLY that
-		// reset's minimal receipt; no other write/query bypasses live binding resolution.
+		// A reset may retrieve ONLY its minimal receipt under the same bearer and request ID.
 		const resetReceiptKey = parsed.command === 'reset-session' && parsed.requestId
-			? JSON.stringify([parsed.sessionKey, parsed.requestId]) : undefined;
+			? JSON.stringify([parsed.sessionKey ?? parsed.contexts, parsed.requestId]) : undefined;
 		if (resetReceiptKey) {
 			const receipt = this.resetReceipts.get(resetReceiptKey);
 			if (receipt) return Object.keys(parsed.args).length
 				? { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } }
 				: receipt;
 		}
-		const resolved = this.resolve(parsed.sessionKey);
+		let resolved: Resolved | undefined;
+		let generation: number | undefined;
+		if (parsed.contexts) {
+			let first: ResolvedCandidate | undefined;
+			for (const candidate of parsed.contexts) {
+				let current: ResolvedCandidate | undefined;
+				try { current = this.resolveCandidate?.(candidate); } catch { /* broken index must fail closed */ }
+				if (!current || !Number.isSafeInteger(current.generation) || current.generation < 1 ||
+					!current.conversationId || !current.aiclawUid || !current.roomId ||
+					(first && (first.conversationId !== current.conversationId || first.generation !== current.generation ||
+						first.aiclawUid !== current.aiclawUid || first.roomId !== current.roomId))) {
+					return { status: 409, json: { ok: false, code: 'AMBIGUOUS_CONTEXT', error: 'unresolved or conflicting context candidates' } };
+				}
+				first = current;
+			}
+			resolved = first;
+			generation = first?.generation;
+		} else {
+			resolved = this.resolve(parsed.sessionKey!);
+		}
 		if (!resolved) {
-			// not cached — an unresolved session is transient (could resolve next time)
-			console.log(
-				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (unresolved) err=unknown session`,
-			);
+			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
 			return { status: 404, json: { ok: false, error: 'unknown session' } };
 		}
 
@@ -125,7 +150,7 @@ export class CapabilityEndpoint {
 			// Failure path — AC "成功/失败都有" covers it. command failed the registry whitelist → untrusted,
 			// sanitize. uid/room are known here (session resolved), so log the full locator.
 			console.log(
-				`[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}) err=unknown command`,
+				`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}) err=unknown command`,
 			);
 			return { status: 400, json: { ok: false, error: `unknown command: ${parsed.command}` } };
 		}
@@ -145,7 +170,7 @@ export class CapabilityEndpoint {
 		const roomKey = JSON.stringify([this.serverNamespace, resolved.aiclawUid, resolved.roomId]);
 		// Only effective business args: never hash bearer/session tokens or ignored caller padding.
 		const fingerprint = write ? createHash('sha256').update(JSON.stringify([
-			parsed.command, resolved.roomId, this.roomGeneration.get(roomKey) ?? 0,
+			parsed.command, resolved.roomId, generation ?? this.roomGeneration.get(roomKey) ?? 0,
 			typeof parsed.args.content === 'string' ? parsed.args.content : null,
 		])).digest('hex') : '';
 		if (write) {
@@ -170,7 +195,7 @@ export class CapabilityEndpoint {
 		}
 
 		// No args (may contain message content), requestId or unmasked sessionKey in logs.
-		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${maskSessionKey(parsed.sessionKey)} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
+		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
 		const execute = async (): Promise<CapabilityResponse> => {
 			try {
 				const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
@@ -215,65 +240,161 @@ export class CapabilityEndpoint {
 
 	/** Wire node:http over a UNIX domain socket (or named pipe on win32) → handle(). */
 	async listen(socketPath: string): Promise<void> {
-		// Anti-spoofing: on POSIX keep the socket private — the PARENT dir must be 0700 so no other
-		// user can place/replace the socket, the explicit chmod defends against the process umask
-		// masking the mkdir mode bits, and the socket itself is locked to 0600 after listen(). On
-		// win32 there is no fs file/dir — ownership relies on the named pipe's DEFAULT SECURITY
-		// DESCRIPTOR (creator + SYSTEM + Administrators only), not on the predictable pipe name.
+		if (this.server || this.lockToken) throw new Error('capability endpoint already listening');
 		prepareSocketPath(socketPath, this.platform);
-		this.socketPath = socketPath;
-		this.server = createServer((req, res) => {
-			void (async () => {
-				const body = await readJsonBody(req);
-				const remoteAddress = req.socket.remoteAddress;
-				const out = await this.handle({ body, remoteAddress });
-				res.writeHead(out.status, { 'Content-Type': 'application/json' });
-				res.end(JSON.stringify(out.json));
-			})();
-		});
-
-		await new Promise<void>((resolve, reject) => {
-			const onError = (err: Error) => reject(err);
-			this.server!.once('error', onError);
-			this.server!.listen(socketPath, () => {
-				this.server!.off('error', onError);
-				if (this.platform !== 'win32') {
-					// Lock the bound socket to owner-only rw. A world/group-writable unix socket on a
-					// shared host lets another user impersonate an aiclaw — required, not best-effort.
-					chmodSync(socketPath, 0o600);
-				}
-				resolve();
+		// Exclusive creation serializes startup across node processes, including the stale-socket probe.
+		// An unambiguous dead owner can be reclaimed; unknown liveness fails closed.
+		if (this.lockHome) {
+			mkdirSync(this.lockHome, { recursive: true, mode: 0o700 });
+			if (this.platform !== 'win32') chmodSync(this.lockHome, 0o700);
+		}
+		const lockPath = this.lockHome ? join(this.lockHome, 'conversation-writer.lock') : this.platform === 'win32'
+			? join(tmpdir(), `aichat-capability-${createHash('sha256').update(socketPath).digest('hex')}.lock`)
+			: `${socketPath}.lock`;
+		const token = `${process.pid}:${randomUUID()}`;
+		let fd: number;
+		try {
+			fd = openSync(lockPath, 'wx', 0o600);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+			await reclaimDeadLock(lockPath, socketPath);
+			fd = openSync(lockPath, 'wx', 0o600);
+		}
+		try { writeSync(fd, token); } finally { closeSync(fd); }
+		this.lockPath = lockPath;
+		this.lockToken = token;
+		try {
+			if (this.platform !== 'win32' && existsSync(socketPath)) {
+				const old = lstatSync(socketPath);
+				if (!old.isSocket()) throw new Error('capability socket path is not a socket');
+				if (await socketAcceptsConnections(socketPath)) throw new Error('capability socket already has a live listener');
+				const current = lstatSync(socketPath);
+				if (old.dev !== current.dev || old.ino !== current.ino) throw new Error('capability socket changed during startup');
+				unlinkSync(socketPath);
+			}
+			const server = createServer((req, res) => {
+				void (async () => {
+					const body = await readJsonBody(req);
+					const out = await this.handle({ body, remoteAddress: req.socket.remoteAddress });
+					res.writeHead(out.status, { 'Content-Type': 'application/json' });
+					res.end(JSON.stringify(out.json));
+				})();
 			});
-		});
+			this.server = server;
+			await new Promise<void>((resolve, reject) => {
+				const onError = (err: Error) => { server.off('error', onError); reject(err); };
+				server.once('error', onError);
+				server.listen(socketPath, () => {
+					server.off('error', onError);
+					try {
+						if (this.platform !== 'win32') chmodSync(socketPath, 0o600);
+						resolve();
+					} catch (err) { reject(err); }
+				});
+			});
+			this.socketPath = socketPath;
+			if (this.platform !== 'win32') {
+				const stat = lstatSync(socketPath);
+				this.socketIdentity = { dev: stat.dev, ino: stat.ino };
+			}
+		} catch (err) {
+			await this.close();
+			throw err;
+		}
 	}
 
 	async close(): Promise<void> {
 		const server = this.server;
 		this.server = null;
-		if (server) {
-			await new Promise<void>((resolve) => server.close(() => resolve()));
-		}
-		if (this.platform !== 'win32' && this.socketPath && existsSync(this.socketPath)) {
+		if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+		if (this.platform !== 'win32' && this.socketPath && this.socketIdentity) {
 			try {
-				unlinkSync(this.socketPath);
-			} catch {
-				/* best-effort cleanup */
-			}
+				const stat = lstatSync(this.socketPath);
+				if (stat.dev === this.socketIdentity.dev && stat.ino === this.socketIdentity.ino) unlinkSync(this.socketPath);
+			} catch { /* removed/replaced by another process: never delete its socket */ }
 		}
+		this.socketPath = null;
+		this.socketIdentity = null;
+		if (this.lockPath && this.lockToken) {
+			try { if (readFileSync(this.lockPath, 'utf8') === this.lockToken) unlinkSync(this.lockPath); }
+			catch { /* ownership changed or already removed */ }
+		}
+		this.lockPath = null;
+		this.lockToken = null;
 	}
+}
+
+/** Never reclaim a live/unknown writer's lock. A dead PID plus a non-listening endpoint is required. */
+async function reclaimDeadLock(lockPath: string, socketPath: string): Promise<void> {
+	const old = lstatSync(lockPath);
+	const value = readFileSync(lockPath, 'utf8');
+	const match = /^(\d+):[0-9a-f-]+$/.exec(value);
+	if (!match) throw new Error('capability lock owner unknown');
+	try {
+		process.kill(Number(match[1]), 0);
+		throw new Error('capability endpoint writer already running');
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+	}
+	try {
+		if (await socketAcceptsConnections(socketPath)) throw new Error('capability socket already has a live listener');
+	} catch (err) {
+		// Missing pipe/socket and an explicitly refused stale socket both indicate no listener.
+		if (!['ENOENT', 'ECONNREFUSED'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err;
+	}
+	const current = lstatSync(lockPath);
+	if (old.dev !== current.dev || old.ino !== current.ino || readFileSync(lockPath, 'utf8') !== value)
+		throw new Error('capability lock changed during recovery');
+	unlinkSync(lockPath);
+}
+
+/** Only ECONNREFUSED proves a leftover socket; all other probe errors fail closed. */
+function socketAcceptsConnections(path: string): Promise<boolean> {
+	return new Promise((resolve, reject) => {
+		const socket = createConnection(path);
+		socket.setTimeout(1000, () => { socket.destroy(); reject(new Error('capability socket probe timed out')); });
+		socket.once('connect', () => { socket.destroy(); resolve(true); });
+		socket.once('error', (err: NodeJS.ErrnoException) => {
+			if (err.code === 'ECONNREFUSED') resolve(false);
+			else reject(err);
+		});
+	});
 }
 
 /** Validate + coerce a raw request body into a CapabilityRequest, or undefined if malformed. */
 function parseBody(body: unknown): CapabilityRequest | undefined {
-	if (!body || typeof body !== 'object') return undefined;
+	if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
 	const b = body as Record<string, unknown>;
-	if (typeof b.sessionKey !== 'string' || b.sessionKey.length === 0) return undefined;
-	if (typeof b.command !== 'string' || b.command.length === 0) return undefined;
+	if (typeof b.command !== 'string' || !b.command || b.command.length > 128) return undefined;
 	if (b.requestId !== undefined && (typeof b.requestId !== 'string' || !b.requestId.trim() || b.requestId.length > 128)) return undefined;
 	if (b.idempotencyKey !== undefined && (typeof b.idempotencyKey !== 'string' || !b.idempotencyKey.trim() || b.idempotencyKey.length > 128)) return undefined;
 	if (b.requestId && b.idempotencyKey && b.requestId !== b.idempotencyKey) return undefined;
 	if (b.args !== undefined && (b.args === null || typeof b.args !== 'object' || Array.isArray(b.args))) return undefined;
-	return { sessionKey: b.sessionKey, command: b.command, args: (b.args ?? {}) as Record<string, unknown>, requestId: (b.requestId ?? b.idempotencyKey) as string | undefined };
+	const args = (b.args ?? {}) as Record<string, unknown>;
+	const requestId = (b.requestId ?? b.idempotencyKey) as string | undefined;
+	if (b.version === 2) {
+		if (b.sessionKey !== undefined || !Array.isArray(b.contexts) || b.contexts.length < 1 || b.contexts.length > 8 ||
+			['uid', 'room', 'roomId', 'aiclawUid', 'identityId'].some((field) => field in b)) return undefined;
+		const contexts: ContextCandidate[] = [];
+		for (const item of b.contexts) {
+			if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
+			const c = item as Record<string, unknown>;
+			if ('key' in c) {
+				if (Object.keys(c).length !== 1 || typeof c.key !== 'string' || !c.key || c.key.length > 256) return undefined;
+				contexts.push({ key: c.key });
+			} else {
+				if (Object.keys(c).some((field) => !['provider', 'nativeId', 'runtimeScope'].includes(field)) ||
+					typeof c.provider !== 'string' || !c.provider || c.provider.length > 32 ||
+					typeof c.nativeId !== 'string' || !c.nativeId || c.nativeId.length > 512 ||
+					(c.runtimeScope !== undefined && (typeof c.runtimeScope !== 'string' || !c.runtimeScope || c.runtimeScope.length > 256))) return undefined;
+				contexts.push({ provider: c.provider, nativeId: c.nativeId, ...(c.runtimeScope === undefined ? {} : { runtimeScope: c.runtimeScope as string }) });
+			}
+		}
+		if (b.command === 'send-message' && ['uid', 'room', 'roomId', 'aiclawUid', 'identityId', 'fromUid'].some((field) => field in args)) return undefined;
+		return { contexts, command: b.command, args, requestId };
+	}
+	if (b.version !== undefined || b.contexts !== undefined || typeof b.sessionKey !== 'string' || !b.sessionKey || b.sessionKey.length > 512) return undefined;
+	return { sessionKey: b.sessionKey, command: b.command, args, requestId };
 }
 
 /**
@@ -337,21 +458,10 @@ export function capabilitySocketPath(opts?: {
 	return posix.join(home, 'capability.sock');
 }
 
-/**
- * Prepare the filesystem for a POSIX unix socket: create the parent dir (0700), re-chmod it 0700
- * (defends against a masking umask), and best-effort unlink a stale socket. NO-OP on win32 — a named
- * pipe needs no dir and is not an fs file, so mkdir/chmod/unlink are all POSIX-only.
- */
+/** Prepare private POSIX parent, never delete an unprobed socket (including an active listener). */
 export function prepareSocketPath(socketPath: string, platform: NodeJS.Platform): void {
 	if (platform === 'win32') return;
 	const dir = dirname(socketPath);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	chmodSync(dir, 0o700);
-	if (existsSync(socketPath)) {
-		try {
-			unlinkSync(socketPath);
-		} catch {
-			/* best-effort: a live listener will fail to bind below and surface the error */
-		}
-	}
 }

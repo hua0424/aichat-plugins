@@ -161,6 +161,16 @@ describe('Supervisor.start', () => {
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 
+	it('does not accept inbound WS traffic until the endpoint and bindings are ready', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries, false);
+		expect(sup.agents).toHaveLength(3);
+		expect(built.wsList.every((ws) => ws.connect.mock.calls.length === 0)).toBe(true);
+		sup.connectInbound();
+		expect(built.wsList.every((ws) => ws.connect.mock.calls.length === 1)).toBe(true);
+	});
+
 	it('#166: starts in PARALLEL yet preserves entries order (pre-sized slots, deterministic)', async () => {
 		const completion: number[] = [];
 		const { deps } = makeDeps({
