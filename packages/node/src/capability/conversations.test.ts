@@ -132,6 +132,92 @@ describe('ConversationStore', () => {
 		expect(() => switched.mintToken('11', '9')).toThrow('provider changed');
 	});
 
+	it('atomically resets generation and revokes old keys and native aliases across restart', () => {
+		const root = home(), opts = active(root, { '11': 'codex' });
+		const store = new ConversationStore(opts);
+		const first = store.registerNative('codex', 'old-thread', '11', '9', { threadId: 'old-thread' });
+		const next = store.reset('11', '9');
+		expect(next).toMatchObject({ conversationId: first.conversationId, generation: 2, state: 'ready', nativeAliases: [], nativeState: {} });
+		expect(next.contextKey).not.toBe(first.contextKey);
+		expect(store.resolveCandidate({ key: first.contextKey })).toBeUndefined();
+		expect(store.resolveLegacy('codex:old-thread')).toBeUndefined();
+		expect(() => store.registerNative('codex', 'old-thread', '11', '9')).toThrow('revoked');
+		const loaded = new ConversationStore(opts);
+		expect(loaded.get('11', '9')).toEqual(next);
+		expect(loaded.resolveCandidate({ key: first.contextKey })).toBeUndefined();
+		expect(loaded.reset('11', '9').generation).toBe(3);
+		const raw = JSON.parse(readFileSync(join(root, 'conversations.json'), 'utf8'));
+		expect(raw.version).toBe(1);
+	});
+
+	it('persists only minimal bearer-bound reset receipts atomically with key revocation', () => {
+		let fail = false;
+		const root = home(), opts = active(root, { '11': 'codex' }, () => { if (fail) throw new Error('disk full'); });
+		const store = new ConversationStore(opts);
+		const first = store.getOrCreate('11', '9');
+		const bearer = JSON.stringify([{ key: first.contextKey }]);
+		fail = true;
+		expect(() => store.reset('11', '9', 'request-1', bearer)).toThrow('disk full');
+		expect(store.getResetReceipt(bearer, 'request-1')).toBeUndefined();
+		expect(store.get('11', '9')).toEqual(first);
+		fail = false;
+		const next = store.reset('11', '9', 'request-1', bearer);
+		expect(store.getResetReceipt(bearer, 'request-1')).toEqual({ reset: true, generation: 2, executionPaused: false });
+		expect(store.getResetReceipt(JSON.stringify([{ key: next.contextKey }]), 'request-1')).toBeUndefined();
+		expect(store.getResetReceipt(bearer, 'other-request')).toBeUndefined();
+		expect(() => store.reset('11', '9', 'request-1', bearer)).toThrow('duplicate reset requestId');
+		expect(new ConversationStore(active(root, { '11': 'codex' })).getResetReceipt(bearer, 'request-1')?.generation).toBe(2);
+		const persisted = readFileSync(join(root, 'conversations.json'), 'utf8');
+		expect(persisted).not.toContain('request-1');
+		expect(persisted).not.toContain(bearer);
+	});
+
+	it('binds native writes to a generation and retains old run recovery through repeated resets', () => {
+		const root = home(), opts = active(root, { '11': 'codex' });
+		const store = new ConversationStore(opts);
+		const bound = store.beginRun('11', '9', 'run-1');
+		bound.saveNativeState('codex', { threadId: 'thread-1' });
+		bound.registerNativeAlias('codex', 'thread-1');
+		bound.saveRecovery({ version: 1, value: { processId: 123 } });
+		expect(() => store.beginRun('11', '9', 'run-2')).toThrow('occupied');
+		store.markCancelling('run-1');
+		expect(store.get('11', '9')?.state).toBe('suspended');
+		expect(() => bound.saveNativeState('codex', { threadId: 'late' })).toThrow('paused');
+		store.reset('11', '9');
+		store.reset('11', '9');
+		expect(store.get('11', '9')).toMatchObject({ generation: 3, state: 'stop_unconfirmed', nativeState: {} });
+		expect(store.pendingRuns()[0]).toMatchObject({ runId: 'run-1', generation: 1, recovery: { version: 1, value: { processId: 123 } } });
+		expect(() => bound.saveNativeState('codex', { threadId: 'late' })).toThrow('STALE_GENERATION');
+		expect(() => bound.registerNativeAlias('codex', 'late')).toThrow('STALE_GENERATION');
+		expect(() => store.registerNative('codex', 'late', '11', '9', { threadId: 'late' })).toThrow('paused');
+		expect(() => store.deleteNative('codex', '11', '9')).toThrow('paused');
+		bound.saveRecovery({ version: 2, value: { processId: 123, diagnostic: 'alive' } });
+		const restarted = new ConversationStore(opts);
+		expect(restarted.pendingRuns()[0].recovery?.version).toBe(2);
+		expect(() => restarted.beginRun('11', '9', 'run-2')).toThrow('paused');
+		restarted.confirmStopped('run-1');
+		expect(restarted.get('11', '9')?.state).toBe('ready');
+		expect(restarted.beginRun('11', '9', 'run-2').generation).toBe(3);
+	});
+
+	it('rolls back reset, bound writes and recovery atomically on persistence failure', () => {
+		let fail = false;
+		const root = home(), opts = active(root, { '11': 'codex' }, () => { if (fail) throw new Error('disk full'); });
+		const store = new ConversationStore(opts);
+		const bound = store.beginRun('11', '9', 'run-1');
+		const previous = store.get('11', '9');
+		fail = true;
+		expect(() => store.reset('11', '9')).toThrow('disk full');
+		expect(() => bound.saveNativeState('codex', { threadId: 'thread' })).toThrow('disk full');
+		expect(() => bound.saveRecovery({ version: 1, value: 'recover' })).toThrow('disk full');
+		expect(() => store.markStopUnconfirmed('run-1')).toThrow('disk full');
+		expect(store.get('11', '9')).toEqual(previous);
+		expect(() => store.reset('11', 'new-room')).toThrow('disk full');
+		expect(store.get('11', 'new-room')).toBeUndefined();
+		expect(store.pendingRuns()[0].recovery).toBeUndefined();
+		expect(new ConversationStore(active(root, { '11': 'codex' })).get('11', '9')?.state).toBe('stop_unconfirmed');
+	});
+
 	it('rolls back new and updated bindings on failed disk commit before exposure', () => {
 		let fail = false;
 		const root = home(), opts = active(root, { '11': 'codex' }, () => { if (fail) throw new Error('disk full'); });

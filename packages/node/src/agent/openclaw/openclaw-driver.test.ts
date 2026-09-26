@@ -678,6 +678,18 @@ describe('parseHelloOk', () => {
 });
 
 describe('OpenclawDriver REQ-018 — AGENTS.md system prompt', () => {
+	it.each(['prepared {displayName}', ''])('writes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const base = mkdtempSync(join(tmpdir(), 'openclaw-prepared-'));
+		const getSelfName = vi.fn(async () => 'ignored');
+		try {
+			const driver = new OpenclawDriver('ws://localhost:18789', '', makeStore(), fakeGateway().factory, base);
+			await driver.openSession({ aiclawUid: '5', roomId: '9', chatContext: { preparedSystemPrompt, templates: TEMPLATES, getSelfName } });
+			expect(readFileSync(join(base, 'AGENTS.md'), 'utf-8')).toBe(`<!-- aichat:system:begin -->\n${preparedSystemPrompt}\n<!-- aichat:system:end -->\n`);
+			expect(getSelfName).not.toHaveBeenCalled();
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
 	it('REQ-018 R1: default workspaceDir (no 5th param) is ~/.openclaw/workspace', () => {
 		// R1 real-env confirmation: openclaw actually reads ~/.openclaw/workspace/AGENTS.md (injected at
 		// session startup), so the constructor default must point there — NOT ~/.openclaw. Build with

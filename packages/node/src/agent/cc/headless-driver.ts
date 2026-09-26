@@ -205,10 +205,10 @@ export class CcHeadlessDriver implements AgentDriver {
 		// templates + persona + resolved display name. The display name of THIS aiclaw is resolved LAZILY
 		// via chatContext.getSelfName (now shared by all four drivers; a driver calls it only when templates
 		// are present). Optional — an unresolved name still anchors the uid in the system prompt.
-		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
-		const systemPrompt = ctx.templates
-			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
-			: undefined;
+		const selfName = ctx.preparedSystemPrompt === undefined && ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.preparedSystemPrompt ?? (ctx.templates
+			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null }) || undefined
+			: undefined);
 		// KEEP the plaintext binding for ALL node-internal keying (session_id store, transcript, registry,
 		// resetSession) — it never leaves the node. BL-014 (#141): mint a STABLE opaque token for the ONLY
 		// agent-facing value (the spawn's AICHAT_BIND env), so a bash-capable agent can't forge (uid,room).
@@ -522,8 +522,8 @@ class CcHeadlessSession implements AgentSession {
 		// (--append-system-prompt, PR #43's proven method) — rendered from server-fetched templates
 		// (identity anchor + persona + reply contract). NOT prepended to each stdin user message (which
 		// would pollute the content). Each headless turn is a fresh process, so it's per-turn. A turn
-		// without templates simply omits the flag (no system layer → degrade gracefully).
-		if (this.d.systemPrompt) {
+		// without templates or a prepared prompt simply omits the flag (no system layer → degrade gracefully).
+		if (this.d.systemPrompt !== undefined) {
 			argv.push('--append-system-prompt', this.d.systemPrompt);
 		}
 		const stored = this.d.sessionStore.get(this.key);

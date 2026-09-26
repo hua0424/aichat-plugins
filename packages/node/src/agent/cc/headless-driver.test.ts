@@ -284,6 +284,20 @@ describe('CcHeadlessDriver — shape', () => {
 });
 
 describe('CcHeadlessSession.send — spawn argv/env/stdin', () => {
+	it.each(['prepared {displayName}', ''])('passes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const { driver, fs } = makeDriver();
+		const getSelfName = vi.fn(async () => 'ignored');
+		const session = await driver.openSession({
+			aiclawUid: '5', roomId: '9',
+			chatContext: { ...BASE_CTX, preparedSystemPrompt, templates: TEMPLATES, getSelfName },
+		});
+		session.send('original');
+		const args = fs.spawnCall!.args;
+		expect(args[args.indexOf('--append-system-prompt') + 1]).toBe(preparedSystemPrompt);
+		expect(getSelfName).not.toHaveBeenCalled();
+		expect(stdinText(fs)).toBe('original');
+		await session.close();
+	});
 	it('spawns claude with the exact headless argv, cc env, and writes the given envelope to stdin verbatim', async () => {
 		const { driver, fs } = makeDriver();
 		// REQ-018: chatContext exposes templates + persona + a lazy getSelfName → the driver renders the

@@ -141,10 +141,10 @@ export class OpencodeDriver implements AgentDriver {
 		// REQ-018: render the unified system prompt once per (per-turn) session from the handler-supplied
 		// templates + persona + resolved display name. The display name is resolved LAZILY via
 		// chatContext.getSelfName (all four drivers share it; called only when templates are present).
-		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
-		const systemPrompt = ctx.templates
-			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
-			: undefined;
+		const selfName = ctx.preparedSystemPrompt === undefined && ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.preparedSystemPrompt ?? (ctx.templates
+			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null }) || undefined
+			: undefined);
 
 		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), systemPrompt, onSessionError);
 	}
@@ -283,7 +283,7 @@ class OpencodeSession implements AgentSession {
 					query: { directory: this.directory },
 					body: {
 						parts: [{ type: 'text', text: message }],
-						...(this.systemPrompt ? { system: this.systemPrompt } : {}),
+						...(this.systemPrompt !== undefined ? { system: this.systemPrompt } : {}),
 						...(this.model ? { model: this.model } : {}),
 					},
 				});

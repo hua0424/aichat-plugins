@@ -313,6 +313,46 @@ describe('local write requestId', () => {
 		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'other', idempotencyKey: undefined }) })).status).toBe(404);
 	});
 
+	it('consults the durable minimal reset receipt after endpoint restart and old bearer revocation', async () => {
+		const receipts = new Map<string, { reset: true; generation: number; executionPaused: boolean }>();
+		let active = true;
+		const registry = new CapabilityRegistry();
+		const reset = vi.fn((uid: string, room: string, requestId?: string, bearer?: string) => {
+			expect([uid, room]).toEqual(['owner', 'room1']);
+			receipts.set(JSON.stringify([bearer, requestId]), { reset: true, generation: 2, executionPaused: true });
+			active = false;
+			return { driverType: 'cc', reset: true, generation: 2, executionPaused: true };
+		});
+		registry.register('reset-session', resetSessionCapability(reset));
+		const deps = {
+			registry, resolve: () => active ? { aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient } : undefined,
+			getResetReceipt: (bearer: string, id: string) => receipts.get(JSON.stringify([bearer, id])),
+		};
+		const request = body({ command: 'reset-session', args: {}, requestId: 'same', idempotencyKey: undefined });
+		expect((await new CapabilityEndpoint(deps).handle({ body: request })).status).toBe(200);
+		const restarted = new CapabilityEndpoint(deps);
+		expect(await restarted.handle({ body: request })).toMatchObject({ status: 200, json: { result: { reset: true, generation: 2, executionPaused: true } } });
+		expect(reset).toHaveBeenCalledOnce();
+		expect((await restarted.handle({ body: body({ ...request, command: 'member-info' }) })).status).toBe(404);
+	});
+
+	it('pauses business writes before cache lookup but permits read and reset control', async () => {
+		let paused = false;
+		const registry = new CapabilityRegistry();
+		const send = vi.fn(async () => ({ msgId: 'once' }));
+		registry.register('send-message', async () => send());
+		registry.register('member-info', async () => ({ visible: true }));
+		registry.register('reset-session', resetSessionCapability(() => ({ driverType: 'cc', reset: true })));
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'u', roomId: 'r', apiClient: {} as HulaApiClient }), isPaused: () => paused });
+		const request = body({ requestId: 'write-1', idempotencyKey: undefined });
+		expect((await endpoint.handle({ body: request })).status).toBe(200);
+		paused = true;
+		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 409, json: { code: 'STOP_UNCONFIRMED' } });
+		expect(send).toHaveBeenCalledOnce();
+		expect((await endpoint.handle({ body: body({ command: 'member-info' }) })).status).toBe(200);
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'reset-1', idempotencyKey: undefined }) })).status).toBe(200);
+	});
+
 	it('confirmed reset advances the same room generation so old send IDs cannot be replayed', async () => {
 		const { endpoint, sendMessage, complete } = setup();
 		const request = body({ requestId: 'pre-reset', idempotencyKey: undefined });
@@ -344,6 +384,28 @@ describe('local write requestId', () => {
 		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
 		complete('107');
 		expect((await first).status).toBe(200);
+	});
+
+	it('reset cancellation begins after the HTTP receipt finishes, never inside the reset capability', async () => {
+		let inReset = false;
+		const delivered = vi.fn(() => expect(inReset).toBe(false));
+		const registry = new CapabilityRegistry();
+		registry.register('reset-session', resetSessionCapability(() => {
+			inReset = true;
+			queueMicrotask(() => { inReset = false; });
+			return { driverType: 'cc', reset: true, generation: 2, executionPaused: true };
+		}));
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'u', roomId: 'r', apiClient: {} as HulaApiClient }), onResetDelivered: delivered });
+		const socket = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-reset-test-${randomUUID()}` : join(mkdtempSync(join(tmpdir(), 'aichat-reset-')), 'capability.sock');
+		await endpoint.listen(socket);
+		try {
+			const receipt = await postCapability(socket, body({ command: 'reset-session', args: {}, requestId: 'reset-http', idempotencyKey: undefined }));
+			expect(receipt).toMatchObject({ status: 200, body: { result: { reset: true, generation: 2, executionPaused: true } } });
+			await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce());
+		} finally {
+			await endpoint.close();
+			if (process.platform !== 'win32') rmSync(join(socket, '..'), { recursive: true, force: true });
+		}
 	});
 
 	it('HTTP named-pipe requests with the same explicit ID share one backend write', async () => {

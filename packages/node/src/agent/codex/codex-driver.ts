@@ -108,11 +108,11 @@ export class CodexDriver implements AgentDriver {
 		// identity anchor + persona + reply contract live THERE — the per-turn user message stays pure.
 		// hash-compare (syncAgentsMdFile) skips the write when unchanged. A write failure degrades to
 		// "no system prompt this turn" (warn, don't fail the turn).
-		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
-		const systemPrompt = ctx.templates
+		const selfName = ctx.preparedSystemPrompt === undefined && ctx.templates ? await ctx.getSelfName?.() : undefined;
+		const systemPrompt = ctx.preparedSystemPrompt ?? (ctx.templates
 			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
-			: undefined;
-		if (systemPrompt) {
+			: undefined);
+		if (systemPrompt !== undefined && (ctx.preparedSystemPrompt !== undefined || systemPrompt !== '')) {
 			try {
 				await syncAgentsMdFile(join(workingDirectory, 'AGENTS.md'), systemPrompt);
 			} catch (err) {

@@ -10,8 +10,12 @@ import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { buildAgentInjection } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
-import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
+import { buildSystemPrompt, type AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
+import { randomUUID } from 'node:crypto';
+import { LegacyDriverBridge } from '../agent/legacy-run.js';
+import type { AgentRun, PreparedRun } from '../agent/events.js';
+import type { ConversationStore } from '../capability/conversations.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -86,6 +90,8 @@ interface ThinkingSession {
 	events: AgentEvent[];
 	/** REQ-008 #75: 当前轮的 driver session，超时/广播 finalize 时 best-effort close。 */
 	agentSession?: AgentSession;
+	/** #299: persisted run owns the room until upstream termination is proven. */
+	run?: { id: string; generation: number; agent: AgentRun; abort: AbortController };
 }
 
 /**
@@ -229,6 +235,7 @@ export class MessageHandler {
 		apiClient: HulaApiClient | undefined,
 		debounceOptions: { waitMs?: number; maxCount?: number; maxWaitMs?: number } | undefined,
 		onTokenExpired: () => void,
+		private readonly getConversations?: () => ConversationStore,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -283,9 +290,65 @@ export class MessageHandler {
 	 * 从 thinkingSessions 删除、flush 待发消息。clean-complete/error 路径不关（迭代器已自然结束）→ closeDriver=false。
 	 */
 	private teardownSession(session: ThinkingSession, roomId: string, closeDriver: boolean): void {
+		if (session.run) {
+			if (closeDriver) void this.stopRun(session, 'thinking interrupted');
+			return; // close/dispose is not proof of upstream termination.
+		}
 		if (closeDriver) void session.agentSession?.close();
 		this.thinkingSessions.delete(session.sessionKey);
 		this.flushPendingMessages(roomId);
+	}
+
+	private releaseRun(session: ThinkingSession): void {
+		if (!session.run || this.thinkingSessions.get(session.sessionKey) !== session) return;
+		const store = this.getConversations!();
+		try {
+			store.finishRun(session.run.id);
+			this.thinkingSessions.delete(session.sessionKey);
+			this.flushPendingMessages(session.roomId);
+		} catch (error) {
+			console.error(`[handler] run ${session.run.id} could not be released: ${errMsg(error)}`);
+			try { store.markStopUnconfirmed(session.run.id); } catch { /* keep room occupied */ }
+		}
+	}
+
+	private async stopRun(session: ThinkingSession, reason: string): Promise<void> {
+		const run = session.run;
+		if (!run || this.thinkingSessions.get(session.sessionKey) !== session) return;
+		try {
+			this.getConversations!().markCancelling(run.id);
+		} catch (error) {
+			console.error(`[handler] cannot persist cancellation gate for ${run.id}: ${errMsg(error)}`);
+			return; // never cancel and reopen the queue after an unrecorded state transition
+		}
+		run.abort.abort();
+		try {
+			const result = await run.agent.cancel(reason);
+			if (result.status === 'stopped') this.releaseRun(session);
+			else this.getConversations!().markStopUnconfirmed(run.id);
+		} catch (error) {
+			console.error(`[handler] cancel run ${run.id} failed: ${errMsg(error)}`);
+			try { this.getConversations!().markStopUnconfirmed(run.id); } catch { /* keep occupied */ }
+		}
+	}
+
+	/** Called after reset HTTP response completes; never waits for a legacy close as stop proof. */
+	async cancelRun(roomId: string, expectedRunId?: string): Promise<void> {
+		const session = this.thinkingSessions.get(bindingKey(this.selfUid, roomId));
+		if (session?.run && (expectedRunId === undefined || session.run.id === expectedRunId)) {
+			if (session.timeoutId) clearTimeout(session.timeoutId);
+			if (!session.finalized) {
+				session.finalized = true;
+				this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: 'error', error: 'conversation_reset', content: session.accumulatedContent });
+			}
+			await this.stopRun(session, 'conversation reset');
+		}
+	}
+
+	private runReady(roomId: string): boolean {
+		if (!this.getConversations) return true;
+		const record = this.getConversations().get(this.selfUid, roomId);
+		return !record || (record.state === 'ready' && !record.pendingRuns?.length);
 	}
 
 	/**
@@ -495,7 +558,7 @@ export class MessageHandler {
 
 		// 6. thinking 活跃 **或** 处于退避窗口时入队——退避窗口内不另起触发、不丢消息，
 		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
-		if (this.thinkingSessions.has(sessionKey) || channel.antiLoopDelaying) {
+		if (this.thinkingSessions.has(sessionKey) || channel.antiLoopDelaying || !this.runReady(roomId)) {
 			channel.pendingMessages.push(content);
 			console.log(`[handler] Message queued (thinking active or anti-loop delaying) room=${roomId}, pending: ${channel.pendingMessages.length}`);
 			return;
@@ -525,6 +588,10 @@ export class MessageHandler {
 
 		const { msgId, roomType, fromUid, isOwner } = channel.lastCtx;
 		const sessionKey = bindingKey(this.selfUid, roomId);
+		if (this.getConversations && !this.runReady(roomId)) {
+			channel.pendingMessages.push(message);
+			return;
+		}
 
 		// 【S8-7 issue #22】防循环守卫：在汇聚点按本轮 BATCH 评估，先于创建 thinking / 发 THINKING_START。
 		//   - skipGuard=true（退避 reschedule 落地）跳过：本轮已评估过，不重复评估。
@@ -571,8 +638,9 @@ export class MessageHandler {
 		// 并发防护：必须先于「消费/清空积累缓冲」——只有真正进入交付路径时才消费缓冲，否则早返回会丢弃
 		// 已清空但从未发送的群聊上下文（P1-a）。REQ-011 S2：cc 现为 node-driven，
 		// 与 openclaw/opencode/codex 共用此标准守卫与 drop 语义（其消息内容不会因此丢失）。
-		if (this.thinkingSessions.has(sessionKey)) {
-			console.warn(`[handler] Thinking session already active for ${sessionKey}`);
+		if (this.thinkingSessions.has(sessionKey) || !this.runReady(roomId)) {
+			console.warn(`[handler] Thinking session already active or paused for ${sessionKey}`);
+			if (this.getConversations) channel.pendingMessages.push(message);
 			return;
 		}
 
@@ -618,6 +686,67 @@ export class MessageHandler {
 			events: [],
 		};
 
+		// Persist the run slot before emitting THINKING_START or touching the legacy driver.
+		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
+		const chatContext = {
+			roomType, roomId, counterpartUid: fromUid, isOwner,
+			workspaceDir: cfg?.workspaceDir, account: cfg?.account,
+			getSelfName: () => this.resolveSelfName(),
+			persona: this.persona, templates: this.templates ?? undefined,
+		};
+		if (this.getConversations) {
+			let begunId: string | undefined;
+			try {
+				const store = this.getConversations();
+				const id = randomUUID();
+				const bound = store.beginRun(this.selfUid, roomId, id);
+				begunId = id;
+				// Render the server template once at the core boundary. Legacy adapters only deliver
+				// this prepared value in their existing native injection channel, never render again.
+				let nameTimer: ReturnType<typeof setTimeout> | undefined;
+				let selfName: string | undefined;
+				try {
+					if (this.templates) selfName = await Promise.race([
+						this.resolveSelfName(),
+						new Promise<never>((_, reject) => {
+							nameTimer = setTimeout(() => reject(new Error('RUN_PREPARATION_TIMEOUT')),
+								Math.max(1, this.THINKING_SESSION_TIMEOUT_MS - (Date.now() - session.startTime)));
+						}),
+					]);
+				} finally { if (nameTimer) clearTimeout(nameTimer); }
+				const systemPrompt = this.templates
+					? buildSystemPrompt(this.templates, { displayName: selfName, uid: this.selfUid, persona: this.persona }) : '';
+				const abort = new AbortController();
+				const prepared: PreparedRun = {
+					runId: id, message: agentEnvelope, systemPrompt,
+					conversation: {
+						id: bound.conversationId, generation: bound.generation,
+						nativeState: bound.nativeState[this.driver.type as keyof typeof bound.nativeState]
+							? { version: 1, value: bound.nativeState[this.driver.type as keyof typeof bound.nativeState] }
+							: undefined,
+						saveNativeState: async (v) => bound.saveNativeState(this.driver.type as Parameters<typeof bound.saveNativeState>[0], v.value as Record<string, unknown>),
+						registerNativeAlias: async (v) => bound.registerNativeAlias(this.driver.type as Parameters<typeof bound.registerNativeAlias>[0], v.id, v.scope),
+					},
+					saveRecovery: async (v) => bound.saveRecovery(v),
+					capabilities: { invoke: async () => { throw new Error('capability command unavailable in legacy bridge'); } },
+					signal: abort.signal,
+				};
+				const bridge = new LegacyDriverBridge(this.driver, () => ({ aiclawUid: this.selfUid, roomId, chatContext }), {
+					nativeScope: { identityId: this.selfUid, roomId, conversationId: bound.conversationId, generation: bound.generation },
+				});
+				session.run = { id, generation: bound.generation, abort, agent: bridge.createRun(prepared) };
+			} catch (error) {
+				if (begunId) {
+					try { this.getConversations().finishRun(begunId); }
+					catch (releaseError) { console.error(`[handler] pre-submit run ${begunId} remains occupied: ${errMsg(releaseError)}`); }
+				}
+				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
+				channel.pendingMessages.unshift(message);
+				console.error(`[handler] run preparation failed for ${sessionKey}: ${errMsg(error)}`);
+				return;
+			}
+		}
+
 		// 设置 5 分钟超时定时器（P-M2-3）
 		session.timeoutId = setTimeout(() => {
 			if (session.finalized) return;
@@ -631,7 +760,7 @@ export class MessageHandler {
 			});
 			// REQ-008 #75: best-effort 收尾 driver session，让卡住的迭代器能终止。
 			this.teardownSession(session, roomId, true);
-		}, this.THINKING_SESSION_TIMEOUT_MS);
+		}, Math.max(1, this.THINKING_SESSION_TIMEOUT_MS - (Date.now() - session.startTime)));
 
 		this.thinkingSessions.set(sessionKey, session);
 
@@ -651,25 +780,8 @@ export class MessageHandler {
 		// opencode driver 据此派生隔离 workspace 目录。私聊（roomType=2）的对端 = fromUid。
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
-		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
-		const agentSession = await this.driver.openSession({
-			aiclawUid: this.selfUid,
-			roomId,
-			chatContext: {
-				roomType,
-				roomId,
-				counterpartUid: fromUid,
-				isOwner,
-				workspaceDir: cfg?.workspaceDir,
-				account: cfg?.account,
-				// REQ-018: LAZY self-name resolver (cached), now feeding the system-prompt identity anchor of
-				// ALL FOUR drivers (opencode/codex/openclaw/cc). Called only when templates are present.
-				getSelfName: () => this.resolveSelfName(),
-				// REQ-018: persona + templates ride in chatContext; each driver renders its system layer
-				// from them. templates null (unprewarmed/failed) → undefined → driver degrades (no system prompt).
-				persona: this.persona,
-				templates: this.templates ?? undefined,
-			},
+		const agentSession = session.run ? undefined : await this.driver.openSession({
+			aiclawUid: this.selfUid, roomId, chatContext,
 		});
 		session.agentSession = agentSession;
 
@@ -703,21 +815,32 @@ export class MessageHandler {
 			this.teardownSession(session, roomId, false);
 		};
 
+		let runDone = false;
 		try {
-			for await (const ev of agentSession.send(agentEnvelope)) {
-				// 超时/广播 finalize 抢先：停止映射后续事件。session 的收尾交给 finally 统一 close。
-				if (session.finalized) {
+			const stream = session.run ? session.run.agent.events : agentSession!.send(agentEnvelope);
+			for await (const ev of stream) {
+				// Reset invalidates a generation even if its HTTP-response cancellation callback has not run yet.
+				if (session.run && this.getConversations!().get(this.selfUid, roomId)?.generation !== session.run.generation) {
+					session.finalized = true;
+					await this.stopRun(session, 'stale generation');
 					break;
 				}
+				if (session.finalized) break;
 				session.events.push(ev);
 				if (ev.type === 'thinking') {
 					// REQ-004 S4: 仅本地累计（超时/广播 partial 帧用），不再逐帧发 THINKING_DELTA。
 					session.accumulatedContent += ev.text;
 				} else if (ev.type === 'done') {
+					if (session.run) { runDone = true; continue; }
 					finalizeComplete();
 					break;
 				} else if (ev.type === 'error') {
 					finalizeError(ev.message);
+					if (session.run) this.getConversations!().markStopUnconfirmed(session.run.id);
+					break;
+				} else if (ev.type === 'cancelled' && session.run) {
+					finalizeError(ev.reason);
+					await this.stopRun(session, ev.reason);
 					break;
 				}
 				// REQ-010 S1: the agent reply path via a terminal event is retired. The agent
@@ -725,12 +848,21 @@ export class MessageHandler {
 				// so there is no per-event reply side-effect here. 'tool' events only feed
 				// reduceThinking's accounting at done.
 			}
+			if (session.run && !session.finalized) {
+				if (runDone && this.getConversations!().get(this.selfUid, roomId)?.generation === session.run.generation) {
+					finalizeComplete();
+					this.releaseRun(session); // done AND stream return: bridge must prove upstream terminal.
+				} else {
+					finalizeError('UNEXPECTED_EOF');
+					this.getConversations!().markStopUnconfirmed(session.run.id);
+				}
+			}
 		} catch (err) {
 			finalizeError(errMsg(err));
+			if (session.run) this.getConversations!().markStopUnconfirmed(session.run.id);
 		} finally {
-			// REQ-008 #75 P2: 无论 done / error / break / throw，总在退出消费循环时收尾 driver session。
-			// 与 Fix 1 配合：close() 唤醒仍 park 在 adapter 上的 for-await。幂等，安全多调。
-			void agentSession.close();
+			if (session.run) void session.run.agent.dispose();
+			else void agentSession!.close();
 		}
 	}
 
@@ -866,6 +998,7 @@ export class MessageHandler {
 					const session = this.thinkingSessions.get(sessionKey);
 					if (session) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
+						if (session.run) session.finalized = true;
 						const reason = LIMIT_REASONS[error];
 						console.log(`[thinking] server rejected: ${error} (no thinkingId fallback), sending autoReply roomId=${roomId}`);
 						this.sendAutoReply(String(roomId), reason);
@@ -933,7 +1066,8 @@ export class MessageHandler {
 		for (const session of this.thinkingSessions.values()) {
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			// REQ-008 #75: best-effort 收尾 driver session（让卡住的迭代器终止）。
-			void session.agentSession?.close();
+			if (session.run) void this.stopRun(session, 'handler destroyed');
+			else void session.agentSession?.close();
 			if (!session.finalized) {
 				session.finalized = true;
 				this.ws.send(WSReqType.THINKING_END, {
@@ -948,7 +1082,10 @@ export class MessageHandler {
 				});
 			}
 		}
-		this.thinkingSessions.clear();
+		if (!this.getConversations) this.thinkingSessions.clear();
+		else for (const [key, session] of this.thinkingSessions) {
+			if (!session.run) this.thinkingSessions.delete(key);
+		}
 		// 清理所有房间的待处理队列与定时器；用 cancel 而非 flush，
 		// 避免 teardown 时 flush 重新触发 triggerAgentLoop 复活会话。
 		for (const channel of this.roomChannels.values()) {
@@ -961,7 +1098,7 @@ export class MessageHandler {
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
 	private flushPendingMessages(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
-		if (!channel || channel.pendingMessages.length === 0) {
+		if (!channel || (this.getConversations && !this.runReady(roomId)) || channel.pendingMessages.length === 0) {
 			this.maybeEvictRoom(roomId);
 			return;
 		}

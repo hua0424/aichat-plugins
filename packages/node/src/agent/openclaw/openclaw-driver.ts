@@ -370,15 +370,16 @@ export class OpenclawDriver implements AgentDriver {
 		// openclaw workspace AGENTS.md marked block (openclaw re-reads it per turn). The identity anchor +
 		// persona + reply contract live THERE — the per-turn gateway message stays pure. hash-compare
 		// (syncAgentsMdFile) skips the write when unchanged; a write failure degrades (warn, don't fail).
-		const selfName = o.chatContext.templates ? await o.chatContext.getSelfName?.() : undefined;
-		const systemPrompt = o.chatContext.templates
+		const selfName = o.chatContext.preparedSystemPrompt === undefined && o.chatContext.templates
+			? await o.chatContext.getSelfName?.() : undefined;
+		const systemPrompt = o.chatContext.preparedSystemPrompt ?? (o.chatContext.templates
 			? buildSystemPrompt(o.chatContext.templates, {
 					displayName: selfName,
 					uid: o.aiclawUid,
 					persona: o.chatContext.persona ?? null,
 				})
-			: undefined;
-		if (systemPrompt) {
+			: undefined);
+		if (systemPrompt !== undefined && (o.chatContext.preparedSystemPrompt !== undefined || systemPrompt !== '')) {
 			try {
 				await syncAgentsMdFile(join(this.workspaceDir, 'AGENTS.md'), systemPrompt);
 			} catch (err) {

@@ -15,12 +15,28 @@ export interface ConversationRecord {
 	adapterInstanceId: string;
 	generation: number;
 	contextKey: string;
-	state: 'ready';
+	state: 'ready' | 'suspended' | 'stop_unconfirmed' | 'disabled';
+	/** A reset can leave several older runs awaiting independent stop confirmation. */
+	pendingRuns?: PendingRun[];
 	nativeAliases: NativeAlias[];
 	/** Original provider store payloads. OpenClaw retains both the bare token and full gateway sessionKey. */
 	nativeState: Partial<Record<Provider, Record<string, unknown>>>;
 }
-interface Snapshot { version: 1; sources: Record<string, string>; records: ConversationRecord[] }
+export interface RecoveryData { version: number; value: unknown }
+export interface PendingRun { runId: string; generation: number; startedAt: string; recovery?: RecoveryData }
+export interface BoundConversationRun {
+	readonly conversationId: string;
+	readonly generation: number;
+	readonly contextKey: string;
+	readonly nativeState: ConversationRecord['nativeState'];
+	saveNativeState(provider: Provider, state: Record<string, unknown>): void;
+	registerNativeAlias(provider: Provider, id: string, runtimeScope?: string): void;
+	registerNative(provider: Provider, id: string, state?: Record<string, unknown>, runtimeScope?: string): void;
+	saveRecovery(value: RecoveryData): void;
+}
+export interface ResetReceipt { reset: true; generation: number; executionPaused: boolean }
+interface StoredResetReceipt { digest: string; receipt: ResetReceipt }
+interface Snapshot { version: 1; sources: Record<string, string>; records: ConversationRecord[]; revokedKeys?: string[]; revokedAliases?: NativeAlias[]; resetReceipts?: StoredResetReceipt[] }
 export interface ConversationStoreOptions {
 	home: string;
 	serverNamespace: string;
@@ -68,6 +84,10 @@ export class ConversationStore {
 			const missing = newlyActive.records.filter((r) => !this.byIdentity.has(identityKey(r.serverNamespace, r.identityId, r.roomId)));
 			if (missing.length) this.commit([...this.snapshot.records, ...missing]);
 		}
+		// A process restart is not evidence that a native run stopped. Persist the gate before admission.
+		if (this.snapshot.records.some((r) => r.pendingRuns?.length && r.state !== 'stop_unconfirmed')) {
+			this.commit(this.snapshot.records.map((r) => r.pendingRuns?.length ? { ...r, state: 'stop_unconfirmed' } : r));
+		}
 	}
 
 	/** Stop accepting late driver writes before releasing the single-writer lease. */
@@ -98,6 +118,120 @@ export class ConversationStore {
 		return copy(record);
 	}
 
+	/** A short synchronous transaction; no driver or network operation runs while changing the binding. */
+	reset(identityId: string, roomId: string, requestId?: string, bearer?: string): ConversationRecord {
+		if ((requestId === undefined) !== (bearer === undefined)) throw new Error('reset receipt requires requestId and bearer');
+		let receiptDigest: string | undefined;
+		if (requestId !== undefined && bearer !== undefined) {
+			receiptDigest = this.receiptDigest(bearer, requestId);
+			if (this.snapshot.resetReceipts?.some((r) => r.digest === receiptDigest)) throw new Error('duplicate reset requestId');
+			// ponytail: fail closed after 1024 lifetime reset receipts rather than evict a still-retriable
+			// revoked bearer; add durable expiry/compaction with an explicit retry window before raising this ceiling.
+			if ((this.snapshot.resetReceipts?.length ?? 0) >= 1024) throw new Error('reset receipt capacity exceeded');
+		}
+		const old = this.get(identityId, roomId) ?? this.newRecord(identityId, roomId);
+		if (this.options.activeProviders?.has(identityId) && old.adapterInstanceId !== this.options.activeProviders.get(identityId))
+			throw new Error('activated provider changed for existing conversation');
+		if (!Number.isSafeInteger(old.generation + 1)) throw new Error('generation exhausted');
+		const record: ConversationRecord = { ...old, generation: old.generation + 1,
+			contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: {},
+			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed' : old.state };
+		const records = this.snapshot.records.some((r) => r.conversationId === old.conversationId)
+			? this.snapshot.records.map((r) => r.conversationId === old.conversationId ? record : r)
+			: [...this.snapshot.records, record];
+		this.commit(records, {
+			revokedKeys: [...(this.snapshot.revokedKeys ?? []), old.contextKey],
+			revokedAliases: [...(this.snapshot.revokedAliases ?? []), ...old.nativeAliases],
+			...(receiptDigest ? { resetReceipts: [...(this.snapshot.resetReceipts ?? []), {
+				digest: receiptDigest, receipt: { reset: true as const, generation: record.generation,
+					executionPaused: record.state !== 'ready' },
+			}] } : {}),
+		});
+		return copy(record);
+	}
+
+	getResetReceipt(bearer: string, requestId: string): ResetReceipt | undefined {
+		const digest = this.receiptDigest(bearer, requestId);
+		const entry = this.snapshot.resetReceipts?.find((r) => r.digest === digest);
+		return entry ? copy(entry.receipt) : undefined;
+	}
+
+	private receiptDigest(bearer: string, requestId: string): string {
+		if (!validId(requestId) || requestId.length > 256 || typeof bearer !== 'string' || !bearer.length || bearer.length > 8192)
+			throw new Error('invalid reset receipt binding');
+		return createHash('sha256').update(JSON.stringify([bearer, requestId])).digest('hex');
+	}
+
+	beginRun(identityId: string, roomId: string, runId: string): BoundConversationRun {
+		if (!validId(runId)) throw new Error('invalid runId');
+		const record = this.getOrCreate(identityId, roomId);
+		if (record.state !== 'ready' || record.pendingRuns?.length) throw new Error('conversation paused or occupied');
+		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
+		record.pendingRuns = [{ runId, generation: record.generation, startedAt: new Date().toISOString() }];
+		this.replace(record);
+		const generation = record.generation, conversationId = record.conversationId;
+		const current = (): ConversationRecord => {
+			const r = this.byIdentity.get(identityKey(this.options.serverNamespace, identityId, roomId));
+			if (this.closed || !r || r.conversationId !== conversationId || r.generation !== generation ||
+				!r.pendingRuns?.some((run) => run.runId === runId)) throw new Error('STALE_GENERATION');
+			if (r.state !== 'ready') throw new Error('conversation paused');
+			return r;
+		};
+		return {
+			conversationId, generation, contextKey: record.contextKey, nativeState: copy(record.nativeState),
+			saveNativeState: (provider, state) => {
+				current(); this.assertProvider(provider, identityId);
+				if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid native state');
+				const updated = copy(current()); updated.nativeState[provider] = copy(state); this.replace(updated);
+			},
+			registerNativeAlias: (provider, id, runtimeScope) => {
+				current(); this.registerNative(provider, id, identityId, roomId, undefined, runtimeScope);
+			},
+			registerNative: (provider, id, state, runtimeScope) => {
+				current(); this.registerNative(provider, id, identityId, roomId, state, runtimeScope);
+			},
+			saveRecovery: (value) => this.saveRecovery(runId, value),
+		};
+	}
+
+	pendingRuns(): Array<PendingRun & { conversationId: string; identityId: string; roomId: string }> {
+		return this.snapshot.records.flatMap((r) => (r.pendingRuns ?? []).map((run) =>
+			({ ...copy(run), conversationId: r.conversationId, identityId: r.identityId, roomId: r.roomId })));
+	}
+
+	saveRecovery(runId: string, value: RecoveryData): void {
+		this.assertRecovery(value);
+		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
+		if (!record || this.closed) throw new Error('run no longer pending');
+		const updated = copy(record);
+		updated.pendingRuns!.find((run) => run.runId === runId)!.recovery = copy(value);
+		this.replace(updated);
+	}
+
+	markCancelling(runId: string): void { this.updateRunState(runId, 'suspended'); }
+	markStopUnconfirmed(runId: string): void { this.updateRunState(runId, 'stop_unconfirmed'); }
+	confirmStopped(runId: string): void { this.finishRun(runId); }
+	finishRun(runId: string): void {
+		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
+		if (!record || this.closed) throw new Error('run no longer pending');
+		const updated = copy(record);
+		updated.pendingRuns = updated.pendingRuns!.filter((run) => run.runId !== runId);
+		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : 'ready';
+		this.replace(updated);
+	}
+	private updateRunState(runId: string, state: 'suspended' | 'stop_unconfirmed'): void {
+		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
+		if (!record || this.closed) throw new Error('run no longer pending');
+		this.replace({ ...copy(record), state });
+	}
+	private assertRecovery(value: RecoveryData): void {
+		if (!value || !Number.isSafeInteger(value.version) || value.version < 1) throw new Error('invalid recovery');
+		let encoded: string | undefined;
+		try { encoded = JSON.stringify(value); } catch { /* cyclic */ }
+		if (!encoded || Buffer.byteLength(encoded) > 65536 || JSON.stringify(JSON.parse(encoded)) !== encoded)
+			throw new Error('invalid recovery');
+	}
+
 	contextKey(identityId: string, roomId: string): string { return this.getOrCreate(identityId, roomId).contextKey; }
 
 	registerNative(provider: Provider, id: string, identityId: string, roomId: string,
@@ -105,6 +239,8 @@ export class ConversationStore {
 		this.assertProvider(provider, identityId);
 		if (!validId(id) || (runtimeScope !== undefined && !validId(runtimeScope))) throw new Error('invalid native alias');
 		const prior = this.get(identityId, roomId);
+		if (prior && (prior.state !== 'ready' || prior.pendingRuns?.some((run) => run.generation !== prior.generation)))
+			throw new Error('conversation paused');
 		if (prior && this.options.activeProviders?.has(identityId) && prior.adapterInstanceId !== this.options.activeProviders.get(identityId))
 			throw new Error('activated provider changed for existing conversation');
 		const record = prior ?? this.newRecord(identityId, roomId);
@@ -119,6 +255,7 @@ export class ConversationStore {
 			return copy(record);
 		}
 		const alias: NativeAlias = { provider, id, ...(runtimeScope === undefined ? {} : { runtimeScope }) };
+		if (this.snapshot.revokedAliases?.some((a) => aliasKey(a) === aliasKey(alias))) throw new Error('native alias revoked');
 		const other = this.byAlias.get(aliasKey(alias));
 		if (other && (other.conversationId !== record.conversationId || other.generation !== record.generation)) {
 			throw new Error('native alias conflict');
@@ -147,6 +284,8 @@ export class ConversationStore {
 		const provider = this.options.activeProviders?.get(identityId);
 		if (provider !== 'openclaw' && provider !== 'cc') throw new Error('bind token requires an activated CC/OpenClaw identity');
 		const record = this.getOrCreate(identityId, roomId);
+		if (record.state !== 'ready' || record.pendingRuns?.some((run) => run.generation !== record.generation))
+			throw new Error('conversation paused');
 		const current = record.nativeAliases.find((alias) => alias.provider === provider);
 		if (current) return current.id;
 		const token = record.contextKey;
@@ -167,6 +306,8 @@ export class ConversationStore {
 	deleteNative(provider: Provider, identityId: string, roomId: string): void {
 		this.assertProvider(provider, identityId);
 		const record = this.get(identityId, roomId);
+		if (record && (record.state !== 'ready' || record.pendingRuns?.some((run) => run.generation !== record.generation)))
+			throw new Error('conversation paused');
 		if (!record || (!record.nativeState[provider] && !record.nativeAliases.some((a) => a.provider === provider))) return;
 		// CC delete means forget the resumable session, not the stable agent-facing bind token.
 		if (provider === 'cc' && !record.nativeState.cc) return;
@@ -231,9 +372,9 @@ export class ConversationStore {
 		const records = this.snapshot.records.filter((r) => r.conversationId !== record.conversationId);
 		this.commit([...records, record]);
 	}
-	private commit(records: ConversationRecord[]): void {
+	private commit(records: ConversationRecord[], additions: Partial<Snapshot> = {}): void {
 		if (this.closed) throw new Error('conversation store closed');
-		const next: Snapshot = { ...this.snapshot, records };
+		const next: Snapshot = { ...this.snapshot, ...additions, records };
 		this.validate(next);
 		this.persist(next);
 		this.snapshot = next;
@@ -249,12 +390,31 @@ export class ConversationStore {
 	private validate(data: Snapshot): void {
 		if (!data || data.version !== 1 || !Array.isArray(data.records) || !data.sources ||
 			typeof data.sources !== 'object' || Array.isArray(data.sources)) throw new Error('invalid conversation snapshot');
-		const ids = new Set<string>(), keys = new Set<string>(), pairs = new Set<string>(), aliases = new Set<string>(), ccSessions = new Set<string>();
+		if (data.resetReceipts !== undefined && (!Array.isArray(data.resetReceipts) || data.resetReceipts.length > 1024 ||
+			new Set(data.resetReceipts.map((r) => r?.digest)).size !== data.resetReceipts.length ||
+			data.resetReceipts.some((r) => !r || typeof r.digest !== 'string' || !/^[0-9a-f]{64}$/.test(r.digest) ||
+				!r.receipt || r.receipt.reset !== true || !Number.isSafeInteger(r.receipt.generation) ||
+				r.receipt.generation < 2 || typeof r.receipt.executionPaused !== 'boolean')))
+			throw new Error('invalid reset receipts');
+		if (data.revokedKeys !== undefined && (!Array.isArray(data.revokedKeys) || data.revokedKeys.some((k) => typeof k !== 'string' || !/^[0-9a-f]{64}$/.test(k)))) throw new Error('invalid revoked keys');
+		if (data.revokedAliases !== undefined && (!Array.isArray(data.revokedAliases) || data.revokedAliases.some((a) => !a || !PROVIDERS.has(a.provider) || !validId(a.id) || (a.runtimeScope !== undefined && !validId(a.runtimeScope))))) throw new Error('invalid revoked aliases');
+		const ids = new Set<string>(), keys = new Set(data.revokedKeys ?? []), pairs = new Set<string>(),
+			aliases = new Set((data.revokedAliases ?? []).map(aliasKey)), ccSessions = new Set<string>(), runs = new Set<string>();
+		if (keys.size !== (data.revokedKeys?.length ?? 0) || aliases.size !== (data.revokedAliases?.length ?? 0)) throw new Error('duplicate revoked binding');
 		for (const r of data.records) {
 			if (!r || r.serverNamespace !== this.options.serverNamespace || !validId(r.identityId) || !validId(r.roomId) ||
 				!validId(r.conversationId) || !validId(r.adapterInstanceId) || !/^[0-9a-f]{64}$/.test(r.contextKey) ||
-				r.generation !== 1 || r.state !== 'ready' || !Array.isArray(r.nativeAliases) ||
-				!r.nativeState || typeof r.nativeState !== 'object' || Array.isArray(r.nativeState)) throw new Error('invalid conversation record');
+				!Number.isSafeInteger(r.generation) || r.generation < 1 || !['ready', 'suspended', 'stop_unconfirmed', 'disabled'].includes(r.state) ||
+				!Array.isArray(r.nativeAliases) || !r.nativeState || typeof r.nativeState !== 'object' || Array.isArray(r.nativeState) ||
+				(r.pendingRuns !== undefined && !Array.isArray(r.pendingRuns))) throw new Error('invalid conversation record');
+			for (const run of r.pendingRuns ?? []) {
+				if (!run || !validId(run.runId) || runs.has(run.runId) || !Number.isSafeInteger(run.generation) ||
+					run.generation < 1 || run.generation > r.generation || !validId(run.startedAt) || Number.isNaN(Date.parse(run.startedAt)))
+					throw new Error('invalid pending run');
+				if (run.recovery !== undefined) this.assertRecovery(run.recovery);
+				runs.add(run.runId);
+			}
+			if (r.state === 'ready' && r.pendingRuns?.some((run) => run.generation !== r.generation)) throw new Error('old run cannot be ready');
 			const pair = identityKey(r.serverNamespace, r.identityId, r.roomId);
 			if (ids.has(r.conversationId) || keys.has(r.contextKey) || pairs.has(pair)) throw new Error('duplicate conversation binding');
 			ids.add(r.conversationId); keys.add(r.contextKey); pairs.add(pair);

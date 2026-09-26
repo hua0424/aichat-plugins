@@ -384,6 +384,23 @@ describe('OpencodeSession.send', () => {
 		expect(spied.returnSpy).toHaveBeenCalled();
 	});
 
+	it.each(['prepared {displayName}', ''])('passes prepared system prompt verbatim (%j) without rendering', async (preparedSystemPrompt) => {
+		const { client, prompt } = mockClient();
+		const driver = new OpencodeDriver({ server: noopServer(client), workspaceBase: BASE, sessionStore: memStore() });
+		const getSelfName = vi.fn(async () => 'ignored');
+		const session = await driver.openSession({
+			aiclawUid: '1', roomId: '1',
+			chatContext: { roomType: 1, roomId: '1', preparedSystemPrompt, templates: TEMPLATES, getSelfName },
+		});
+		session.send('original');
+		await new Promise((r) => setImmediate(r));
+		const body = (prompt.mock.calls[0][0] as { body: { parts: Array<{ text: string }>; system?: string } }).body;
+		expect(body).toHaveProperty('system', preparedSystemPrompt);
+		expect(body.parts[0].text).toBe('original');
+		expect(getSelfName).not.toHaveBeenCalled();
+		await session.close();
+	});
+
 	// REQ-018 — the reply contract + identity anchor + persona are rendered into the prompt body's
 	// `system` field (server-fetched templates); the user message part is PURE text now.
 	it('REQ-018: user message part is pure; system carries identity + persona + reply contract', async () => {
