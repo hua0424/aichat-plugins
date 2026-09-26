@@ -9,7 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { capabilitySocketPath } from '../capability/endpoint.js';
 import { postCapability } from '../capability/client.js';
-import { resolveAgentSessionKey } from './send-message.js';
+import { resolveAgentContexts } from './send-message.js';
 
 export async function handleListGroupMembers(args: string[]): Promise<void> {
 	let online = false;
@@ -19,14 +19,14 @@ export async function handleListGroupMembers(args: string[]): Promise<void> {
 		else if (args[i] === '--groupid' && args[i + 1]) groupid = args[++i];
 	}
 
-	const sessionKey = resolveAgentSessionKey();
-	if (!sessionKey) {
+	const contexts = resolveAgentContexts();
+	if (!contexts.length) {
 		console.error('Error: no agent session env (OPENCODE_SESSION_ID)');
 		process.exit(1);
 	}
 
 	const res = await postCapability(capabilitySocketPath(), {
-		sessionKey,
+		version: 2, contexts,
 		command: 'list-group-members',
 		args: {
 			...(online ? { online: true } : {}),

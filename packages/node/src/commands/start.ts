@@ -6,13 +6,9 @@ import { MessageHandler } from '../handler/message.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
-import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
-import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
 import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
-import { FileBindTokenStore } from '../agent/bind-token-store.js';
-import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
@@ -31,7 +27,9 @@ import {
 	resetSessionCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
-import { resolveBoundSession } from '../capability/session-key.js';
+import { ConversationStore, type Provider } from '../capability/conversations.js';
+import { legacyBridges } from '../capability/legacy-bridges.js';
+import type { ContextCandidate } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
 import { ensureAichatOnPath } from '../util/path-inject.js';
 
@@ -93,6 +91,9 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// env-injection plugin (codex natively injects CODEX_THREAD_ID into its exec shell). Its
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
+	// SDK v0.142.3 accepts a per-client env (without inheriting process.env); never mutate global env.
+	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+		value !== undefined && !['OPENCODE_SESSION_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY'].includes(name))) as Record<string, string>;
 
 	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
 	// their matching headless turn. Every CC identity's driver and the broker share this registry.
@@ -103,15 +104,14 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
 	const ccTranscript = new FileCcTranscriptWriter();
 
-	// BL-014 (#141): ONE shared opaque bind-token store for the whole node. openclaw/cc drivers mint a
-	// stable token per (uid,room) as the AGENT-FACING binding (OPENCLAW_BIND / AICHAT_BIND); the capability
-	// endpoint + CC broker resolve that token back to (uid,room) here. Persisted (0600) so a token minted
-	// before a restart still resolves. codex/opencode keep their own runtime-id stores (already unforgeable).
-	const bindTokenStore = new FileBindTokenStore();
-	// One loaded snapshot/writer per used type, shared across identities and connection retries.
-	let opencodeSessions: FileSessionStore | undefined;
-	let codexSessions: FileCodexSessionStore | undefined;
-	let ccSessions: FileCcHeadlessSessionStore | undefined;
+	// Drivers keep their native CLI APIs; these thin views all delegate to ONE atomic core record.
+	// Construction is deferred until credentials are verified and the endpoint's single-writer lock is held.
+	let conversations: ConversationStore | undefined;
+	const bridges = legacyBridges(() => {
+		if (!conversations) throw new Error('conversation bindings not ready');
+		return conversations;
+	});
+	const bindTokenStore = bridges.bindTokens;
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
@@ -124,7 +124,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new OpencodeDriver({
 					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
 					workspaceBase: opencodeWorkspaceBase,
-					sessionStore: (opencodeSessions ??= new FileSessionStore()),
+					sessionStore: bridges.opencode,
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -133,9 +133,9 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				// turn. `new Codex()` omits apiKey/baseUrl → uses the baked ~/.codex/config.toml provider
 				// + auth.json. resolveSession reverse-looks-up the bound (aiclaw, room) by CODEX_THREAD_ID.
 				return new CodexDriver({
-					codex: new Codex(),
+					codex: new Codex({ env: codexEnv }),
 					workspaceBase: codexWorkspaceBase,
-					sessionStore: (codexSessions ??= new FileCodexSessionStore()),
+					sessionStore: bridges.codex,
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -148,7 +148,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new CcHeadlessDriver({
 					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
-					sessionStore: (ccSessions ??= new FileCcHeadlessSessionStore()),
+					sessionStore: bridges.cc,
 					bindTokens: bindTokenStore,
 					registry: ccRegistry,
 					transcript: ccTranscript,
@@ -183,14 +183,8 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
 	});
 
-	await supervisor.start(registry);
-
-	// REQ-010 S1: node-local capability endpoint (Flow2). The agent replies by running
-	// `aichat send-message --content "..."`, which POSTs here over a loopback unix socket. resolve()
-	// maps the agent's session key → the bound identity/room/api — room/identity NEVER come from the
-	// CLI args (anti-spoofing). REQ-010 S5: require a KNOWN agent-type prefix and route ONLY to the
-	// driver of that type (no more try-every-driver); resolveBoundSession maps it to the bound
-	// identity/room + that owner uid's per-identity api.
+	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.
+	// Core lookup, not the first matching driver, is the only capability routing authority.
 	const registry$ = new CapabilityRegistry();
 	registry$.register('send-message', sendMessageCapability());
 	// REQ-010 S3: read-only query capabilities (token-scoped via the resolved per-identity apiClient)
@@ -211,36 +205,56 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			return { driverType: owner.driver.type, reset };
 		}),
 	);
+	const bound = (record: ReturnType<ConversationStore['resolveCandidate']>) => {
+		if (!record) return undefined;
+		const agent = supervisor.agents.find((a) => a.uid === record.identityId && a.status !== 'offline');
+		return agent ? { aiclawUid: agent.uid, roomId: record.roomId, apiClient: agent.api,
+			conversationId: record.conversationId, generation: record.generation } : undefined;
+	};
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
-		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
+		resolve: (sessionKey) => bound(conversations?.resolveLegacy(sessionKey)),
+		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
+			Parameters<ConversationStore['resolveCandidate']>[0])),
 		serverNamespace: restBaseUrl,
+		lockHome: AICHAT_HOME,
 	});
-	await endpoint.listen(capabilitySocketPath());
-	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
-
-	// REQ-011 S2: if any cc identity is registered, start the CC hook broker. CC's headless hooks POST
-	// here; the bridge sink routes each resolved hook to its original identity/room/spawn only
-	// via the shared ccRegistry. Stdout, not hooks, supplies panel thinking. BL-014 (#141):
-	// resolve() = the shared opaque bind-token store lookup (CC's hook Authorization: Bearer <token> carries
-	// the same AICHAT_BIND token, so the broker resolves it exactly like CcHeadlessDriver.resolveSession).
-	// Only bound when a cc identity exists (don't bind 9100 otherwise). Closed on shutdown.
 	let ccBroker: CcBroker | null = null;
-	if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
-		ccBroker = new CcBroker({
-			resolve: (token) => bindTokenStore.resolve(token),
-			sink: buildCcBridgeSink(ccRegistry),
-		});
-		await ccBroker.listen(ccBrokerPort());
-		console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
-	}
-
-	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
 	try {
-		const written = installSkill();
-		if (written.length > 0) console.log(`[start] Installed aichat-reply skill: ${written.join(', ')}`);
-	} catch {
-		/* best-effort */
+		await endpoint.listen(capabilitySocketPath());
+		console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
+		await supervisor.start(registry, false);
+		const activeProviders = new Map(supervisor.agents.map((a) => [a.uid, a.driver.type as Provider]));
+		if (activeProviders.size !== supervisor.agents.length) throw new Error('duplicate activated identity');
+		conversations = new ConversationStore({
+			home: AICHAT_HOME, serverNamespace: restBaseUrl,
+			activeUids: new Set(activeProviders.keys()), activeProviders,
+		});
+
+		// CC hook broker must also be ready before a CC message can reach the driver.
+		if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
+			ccBroker = new CcBroker({
+				resolve: (token) => bindTokenStore.resolve(token),
+				sink: buildCcBridgeSink(ccRegistry),
+			});
+			await ccBroker.listen(ccBrokerPort());
+			console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
+		}
+		// Refreshing the skill is best-effort; transport and bindings must never be best-effort.
+		try {
+			const written = installSkill();
+			if (written.length > 0) console.log(`[start] Installed aichat-reply skill: ${written.join(', ')}`);
+		} catch {
+			/* best-effort */
+		}
+		supervisor.connectInbound();
+	} catch (err) {
+		await supervisor.stop().catch(() => {});
+		await ccBroker?.close().catch(() => {});
+		await opencodeServer.stop().catch(() => {});
+		conversations?.close();
+		await endpoint.close().catch(() => {});
+		throw err;
 	}
 
 	let shuttingDown = false;
@@ -251,17 +265,14 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		// Stop per-identity supervision first, THEN close the shared opencode server. The
 		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
-		await endpoint.close().catch(() => {});
-		await ccBroker?.close().catch(() => {});
+		// Quiesce every writer before releasing the home lease held by endpoint.close().
 		await supervisor.stop().catch(() => {});
+		await ccBroker?.close().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
-		const persisted = await Promise.allSettled([
-			opencodeSessions?.whenPersisted(), codexSessions?.whenPersisted(),
-			ccSessions?.whenPersisted(), bindTokenStore.whenPersisted(),
-		]);
-		const failed = persisted.filter((result) => result.status === 'rejected');
-		if (failed.length) console.error('[start] State flush failed:', failed);
-		process.exit(failed.length ? 1 : 0);
+		conversations?.close();
+		await endpoint.close().catch(() => {});
+		// ConversationStore commits each binding synchronously before exposing it; no queued binding writes.
+		process.exit(0);
 	};
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);

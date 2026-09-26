@@ -24,6 +24,7 @@ const AGENT_MAIN_PREFIX = 'agent:main:';
 // The token is base64url (`[A-Za-z0-9_-]`, no `:`) and the `$`-anchored binding has no `:`, so the
 // single `:` between them is unambiguous; `.+` greedily backtracks to it.
 const COMPOUND_RE = /^(.+):(aiclaw-\d+-room-\d+)$/;
+const NO_CONTEXT = { OPENCLAW_BIND: '', OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' };
 
 /**
  * Shape-tolerant sessionKey extraction for the `resolve_exec_env` hook (mirrors the Phase-1 probe).
@@ -43,10 +44,10 @@ export function extractExecEnvSessionKey(
 }
 
 export function buildOpenclawExecEnv(sessionKey: string | null | undefined): Record<string, string> {
-	if (typeof sessionKey !== 'string') return {};
-	if (!sessionKey.startsWith(AGENT_MAIN_PREFIX)) return {};
+	if (typeof sessionKey !== 'string') return { ...NO_CONTEXT };
+	if (!sessionKey.startsWith(AGENT_MAIN_PREFIX)) return { ...NO_CONTEXT };
 	const rest = sessionKey.slice(AGENT_MAIN_PREFIX.length); // `<token>:aiclaw-{uid}-room-{roomId}`
 	const m = COMPOUND_RE.exec(rest); // split token prefix from binding suffix
-	if (!m) return {}; // not a compound → inject nothing (safe no-op)
-	return { OPENCLAW_BIND: m[1] }; // the BARE opaque token → CLI emits `openclaw:<token>`
+	if (!m) return { ...NO_CONTEXT }; // no valid session: suppress every inherited identity
+	return { ...NO_CONTEXT, OPENCLAW_BIND: m[1] }; // bare token, not the compound or self-reported room
 }

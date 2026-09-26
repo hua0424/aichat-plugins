@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { resolveAgentSessionKey, handleSendMessage } from './send-message.js';
+import { resolveAgentSessionKey, resolveAgentContexts, handleSendMessage } from './send-message.js';
 import { handleResetSession } from './reset-session.js';
 import { postCapability } from '../capability/client.js';
 
@@ -18,6 +18,7 @@ describe('resolveAgentSessionKey', () => {
 		CODEX_THREAD_ID: process.env.CODEX_THREAD_ID,
 		OPENCLAW_BIND: process.env.OPENCLAW_BIND,
 		AICHAT_BIND: process.env.AICHAT_BIND,
+		AICHAT_CONTEXT_KEY: process.env.AICHAT_CONTEXT_KEY,
 	};
 
 	beforeEach(() => {
@@ -25,6 +26,7 @@ describe('resolveAgentSessionKey', () => {
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
 		delete process.env.AICHAT_BIND;
+		delete process.env.AICHAT_CONTEXT_KEY;
 	});
 
 	afterEach(() => {
@@ -66,11 +68,28 @@ describe('resolveAgentSessionKey', () => {
 	it('none set → undefined', () => {
 		expect(resolveAgentSessionKey()).toBeUndefined();
 	});
+
+	it('V2 collects every inherited candidate instead of trusting the first driver', () => {
+		process.env.AICHAT_CONTEXT_KEY = 'opaque-context';
+		process.env.OPENCODE_SESSION_ID = 'ses_x';
+		process.env.CODEX_THREAD_ID = 'thr_y';
+		process.env.OPENCLAW_BIND = 'opaque-openclaw';
+		process.env.AICHAT_BIND = 'opaque-cc';
+		expect(resolveAgentContexts()).toEqual([
+			{ key: 'opaque-context' },
+			{ provider: 'opencode', nativeId: 'ses_x' },
+			{ provider: 'codex', nativeId: 'thr_y' },
+			{ provider: 'openclaw', nativeId: 'opaque-openclaw' },
+			{ provider: 'cc', nativeId: 'opaque-cc' },
+		]);
+	});
 });
 
 describe('CLI write request ID', () => {
 	const originalBind = process.env.AICHAT_BIND;
+	const originalKey = process.env.AICHAT_CONTEXT_KEY;
 	beforeEach(() => {
+		delete process.env.AICHAT_CONTEXT_KEY;
 		delete process.env.OPENCODE_SESSION_ID;
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
@@ -79,6 +98,8 @@ describe('CLI write request ID', () => {
 	afterEach(() => {
 		if (originalBind === undefined) delete process.env.AICHAT_BIND;
 		else process.env.AICHAT_BIND = originalBind;
+		if (originalKey === undefined) delete process.env.AICHAT_CONTEXT_KEY;
+		else process.env.AICHAT_CONTEXT_KEY = originalKey;
 		vi.restoreAllMocks();
 	});
 
@@ -87,7 +108,7 @@ describe('CLI write request ID', () => {
 		const out = vi.spyOn(console, 'log').mockImplementation(() => {});
 		await handleSendMessage(['--content', ' hi ', '--request-id', 'retry-id']);
 		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({
-			sessionKey: 'cc:opaque-token', command: 'send-message', requestId: 'retry-id', args: { content: 'hi' },
+			version: 2, contexts: [{ provider: 'cc', nativeId: 'opaque-token' }], command: 'send-message', requestId: 'retry-id', args: { content: 'hi' },
 		});
 		expect(out).toHaveBeenCalledWith('Message sent: {"msgId":"91"}');
 	});

@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, statSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, statSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { postCapability } from './client.js';
 import {
 	CapabilityEndpoint,
@@ -150,6 +150,66 @@ describe('CapabilityEndpoint.handle', () => {
 		expect((res.json as { ok: boolean }).ok).toBe(false);
 		expect((await endpoint.handle({ body: body() })).status).toBe(200);
 		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+});
+
+describe('V2 all-candidate binding', () => {
+	function setup() {
+		const sendMessage = vi.fn(async () => ({ msgId: 'ok' }));
+		const apiClient = { sendMessage } as unknown as HulaApiClient;
+		const registry = new CapabilityRegistry();
+		registry.register('send-message', sendMessageCapability());
+		const resolve = vi.fn(() => undefined);
+		const resolveCandidate = vi.fn((candidate: { key?: string; nativeId?: string }) => {
+			const id = candidate.key ?? candidate.nativeId;
+			if (id === 'unknown') return undefined;
+			return { conversationId: id === 'other' ? 'other' : 'conv', generation: id === 'new-generation' ? 2 : 1,
+				aiclawUid: 'owner', roomId: 'room-1', apiClient };
+		});
+		const endpoint = new CapabilityEndpoint({ registry, resolve, resolveCandidate });
+		const request = (contexts: unknown) => ({ version: 2, contexts, command: 'send-message', args: { content: 'hello' }, requestId: randomUUID() });
+		return { endpoint, resolve, resolveCandidate, sendMessage, request };
+	}
+
+	it('resolves all key/native candidates to one conversation and never consults legacy resolver', async () => {
+		const { endpoint, resolve, resolveCandidate, sendMessage, request } = setup();
+		const res = await endpoint.handle({ body: request([{ key: 'bound-key' }, { provider: 'codex', nativeId: 'native-thread', runtimeScope: 'owner' }]) });
+		expect(res.status).toBe(200);
+		expect(resolveCandidate).toHaveBeenCalledTimes(2);
+		expect(resolve).not.toHaveBeenCalled();
+		expect(sendMessage).toHaveBeenCalledWith('room-1', 'hello');
+	});
+
+	it.each([
+		[{ key: 'bound-key' }, { key: 'other' }],
+		[{ key: 'bound-key' }, { provider: 'codex', nativeId: 'unknown' }],
+		[{ key: 'bound-key' }, { key: 'new-generation' }],
+	])('rejects conflicting, unknown, or cross-generation candidates before side effects: %j', async (...contexts) => {
+		const { endpoint, sendMessage, request } = setup();
+		expect(await endpoint.handle({ body: request(contexts) })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT' } });
+		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('rejects empty/overbound/malformed/mixed envelopes and V2 self-reported routing', async () => {
+		const { endpoint, sendMessage, resolveCandidate, request } = setup();
+		for (const invalid of [[], Array(9).fill({ key: 'x' }), [{ key: '' }], [{ key: 'x', provider: 'cc' }],
+			[{ provider: 'cc', nativeId: '' }], [{ provider: 'cc', nativeId: 'x', runtimeScope: 'x'.repeat(257) }]]) {
+			expect((await endpoint.handle({ body: request(invalid) })).status).toBe(400);
+		}
+		for (const extra of [{ sessionKey: 'cc:other' }, { roomId: 'forged' }, { args: { content: 'hello', uid: 'forged' } }, { version: 3 }]) {
+			expect((await endpoint.handle({ body: { ...request([{ key: 'bound-key' }]), ...extra } })).status).toBe(400);
+		}
+		expect(resolveCandidate).not.toHaveBeenCalled();
+		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('fails closed without a production resolver, does not fall back to legacy resolver', async () => {
+		const registry = new CapabilityRegistry();
+		registry.register('send-message', sendMessageCapability());
+		const resolve = vi.fn(() => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }));
+		const endpoint = new CapabilityEndpoint({ registry, resolve });
+		expect(await endpoint.handle({ body: { version: 2, contexts: [{ key: 'not-registered' }], command: 'send-message', requestId: 'id' } })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT' } });
+		expect(resolve).not.toHaveBeenCalled();
 	});
 });
 
@@ -452,6 +512,15 @@ describe('prepareSocketPath (platform-aware)', () => {
 		}
 	});
 
+	it.runIf(process.platform !== 'win32')('never removes a pre-existing socket path', () => {
+		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
+		dirs.push(base);
+		const socketPath = join(base, 'capability.sock');
+		writeFileSync(socketPath, 'not owned');
+		prepareSocketPath(socketPath, process.platform);
+		expect(readFileSync(socketPath, 'utf8')).toBe('not owned');
+	});
+
 	it('win32 → NO-OP: parent dir of a missing path is NOT created', () => {
 		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
 		dirs.push(base);
@@ -477,6 +546,47 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		for (const d of dirs.splice(0)) {
 			rmSync(d, { recursive: true, force: true });
 		}
+	});
+
+	it('second endpoint cannot take the same socket/pipe or close the first endpoint', async () => {
+		const socketPath = process.platform === 'win32'
+			? `\\\\.\\pipe\\aichat-double-${randomUUID()}`
+			: join(mkdtempSync(join(tmpdir(), 'aichat-double-')), 'capability.sock');
+		if (process.platform !== 'win32') dirs.push(join(socketPath, '..'));
+		endpoint = build({ resolveRoom: 42 }).endpoint;
+		await endpoint.listen(socketPath);
+		const second = build({ resolveRoom: 99 }).endpoint;
+		await expect(second.listen(socketPath)).rejects.toThrow();
+		await second.close();
+		expect((await postCapability(socketPath, body())).body).toMatchObject({ result: { roomId: 42 } });
+	});
+
+	it('a second socket override cannot bypass the same-home writer lease', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'aichat-same-home-'));
+		dirs.push(home);
+		const one = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-one-${randomUUID()}` : join(home, 'one.sock');
+		const two = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-two-${randomUUID()}` : join(home, 'two.sock');
+		const deps = { registry: new CapabilityRegistry(), resolve: () => undefined, lockHome: home };
+		endpoint = new CapabilityEndpoint(deps);
+		await endpoint.listen(one);
+		const second = new CapabilityEndpoint(deps);
+		await expect(second.listen(two)).rejects.toThrow();
+		await second.close();
+		expect((await postCapability(one, body())).status).toBe(404); // first pipe remains alive
+	});
+
+	it('reclaims only a verifiably dead writer lock and still handles a request', async () => {
+		const socketPath = process.platform === 'win32'
+			? `\\\\.\\pipe\\aichat-restart-${randomUUID()}`
+			: join(mkdtempSync(join(tmpdir(), 'aichat-restart-')), 'capability.sock');
+		if (process.platform !== 'win32') dirs.push(join(socketPath, '..'));
+		const lock = process.platform === 'win32'
+			? join(tmpdir(), `aichat-capability-${createHash('sha256').update(socketPath).digest('hex')}.lock`)
+			: `${socketPath}.lock`;
+		writeFileSync(lock, `9999999:${randomUUID()}`);
+		endpoint = build({ resolveRoom: 42 }).endpoint;
+		await endpoint.listen(socketPath);
+		expect((await postCapability(socketPath, body())).body).toMatchObject({ result: { roomId: 42 } });
 	});
 
 	it.runIf(process.platform !== 'win32')('binds the socket 0600 inside a 0700 parent dir (anti-spoofing)', async () => {

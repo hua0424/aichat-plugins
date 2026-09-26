@@ -19,11 +19,12 @@ describe('SessionEnvPlugin', () => {
 	it('injects OPENCODE_SESSION_ID when sessionID is present', async () => {
 		const output = await runHook({ cwd: '/work', sessionID: 'ses_x' });
 		expect(output.env.OPENCODE_SESSION_ID).toBe('ses_x');
+		expect(output.env).toMatchObject({ CODEX_THREAD_ID: '', OPENCLAW_BIND: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' });
 	});
 
-	it('does NOT set OPENCODE_SESSION_ID when sessionID is absent', async () => {
+	it('suppresses inherited credentials when sessionID is absent', async () => {
 		const output = await runHook({ cwd: '/work' });
-		expect('OPENCODE_SESSION_ID' in output.env).toBe(false);
+		expect(output.env).toMatchObject({ OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', OPENCLAW_BIND: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' });
 	});
 
 	it('preserves any env the hook already received', async () => {

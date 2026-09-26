@@ -32,8 +32,8 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 		process.exit(1);
 	}
 
-	const sessionKey = resolveAgentSessionKey();
-	if (!sessionKey) {
+	const contexts = resolveAgentContexts();
+	if (!contexts.length) {
 		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID / OPENCLAW_BIND / AICHAT_BIND)');
 		process.exit(1);
 	}
@@ -41,7 +41,8 @@ export async function handleSendMessage(args: string[]): Promise<void> {
 	let res: Awaited<ReturnType<typeof postCapability>>;
 	try {
 		res = await postCapability(capabilitySocketPath(), {
-			sessionKey,
+			version: 2,
+			contexts,
 			command: 'send-message',
 			args: { content: content.trim() },
 			requestId,
@@ -78,6 +79,19 @@ export async function handleSendMessage(args: string[]): Promise<void> {
  * Precedence opencode > codex > openclaw > cc (cc last). Returns undefined when no recognized session
  * env is set — the CLI never accepts a session id (or room/identity) as an argument (anti-spoofing).
  */
+export function resolveAgentContexts(env: NodeJS.ProcessEnv = process.env): Array<{ key: string } | { provider: string; nativeId: string }> {
+	const contexts: Array<{ key: string } | { provider: string; nativeId: string }> = [];
+	if (env.AICHAT_CONTEXT_KEY) contexts.push({ key: env.AICHAT_CONTEXT_KEY });
+	for (const [name, provider] of [
+		['OPENCODE_SESSION_ID', 'opencode'], ['CODEX_THREAD_ID', 'codex'],
+		['OPENCLAW_BIND', 'openclaw'], ['AICHAT_BIND', 'cc'],
+	] as const) {
+		if (env[name]) contexts.push({ provider, nativeId: env[name] });
+	}
+	return contexts;
+}
+
+/** Legacy single-key accessor retained for old callers; V2 requests use every candidate above. */
 export function resolveAgentSessionKey(): string | undefined {
 	const opencode = process.env.OPENCODE_SESSION_ID;
 	if (opencode) return `opencode:${opencode}`;

@@ -135,7 +135,7 @@ export class Supervisor {
 	 * supervised —— `agents` 顺序仍 = entries 顺序（便于测试）。onConnected/onDisconnected 在各 driver
 	 * connect 完成（start 返回、supervised 已就绪）之后才由 HuLa ws 触发，故无「startup 窗口内标记丢失」。
 	 */
-	async start(entries: AgentEntry[]): Promise<void> {
+	async start(entries: AgentEntry[], connectInbound = true): Promise<void> {
 		const slots: Array<SupervisedAgent | null> = entries.map(() => null);
 		await Promise.allSettled(
 			entries.map(async (entry, i) => {
@@ -147,6 +147,12 @@ export class Supervisor {
 			}),
 		);
 		this.supervised = slots.filter((s): s is SupervisedAgent => s !== null);
+		if (connectInbound) this.connectInbound();
+	}
+
+	/** The endpoint and imported bindings must be ready before accepting a WS message. */
+	connectInbound(): void {
+		for (const agent of this.supervised) agent.ws.connect();
 	}
 
 	/**
@@ -217,8 +223,6 @@ export class Supervisor {
 		);
 		// REQ-018: 把 fail-fast 拉取的模板注入 handler 缓存，供每次 openSession 的 chatContext.templates 读取。
 		ref.handler.setPromptTemplates(templates);
-
-		ws.connect();
 
 		const agent: SupervisedAgent = { entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler, api };
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);

@@ -12,7 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import { capabilitySocketPath } from '../capability/endpoint.js';
 import { postCapability } from '../capability/client.js';
-import { resolveAgentSessionKey } from './send-message.js';
+import { resolveAgentContexts } from './send-message.js';
 
 export async function handleResetSession(args: string[]): Promise<void> {
 	let requestId: string = randomUUID();
@@ -26,8 +26,8 @@ export async function handleResetSession(args: string[]): Promise<void> {
 			requestId = id;
 		}
 	}
-	const sessionKey = resolveAgentSessionKey();
-	if (!sessionKey) {
+	const contexts = resolveAgentContexts();
+	if (!contexts.length) {
 		console.error('Error: no agent session env (OPENCODE_SESSION_ID / CODEX_THREAD_ID / OPENCLAW_BIND / AICHAT_BIND)');
 		process.exit(1);
 	}
@@ -35,7 +35,7 @@ export async function handleResetSession(args: string[]): Promise<void> {
 	let res: Awaited<ReturnType<typeof postCapability>>;
 	try {
 		res = await postCapability(capabilitySocketPath(), {
-			sessionKey,
+			version: 2, contexts,
 			command: 'reset-session',
 			args: {},
 			requestId,
