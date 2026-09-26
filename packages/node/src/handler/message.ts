@@ -64,6 +64,11 @@ interface ThinkingSession {
 	sessionKey: string;
 	/** server 生成的 thinking 记录 ID（START 广播后回填） */
 	thinkingId: string;
+	/**
+	 * #295: 本轮房间 ID。服务端 THINKING_END 持久化要求显式 thinkingId + roomId（防跨房伪造），
+	 * 三条 finalize 路径与 destroy 共用，创建时从会话绑定写入。
+	 */
+	roomId: string;
 	/** 触发消息的 msgId */
 	triggerMsgId: string;
 	/** 思考开始时间戳 */
@@ -264,6 +269,8 @@ export class MessageHandler {
 	): void {
 		this.ws.send(WSReqType.THINKING_END, {
 			thinkingId: session.thinkingId || undefined,
+			// #295: 服务端要求 END 显式携带 roomId（认证/房间授权关联），否则拒绝持久化。
+			roomId: session.roomId,
 			durationMs: frame.durationMs,
 			status: frame.status,
 			...(frame.error !== undefined ? { error: frame.error } : {}),
@@ -603,6 +610,7 @@ export class MessageHandler {
 		const session: ThinkingSession = {
 			sessionKey,
 			thinkingId: '',
+			roomId,
 			triggerMsgId: msgId,
 			startTime: Date.now(),
 			accumulatedContent: '',
@@ -930,6 +938,8 @@ export class MessageHandler {
 				session.finalized = true;
 				this.ws.send(WSReqType.THINKING_END, {
 					thinkingId: session.thinkingId || undefined,
+					// #295: 同 sendThinkingEnd——服务端要求显式 roomId。
+					roomId: session.roomId,
 					durationMs: Date.now() - session.startTime,
 					status: 'error',
 					error: 'handler_destroyed',

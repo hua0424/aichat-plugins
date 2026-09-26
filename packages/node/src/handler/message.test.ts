@@ -448,6 +448,22 @@ describe('MessageHandler per-room isolation', () => {
 		expect(end.content).toBe('reasoning');
 	});
 
+	// #295: 服务端 THINKING_END 持久化要求显式 thinkingId + roomId；缺 roomId 的 END 帧会被拒绝，
+	// 导致 thinking 恒 status=0 / content 空（真实 E2E 实锤）。所有 finalize 路径共用 sendThinkingEnd。
+	it('THINKING_END carries the turn\'s roomId (#295 server persistence contract)', async () => {
+		const { adapter, calls } = fakeAdapter();
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(42, 100, 'hi', 1) } as never);
+		await waitFor(() => calls.length >= 1);
+		calls[0].callbacks.onThinkingEnd(100);
+		await calls[0].flush();
+
+		const end = sent.find((f) => f.type === THINKING_END)!.data as Record<string, unknown>;
+		expect(end.roomId).toBe('42');
+	});
+
 	it('empty thinking turn → THINKING_END complete, empty content, NO skipReason', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
