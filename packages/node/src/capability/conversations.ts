@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { bindingKey, parseBindingKey } from '../agent/bind-token-store.js';
 import { parseSessionKey } from './session-key.js';
 
@@ -105,6 +105,33 @@ export class ConversationStore {
 	get(identityId: string, roomId: string): ConversationRecord | undefined {
 		const record = this.byIdentity.get(identityKey(this.options.serverNamespace, identityId, roomId));
 		return record ? copy(record) : undefined;
+	}
+
+	/** Check persisted OpenCode owners on every run, including after restart and legacy import. */
+	assertOpencodeDirectoryOwner(conversationId: string, directory: string): void {
+		if (!validId(conversationId) || !isAbsolute(directory)) throw new Error('invalid OpenCode directory claim');
+		const canonical = (path: string): string => {
+			const normalized = resolve(path);
+			let physical: string;
+			try { physical = realpathSync.native(normalized); }
+			catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+				physical = normalized; // An absent legacy directory cannot be a current symlink.
+			}
+			return process.platform === 'win32' ? physical.toLowerCase() : physical;
+		};
+		const wanted = canonical(directory);
+		for (const record of this.snapshot.records) {
+			if (record.conversationId === conversationId) continue;
+			const directories = [record.nativeState.opencode?.directory,
+				...(record.pendingRuns ?? []).map((run) => {
+					const recovery = run.recovery?.value;
+					return recovery && typeof recovery === 'object' && 'provider' in recovery && recovery.provider === 'opencode' &&
+						'directory' in recovery ? recovery.directory : undefined;
+				})];
+			if (directories.some((prior) => typeof prior === 'string' && canonical(prior) === wanted))
+				throw new Error('PROMPT_SCOPE_CONFLICT: OpenCode directory belongs to another conversation');
+		}
 	}
 
 	getOrCreate(identityId: string, roomId: string): ConversationRecord {
@@ -281,6 +308,7 @@ export class ConversationStore {
 		if (!record.nativeAliases.some((a) => aliasKey(a) === aliasKey(alias))) record.nativeAliases.push(alias);
 		if (nativeState !== undefined) {
 			if (!nativeState || typeof nativeState !== 'object' || Array.isArray(nativeState)) throw new Error('invalid native state');
+			if (provider === 'opencode') this.assertOpencodeDirectoryOwner(record.conversationId, nativeState.directory as string);
 			this.assertCodexNativeWrite(record, provider, nativeState);
 			record.nativeState[provider] = copy(nativeState);
 		}

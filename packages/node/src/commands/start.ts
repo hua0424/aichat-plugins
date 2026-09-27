@@ -124,9 +124,11 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			}
 			if (entry.tool === 'opencode') {
 				return new OpencodeDriver({
-					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
-					workspaceBase: opencodeWorkspaceBase,
-					sessionStore: bridges.opencode,
+					server: opencodeServer, // 单例由 factory 创建并在全局 shutdown 释放；driver 不停止其他身份的 backend
+					assertDirectoryOwner: (id, directory) => {
+						if (!conversations) throw new Error('conversation bindings not ready');
+						conversations.assertOpencodeDirectoryOwner(id, directory);
+					},
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -180,7 +182,8 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
 				if (!conversations) throw new Error('conversation bindings not ready');
 				return conversations;
-			}, driver.type === 'cc' ? ccWorkspaceBase : driver.type === 'codex' ? codexWorkspaceBase : undefined),
+			}, driver.type === 'cc' ? ccWorkspaceBase : driver.type === 'codex' ? codexWorkspaceBase
+				: driver.type === 'opencode' ? opencodeWorkspaceBase : undefined),
 	});
 
 	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.

@@ -121,9 +121,9 @@ describe('mapOpencodeEvent', () => {
 		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'UnknownError: boom' });
 	});
 
-	it('session.error with no sessionID still maps (id absent → not filtered)', () => {
+	it('session.error without sessionID cannot be attributed on shared SSE', () => {
 		const evt = { type: 'session.error', properties: { error: 'plain string error' } };
-		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toEqual({ type: 'error', message: 'plain string error' });
+		expect(mapOpencodeEvent(evt, SID, ASSISTANT)).toBeNull();
 	});
 
 	// aichatoverview#256 — serve reports provider rate-limit/backoff via session.status=retry.
