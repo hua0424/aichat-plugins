@@ -160,7 +160,7 @@ export class CapabilityEndpoint {
 		}
 		if (!resolved) {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
-			return { status: 404, json: { ok: false, code: 'UNKNOWN_CONTEXT', error: 'unknown session', retryable: false } };
+			return { status: 404, json: { ok: false, code: parsed.sessionKey ? 'CONTEXT_REVOKED' : 'UNKNOWN_CONTEXT', error: 'unknown session', retryable: false } };
 		}
 		if (parsed.command === 'send-message' && this.isPaused?.(resolved.aiclawUid, resolved.roomId)) {
 			return { status: 409, json: { ok: false, code: 'RUN_STOP_UNCONFIRMED', error: 'conversation execution paused pending stop confirmation', retryable: true } };

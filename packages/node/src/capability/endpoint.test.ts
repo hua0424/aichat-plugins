@@ -94,7 +94,7 @@ describe('CapabilityEndpoint.handle', () => {
 		const { endpoint, sendMessage } = build({ resolveRoom: undefined });
 		const res = await endpoint.handle({ body: body() });
 		expect(res.status).toBe(404);
-		expect((res.json as { ok: boolean }).ok).toBe(false);
+		expect(res.json).toMatchObject({ ok: false, code: 'CONTEXT_REVOKED' });
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
