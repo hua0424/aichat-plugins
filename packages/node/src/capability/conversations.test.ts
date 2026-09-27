@@ -60,6 +60,24 @@ describe('ConversationStore', () => {
 			.toThrow('PROMPT_SCOPE_CONFLICT');
 	});
 
+	it('retains OpenClaw global prompt ownership across restart and reset with unconfirmed old work', () => {
+		const root = home(), opts = active(root, { '1': 'openclaw', '2': 'openclaw' });
+		const store = new ConversationStore(opts);
+		const first = store.registerNative('openclaw', token, '1', '9', { token, nativeRef: `${token}:aiclaw-1-room-9` });
+		const sameIdentity = store.getOrCreate('1', '10');
+		const other = store.getOrCreate('2', '9');
+		const reopened = new ConversationStore(opts);
+		expect(() => reopened.assertOpenclawPromptOwner(sameIdentity.conversationId, '1')).not.toThrow();
+		expect(() => reopened.assertOpenclawPromptOwner(other.conversationId, '2')).toThrow('PROMPT_SCOPE_CONFLICT');
+		const pending = reopened.beginRun('1', '9', 'old-openclaw');
+		pending.saveRecovery({ version: 1, value: { provider: 'openclaw', nativeRef: `${token}:aiclaw-1-room-9` } });
+		reopened.reset('1', '9');
+		const afterReset = new ConversationStore(opts);
+		expect(afterReset.get('1', '9')?.nativeState.openclaw).toBeUndefined();
+		expect(() => afterReset.assertOpenclawPromptOwner(sameIdentity.conversationId, '1')).toThrow('PROMPT_SCOPE_CONFLICT');
+		expect(() => afterReset.assertOpenclawPromptOwner(first.conversationId, '2')).toThrow('invalid OpenClaw prompt owner');
+	});
+
 	it('uses native aliases as the sole legacy authority, rejects duplicate or ambiguous aliases', () => {
 		const store = new ConversationStore(active(home(), { '1': 'codex', '2': 'codex' }));
 		const one = store.registerNative('codex', 'thread', '1', '9', { threadId: 'thread' });

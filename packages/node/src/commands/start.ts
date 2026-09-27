@@ -120,7 +120,11 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
 		buildDriver: (entry) => {
 			if (entry.tool === 'openclaw') {
-				return new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, bindTokenStore);
+				return new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, bindTokenStore,
+					undefined, undefined, (id, _workspace, identityId) => {
+						if (!conversations) throw new Error('conversation bindings not ready');
+						conversations.assertOpenclawPromptOwner(id, identityId);
+					});
 			}
 			if (entry.tool === 'opencode') {
 				return new OpencodeDriver({

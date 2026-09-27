@@ -721,12 +721,12 @@ export class MessageHandler {
 				const abort = new AbortController();
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
-					contextKey: bound.contextKey,
+					contextKey: bound.contextKey, promptOwner: this.selfUid,
 					bindToken: this.driver.type === 'cc' && 'createRun' in this.driver
 						? store.mintToken(this.selfUid, roomId) : undefined,
 					transcriptKey: sessionKey,
-					workspace: 'createRun' in this.driver
-						? deriveWorkspaceDir(this.workspaceBase!, this.selfUid, chatContext) : undefined,
+					workspace: 'createRun' in this.driver && this.workspaceBase
+						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, chatContext) : undefined,
 					conversation: {
 						id: bound.conversationId, generation: bound.generation,
 						assertCurrent: () => bound.assertCurrent(),
@@ -788,7 +788,7 @@ export class MessageHandler {
 		// REQ-008 #75: 通过 AgentDriver 抽象消费规范化 AgentEvent 流，再映射成与既有
 		// 完全一致的 WS 发送。openSession 绑定 (aiclawUid, roomId) → sessionKey；
 		// session 存到 thinkingSession 上，供超时/广播/destroy finalize 时 best-effort close。
-		// REQ-008 #77: 透传会话上下文给 driver。openclaw driver 忽略 chatContext（行为不变）；
+		// REQ-008 #77: 透传会话上下文给 legacy driver；native OpenClaw 消费上方核心 PreparedRun。
 		// opencode driver 据此派生隔离 workspace 目录。私聊（roomType=2）的对端 = fromUid。
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。

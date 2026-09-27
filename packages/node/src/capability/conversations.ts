@@ -107,6 +107,22 @@ export class ConversationStore {
 		return record ? copy(record) : undefined;
 	}
 
+	/** Old OpenClaw records have no workspace locator: conservatively claim the global prompt
+	 * across conversations, including pending recovery retained after reset/restart. */
+	assertOpenclawPromptOwner(conversationId: string, identityId: string): void {
+		if (!validId(conversationId) || !validId(identityId) ||
+			!this.snapshot.records.some((r) => r.conversationId === conversationId && r.identityId === identityId && r.adapterInstanceId === 'openclaw'))
+			throw new Error('invalid OpenClaw prompt owner');
+		for (const record of this.snapshot.records) {
+			if (record.conversationId === conversationId) continue;
+			if ((record.nativeState.openclaw && record.identityId !== identityId) ||
+				(record.state !== 'ready' && record.pendingRuns?.some((run) => {
+					const value = run.recovery?.value;
+					return value && typeof value === 'object' && 'provider' in value && value.provider === 'openclaw';
+				}))) throw new Error('PROMPT_SCOPE_CONFLICT: OpenClaw global AGENTS.md belongs to another identity or an unconfirmed run');
+		}
+	}
+
 	/** Check persisted OpenCode owners on every run, including after restart and legacy import. */
 	assertOpencodeDirectoryOwner(conversationId: string, directory: string): void {
 		if (!validId(conversationId) || !isAbsolute(directory)) throw new Error('invalid OpenCode directory claim');
