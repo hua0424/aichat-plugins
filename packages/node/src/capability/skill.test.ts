@@ -56,14 +56,21 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 		expect(md).toContain('--groupid <id>');
 		expect(md).toContain('list-groups');
 		expect(md).toMatch(/`id`/);
+		expect(md).toContain('result.error');
+		expect(md).toContain('exit status 0');
+		expect(md).toContain('--json');
+		expect(md).toContain('"ok": false');
+		expect(md).toContain('"code": "FORBIDDEN"');
 	});
 
-	it('aichat-reply content is unchanged (still send-message based)', () => {
+	it('aichat-reply uses machine output to confirm send success', () => {
 		installSkill();
 		const reply = writes.find((w) => w.path.endsWith(join('aichat-reply', 'SKILL.md')));
 		expect(reply).toBeDefined();
 		expect(reply!.content).toContain('name: aichat-reply');
-		expect(reply!.content).toContain('aichat send-message --content');
+		expect(reply!.content).toContain('aichat send-message --content "<your reply to the user>" --json');
+		expect(reply!.content).toContain('ok === true');
+		expect(reply!.content).toContain('DELIVERY_UNKNOWN');
 	});
 
 	// REQ-010 #102 — make "invoking the skill ≠ sent" unambiguous in the skill itself.
@@ -73,9 +80,9 @@ describe('installSkill (REQ-010 — install aichat-reply + aichat-query skills)'
 		expect(reply).toBeDefined();
 		const md = reply!.content;
 		expect(md).toContain('does NOT send anything');
-		expect(md).toContain('A message is sent ONLY when you actually');
-		expect(md).toContain('Do NOT claim you sent a');
-		expect(md).toContain('unless you have actually run that command');
+		expect(md).toContain('check its result before claiming delivery');
+		expect(md).toContain('Only `ok === true`');
+		expect(md).toContain('do not claim delivery or resend automatically');
 	});
 
 	it('best-effort: a root that throws is skipped, others still written, no throw', () => {

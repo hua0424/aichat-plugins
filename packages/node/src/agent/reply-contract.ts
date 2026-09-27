@@ -17,4 +17,4 @@
  */
 
 /** The exact reply CLI the agent must run to send a message (single-sourced so it can't drift). */
-export const REPLY_COMMAND = 'aichat send-message --content "<你的回复>"';
+export const REPLY_COMMAND = 'aichat send-message --content "<你的回复>" --json';

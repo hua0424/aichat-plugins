@@ -6,10 +6,9 @@ import { unlinkSync, existsSync, mkdirSync, chmodSync, openSync, writeSync, clos
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
-import { CapabilityRejectedError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
+import { CapabilityPersistenceError, CapabilityRejectedError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
 import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
-import { errMsg } from '../util/err.js';
 
 /** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
 type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
@@ -110,19 +109,19 @@ export class CapabilityEndpoint {
 	async handle(req: { body: unknown; remoteAddress?: string }): Promise<CapabilityResponse> {
 		// Non-local guard (defense-in-depth; a unix socket reports remoteAddress undefined → allowed).
 		if (req.remoteAddress !== undefined && !LOOPBACK.has(req.remoteAddress)) {
-			return { status: 403, json: { ok: false, error: 'forbidden: non-local connection' } };
+			return { status: 403, json: { ok: false, code: 'FORBIDDEN', error: 'forbidden: non-local connection', retryable: false } };
 		}
 
 		const parsed = parseBody(req.body);
 		if (!parsed) {
-			return { status: 400, json: { ok: false, error: 'bad request: invalid body' } };
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'bad request: invalid body', retryable: false } };
 		}
 
 		const logKey = parsed.sessionKey ? maskSessionKey(parsed.sessionKey) : '<v2>';
 		// Legacy callers keep their exact original prefix and resolution contract.
 		if (parsed.sessionKey && !parseSessionKey(parsed.sessionKey)) {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session key prefix`);
-			return { status: 400, json: { ok: false, error: 'unknown or missing session key prefix' } };
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'unknown or missing session key prefix', retryable: false } };
 		}
 
 		// A reset may retrieve ONLY its minimal receipt under the same bearer and request ID.
@@ -132,9 +131,9 @@ export class CapabilityEndpoint {
 			const receipt = this.resetReceipts.get(resetReceiptKey);
 			let durable: ReturnType<NonNullable<CapabilityEndpointDeps['getResetReceipt']>>;
 			try { durable = this.getResetReceipt?.(JSON.stringify(parsed.sessionKey ?? parsed.contexts), parsed.requestId!); }
-			catch { return { status: 503, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'reset receipt lookup unavailable' } }; }
+			catch { return { status: 503, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'reset receipt lookup unavailable', retryable: true } }; }
 			if (receipt || durable) return Object.keys(parsed.args).length
-				? { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } }
+				? { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write', retryable: false } }
 				: receipt ?? { status: 200, json: { ok: true, result: durable } };
 		}
 		let resolved: Resolved | undefined;
@@ -148,7 +147,9 @@ export class CapabilityEndpoint {
 					!current.conversationId || !current.aiclawUid || !current.roomId ||
 					(first && (first.conversationId !== current.conversationId || first.generation !== current.generation ||
 						first.aiclawUid !== current.aiclawUid || first.roomId !== current.roomId))) {
-					return { status: 409, json: { ok: false, code: 'AMBIGUOUS_CONTEXT', error: 'unresolved or conflicting context candidates' } };
+					const single = parsed.contexts.length === 1;
+					return { status: single ? 404 : 409, json: { ok: false, code: single ? 'UNKNOWN_CONTEXT' : 'AMBIGUOUS_CONTEXT',
+						error: single ? 'unknown context candidate' : 'unresolved or conflicting context candidates', retryable: false } };
 				}
 				first = current;
 			}
@@ -159,10 +160,10 @@ export class CapabilityEndpoint {
 		}
 		if (!resolved) {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
-			return { status: 404, json: { ok: false, code: 'CONTEXT_REVOKED', error: 'unknown session' } };
+			return { status: 404, json: { ok: false, code: parsed.sessionKey ? 'CONTEXT_REVOKED' : 'UNKNOWN_CONTEXT', error: 'unknown session', retryable: false } };
 		}
 		if (parsed.command === 'send-message' && this.isPaused?.(resolved.aiclawUid, resolved.roomId)) {
-			return { status: 409, json: { ok: false, code: 'STOP_UNCONFIRMED', error: 'conversation execution paused pending stop confirmation' } };
+			return { status: 409, json: { ok: false, code: 'RUN_STOP_UNCONFIRMED', error: 'conversation execution paused pending stop confirmation', retryable: true } };
 		}
 
 		if (!this.registry.has(parsed.command)) {
@@ -171,7 +172,7 @@ export class CapabilityEndpoint {
 			console.log(
 				`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}) err=unknown command`,
 			);
-			return { status: 400, json: { ok: false, error: `unknown command: ${parsed.command}` } };
+			return { status: 400, json: { ok: false, code: 'UNSUPPORTED', error: 'unknown command', retryable: false } };
 		}
 
 		const ctx: CapabilityContext = {
@@ -185,7 +186,7 @@ export class CapabilityEndpoint {
 		};
 		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
 		if (write && !parsed.requestId) {
-			return { status: 400, json: { ok: false, error: 'requestId required for write' } };
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'requestId required for write', retryable: false } };
 		}
 		// Key is the configured server + resolved identity, never a caller-supplied identity/room.
 		if (parsed.command === 'send-message' && typeof parsed.args.content === 'string') parsed.args.content = parsed.args.content.trim();
@@ -200,21 +201,21 @@ export class CapabilityEndpoint {
 			const prior = this.inFlight.get(key) ?? this.completed.get(key) ?? this.unknown.get(key);
 			if (prior) {
 				if (prior.fingerprint !== fingerprint) {
-					return { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write' } };
+					return { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write', retryable: false } };
 				}
 				return prior.result;
 			}
 		}
 		if (parsed.command === 'send-message' &&
 			(typeof parsed.args.content !== 'string' || !parsed.args.content)) {
-			return { status: 400, json: { ok: false, error: 'send-message: `content` is required and must be a non-empty string' } };
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'send-message: `content` is required and must be a non-empty string', retryable: false } };
 		}
 		if (parsed.command === 'reset-session' && Object.keys(parsed.args).length) {
-			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'reset-session takes no args' } };
+			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'reset-session takes no args', retryable: false } };
 		}
 		if (write && this.inFlight.size + this.completed.size + this.unknown.size >= this.maxWriteIds) {
 			// ponytail: fail closed at receipt capacity; T15/T16 durable receipts permit safe eviction.
-			return { status: 507, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'local write receipt capacity exhausted; no write started' } };
+			return { status: 507, json: { ok: false, code: 'PERSISTENCE_FAILED', error: 'local write receipt capacity exhausted; no write started', retryable: true } };
 		}
 
 		// No args (may contain message content), requestId or unmasked sessionKey in logs.
@@ -242,16 +243,22 @@ export class CapabilityEndpoint {
 				}
 				return response;
 			} catch (err) {
-				const msg = errMsg(err);
-				console.log(`${loc} err=${sanitizeLogField(msg)}`);
-				if (write && (err instanceof CapabilityRejectedError || err instanceof HulaApiRejectedError)) {
-					const code = err instanceof HulaApiRejectedError ? err.code : 'IDENTITY_UNAVAILABLE';
-					return { status: code === 'FORBIDDEN' ? 403 : 400, json: { ok: false, code, error: msg } };
+				// An upstream error may contain a bearer. Log only the stable class, never its raw message.
+				const code = err instanceof HulaApiRejectedError ? err.code
+					: err instanceof CapabilityRejectedError ? 'IDENTITY_UNAVAILABLE'
+					: err instanceof CapabilityPersistenceError ? 'PERSISTENCE_FAILED'
+					: write ? 'DELIVERY_UNKNOWN' : 'UPSTREAM_FAILED';
+				console.log(`${loc} err=${code}`);
+				if (err instanceof HulaApiRejectedError || err instanceof CapabilityRejectedError) {
+					return { status: code === 'FORBIDDEN' ? 403 : 400,
+						json: { ok: false, code, error: code === 'FORBIDDEN' ? 'forbidden by API' : 'capability rejected', retryable: false } };
 				}
+				if (err instanceof CapabilityPersistenceError) return { status: 503,
+					json: { ok: false, code, error: 'reset persistence unavailable; retain requestId', retryable: false } };
 				// Once a write starts, transport failures cannot establish whether the server committed it.
 				return write
-					? { status: 503, json: { ok: false, code: 'DELIVERY_UNKNOWN', error: 'write result unknown locally; retain requestId and do not resend automatically', requestId: parsed.requestId } }
-					: { status: 500, json: { ok: false, error: msg } };
+					? { status: 503, json: { ok: false, code, error: 'write result unknown locally; retain requestId and do not resend automatically', requestId: parsed.requestId, retryable: false } }
+					: { status: 503, json: { ok: false, code, error: 'upstream query unavailable', retryable: true } };
 			}
 		};
 		if (!write) return execute(); // Queries never consult or populate the write cache.
