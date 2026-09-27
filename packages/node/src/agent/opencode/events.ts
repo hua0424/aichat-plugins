@@ -80,9 +80,8 @@ export function mapOpencodeEvent(
 		}
 
 		case 'session.error': {
-			// sessionID may be absent on session.error; only filter it out when it is
-			// present AND points at a different session.
-			if (typeof props.sessionID === 'string' && props.sessionID !== sessionID) return null;
+			// Shared SSE may carry unscoped errors; they cannot terminate another identity's run.
+			if (props.sessionID !== sessionID) return null;
 			return { type: 'error', message: stringifyError(props.error) };
 		}
 

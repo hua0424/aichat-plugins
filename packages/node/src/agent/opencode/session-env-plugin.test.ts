@@ -27,13 +27,14 @@ describe('SessionEnvPlugin', () => {
 		expect(output.env).toMatchObject({ OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', OPENCLAW_BIND: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' });
 	});
 
-	it('preserves any env the hook already received', async () => {
+	it('overrides conflicting inherited binding only for this shell invocation', async () => {
 		const hooks = await SessionEnvPlugin({} as never, undefined);
 		const hook = hooks['shell.env'];
 		if (!hook) throw new Error('shell.env hook not registered');
-		const output = { env: { EXISTING: '1' } as Record<string, string> };
+		const output = { env: { EXISTING: '1', OPENCODE_SESSION_ID: 'old', AICHAT_CONTEXT_KEY: 'foreign' } as Record<string, string> };
+		const prior = process.env.OPENCODE_SESSION_ID;
 		await hook({ cwd: '/work', sessionID: 'ses_y' }, output);
-		expect(output.env.EXISTING).toBe('1');
-		expect(output.env.OPENCODE_SESSION_ID).toBe('ses_y');
+		expect(output.env).toMatchObject({ EXISTING: '1', OPENCODE_SESSION_ID: 'ses_y', AICHAT_CONTEXT_KEY: '' });
+		expect(process.env.OPENCODE_SESSION_ID).toBe(prior);
 	});
 });

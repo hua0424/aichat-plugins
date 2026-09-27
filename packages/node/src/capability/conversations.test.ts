@@ -37,6 +37,29 @@ describe('ConversationStore', () => {
 		if (process.platform !== 'win32') expect(statSync(join(root, 'conversations.json')).mode & 0o777).toBe(0o600);
 	});
 
+	it('rejects another OpenCode conversation claiming the same physical directory across restart', () => {
+		const root = home(), opts = active(root, { '1': 'opencode', '2': 'opencode' });
+		const directory = join(root, 'workspace');
+		mkdirSync(directory);
+		const store = new ConversationStore(opts);
+		const one = store.registerNative('opencode', 'session-1', '1', '9', { sessionID: 'session-1', directory });
+		const aliasPath = join(root, 'workspace', '..', 'workspace');
+		const reopened = new ConversationStore(opts);
+		expect(() => reopened.assertOpencodeDirectoryOwner(one.conversationId, aliasPath)).not.toThrow();
+		expect(() => reopened.assertOpencodeDirectoryOwner(reopened.getOrCreate('2', '9').conversationId, aliasPath))
+			.toThrow('PROMPT_SCOPE_CONFLICT');
+		expect(() => reopened.registerNative('opencode', 'session-2', '2', '9', { sessionID: 'session-2', directory: aliasPath }))
+			.toThrow('PROMPT_SCOPE_CONFLICT');
+		expect(reopened.resolveLegacy('opencode:session-2')).toBeUndefined();
+		const pending = reopened.beginRun('1', '9', 'old-run');
+		pending.saveRecovery({ version: 1, value: { provider: 'opencode', directory, sessionID: 'session-1' } });
+		reopened.reset('1', '9'); // Clears nativeState, but does not prove old task stopped.
+		const afterReset = new ConversationStore(opts);
+		expect(afterReset.get('1', '9')?.nativeState.opencode).toBeUndefined();
+		expect(() => afterReset.assertOpencodeDirectoryOwner(afterReset.get('2', '9')!.conversationId, aliasPath))
+			.toThrow('PROMPT_SCOPE_CONFLICT');
+	});
+
 	it('uses native aliases as the sole legacy authority, rejects duplicate or ambiguous aliases', () => {
 		const store = new ConversationStore(active(home(), { '1': 'codex', '2': 'codex' }));
 		const one = store.registerNative('codex', 'thread', '1', '9', { threadId: 'thread' });
