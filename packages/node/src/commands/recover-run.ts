@@ -27,6 +27,18 @@ export async function recoverRun(args: string[], options: { home: string; server
 	if (args.length !== 2 || args[0]?.startsWith('-') || !args[0]?.trim() || args[1] !== '--verified-stopped')
 		throw new Error('usage: aichat recover-run <runId> --verified-stopped (manually verify the upstream run has stopped first)');
 	const runId = args[0];
+	await withOfflineConversationStore(options, async (store) => {
+		const pending = store.pendingRuns().find((run) => run.runId === runId);
+		if (!pending) throw new Error(`runId ${runId} is not pending`);
+		await assertNoListener(options.socketPath);
+		store.confirmStopped(runId);
+		console.log(`Confirmed stopped run ${runId} (conversation ${pending.conversationId}, identity ${pending.identityId}, room ${pending.roomId}). Other pending runs remain blocked.`);
+	});
+}
+
+/** Exclusive offline writer; checks the endpoint both before loading and immediately before mutation. */
+export async function withOfflineConversationStore<T>(options: { home: string; serverNamespace: string; socketPath: string },
+	operation: (store: ConversationStore) => Promise<T>): Promise<T> {
 	const statePath = join(options.home, 'conversations.json');
 	if (!existsSync(statePath)) throw new Error('no existing conversation state; refusing to create recovery state');
 	const lockPath = join(options.home, 'conversation-writer.lock');
@@ -39,11 +51,8 @@ export async function recoverRun(args: string[], options: { home: string; server
 		await assertNoListener(options.socketPath);
 		const store = new ConversationStore({ home: options.home, serverNamespace: options.serverNamespace, activeUids: new Set() });
 		try {
-			const pending = store.pendingRuns().find((run) => run.runId === runId);
-			if (!pending) throw new Error(`runId ${runId} is not pending`);
 			await assertNoListener(options.socketPath);
-			store.confirmStopped(runId);
-			console.log(`Confirmed stopped run ${runId} (conversation ${pending.conversationId}, identity ${pending.identityId}, room ${pending.roomId}). Other pending runs remain blocked.`);
+			return await operation(store);
 		} finally { store.close(); }
 	} finally {
 		try { closeSync(fd); } catch { /* already closed */ }

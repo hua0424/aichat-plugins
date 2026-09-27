@@ -150,9 +150,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				return new CcHeadlessDriver({
 					workspaceBase: ccWorkspaceBase,
 					brokerPort: ccBrokerPort(),
-					sessionStore: bridges.cc,
-					bindTokens: bindTokenStore,
-					registry: ccRegistry,
+					registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
 					transcript: ccTranscript,
 				});
 			}
@@ -185,7 +183,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
 				if (!conversations) throw new Error('conversation bindings not ready');
 				return conversations;
-			}),
+			}, driver.type === 'cc' ? ccWorkspaceBase : undefined),
 	});
 
 	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.
@@ -206,7 +204,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resetSessionCapability((aiclawUid, roomId, requestId, bearer) => {
 			const owner = supervisor.agents.find((a) => a.uid === aiclawUid && a.status !== 'offline');
 			if (!owner || !conversations) return undefined;
-			if (!supportsLegacyReset(owner.driver)) return { driverType: owner.driver.type, reset: false };
+			if (!('createRun' in owner.driver ? owner.driver.features.reset === 'supported' : supportsLegacyReset(owner.driver))) return { driverType: owner.driver.type, reset: false };
 			const cancelRunId = conversations.get(aiclawUid, roomId)?.pendingRuns?.[0]?.runId;
 			const record = conversations.reset(aiclawUid, roomId, requestId, bearer);
 			return { driverType: owner.driver.type, reset: true, generation: record.generation,
@@ -252,7 +250,12 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		// CC hook broker must also be ready before a CC message can reach the driver.
 		if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
 			ccBroker = new CcBroker({
-				resolve: (token) => bindTokenStore.resolve(token),
+				resolve: (token) => {
+					const record = conversations?.resolveCandidate({ key: token }) ?? conversations?.resolveToken('cc', token);
+					return record?.adapterInstanceId === 'cc' ? {
+						aiclawUid: record.identityId, roomId: record.roomId, contextKey: record.contextKey,
+					} : undefined;
+				},
 				sink: buildCcBridgeSink(ccRegistry),
 			});
 			await ccBroker.listen(ccBrokerPort());

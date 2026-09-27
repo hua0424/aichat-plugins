@@ -4,6 +4,7 @@ import { start } from './commands/start.js';
 import { handleSendMessage } from './commands/send-message.js';
 import { handleResetSession } from './commands/reset-session.js';
 import { handleRecoverRun } from './commands/recover-run.js';
+import { handleConfirmCcCwd } from './commands/confirm-cc-cwd.js';
 import { handleMemberInfo } from './commands/member-info.js';
 import { handleListFriends } from './commands/list-friends.js';
 import { handleFindFriend } from './commands/find-friend.js';
@@ -32,6 +33,9 @@ switch (command) {
 		break;
 	case 'recover-run':
 		await handleRecoverRun(args.slice(1));
+		break;
+	case 'confirm-cc-cwd':
+		await handleConfirmCcCwd(args.slice(1));
 		break;
 	// REQ-010 S3: read-only query subcommands
 	case 'member-info':
@@ -98,6 +102,18 @@ Commands:
   reset-session [--request-id <id>]              Reset this room's agent session (fresh next msg)
   recover-run <runId> --verified-stopped          Offline-only: confirm a manually verified stopped run
                                                  (stop daemon first; NEVER assume restart proves stopped)
+  confirm-cc-cwd <uid> <room> <sessionId> <generation> <ORIGINAL-absolute-cwd> <owner-approval.json>
+                                                 Offline ONLY (not an agent capability): stop daemon, back up
+                                                 conversations.json, independently verify product-owner identity,
+                                                 immutable approval artifact/reference and ORIGINAL cwd + exact
+                                                 uid/room/sessionId/generation; preserve artifact SHA-256.
+                                                 If config cwd differs, owner corrects config BEFORE restart.
+                                                 Run offline command, then restart. This is manual trust, NOT
+                                                 cryptographic server authentication; never guess from config.
+                                                 Approval JSON: {"owner":"...","approvalRef":"https://...",
+                                                 "uid":"...","room":"...","sessionId":"...",
+                                                 "generation":1,"originalCwd":"/absolute/path",
+                                                 "approvedOriginalCwd":true}. Conflict: reset-session fresh instead.
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
   find-friend <keyword>                          Search users by keyword (substring match)

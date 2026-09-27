@@ -3,11 +3,12 @@ import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import { resolveBoundSession, type BindableAgent } from './session-key.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
-import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import { ConversationStore } from './conversations.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
-import { CcSessionRegistry } from '../agent/cc/sink.js';
 import type { HulaApiClient } from '../api/hula-api.js';
-import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 
 /**
  * BL-014 (#141) — THE anti-forgery property, end-to-end.
@@ -21,11 +22,6 @@ import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/c
  * token → resolveSession/store returns undefined → the capability endpoint returns 404 "unknown session".
  * A genuinely minted token resolves to its real (uid,room). This test proves BOTH, at the endpoint level.
  */
-
-function memCcStore(): CcHeadlessSessionStore {
-	const map = new Map<string, StoredCcHeadlessSession>();
-	return { get: (k) => map.get(k), set: (k, v) => void map.set(k, v), delete: (k) => void map.delete(k) };
-}
 
 /** A tagged fake api client so we can assert WHICH identity's client the endpoint would reply through. */
 function fakeApi(tag: string): HulaApiClient {
@@ -83,29 +79,21 @@ describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves
 	});
 
 	it('cc: a minted token resolves; a forged `cc:aiclaw-…` plaintext binding → endpoint 404', async () => {
-		const store = new InMemoryBindTokenStore();
-		const cc = new CcHeadlessDriver({
-			workspaceBase: '/tmp/aichat-antiforgery-cc',
-			brokerPort: 9100,
-			sessionStore: memCcStore(),
-			bindTokens: store,
-			registry: new CcSessionRegistry(),
-			transcript: { append: () => {} },
-			spawn: (() => {
-				throw new Error('should not spawn in this resolve-only test');
-			}) as never,
-		});
+		const home = mkdtempSync(join(tmpdir(), 'cc-antiforgery-'));
+		const core = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['5']),
+			activeProviders: new Map([['5', 'cc']]) });
 		const api5 = fakeApi('uid-5');
-		// mint the real (5,9) binding directly (openSession would spawn; we only need the token).
-		const mintedToken = store.mint('5', '9');
-
-		const agents: BindableAgent[] = [{ driver: cc, uid: '5', api: api5 } as unknown as BindableAgent];
-
+		const mintedToken = core.mintToken('5', '9');
+		expect(core.resolveCandidates([{ key: core.contextKey('5', '9') },
+			{ provider: 'cc', nativeId: mintedToken }])?.roomId).toBe('9');
 		const registry = new CapabilityRegistry();
 		registry.register('send-message', sendMessageCapability());
-		const endpoint = new CapabilityEndpoint({
-			registry,
-			resolve: (sk) => resolveBoundSession(sk, agents),
+		const endpoint = new CapabilityEndpoint({ registry,
+			resolve: (sk) => {
+				const candidate = sk.startsWith('cc:') ? core.resolveCandidate({ key: sk.slice(3) }) : undefined;
+				return candidate ? { aiclawUid: '5', roomId: candidate.roomId, apiClient: api5,
+					conversationId: candidate.conversationId, generation: candidate.generation } : undefined;
+			},
 		});
 
 		// FORGED plaintext binding under the cc: prefix → 404.
@@ -121,5 +109,7 @@ describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves
 		});
 		expect(genuine.status).toBe(200);
 		expect((api5 as unknown as { sendMessage: ReturnType<typeof vi.fn> }).sendMessage).toHaveBeenCalledWith('9', 'hi');
+		core.close();
+		rmSync(home, { recursive: true, force: true });
 	});
 });

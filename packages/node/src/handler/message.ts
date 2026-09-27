@@ -1,7 +1,8 @@
 import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, GroupConfigChangeDTO, AiclawPersonaChangeDTO } from '../stream/protocol.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
-import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
+import type { AgentDriver, RunDriver, AgentSession, AgentEvent } from '../agent/events.js';
+import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
 import { MessageDebouncer } from '../util/debounce.js';
@@ -174,7 +175,7 @@ const LIMIT_REASONS: Record<string, string> = {
  */
 export class MessageHandler {
 	private ws: HulaWSClient;
-	private driver: AgentDriver;
+	private driver: AgentDriver | RunDriver;
 	// REQ-029 (#29): selfUid is an opaque string end-to-end.
 	private selfUid: string;
 
@@ -230,12 +231,13 @@ export class MessageHandler {
 
 	constructor(
 		ws: HulaWSClient,
-		driver: AgentDriver,
+		driver: AgentDriver | RunDriver,
 		selfUid: string,
 		apiClient: HulaApiClient | undefined,
 		debounceOptions: { waitMs?: number; maxCount?: number; maxWaitMs?: number } | undefined,
 		onTokenExpired: () => void,
 		private readonly getConversations?: () => ConversationStore,
+		private readonly workspaceBase?: string,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -719,6 +721,11 @@ export class MessageHandler {
 				const abort = new AbortController();
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
+					contextKey: bound.contextKey,
+					bindToken: 'createRun' in this.driver ? store.mintToken(this.selfUid, roomId) : undefined,
+					transcriptKey: sessionKey,
+					workspace: 'createRun' in this.driver
+						? deriveWorkspaceDir(this.workspaceBase!, this.selfUid, chatContext) : undefined,
 					conversation: {
 						id: bound.conversationId, generation: bound.generation,
 						assertCurrent: () => bound.assertCurrent(),
@@ -732,10 +739,11 @@ export class MessageHandler {
 					capabilities: { invoke: async () => { throw new Error('capability command unavailable in legacy bridge'); } },
 					signal: abort.signal,
 				};
-				const bridge = new LegacyDriverBridge(this.driver, () => ({ aiclawUid: this.selfUid, roomId, chatContext }), {
-					nativeScope: { identityId: this.selfUid, roomId, conversationId: bound.conversationId, generation: bound.generation },
-				});
-				session.run = { id, generation: bound.generation, abort, agent: bridge.createRun(prepared) };
+				const agent = 'createRun' in this.driver ? this.driver.createRun(prepared)
+					: new LegacyDriverBridge(this.driver, () => ({ aiclawUid: this.selfUid, roomId, chatContext }), {
+						nativeScope: { identityId: this.selfUid, roomId, conversationId: bound.conversationId, generation: bound.generation },
+					}).createRun(prepared);
+				session.run = { id, generation: bound.generation, abort, agent };
 			} catch (error) {
 				if (begunId) {
 					try { this.getConversations().finishRun(begunId); }
@@ -781,7 +789,7 @@ export class MessageHandler {
 		// opencode driver 据此派生隔离 workspace 目录。私聊（roomType=2）的对端 = fromUid。
 		// REQ-009 #85: 群房间附带 owner 配置的 workspaceDir（绝对覆盖）+ account（人类可读 groupkey）。
 		//   私聊无群配置 → 两者 undefined → driver 走默认派生。房间/身份只取自会话绑定，不取自事件。
-		const agentSession = session.run ? undefined : await this.driver.openSession({
+		const agentSession = session.run ? undefined : await (this.driver as AgentDriver).openSession({
 			aiclawUid: this.selfUid, roomId, chatContext,
 		});
 		session.agentSession = agentSession;
@@ -794,7 +802,7 @@ export class MessageHandler {
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
 			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
-			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
+			const rawContent = ('finalizeThinking' in this.driver ? this.driver.finalizeThinking?.(outcome.content) : undefined) ?? outcome.content;
 			this.sendThinkingEnd(session, { durationMs: outcome.durationMs, status: 'complete', content: rawContent });
 			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}`);
 			// clean-complete：迭代器已自然结束，不再 close（closeDriver=false）。
@@ -837,7 +845,7 @@ export class MessageHandler {
 					break;
 				} else if (ev.type === 'error') {
 					finalizeError(ev.message);
-					if (session.run) this.getConversations!().markStopUnconfirmed(session.run.id);
+					if (session.run) await this.stopRun(session, ev.message);
 					break;
 				} else if (ev.type === 'cancelled' && session.run) {
 					finalizeError(ev.reason);

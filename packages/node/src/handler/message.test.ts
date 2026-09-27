@@ -9,9 +9,8 @@ import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
-import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
+import { ConversationStore } from '../capability/conversations.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
-import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 import type { CcTranscriptRecord } from '../agent/cc/transcript.js';
 import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 
@@ -2019,38 +2018,48 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		const stdinWrites: string[] = [];
 		let spawnCall: { command: string; args: readonly string[] } | null = null;
 		const endCbs: Array<() => void> = [];
+		const dataCbs: Array<(s: string) => void> = [];
+		const closeCbs: Array<(code: number | null, signal: string | null) => void> = [];
 		const child: CcChild = {
 			pid: 5252,
 			stdin: { write: (c: string) => void stdinWrites.push(c), end: () => {} },
 			stdout: {
 				on: (event: string, listener: (...a: never[]) => void) => {
 					if (event === 'end' || event === 'close') endCbs.push(listener as () => void);
+					if (event === 'data') dataCbs.push(listener as (s: string) => void);
 				},
 			} as CcChild['stdout'],
 			stderr: { on: () => {} } as CcChild['stderr'],
-			on: () => {},
+			on: (event: string, listener: (...a: never[]) => void) => {
+				if (event === 'close') closeCbs.push(listener as (code: number | null, signal: string | null) => void);
+			},
 			kill: () => true,
 		};
 		const spawn: CcSpawnFn = (command, args) => {
 			spawnCall = { command, args };
 			return child;
 		};
-		return { spawn, stdinWrites, endStdout: () => endCbs.forEach((cb) => cb()), get spawnCall() { return spawnCall; } };
-	}
-	function memCcStore(): CcHeadlessSessionStore {
-		const map = new Map<string, StoredCcHeadlessSession>();
-		return { get: (k) => map.get(k), set: (k, v) => void map.set(k, v), delete: (k) => void map.delete(k) };
+		return { spawn, stdinWrites, endStdout: () => {
+			dataCbs.forEach((cb) => cb('{"type":"result","is_error":false}\n'));
+			endCbs.forEach((cb) => cb());
+			closeCbs.forEach((cb) => cb(0, null));
+		}, get spawnCall() { return spawnCall; } };
 	}
 
 	it('e2e: cc group @ through the REAL CcHeadlessDriver → spawned stdin envelope is the attributed [HuLa 群聊] transcript', async () => {
 		const fs = ccE2eSpawn();
+		const home = ccTmpBase();
+		const core = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set([SELF_UID]),
+			activeProviders: new Map([[SELF_UID, 'cc']]) });
+		const registry = new CcSessionRegistry();
 		const transcriptRecords: CcTranscriptRecord[] = [];
 		const driver = new CcHeadlessDriver({
-			workspaceBase: ccTmpBase(),
+			workspaceBase: home,
 			brokerPort: 9100,
-			sessionStore: memCcStore(),
-			bindTokens: new InMemoryBindTokenStore(),
-			registry: new CcSessionRegistry(),
+			registerHook: (key, run, push) => registry.registerContext(key, run, push),
+			platform: 'linux', kill: (_pid, signal) => {
+				if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+			},
 			transcript: { append: (_k, r) => void transcriptRecords.push(r) },
 			spawn: fs.spawn,
 			firstEventTimeoutMs: 1000,
@@ -2058,7 +2067,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 			killGraceMs: 20,
 		});
 		const { ws } = fakeWs();
-		const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 5, maxWaitMs: 30 }, () => {});
+		const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 5, maxWaitMs: 30 }, () => {}, () => core, home);
 		setGroupConfig(handler, 1, { mentionRequired: true });
 
 		// one un-@ accumulates, then an @-message triggers the real spawn.
@@ -2076,6 +2085,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		fs.endStdout();
 		await waitFor(() => getThinkingSession(handler, `aiclaw-${SELF_UID}-room-1`) === undefined);
 		handler.destroy();
+		core.close();
 	});
 });
 

@@ -5,6 +5,19 @@ import type { CcHookSink } from './broker.js';
 export type CcEventPush = (ev: AgentEvent) => void;
 
 export class CcSessionRegistry {
+	private readonly byContext = new Map<string, { runId: string; push: CcEventPush }>();
+
+	registerContext(key: string, runId: string, push: CcEventPush): () => void {
+		const entry = { runId, push };
+		this.byContext.set(key, entry);
+		return () => { if (this.byContext.get(key) === entry) this.byContext.delete(key); };
+	}
+
+	pushContext(key: string, runId: string, ev: AgentEvent): void {
+		const entry = this.byContext.get(key);
+		if (entry?.runId === runId) entry.push(ev);
+	}
+
 	private readonly byIdentity = new Map<string, Map<string, { runId: string; push: CcEventPush }>>();
 
 	register(uid: string, roomId: string, runId: string, push: CcEventPush): () => void {
@@ -32,7 +45,11 @@ export class CcSessionRegistry {
 /** Stop is intentionally inert: stdout result/EOF, not a hook, ends the turn. */
 export function buildCcBridgeSink(registry: CcSessionRegistry): CcHookSink {
 	return {
-		tool: (roomId, uid, runId, toolName) => registry.push(uid, roomId, runId, { type: 'tool', name: toolName, phase: 'end' }),
+		tool: (roomId, uid, runId, toolName, key) => {
+			const event: AgentEvent = { type: 'tool', name: toolName, phase: 'end' };
+			if (key) registry.pushContext(key, runId, event);
+			else registry.push(uid, roomId, runId, event);
+		},
 		flush: () => {},
 	};
 }
