@@ -722,7 +722,8 @@ export class MessageHandler {
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
 					contextKey: bound.contextKey,
-					bindToken: 'createRun' in this.driver ? store.mintToken(this.selfUid, roomId) : undefined,
+					bindToken: this.driver.type === 'cc' && 'createRun' in this.driver
+						? store.mintToken(this.selfUid, roomId) : undefined,
 					transcriptKey: sessionKey,
 					workspace: 'createRun' in this.driver
 						? deriveWorkspaceDir(this.workspaceBase!, this.selfUid, chatContext) : undefined,
@@ -734,6 +735,8 @@ export class MessageHandler {
 							: undefined,
 						saveNativeState: async (v) => bound.saveNativeState(this.driver.type as Parameters<typeof bound.saveNativeState>[0], v.value as Record<string, unknown>),
 						registerNativeAlias: async (v) => bound.registerNativeAlias(this.driver.type as Parameters<typeof bound.registerNativeAlias>[0], v.id, v.scope),
+						registerNative: async (id, state) => bound.registerNative(this.driver.type as Parameters<typeof bound.registerNative>[0], id,
+							state.value as Record<string, unknown>),
 					},
 					saveRecovery: async (v) => bound.saveRecovery(v),
 					capabilities: { invoke: async () => { throw new Error('capability command unavailable in legacy bridge'); } },

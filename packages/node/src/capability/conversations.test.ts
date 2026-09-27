@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -137,6 +138,49 @@ describe('ConversationStore', () => {
 		expect(reopened.get('44', '888')?.state).toBe('suspended');
 		expect(JSON.parse(readFileSync(join(root, 'conversations.json'), 'utf8')).records[0].state).toBe('suspended');
 		expect(reopened.reset('44', '888')).toMatchObject({ state: 'ready', nativeState: {}, generation: 2 });
+	});
+
+	it('confirms only frozen legacy Codex provenance atomically; survives restart and rejects agent overrides', () => {
+		let fail = false;
+		const root = home(), opts = active(root, { '22': 'codex' }, () => { if (fail) throw new Error('disk full'); });
+		legacy(root, 'codex/sessions.json', { 'aiclaw-22-room-888': { threadId: 'old-thread' } });
+		const store = new ConversationStore(opts);
+		const before = store.get('22', '888')!;
+		expect(before.state).toBe('suspended');
+		expect(() => store.beginRun('22', '888', 'pending')).toThrow('paused');
+		const confirm = (room = '888', thread = 'old-thread', generation = 1, cwd = join(root, 'original'), prompt = 'frozen prompt', ref = 'https://example.test/owner', artifact = 'a'.repeat(64)) =>
+			store.confirmCodexOriginalThread('22', room, thread, generation, cwd, prompt, ref, artifact);
+		expect(() => confirm('wrong')).toThrow('target changed');
+		expect(() => confirm('888', 'wrong')).toThrow('target changed');
+		expect(() => confirm('888', 'old-thread', 2)).toThrow('target changed');
+		fail = true;
+		expect(() => confirm()).toThrow('disk full');
+		expect(store.get('22', '888')).toEqual(before);
+		expect(new ConversationStore(active(root, { '22': 'codex' })).get('22', '888')).toEqual(before);
+		fail = false;
+		const approved = confirm();
+		expect(approved).toMatchObject({ state: 'ready', nativeState: { codex: { threadId: 'old-thread', workspace: join(root, 'original'), originalPrompt: 'frozen prompt',
+			promptHash: createHash('sha256').update('frozen prompt').digest('hex'), legacyConfirmationRequired: false } },
+			codexThreadConfirmation: { threadId: 'old-thread', artifactSha256: 'a'.repeat(64) } });
+		expect(confirm()).toEqual(approved);
+		expect(() => confirm('888', 'old-thread', 1, join(root, 'other'))).toThrow('conflicting');
+		const snapshotPath = join(root, 'conversations.json'), trusted = readFileSync(snapshotPath, 'utf8');
+		const corrupted = JSON.parse(trusted);
+		corrupted.records[0].nativeState.codex.originalPrompt = 'other prompt';
+		writeFileSync(snapshotPath, JSON.stringify(corrupted));
+		expect(() => new ConversationStore(active(root, { '22': 'codex' }))).toThrow('confirmed original prompt conflicts');
+		writeFileSync(snapshotPath, trusted);
+		const bound = store.beginRun('22', '888', 'run');
+		expect(() => confirm()).toThrow('pending run');
+		expect(() => bound.saveNativeState('codex', { threadId: 'old-thread', workspace: join(root, 'original'), promptHash: approved.nativeState.codex!.promptHash })).toThrow('provenance');
+		expect(() => bound.registerNative('codex', 'different', { threadId: 'different' })).toThrow('alias');
+		store.finishRun('run');
+		expect(() => store.deleteNative('codex', '22', '888')).toThrow('reset');
+		const restarted = new ConversationStore(active(root, { '22': 'codex' }));
+		expect(restarted.get('22', '888')).toEqual({ ...approved, pendingRuns: [] });
+		expect(restarted.resolveLegacy('codex:old-thread')?.conversationId).toBe(approved.conversationId);
+		expect(readFileSync(join(root, 'conversation-backups', 'codex-sessions.json.bak'), 'utf8')).toBe(readFileSync(join(root, 'codex', 'sessions.json'), 'utf8'));
+		expect(restarted.reset('22', '888')).toMatchObject({ state: 'ready', generation: 2, nativeState: {} });
 	});
 
 	it('fails closed on broken, duplicate and ambiguous legacy input without committing a marker', () => {

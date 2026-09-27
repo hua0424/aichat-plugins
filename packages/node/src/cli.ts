@@ -5,6 +5,8 @@ import { handleSendMessage } from './commands/send-message.js';
 import { handleResetSession } from './commands/reset-session.js';
 import { handleRecoverRun } from './commands/recover-run.js';
 import { handleConfirmCcCwd } from './commands/confirm-cc-cwd.js';
+import { handleConfirmCodexThread } from './commands/confirm-codex-thread.js';
+import { handleReconcileCodexAgents } from './commands/reconcile-codex-agents.js';
 import { handleMemberInfo } from './commands/member-info.js';
 import { handleListFriends } from './commands/list-friends.js';
 import { handleFindFriend } from './commands/find-friend.js';
@@ -36,6 +38,12 @@ switch (command) {
 		break;
 	case 'confirm-cc-cwd':
 		await handleConfirmCcCwd(args.slice(1));
+		break;
+	case 'confirm-codex-thread':
+		await handleConfirmCodexThread(args.slice(1));
+		break;
+	case 'reconcile-codex-agents':
+		await handleReconcileCodexAgents(args.slice(1));
 		break;
 	// REQ-010 S3: read-only query subcommands
 	case 'member-info':
@@ -114,6 +122,20 @@ Commands:
                                                  "uid":"...","room":"...","sessionId":"...",
                                                  "generation":1,"originalCwd":"/absolute/path",
                                                  "approvedOriginalCwd":true}. Conflict: reset-session fresh instead.
+  confirm-codex-thread <uid> <room> <threadId> <generation> <ORIGINAL-absolute-cwd> <owner-approval-with-original-prompt.json>
+                                                 Offline ONLY; stop daemon, independently verify owner HTTPS
+                                                 approval and exact original cwd/prompt. JSON binds uid, room,
+                                                 threadId, generation, originalCwd, originalPrompt,
+                                                 originalPromptSha256, approvedOriginalThread:true,
+                                                 owner, approvalRef. The CLI cannot authenticate the owner.
+  reconcile-codex-agents <uid> <room> <generation> <controlled-root> <absolute-AGENTS.md> <replacement-prompt-file|remove> <owner-approval.json>
+                                                 Offline ONLY: owner-approved controlled test directory with no other file writers.
+                                                  Full backup and pre-rename original hash/inode check. Artifact binds
+                                                  uid/room/generation/root/file, owner HTTPS reference, originalFileSha256,
+                                                  originalBlockSha256, operation, optional replacementPromptSha256,
+                                                  approvedControlledTestDirectory:true, approvedOwnedBlock:true,
+                                                  approvedExclusiveTestWindow:true.
+                                                  A pre-check cannot exclude a non-cooperating writer in rename window.
   member-info <uid>                              Look up a user's public profile
   list-friends                                   List this assistant's friends
   find-friend <keyword>                          Search users by keyword (substring match)

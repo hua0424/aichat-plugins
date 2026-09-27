@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { MessageHandler } from './message.js';
 import { ConversationStore } from '../capability/conversations.js';
 import { WSReqType } from '../stream/protocol.js';
-import type { AgentDriver, AgentEvent, AgentSession } from '../agent/events.js';
+import type { AgentDriver, AgentEvent, AgentSession, RunDriver } from '../agent/events.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
@@ -48,6 +48,34 @@ function setup() {
 }
 
 describe('persisted MessageHandler run', () => {
+	it('prepares Codex through the core without requesting a CC bind token', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'handler-codex-'));
+		homes.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']),
+			activeProviders: new Map([['42', 'codex']]) });
+		const received: string[] = [];
+		const driver: RunDriver = {
+			type: 'codex', features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
+			connect: async () => {}, disconnect: async () => {},
+			createRun(input) {
+				input.conversation.assertCurrent();
+				expect(input.bindToken).toBeUndefined();
+				expect(input.workspace).toBe(join(home, '42', 'dm', '7'));
+				received.push(input.message);
+				return { events: { async *[Symbol.asyncIterator]() { yield { type: 'done' as const, durationMs: 1 }; } },
+					cancel: async () => ({ status: 'stopped' as const }), dispose: async () => {} };
+			},
+		};
+		const ws = { isConnected: true, send: vi.fn() } as unknown as HulaWSClient;
+		const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
+		handler.handle({ type: 'receiveMessage', data: message(501) } as never);
+		for (let i = 0; i < 30 && !received.length; i++) await tick();
+		expect(received).toEqual(['[HuLa 私聊]\n[user(7)]: message 501']);
+		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
+		expect(store.pendingRuns()).toHaveLength(0);
+		handler.destroy();
+		store.close();
+	});
 	it('bridges a real CC driver to persistent run completion after native EOF', async () => {
 		const home = mkdtempSync(join(tmpdir(), 'handler-cc-'));
 		homes.push(home);
