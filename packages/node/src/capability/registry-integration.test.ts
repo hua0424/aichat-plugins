@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { handleSendMessage } from '../commands/send-message.js';
+import { runCapabilityCommand } from '../commands/capability-command.js';
 import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import { ConversationStore, type Provider } from './conversations.js';
@@ -43,6 +44,7 @@ describe('four driver legacy bridges through real capability endpoint', () => {
 			generation: r.generation, apiClient: apis.get(r.identityId)!,
 		});
 		const registry = new CapabilityRegistry(); registry.register('send-message', sendMessageCapability());
+		registry.register('fake-query', async (ctx) => ({ uid: ctx.aiclawUid, roomId: ctx.roomId }));
 		endpoint = new CapabilityEndpoint({ registry,
 			resolve: (key) => bound(store.resolveLegacy(key)),
 			resolveCandidate: (candidate) => bound(store.resolveCandidate(candidate as Parameters<typeof store.resolveCandidate>[0])),
@@ -61,6 +63,12 @@ describe('four driver legacy bridges through real capability endpoint', () => {
 			await handleSendMessage(['--content', 'real IPC bridge']);
 		}
 		expect(written).toEqual(['1:101', '2:202', '3:303', '4:404']);
+		// One new read requires only core registration + generic CLI invocation, not four driver edits.
+		await runCapabilityCommand('fake-query', ['--json'], JSON.stringify);
+		expect(JSON.parse(vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)).toEqual({
+			ok: true, result: { uid: '4', roomId: '404' },
+		});
+		expect(written).toHaveLength(4);
 		process.env.CODEX_THREAD_ID = 'thread-303';
 		const rejected = await postCapability(socket, { version: 2, contexts: [
 			{ provider: 'opencode', nativeId: 'session-404' }, { provider: 'codex', nativeId: 'thread-303' },

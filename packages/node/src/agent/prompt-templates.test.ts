@@ -20,7 +20,7 @@ describe('buildSystemPrompt (REQ-018 — unified system layer)', () => {
 		expect(out).toContain('CCTestAI');
 		expect(out).toContain('（uid 5）');
 		expect(out).toContain('猫娘');
-		expect(out).toContain('aichat send-message --content "<你的回复>"');
+		expect(out).toContain('aichat send-message --content "<你的回复>" --json');
 		expect(out).toContain(REPLY_COMMAND);
 	});
 
@@ -41,7 +41,8 @@ describe('buildSystemPrompt (REQ-018 — unified system layer)', () => {
 		const contract = TEMPLATES.replyContract.replace('{reply_command}', REPLY_COMMAND).trim();
 		for (const persona of [undefined, null, '   \n\t ']) {
 			const out = buildSystemPrompt(TEMPLATES, { displayName: 'X', uid: '1', persona });
-			expect(out).toBe(`${anchor}\n${contract}`);
+			expect(out.startsWith(`${anchor}\n${contract}\n`)).toBe(true);
+			expect(out).toContain('DELIVERY_UNKNOWN');
 			expect(out).not.toContain('你的人设');
 		}
 	});
@@ -75,5 +76,8 @@ describe('buildSystemPrompt (REQ-018 — unified system layer)', () => {
 	it('reply contract always carries REPLY_COMMAND (injected at render time)', () => {
 		const out = buildSystemPrompt(TEMPLATES, { uid: '1', persona: null });
 		expect(out).toContain(REPLY_COMMAND);
+		expect(out).toContain('ok === true');
+		expect(out).toContain('ok === false');
+		expect(out).toContain('不自动重发');
 	});
 });

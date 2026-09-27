@@ -141,6 +141,9 @@ Commands:
   find-friend <keyword>                          Search users by keyword (substring match)
   list-groups                                    List the groups this assistant has joined
   list-group-members [--online] [--groupid <id>] List a group's members with online status
+                                                  (send/query/reset accept --json for {ok,result} or
+                                                   {ok:false,code,message,retryable}; legacy group
+                                                   result.error exits 0, --json errors exit nonzero)
                                                  (default: the current chat's group;
                                                   --groupid <id> targets a different joined group,
                                                   where <id> is the 'id' from list-groups output;

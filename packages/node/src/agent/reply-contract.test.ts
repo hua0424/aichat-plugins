@@ -8,7 +8,7 @@ import { REPLY_COMMAND } from './reply-contract.js';
 // drift between drivers.
 describe('REPLY_COMMAND (REQ-018 — single source, injected at render time)', () => {
 	it('is the exact reply CLI the agent must run', () => {
-		expect(REPLY_COMMAND).toBe('aichat send-message --content "<你的回复>"');
+		expect(REPLY_COMMAND).toBe('aichat send-message --content "<你的回复>" --json');
 	});
 
 	it('uses no [SYSTEM] markers (filtered by openclaw security hardening)', () => {

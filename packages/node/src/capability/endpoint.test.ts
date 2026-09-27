@@ -105,6 +105,20 @@ describe('CapabilityEndpoint.handle', () => {
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
+	it('errors carry stable codes and never echo a token from upstream failures', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			expect(await endpoint.handle({ body: { version: 2, contexts: [], command: 'send-message' } })).toMatchObject({ status: 400, json: { code: 'INVALID_ARGUMENT', retryable: false } });
+			expect(await endpoint.handle({ body: body({ command: 'no-such-command' }) })).toMatchObject({ status: 400, json: { code: 'UNSUPPORTED', retryable: false } });
+			sendMessage.mockRejectedValueOnce(new HulaApiRejectedError('token=secret', 'FORBIDDEN'));
+			const forbidden = await endpoint.handle({ body: body() });
+			expect(forbidden).toMatchObject({ status: 403, json: { code: 'FORBIDDEN', retryable: false } });
+			expect(JSON.stringify(forbidden)).not.toContain('secret');
+			expect(JSON.stringify(log.mock.calls)).not.toContain('secret');
+		} finally { log.mockRestore(); }
+	});
+
 	it('sessionKey with no known prefix → 400, resolve + capability NOT invoked', async () => {
 		const { endpoint, sendMessage, resolve } = build({ resolveRoom: 42 });
 		const res = await endpoint.handle({ body: body({ sessionKey: 'ses_no_prefix' }) });
@@ -203,12 +217,18 @@ describe('V2 all-candidate binding', () => {
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
+	it('single unknown candidate differs from multi-candidate ambiguity', async () => {
+		const { endpoint, request } = setup();
+		expect(await endpoint.handle({ body: request([{ key: 'unknown' }]) })).toMatchObject({ status: 404, json: { code: 'UNKNOWN_CONTEXT', retryable: false } });
+		expect(await endpoint.handle({ body: request([{ key: 'bound-key' }, { key: 'unknown' }]) })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT', retryable: false } });
+	});
+
 	it('fails closed without a production resolver, does not fall back to legacy resolver', async () => {
 		const registry = new CapabilityRegistry();
 		registry.register('send-message', sendMessageCapability());
 		const resolve = vi.fn(() => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }));
 		const endpoint = new CapabilityEndpoint({ registry, resolve });
-		expect(await endpoint.handle({ body: { version: 2, contexts: [{ key: 'not-registered' }], command: 'send-message', requestId: 'id' } })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT' } });
+		expect(await endpoint.handle({ body: { version: 2, contexts: [{ key: 'not-registered' }], command: 'send-message', requestId: 'id' } })).toMatchObject({ status: 404, json: { code: 'UNKNOWN_CONTEXT' } });
 		expect(resolve).not.toHaveBeenCalled();
 	});
 });
@@ -234,6 +254,41 @@ describe('local write requestId', () => {
 		});
 		return { endpoint, sendMessage, complete: (id: string) => release({ msgId: id }) };
 	}
+
+	it('query rejection and transport failure have stable codes without leaking upstream secrets', async () => {
+		const registry = new CapabilityRegistry();
+		const query = vi.fn().mockRejectedValueOnce(new HulaApiRejectedError('token=hidden', 'FORBIDDEN'))
+			.mockRejectedValueOnce(new Error('token=hidden'));
+		registry.register('fake-query', query);
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }) });
+		const request = body({ command: 'fake-query', args: {}, requestId: 'same', idempotencyKey: undefined });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			const forbidden = await endpoint.handle({ body: request });
+			const failed = await endpoint.handle({ body: request });
+			expect(forbidden).toMatchObject({ status: 403, json: { code: 'FORBIDDEN', retryable: false } });
+			expect(failed).toMatchObject({ status: 503, json: { code: 'UPSTREAM_FAILED', retryable: true } });
+			expect(JSON.stringify([forbidden, failed, log.mock.calls])).not.toContain('hidden');
+			expect(query).toHaveBeenCalledTimes(2);
+		} finally { log.mockRestore(); }
+	});
+
+	it('fake registered query reruns despite a reused write requestId and cannot return a write receipt', async () => {
+		const registry = new CapabilityRegistry();
+		const fakeQuery = vi.fn(async () => ({ ordinal: fakeQuery.mock.calls.length }));
+		const fakeWrite = vi.fn(async () => ({ msgId: 'committed' }));
+		registry.register('fake-query', fakeQuery);
+		registry.register('send-message', fakeWrite);
+		const endpoint = new CapabilityEndpoint({ registry,
+			resolve: () => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }) });
+		const requestId = 'shared';
+		const query = body({ command: 'fake-query', args: {}, requestId, idempotencyKey: undefined });
+		expect(await endpoint.handle({ body: query })).toMatchObject({ status: 200, json: { result: { ordinal: 1 } } });
+		expect(await endpoint.handle({ body: body({ requestId, idempotencyKey: undefined }) })).toMatchObject({ status: 200, json: { result: { msgId: 'committed' } } });
+		expect(await endpoint.handle({ body: query })).toMatchObject({ status: 200, json: { result: { ordinal: 2 } } });
+		expect(fakeQuery).toHaveBeenCalledTimes(2);
+		expect(fakeWrite).toHaveBeenCalledOnce();
+	});
 
 	it('registers before invoking: two concurrent callers share a single real resolution/result', async () => {
 		const { endpoint, sendMessage, complete } = setup();
@@ -295,6 +350,19 @@ describe('local write requestId', () => {
 		expect((await endpoint.handle({ body: body({ ...request, sessionKey: 'opencode:revoked' }) })).status).toBe(404);
 	});
 
+	it('reset persistence exceptions use a stable code without exposing stored details', async () => {
+		const registry = new CapabilityRegistry();
+		registry.register('reset-session', resetSessionCapability(() => { throw new Error('token=private'); }));
+		const endpoint = new CapabilityEndpoint({ registry,
+			resolve: () => ({ aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient }) });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			const out = await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'durable', idempotencyKey: undefined }) });
+			expect(out).toMatchObject({ status: 503, json: { code: 'PERSISTENCE_FAILED', retryable: false } });
+			expect(JSON.stringify([out, log.mock.calls])).not.toContain('private');
+		} finally { log.mockRestore(); }
+	});
+
 	it('reset receipt remains available only for its old key and exact ID after reset revokes the binding', async () => {
 		let active = true;
 		const registry = new CapabilityRegistry();
@@ -347,7 +415,7 @@ describe('local write requestId', () => {
 		const request = body({ requestId: 'write-1', idempotencyKey: undefined });
 		expect((await endpoint.handle({ body: request })).status).toBe(200);
 		paused = true;
-		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 409, json: { code: 'STOP_UNCONFIRMED' } });
+		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 409, json: { code: 'RUN_STOP_UNCONFIRMED' } });
 		expect(send).toHaveBeenCalledOnce();
 		expect((await endpoint.handle({ body: body({ command: 'member-info' }) })).status).toBe(200);
 		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'reset-1', idempotencyKey: undefined }) })).status).toBe(200);
@@ -472,7 +540,7 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 		expect(res.status).toBe(503);
 		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
 		expect(capLines).toHaveLength(1);
-		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) err=upstream failed/);
+		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) err=DELIVERY_UNKNOWN$/);
 	});
 
 	it('prefix-parse-failure branch (400) logs one (unresolved) unknown session key prefix line', async () => {
