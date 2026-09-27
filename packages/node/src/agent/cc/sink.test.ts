@@ -43,6 +43,47 @@ describe('CcSessionRegistry', () => {
 });
 
 describe('CcBroker → buildCcBridgeSink', () => {
+	it('routes a legacy bind alias to the core opaque context; drops stale hooks after reset', async () => {
+		const reg = new CcSessionRegistry();
+		let contextKey = 'context-generation-1';
+		const broker = new CcBroker({
+			resolve: (token) => token === 'legacy-cc-alias' && contextKey ?
+				{ aiclawUid: 'A', roomId: 'room', contextKey } : undefined,
+			sink: buildCcBridgeSink(reg),
+		});
+		const old: AgentEvent[] = [], current: AgentEvent[] = [];
+		const remove = reg.registerContext(contextKey, 'core-run:old-attempt', (ev) => old.push(ev));
+		const hook = (runId: string) => broker.handle({ authToken: 'legacy-cc-alias', runId,
+			body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
+		await hook('core-run:old-attempt');
+		contextKey = 'context-generation-2';
+		reg.registerContext(contextKey, 'next-run:attempt', (ev) => current.push(ev));
+		remove();
+		await hook('core-run:old-attempt');
+		await hook('next-run:attempt');
+		expect(old).toHaveLength(1);
+		expect(current).toEqual([{ type: 'tool', name: 'Bash', phase: 'end' }]);
+	});
+	it('keeps two native CC identities in the same room isolated by core context and attempt', async () => {
+		const reg = new CcSessionRegistry();
+		const contexts = new Map([['token-a', { aiclawUid: 'A', roomId: 'shared', contextKey: 'key-a' }],
+			['token-b', { aiclawUid: 'B', roomId: 'shared', contextKey: 'key-b' }]]);
+		const broker = new CcBroker({ resolve: (token) => contexts.get(token), sink: buildCcBridgeSink(reg) });
+		const a: AgentEvent[] = [], b: AgentEvent[] = [], next: AgentEvent[] = [];
+		const removeA = reg.registerContext('key-a', 'run-a:1', (ev) => a.push(ev));
+		reg.registerContext('key-b', 'run-b:1', (ev) => b.push(ev));
+		const hook = (token: string, runId: string) => broker.handle({ authToken: token, runId,
+			body: { hook_event_name: 'PostToolUse', tool_name: 'Bash' } });
+		await hook('token-a', 'run-a:1'); await hook('token-b', 'run-b:1');
+		reg.registerContext('key-a', 'run-a:2', (ev) => next.push(ev));
+		removeA(); // old cleanup cannot remove either the new A attempt or B's receiver
+		await hook('token-a', 'run-a:1'); await hook('token-a', 'run-a:2');
+		await hook('token-b', 'run-b:1'); await hook('token-b', 'run-a:2');
+		expect(a).toHaveLength(1);
+		expect(next).toHaveLength(1);
+		expect(b).toHaveLength(2);
+	});
+
 	it('routes only matching token identity + room + run; a missing/late run never selects the active room', async () => {
 		const reg = new CcSessionRegistry();
 		const tokens = new InMemoryBindTokenStore();

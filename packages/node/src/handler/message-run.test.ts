@@ -52,29 +52,31 @@ describe('persisted MessageHandler run', () => {
 		const home = mkdtempSync(join(tmpdir(), 'handler-cc-'));
 		homes.push(home);
 		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']), activeProviders: new Map([['42', 'cc']]) });
-		const sessions = new Map<string, StoredCcHeadlessSession>();
-		const sessionStore: CcHeadlessSessionStore = {
-			get: (key) => sessions.get(key), set: (key, value) => void sessions.set(key, value), delete: (key) => void sessions.delete(key),
-		};
-		const stdoutEnd: Array<() => void> = [];
+		const stdoutData: Array<(data: string) => void> = [];
+		const childClose: Array<(code: number | null, signal: string | null) => void> = [];
 		const writes: string[] = [];
 		const child: CcChild = {
 			pid: 1251, stdin: { write: (text) => void writes.push(text), end: () => {} },
 			stdout: { on: (event: string, cb: (...args: never[]) => void) => {
-				if (event === 'end' || event === 'close') stdoutEnd.push(cb as () => void);
+				if (event === 'data') stdoutData.push(cb as (data: string) => void);
 			} } as CcChild['stdout'],
-			stderr: { on: () => {} } as CcChild['stderr'], on: () => {}, kill: () => true,
+			stderr: { on: () => {} } as CcChild['stderr'],
+			on: (event: string, cb: (...args: never[]) => void) => {
+				if (event === 'close') childClose.push(cb as (code: number | null, signal: string | null) => void);
+			}, kill: () => true,
 		};
 		let argv: readonly string[] = [];
 		const spawn: CcSpawnFn = (_command, args) => { argv = args; return child; };
+		const registry = new CcSessionRegistry();
 		const driver = new CcHeadlessDriver({
-			workspaceBase: home, brokerPort: 9100, sessionStore,
-			bindTokens: new InMemoryBindTokenStore(), registry: new CcSessionRegistry(),
-			transcript: { append: () => {} }, spawn, firstEventTimeoutMs: 1000, drainMs: 5, killGraceMs: 20,
+			workspaceBase: home, brokerPort: 9100, registerHook: (key, run, push) => registry.registerContext(key, run, push),
+			transcript: { append: () => {} }, spawn, platform: 'linux',
+			kill: (_pid, signal) => { if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
+			firstEventTimeoutMs: 1000, drainMs: 5, killGraceMs: 20,
 		});
 		const sent: number[] = [];
 		const ws = { isConnected: true, send: (type: number) => void sent.push(type) } as HulaWSClient;
-		const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store);
+		const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
 		handler.setPromptTemplates({ identityAnchor: 'identity:{uid}', personaSection: 'persona:{persona}', replyContract: 'reply-contract:{reply_command}' });
 		handler.handle({ type: 'receiveMessage', data: message(30) } as never);
 		for (let i = 0; i < 30 && !writes.length; i++) await tick();
@@ -83,7 +85,8 @@ describe('persisted MessageHandler run', () => {
 		expect(argv.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
 		expect(argv[argv.indexOf('--append-system-prompt') + 1].match(/identity:42/g)).toHaveLength(1);
 		expect(store.pendingRuns()).toHaveLength(1);
-		stdoutEnd.forEach((end) => end());
+		stdoutData.forEach((data) => data('{"type":"result","is_error":false}\n'));
+		childClose.forEach((close) => close(0, null));
 		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
 		expect(store.pendingRuns()).toHaveLength(0);
 		expect(sent).toContain(WSReqType.THINKING_END);

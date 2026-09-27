@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { bindingKey, parseBindingKey } from '../agent/bind-token-store.js';
 import { parseSessionKey } from './session-key.js';
 
@@ -21,6 +21,8 @@ export interface ConversationRecord {
 	nativeAliases: NativeAlias[];
 	/** Original provider store payloads. OpenClaw retains both the bare token and full gateway sessionKey. */
 	nativeState: Partial<Record<Provider, Record<string, unknown>>>;
+	/** Offline operator evidence, retained across native state updates and reset for audit. Not proof of owner authentication. */
+	ccCwdConfirmation?: { sessionId: string; cwd: string; generation: number; approvalRef: string; approvalSha256: string; confirmedAt: string };
 }
 export interface RecoveryData { version: number; value: unknown }
 export interface PendingRun { runId: string; generation: number; startedAt: string; recovery?: RecoveryData }
@@ -86,9 +88,12 @@ export class ConversationStore {
 			const missing = newlyActive.records.filter((r) => !this.byIdentity.has(identityKey(r.serverNamespace, r.identityId, r.roomId)));
 			if (missing.length) this.commit([...this.snapshot.records, ...missing]);
 		}
-		// A process restart is not evidence that a native run stopped. Persist the gate before admission.
-		if (this.snapshot.records.some((r) => r.pendingRuns?.length && r.state !== 'stop_unconfirmed')) {
-			this.commit(this.snapshot.records.map((r) => r.pendingRuns?.length ? { ...r, state: 'stop_unconfirmed' } : r));
+		// Persist the legacy CC cwd gate even for snapshots created before this safety check.
+		// A process restart is not evidence that a native run stopped.
+		if (this.snapshot.records.some((r) => (r.pendingRuns?.length && r.state !== 'stop_unconfirmed') ||
+			(this.ccCwdPending(r) && r.state === 'ready'))) {
+			this.commit(this.snapshot.records.map((r) => r.pendingRuns?.length ? { ...r, state: 'stop_unconfirmed' }
+				: this.ccCwdPending(r) && r.state === 'ready' ? { ...r, state: 'suspended' } : r));
 		}
 	}
 
@@ -137,7 +142,8 @@ export class ConversationStore {
 		if (!Number.isSafeInteger(old.generation + 1)) throw new Error('generation exhausted');
 		const record: ConversationRecord = { ...old, generation: old.generation + 1,
 			contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: {},
-			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed' : old.state };
+			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed'
+				: this.ccCwdPending(old) ? 'ready' : old.state };
 		const records = this.snapshot.records.some((r) => r.conversationId === old.conversationId)
 			? this.snapshot.records.map((r) => r.conversationId === old.conversationId ? record : r)
 			: [...this.snapshot.records, record];
@@ -219,7 +225,7 @@ export class ConversationStore {
 		if (!record || this.closed) throw new Error('run no longer pending');
 		const updated = copy(record);
 		updated.pendingRuns = updated.pendingRuns!.filter((run) => run.runId !== runId);
-		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : 'ready';
+		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : this.ccCwdPending(updated) ? 'suspended' : 'ready';
 		this.replace(updated);
 	}
 	private updateRunState(runId: string, state: 'suspended' | 'stop_unconfirmed'): void {
@@ -274,6 +280,38 @@ export class ConversationStore {
 		}
 		this.replace(record);
 		return copy(record);
+	}
+
+	private ccCwdPending(record: ConversationRecord): boolean {
+		const state = record.nativeState.cc;
+		return validId(state?.sessionId) && (state.cwdConfirmationRequired === true || !validId(state.workspace));
+	}
+
+	/** Offline-only owner approval recording; the caller must independently verify the owner and artifact. */
+	confirmCcOriginalCwd(identityId: string, roomId: string, sessionId: string, generation: number,
+		cwd: string, approvalRef: string, approvalSha256: string): ConversationRecord {
+		if (!validId(identityId) || !validId(roomId) || !validId(sessionId) || !Number.isSafeInteger(generation) ||
+			!validId(cwd) || !isAbsolute(cwd) || !validId(approvalRef) || !/^[0-9a-f]{64}$/.test(approvalSha256))
+			throw new Error('invalid CC cwd confirmation');
+		const record = this.get(identityId, roomId);
+		if (!record || record.adapterInstanceId !== 'cc' || record.generation !== generation ||
+			record.nativeState.cc?.sessionId !== sessionId || record.pendingRuns?.length)
+			throw new Error('CC confirmation target changed or has a pending run');
+		const state = record.nativeState.cc!;
+		if (!this.ccCwdPending(record)) {
+			if (record.state === 'ready' && state.workspace === cwd &&
+				record.ccCwdConfirmation?.sessionId === sessionId && record.ccCwdConfirmation.generation === generation &&
+				record.ccCwdConfirmation.approvalSha256 === approvalSha256 && record.ccCwdConfirmation.approvalRef === approvalRef) return record;
+			throw new Error('CC cwd already trusted or conflicting confirmation');
+		}
+		if (record.state !== 'suspended') throw new Error('CC confirmation requires suspended state');
+		const updated = copy(record);
+		updated.nativeState.cc = { ...state, workspace: cwd, cwdConfirmationRequired: false };
+		updated.ccCwdConfirmation = { sessionId, cwd, generation, approvalRef, approvalSha256,
+			confirmedAt: new Date().toISOString() };
+		updated.state = 'ready';
+		this.replace(updated);
+		return copy(updated);
 	}
 
 	getNative(provider: Provider, identityId: string, roomId: string): Record<string, unknown> | undefined {
@@ -410,6 +448,12 @@ export class ConversationStore {
 				!Number.isSafeInteger(r.generation) || r.generation < 1 || !['ready', 'suspended', 'stop_unconfirmed', 'disabled'].includes(r.state) ||
 				!Array.isArray(r.nativeAliases) || !r.nativeState || typeof r.nativeState !== 'object' || Array.isArray(r.nativeState) ||
 				(r.pendingRuns !== undefined && !Array.isArray(r.pendingRuns))) throw new Error('invalid conversation record');
+			if (r.ccCwdConfirmation !== undefined && (!r.ccCwdConfirmation ||
+				!validId(r.ccCwdConfirmation.sessionId) || !validId(r.ccCwdConfirmation.cwd) ||
+				!Number.isSafeInteger(r.ccCwdConfirmation.generation) || r.ccCwdConfirmation.generation < 1 ||
+				r.ccCwdConfirmation.generation > r.generation || !validId(r.ccCwdConfirmation.approvalRef) ||
+				!/^[0-9a-f]{64}$/.test(r.ccCwdConfirmation.approvalSha256) ||
+				!validId(r.ccCwdConfirmation.confirmedAt))) throw new Error('invalid CC cwd confirmation');
 			for (const run of r.pendingRuns ?? []) {
 				if (!run || !validId(run.runId) || runs.has(run.runId) || !Number.isSafeInteger(run.generation) ||
 					run.generation < 1 || run.generation > r.generation || !validId(run.startedAt) || Number.isNaN(Date.parse(run.startedAt)))
@@ -433,11 +477,22 @@ export class ConversationStore {
 				const state = value as Record<string, unknown>;
 				if (provider === 'opencode' && (!validId(state.sessionID) || !validId(state.directory))) throw new Error('invalid opencode native state');
 				if (provider === 'codex' && !validId(state.threadId)) throw new Error('invalid codex native state');
-				if (provider === 'cc' && state.sessionId !== undefined && !validId(state.sessionId)) throw new Error('invalid CC native state');
+				if (provider === 'cc' && (state.sessionId !== undefined && !validId(state.sessionId) ||
+					state.workspace !== undefined && !validId(state.workspace) ||
+					state.cwdConfirmationRequired !== undefined && typeof state.cwdConfirmationRequired !== 'boolean' ||
+					state.cwdConfirmation !== undefined && (!state.cwdConfirmation || typeof state.cwdConfirmation !== 'object' ||
+						!validId((state.cwdConfirmation as Record<string, unknown>).approvalRef) ||
+						!/^[0-9a-f]{64}$/.test(String((state.cwdConfirmation as Record<string, unknown>).approvalSha256)) ||
+						!validId((state.cwdConfirmation as Record<string, unknown>).confirmedAt)))) throw new Error('invalid CC native state');
 				if (provider === 'openclaw' && (!validId(state.token) ||
 					state.nativeRef !== `${state.token}:${bindingKey(r.identityId, r.roomId)}`)) throw new Error('invalid OpenClaw nativeRef');
 			}
 			const ccId = r.nativeState.cc?.sessionId;
+			// The original-cwd approval must remain attached to the exact native session it authorized.
+			// Reject a modified snapshot before it can admit a run or silently bless another cwd.
+			if (r.ccCwdConfirmation?.generation === r.generation && r.ccCwdConfirmation.sessionId === ccId &&
+				(r.nativeState.cc?.workspace !== r.ccCwdConfirmation.cwd || r.nativeState.cc?.cwdConfirmationRequired === true))
+				throw new Error('CC confirmed original cwd conflicts with native state');
 			if (ccId !== undefined) {
 				if (!validId(ccId) || ccSessions.has(ccId)) throw new Error('duplicate or invalid CC native session');
 				ccSessions.add(ccId);
@@ -545,7 +600,8 @@ export class ConversationStore {
 					if (this.options.activeUids.has(bound.aiclawUid)) {
 						this.assertProvider(provider, bound.aiclawUid);
 						const record = get(bound.aiclawUid, bound.roomId);
-						record.nativeState.cc = copy(state);
+						record.nativeState.cc = { ...copy(state), cwdConfirmationRequired: true };
+						record.state = 'suspended';
 					} // Inactive CC history is not a capability alias.
 					continue;
 				}

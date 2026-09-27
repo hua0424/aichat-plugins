@@ -63,7 +63,10 @@ describe('ConversationStore', () => {
 		expect(store.resolveLegacy(`openclaw:${token}`)?.identityId).toBe('11');
 		expect(store.resolveLegacy(`openclaw:${token}:aiclaw-11-room-888`)).toBeUndefined();
 		expect(store.getNative('openclaw', '11', '888')).toEqual({ token, nativeRef: `${token}:aiclaw-11-room-888` });
-		expect(store.getNative('cc', '44', '888')).toEqual({ sessionId: 'cc-44' });
+		expect(store.getNative('cc', '44', '888')).toEqual({ sessionId: 'cc-44', cwdConfirmationRequired: true });
+		expect(store.get('44', '888')?.state).toBe('suspended');
+		expect(() => store.mintToken('44', '888')).toThrow('paused');
+		store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/original', 'https://example.test/owner-approval', 'f'.repeat(64));
 		expect(store.mintToken('44', '888')).toBe('b'.repeat(64));
 		expect(store.resolveToken('cc', 'b'.repeat(64))?.identityId).toBe('44');
 		expect(store.resolveLegacy('cc:cc-44')).toBeUndefined();
@@ -82,6 +85,58 @@ describe('ConversationStore', () => {
 		}
 		legacy(root, 'codex/sessions.json', { 'aiclaw-22-room-888': { threadId: 'silently-mutated' } });
 		expect(() => new ConversationStore(opts)).toThrow('legacy source changed');
+	});
+
+	it('durably gates legacy CC snapshots, confirms only exact original cwd with audit, and reset opens fresh', () => {
+		let fail = false;
+		const root = home(), opts = active(root, { '44': 'cc' }, () => { if (fail) throw new Error('disk full'); });
+		legacy(root, 'cc/sessions.json', { 'aiclaw-44-room-888': { sessionId: 'cc-44' } });
+		const store = new ConversationStore(opts);
+		const old = store.get('44', '888')!;
+		expect(old.state).toBe('suspended');
+		expect(() => store.beginRun('44', '888', 'run')).toThrow('paused');
+		expect(() => store.confirmCcOriginalCwd('44', 'other', 'cc-44', 1, '/original', 'https://example.test/approval', 'a'.repeat(64))).toThrow('target changed');
+		expect(() => store.confirmCcOriginalCwd('44', '888', 'wrong', 1, '/original', 'https://example.test/approval', 'a'.repeat(64))).toThrow('target changed');
+		fail = true;
+		expect(() => store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/original', 'https://example.test/approval', 'a'.repeat(64))).toThrow('disk full');
+		expect(store.get('44', '888')).toEqual(old);
+		fail = false;
+		const approved = store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/original', 'https://example.test/approval', 'a'.repeat(64));
+		expect(approved).toMatchObject({ state: 'ready', ccCwdConfirmation: { cwd: '/original', sessionId: 'cc-44', approvalSha256: 'a'.repeat(64) } });
+		expect(store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/original', 'https://example.test/approval', 'a'.repeat(64))).toEqual(approved);
+		expect(() => store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/different', 'https://example.test/approval', 'a'.repeat(64))).toThrow('conflicting');
+		const run = store.beginRun('44', '888', 'run');
+		run.saveNativeState('cc', { sessionId: 'cc-44', workspace: '/original' });
+		expect(store.get('44', '888')?.ccCwdConfirmation).toEqual(approved.ccCwdConfirmation);
+		store.finishRun('run');
+		expect(new ConversationStore(active(root, { '44': 'cc' })).get('44', '888')?.ccCwdConfirmation).toEqual(approved.ccCwdConfirmation);
+		const snapshotPath = join(root, 'conversations.json'), trustedBytes = readFileSync(snapshotPath, 'utf8');
+		for (const tamper of [
+			(state: Record<string, unknown>) => { state.workspace = '/other'; },
+			(state: Record<string, unknown>) => { state.cwdConfirmationRequired = true; },
+		]) {
+			const corrupted = JSON.parse(trustedBytes);
+			tamper(corrupted.records[0].nativeState.cc);
+			const corruptedBytes = JSON.stringify(corrupted);
+			writeFileSync(snapshotPath, corruptedBytes);
+			expect(() => new ConversationStore(active(root, { '44': 'cc' }))).toThrow('confirmed original cwd conflicts');
+			expect(readFileSync(snapshotPath, 'utf8')).toBe(corruptedBytes); // fail closed, do not rewrite history
+		}
+		writeFileSync(snapshotPath, trustedBytes);
+		const fresh = store.reset('44', '888');
+		expect(fresh).toMatchObject({ state: 'ready', nativeState: {}, generation: 2 });
+		expect(fresh.ccCwdConfirmation).toEqual(approved.ccCwdConfirmation);
+		store.beginRun('44', '888', 'fresh');
+	});
+
+	it('upgrades a preexisting ready snapshot with missing CC cwd to persisted suspended gate', () => {
+		const root = home(), opts = active(root, { '44': 'cc' });
+		const store = new ConversationStore(opts);
+		store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44' });
+		const reopened = new ConversationStore(opts);
+		expect(reopened.get('44', '888')?.state).toBe('suspended');
+		expect(JSON.parse(readFileSync(join(root, 'conversations.json'), 'utf8')).records[0].state).toBe('suspended');
+		expect(reopened.reset('44', '888')).toMatchObject({ state: 'ready', nativeState: {}, generation: 2 });
 	});
 
 	it('fails closed on broken, duplicate and ambiguous legacy input without committing a marker', () => {

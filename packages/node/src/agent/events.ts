@@ -35,6 +35,12 @@ export interface PreparedRun {
 	runId: string;
 	message: string;
 	workspace?: string;
+	/** Opaque core capability key, never inferred from a native session or server DTO. */
+	contextKey?: string;
+	/** Existing imported CC bind alias or the newly minted core alias; CLI candidates must agree. */
+	bindToken?: string;
+	/** Legacy transcript file key only; not an authorization source. */
+	transcriptKey?: string;
 	systemPrompt: string;
 	conversation: BoundConversation;
 	saveRecovery(value: { version: number; value: unknown }): Promise<void>;

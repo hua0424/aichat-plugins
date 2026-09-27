@@ -123,6 +123,16 @@ describe('CLI write request ID', () => {
 		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({ command: 'reset-session', requestId: 'reset-1' });
 	});
 
+	it('reset reports a rotated history without promising execution when old stop is unconfirmed', async () => {
+		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: {
+			ok: true, result: { reset: true, driverType: 'cc', roomId: '9', executionPaused: true },
+		} });
+		const out = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleResetSession(['--request-id', 'paused-reset']);
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('旧任务停止未确认，执行仍暂停'));
+		expect(out).not.toHaveBeenCalledWith(expect.stringContaining('下一条消息将开启全新会话'));
+	});
+
 	it('transport errors report the reusable ID rather than silently generating another request', async () => {
 		vi.mocked(postCapability).mockRejectedValue(new Error('timeout'));
 		const out = vi.spyOn(console, 'error').mockImplementation(() => {});

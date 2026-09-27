@@ -34,13 +34,13 @@ import { readJsonBody } from '../../util/http-body.js';
  */
 export interface CcHookSink {
 	/** PostToolUse → the exact registered CC attempt; never choose the current room alone. */
-	tool(roomId: string, aiclawUid: string, runId: string, toolName: string): void;
+	tool(roomId: string, aiclawUid: string, runId: string, toolName: string, contextKey?: string): void;
 	/** Stop is not terminal: stdout result/EOF controls completion. */
 	flush(roomId: string, aiclawUid: string, runId: string): void;
 }
 
 /** resolve() result: the bound identity + room for a binding token (REQ-029: opaque strings). */
-type Resolved = { aiclawUid: string; roomId: string };
+type Resolved = { aiclawUid: string; roomId: string; contextKey?: string };
 
 export interface CcBrokerDeps {
 	/** Map a CC binding token → bound identity/room, or undefined if unknown. */
@@ -106,7 +106,8 @@ export class CcBroker {
 				break;
 			case 'PostToolUse': {
 				const toolName = typeof hook.body.tool_name === 'string' ? hook.body.tool_name : 'tool';
-				this.sink.tool(roomId, aiclawUid, req.runId!, toolName);
+				if (bound.contextKey) this.sink.tool(roomId, aiclawUid, req.runId!, toolName, bound.contextKey);
+				else this.sink.tool(roomId, aiclawUid, req.runId!, toolName);
 				break;
 			}
 			case 'Stop':
