@@ -49,7 +49,7 @@ export interface CcHeadlessDriverDeps {
 const MAX_TOOL_INPUT_CHARS = 2000;
 const MAX_CC_LINE_CHARS = 8 * 1024 * 1024;
 type Notice = { type: 'line'; text: string } | { type: 'hook'; event: AgentEvent } |
-	{ type: 'close'; code: number | null } | { type: 'failure'; message: string };
+	{ type: 'close'; code: number | null } | { type: 'failure'; message: string } | { type: 'drain-end' };
 type StopResult = Awaited<ReturnType<AgentRun['cancel']>>;
 
 /** One invocation per inbound turn; the factory owns the shared broker and hook registry. */
@@ -258,6 +258,7 @@ class CcRun implements AgentRun {
 					break;
 				}
 				if (notice.type === 'hook') { yield notice.event; continue; }
+				if (notice.type !== 'line') continue;
 				let obj: Record<string, unknown>;
 				try { obj = JSON.parse(notice.text.trim().replace(/^data:\s*/, '')) as Record<string, unknown>; }
 				catch { continue; }
@@ -301,8 +302,18 @@ class CcRun implements AgentRun {
 			else if (resultError) yield { type: 'error', message: resultError };
 			else if (this.cancelled) yield { type: 'cancelled', reason: 'CC cancelled' };
 			else {
-				await new Promise((resolve) => setTimeout(resolve, this.deps.drainMs ?? 250));
-				yield { type: 'done', durationMs: Date.now() - this.startedAt };
+				// The final async PostToolUse hook may reach the broker after stdout/child close.
+				// Preserve its run-scoped ordering before the terminal event during the drain window.
+				const timer = setTimeout(() => this.notify({ type: 'drain-end' }), this.deps.drainMs ?? 250);
+				try {
+					while (true) {
+						const notice = await this.next();
+						if (notice.type === 'drain-end') break;
+						if (notice.type === 'hook' && !this.cancelled) yield notice.event;
+					}
+				} finally { clearTimeout(timer); }
+				if (this.cancelled) yield { type: 'cancelled', reason: 'CC cancelled during hook drain' };
+				else yield { type: 'done', durationMs: Date.now() - this.startedAt };
 			}
 		} catch (error) {
 			if (this.submitted && !this.groupGone) await this.cancel(errMsg(error));

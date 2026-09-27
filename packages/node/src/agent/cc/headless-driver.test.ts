@@ -196,6 +196,18 @@ describe('CC PreparedRun native execution', () => {
 		expect((tool?.[1] as { tool_input: string }).tool_input).toContain('…[truncated ');
 	});
 
+	posix('delivers a PostToolUse hook racing after child close before done', async () => {
+		const f = fixture({ drainMs: 40 });
+		const { collected, done } = await f.start();
+		const attempt = f.spawnCalls[0].options.env.AICHAT_CC_RUN!;
+		f.line({ type: 'result', is_error: false });
+		f.groupExit(); f.close(0);
+		await tick(); // the native stream closed, but the broker hook is still in flight
+		f.registry.pushContext('opaque-new-key', attempt, { type: 'tool', name: 'Bash', phase: 'end' });
+		await done;
+		expect(collected.map((event) => event.type)).toEqual(['tool', 'done']);
+	});
+
 	posix('drops a late hook after completion without selecting a replacement run', async () => {
 		const f = fixture();
 		const { collected, done } = await f.start();
