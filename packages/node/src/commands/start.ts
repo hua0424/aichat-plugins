@@ -95,7 +95,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 	// SDK v0.142.3 accepts a per-client env (without inheriting process.env); never mutate global env.
 	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
-		value !== undefined && !['OPENCODE_SESSION_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY'].includes(name))) as Record<string, string>;
+		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
 
 	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
 	// their matching headless turn. Every CC identity's driver and the broker share this registry.
@@ -131,13 +131,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				});
 			}
 			if (entry.tool === 'codex') {
-				// No shared-server singleton (unlike opencode): the codex SDK spawns `codex exec` per
-				// turn. `new Codex()` omits apiKey/baseUrl → uses the baked ~/.codex/config.toml provider
-				// + auth.json. resolveSession reverse-looks-up the bound (aiclaw, room) by CODEX_THREAD_ID.
+				// Each Codex SDK client spawns its own native exec; core owns the thread and generation.
 				return new CodexDriver({
-					codex: new Codex({ env: codexEnv }),
-					workspaceBase: codexWorkspaceBase,
-					sessionStore: bridges.codex,
+					createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
+						config: { developer_instructions: systemPrompt } }),
 					...(entry.model !== undefined ? { model: entry.model } : {}),
 				});
 			}
@@ -183,7 +180,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
 				if (!conversations) throw new Error('conversation bindings not ready');
 				return conversations;
-			}, driver.type === 'cc' ? ccWorkspaceBase : undefined),
+			}, driver.type === 'cc' ? ccWorkspaceBase : driver.type === 'codex' ? codexWorkspaceBase : undefined),
 	});
 
 	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.

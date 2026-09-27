@@ -23,7 +23,9 @@ export interface BoundConversation {
 	/** Core's synchronous generation gate, callable without native or network side effects. */
 	assertCurrent(): void;
 	saveNativeState(value: { version: number; value: unknown }): Promise<void>;
-	registerNativeAlias(alias: { scope: string; id: string }): Promise<void>;
+	registerNativeAlias(alias: { scope?: string; id: string }): Promise<void>;
+	/** Atomically bind the native ID and state in the core snapshot. */
+	registerNative?(id: string, state: { version: number; value: unknown }): Promise<void>;
 }
 
 /** A capability handle bound by the core, never a server API client or routing DTO. */
