@@ -48,7 +48,8 @@ describe('ensureAichatOnPath', () => {
 
 			const sh = readFileSync(join(bin, 'aichat'), 'utf-8');
 			expect(sh).toContain(`exec '${process.execPath}' '/abs/dist/cli.js' "$@"`);
-			expect(statSync(join(bin, 'aichat')).mode & 0o111).toBeTruthy();
+			// Windows filesystems do not expose POSIX executable bits, even for a Linux-targeted shim.
+			if (process.platform !== 'win32') expect(statSync(join(bin, 'aichat')).mode & 0o111).toBeTruthy();
 
 			const parts = process.env.PATH!.split(delimiter);
 			expect(parts[0]).toBe(bin);

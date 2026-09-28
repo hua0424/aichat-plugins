@@ -2,9 +2,9 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MessageHandler } from './message.js';
+import { MessageHandler as NativeMessageHandler } from './message.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
-import type { AgentDriver, AgentSession, AgentEvent } from '../agent/events.js';
+import type { AgentEvent, PreparedRun, RunDriver } from '../agent/events.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
@@ -35,7 +35,8 @@ interface CallbacksShim {
 interface ChatCall {
 	message: string;
 	sessionKey: string;
-	context?: { roomId: number };
+	input: PreparedRun;
+	context?: { roomId: string };
 	callbacks: CallbacksShim;
 	/** resolves once the handler's for-await loop over this send has fully drained */
 	flush: () => Promise<void>;
@@ -48,82 +49,35 @@ interface ChatCall {
  */
 function fakeAdapter() {
 	const calls: ChatCall[] = [];
-	const driver = {
-		type: 'fake',
-		connect: vi.fn().mockResolvedValue(undefined),
-		disconnect: vi.fn().mockResolvedValue(undefined),
-		openSession: vi.fn(async (o: { aiclawUid: number; roomId: number; chatContext: Record<string, unknown> }) => {
-			const sessionKey = `aiclaw-${o.aiclawUid}-room-${o.roomId}`;
-			const session: AgentSession = {
-				send(message: string): AsyncIterable<AgentEvent> {
-					const buffer: AgentEvent[] = [];
-					let done = false;
-					let resolveNext: (() => void) | null = null;
-
-					const wake = () => {
-						if (resolveNext) {
-							const r = resolveNext;
-							resolveNext = null;
-							r();
-						}
-					};
-					const push = (ev: AgentEvent) => {
-						if (done) return;
-						buffer.push(ev);
-						wake();
-					};
-					const finish = () => {
-						if (done) return;
-						done = true;
-						wake();
-					};
-
-					const callbacks: CallbacksShim = {
-						onThinkingDelta: (text) => push({ type: 'thinking', text }),
-						onThinkingEnd: (durationMs) => {
-							push({ type: 'done', durationMs });
-							finish();
-						},
-						onError: (err) => {
-							push({ type: 'error', message: err.message });
-							finish();
-						},
-					};
-
-					calls.push({
-						message,
-						sessionKey,
-						context: { roomId: o.roomId },
-						callbacks,
-						// Let the handler's async for-await drain the pushed events.
-						// A macrotask is more than enough (mapping happens within a few
-						// microtasks of each push). Works under real timers; under fake
-						// timers tests advance their own timers as before.
-						flush: () => new Promise<void>((resolve) => setImmediate(resolve)),
-					});
-
-					return {
-						async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
-							while (true) {
-								while (buffer.length > 0) {
-									yield buffer.shift()!;
-								}
-								if (done) return;
-								await new Promise<void>((resolve) => {
-									resolveNext = resolve;
-								});
-							}
-						},
-					};
-				},
-				// REQ-008 #75: spy so tests can assert the handler best-effort closes the session.
-				close: vi.fn(async () => {
-					/* no-op for the fake; handler best-effort close */
-				}),
-			};
-			return session;
-		}),
-	} as unknown as AgentDriver & { openSession: ReturnType<typeof vi.fn> };
+	const cancel = vi.fn(async () => ({ status: 'unconfirmed' as const, reason: 'fake cannot confirm stop' }));
+	const createRun = vi.fn((input: PreparedRun) => {
+		const buffer: AgentEvent[] = [];
+		let done = false;
+		let resolveNext: (() => void) | null = null;
+		const wake = () => { const resolve = resolveNext; resolveNext = null; resolve?.(); };
+		const push = (ev: AgentEvent) => { if (!done) { buffer.push(ev); wake(); } };
+		const finish = () => { done = true; wake(); };
+		const callbacks: CallbacksShim = {
+			onThinkingDelta: (text) => push({ type: 'thinking', text }),
+			onThinkingEnd: (durationMs) => { push({ type: 'done', durationMs }); finish(); },
+			onError: (err) => { push({ type: 'error', message: err.message }); finish(); },
+		};
+		const sessionKey = input.transcriptKey!;
+		calls.push({ message: input.message, input, sessionKey,
+			context: { roomId: sessionKey.slice(sessionKey.lastIndexOf('-room-') + 6) }, callbacks,
+			flush: () => new Promise<void>((resolve) => setImmediate(resolve)) });
+		return { events: { async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+			while (true) {
+				while (buffer.length) yield buffer.shift()!;
+				if (done) return;
+				await new Promise<void>((resolve) => { resolveNext = resolve; });
+			}
+		} }, cancel, dispose: vi.fn(async () => {}) };
+	});
+	const driver: RunDriver & { createRun: typeof createRun; cancel: typeof cancel } = {
+		type: 'fake', features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+		connect: async () => {}, disconnect: async () => {}, createRun, cancel,
+	};
 	return { adapter: driver, calls };
 }
 
@@ -132,10 +86,12 @@ function fakeWs() {
 	const sent: Array<{ type: number; data: unknown }> = [];
 	const ws = {
 		isConnected: true,
-		send: vi.fn((type: number, data: unknown) => {
+		onThinkingStart: undefined as undefined | ((data: Record<string, unknown>) => void),
+		send: vi.fn((type: number, data: Record<string, unknown>) => {
 			sent.push({ type, data });
+			if (type === WSReqType.THINKING_START) queueMicrotask(() => ws.onThinkingStart?.(data));
 		}),
-	} as unknown as HulaWSClient & { send: ReturnType<typeof vi.fn> };
+	} as unknown as HulaWSClient & { send: ReturnType<typeof vi.fn>; onThinkingStart?: (data: Record<string, unknown>) => void };
 	return { ws, sent };
 }
 
@@ -305,14 +261,25 @@ async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
 	}
 }
 
-/** 读取指定 sessionKey 的 active thinking session（白盒断言用） */
-function getThinkingSession(handler: MessageHandler, sessionKey: string): { agentSession?: AgentSession } | undefined {
-	// @ts-expect-error 访问私有字段做白盒断言
-	return handler.thinkingSessions.get(sessionKey);
-}
-
 // REQ-029 (#29): selfUid/roomId/uid are opaque strings end-to-end.
 const SELF_UID = '999';
+const PROMPT_TEMPLATES: AgentPromptTemplates = { identityAnchor: 'identity {displayName} {uid}',
+	personaSection: 'persona {persona}', replyContract: 'reply {reply_command}' };
+const testCores: Array<{ home: string; store: ConversationStore }> = [];
+class MessageHandler extends NativeMessageHandler {
+	constructor(...args: ConstructorParameters<typeof NativeMessageHandler>) {
+		const home = mkdtempSync(join(tmpdir(), 'msg-native-core-'));
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set([args[2]]),
+			activeProviders: new Map([[args[2], args[1].type]]) });
+		testCores.push({ home, store });
+		super(...([args[0], args[1], args[2], args[3], args[4], args[5], args[6] ?? (() => store), args[7]] as ConstructorParameters<typeof NativeMessageHandler>));
+		const ws = args[0] as HulaWSClient & { onThinkingStart?: (data: Record<string, unknown>) => void };
+		if ('onThinkingStart' in ws) ws.onThinkingStart = (data) => this.handle({ type: 'thinkingStart', data: {
+			fromUid: args[2], roomId: data.roomId, triggerMsgId: data.triggerMsgId,
+			clientRunId: data.clientRunId, thinkingId: `tid-${data.triggerMsgId}`,
+		} } as never);
+	}
+}
 
 /** REQ-011 S3 e2e: temp workspace bases for the real CcHeadlessDriver, cleaned up after each test. */
 const ccTmpDirs: string[] = [];
@@ -322,6 +289,7 @@ function ccTmpBase(): string {
 	return d;
 }
 afterEach(() => {
+	for (const { home, store } of testCores.splice(0)) { store.close(); rmSync(home, { recursive: true, force: true }); }
 	for (const d of ccTmpDirs.splice(0)) {
 		try {
 			rmSync(d, { recursive: true, force: true });
@@ -588,6 +556,7 @@ describe('MessageHandler per-room isolation', () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws, sent } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+		ws.onThinkingStart = undefined; // this test drives the persisted receipt explicitly
 
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi', 1) } as never);
 		await waitFor(() => calls.length >= 1);
@@ -596,7 +565,7 @@ describe('MessageHandler per-room isolation', () => {
 		// server 广播 thinkingStart 回填 thinkingId
 		handler.handle({
 			type: 'thinkingStart',
-			data: { fromUid: SELF_UID, roomId: 1, triggerMsgId: '1', thinkingId: 'tid-abc' },
+			data: { fromUid: SELF_UID, roomId: 1, triggerMsgId: '1', clientRunId: calls[0].input.runId, thinkingId: 'tid-abc' },
 		} as never);
 
 		cb.onThinkingDelta('x');
@@ -608,7 +577,7 @@ describe('MessageHandler per-room isolation', () => {
 		expect(end.content).toBe('x');
 	});
 
-	it('REQ-008 #75: thinkingEnd broadcast finalize closes the agentSession (best-effort) and removes the session', async () => {
+	it('REQ-008 #75: server rejection cancels native run but retains room without stop proof', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
@@ -618,21 +587,21 @@ describe('MessageHandler per-room isolation', () => {
 		await waitFor(() => calls.length >= 1);
 
 		const sessionKey = `aiclaw-${SELF_UID}-room-5`;
-		const thinking = getThinkingSession(handler, sessionKey);
-		expect(thinking).toBeDefined();
-		const closeSpy = thinking!.agentSession!.close as ReturnType<typeof vi.fn>;
-		expect(closeSpy).not.toHaveBeenCalled();
+		expect(calls[0].sessionKey).toBe(sessionKey);
+		const cancel = adapter.cancel;
+		expect(cancel).not.toHaveBeenCalled();
 
 		// server 限流拒绝（无 thinkingId 兜底分支）：status=error + rate_limit_exceeded + fromUid=selfUid
 		handler.handle({
 			type: 'thinkingEnd',
-			data: { fromUid: SELF_UID, roomId: 5, status: 'error', error: 'rate_limit_exceeded' },
+			data: { fromUid: SELF_UID, roomId: 5, status: 'error', error: 'rate_limit_exceeded',
+				clientRunId: calls[0].input.runId, thinkingId: 'tid-1' },
 		} as never);
 
-		// finalize 分支 best-effort close 了 driver session，并移除了 session
-		expect(closeSpy).toHaveBeenCalled();
+		// A server rejection requests cancellation, but the unconfirmed fake cannot prove the run stopped.
+		await waitFor(() => cancel.mock.calls.length > 0);
 		// @ts-expect-error 访问私有字段做白盒断言
-		expect(handler.thinkingSessions.has(sessionKey)).toBe(false);
+		expect(handler.thinkingSessions.has(sessionKey)).toBe(true); // unconfirmed native cancel cannot release the room
 	});
 
 	it('S4: caps THINKING_END content to 256KB UTF-8 without corrupting multibyte chars', async () => {
@@ -724,8 +693,8 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 	it('REQ-009 #85: group openSession chatContext carries workspaceDir + account from cache', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
-		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+		const createRun = adapter.createRun;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {}, undefined, ccTmpBase());
 		setGroupConfig(handler, 1, { mentionRequired: true, workspaceDir: '/srv/proj', account: '888888' });
 
 		handler.handle({
@@ -734,36 +703,28 @@ describe('MessageHandler S5: 群聊 @ 触发 + 惰性积累', () => {
 		} as never);
 
 		await waitFor(() => calls.length >= 1);
-		const ctx = openSession.mock.calls[0][0].chatContext as { workspaceDir?: string; account?: string };
-		expect(ctx.workspaceDir).toBe('/srv/proj');
-		expect(ctx.account).toBe('888888');
+		const input = createRun.mock.calls[0][0];
+		expect(input.workspace).toBe('/srv/proj');
+		expect(input.message).toContain('hey bot');
 	});
 
-	it('#132: openSession chatContext carries a LAZY getSelfName that resolves via getMemberInfo, cached across turns', async () => {
+	it('#132: core renders self name once and caches across turns', async () => {
 		const { adapter, calls } = fakeAdapter();
 		(adapter as unknown as { type: string }).type = 'cc';
 		const { ws } = fakeWs();
-		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+		const createRun = adapter.createRun;
 		const getMemberInfo = vi.fn(async () => ({ uid: SELF_UID, name: 'CCTestAI', account: 'cctest' }));
 		const apiClient = { getMemberInfo } as unknown as import('../api/hula-api.js').HulaApiClient;
 		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 10, maxWaitMs: 50 }, () => {});
-
+		handler.setPromptTemplates(PROMPT_TEMPLATES);
 		handler.handle({ type: 'receiveMessage', data: humanMessage(1, 100, 'hi cc', 1) } as never);
 		await waitFor(() => calls.length >= 1);
-		// the handler is now driver-agnostic: it threads a LAZY resolver and does NOT eagerly fetch.
-		expect(getMemberInfo).not.toHaveBeenCalled();
-
-		const ctx = openSession.mock.calls[0][0].chatContext as { getSelfName?: () => Promise<string | undefined> };
-		expect(typeof ctx.getSelfName).toBe('function');
-		expect(await ctx.getSelfName!()).toBe('CCTestAI');
+		expect(createRun.mock.calls[0][0].systemPrompt).toContain('CCTestAI');
 		expect(getMemberInfo).toHaveBeenCalledWith(SELF_UID);
-
-		// a turn in a DIFFERENT room resolves the SAME cached name — never re-fetches
 		handler.handle({ type: 'receiveMessage', data: humanMessage(2, 100, 'hi again', 2) } as never);
 		await waitFor(() => calls.length >= 2);
-		const ctx2 = openSession.mock.calls[1][0].chatContext as { getSelfName?: () => Promise<string | undefined> };
-		expect(await ctx2.getSelfName!()).toBe('CCTestAI');
-		expect(getMemberInfo).toHaveBeenCalledTimes(1); // cached across calls + turns
+		expect(createRun.mock.calls[1][0].systemPrompt).toContain('CCTestAI');
+		expect(getMemberInfo).toHaveBeenCalledTimes(1);
 	});
 
 	it('#132: a driver that never calls getSelfName triggers NO getMemberInfo fetch (pay-per-use)', async () => {
@@ -1445,7 +1406,7 @@ describe('real-shape (server contract) regression', () => {
 		await new Promise((r) => setTimeout(r, 40));
 		// userType 缺失时此开关亦失效（isFromAi false → 不进 respondToAi 分支 → 误触发）；
 		// 真实形状下 userType=4 被识别 → respondToAi=false 生效 → 不开 session。
-		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).not.toHaveBeenCalled();
+		expect(adapter.createRun).not.toHaveBeenCalled();
 		expect(calls.length).toBe(0);
 	});
 
@@ -1735,7 +1696,7 @@ describe('MessageHandler.prewarmPromptTemplates + setPromptTemplates (REQ-018)',
 	it('setPromptTemplates 播种缓存，且种子模板流入下一次 openSession chatContext', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+		const createRun = adapter.createRun;
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.setPromptTemplates(TEMPLATES);
@@ -1744,8 +1705,7 @@ describe('MessageHandler.prewarmPromptTemplates + setPromptTemplates (REQ-018)',
 		handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
 		await waitFor(() => calls.length >= 1);
 
-		const ctx = openSession.mock.calls[0][0].chatContext as { templates?: AgentPromptTemplates };
-		expect(ctx.templates).toEqual(TEMPLATES);
+		expect(createRun.mock.calls[0][0].systemPrompt).toContain('ia');
 	});
 });
 
@@ -1812,8 +1772,9 @@ describe('MessageHandler persona → chatContext 接线 (REQ-018)', () => {
 			const { adapter, calls } = fakeAdapter();
 			(adapter as unknown as { type: string }).type = driverType;
 			const { ws } = fakeWs();
-			const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+			const createRun = adapter.createRun;
 			const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+			handler.setPromptTemplates(PROMPT_TEMPLATES);
 			setPersona(handler, '你是一个暴躁的猫娘');
 
 			handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
@@ -1823,23 +1784,21 @@ describe('MessageHandler persona → chatContext 接线 (REQ-018)', () => {
 			expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hello');
 			expect(calls[0].message).not.toContain('人设');
 			// persona 经 chatContext 进 system 层
-			const ctx = openSession.mock.calls[0][0].chatContext as { persona?: string | null };
-			expect(ctx.persona).toBe('你是一个暴躁的猫娘');
+			expect(createRun.mock.calls[0][0].systemPrompt).toContain('你是一个暴躁的猫娘');
 		},
 	);
 
 	it('缓存为空 → chatContext.persona 为 null（不注入语义）', async () => {
 		const { adapter, calls } = fakeAdapter();
 		const { ws } = fakeWs();
-		const openSession = (adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession;
+		const createRun = adapter.createRun;
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 
 		handler.handle({ type: 'receiveMessage', data: dmMessage(1, 100, 'hello', 1) } as never);
 		await waitFor(() => calls.length >= 1);
 
 		expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hello');
-		const ctx = openSession.mock.calls[0][0].chatContext as { persona?: string | null };
-		expect(ctx.persona).toBeNull();
+		expect(createRun.mock.calls[0][0].systemPrompt).toBe('');
 	});
 });
 
@@ -1863,7 +1822,7 @@ describe('MessageHandler REQ-011 S2: cc drives the standard node-driven path', (
 		await waitFor(() => calls.length >= 1);
 
 		expect(calls[0].message).toBe('[HuLa 私聊]\n[user(100)]: hi cc');
-		expect((adapter as unknown as { openSession: ReturnType<typeof vi.fn> }).openSession).toHaveBeenCalled();
+		expect(adapter.createRun).toHaveBeenCalled();
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
 
@@ -1896,11 +1855,11 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		(adapter as unknown as { type: string }).type = 'cc';
 		return { adapter, calls };
 	}
-	const openSessionOf = (adapter: unknown) => (adapter as { openSession: ReturnType<typeof vi.fn> }).openSession;
+
 
 	it('AC5: a cc driver gets the UNIFIED envelope containing the trigger sender`s [name(uid)] line', async () => {
 		const { adapter, calls } = ccAdapter();
-		const openSession = openSessionOf(adapter);
+		const createRun = adapter.createRun;
 		const { ws } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
@@ -1917,9 +1876,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		// layer), NOT a raw message — the same envelope every driver now gets.
 		expect(calls[0].message).toBe('[HuLa 群聊]\n[alice(100)]: first\n[bob(101)]: second\n[dave(102)]: hey bot');
 		// the generic per-turn attribution fields are no longer forwarded via chatContext (envelope is built upstream).
-		const ctx = openSession.mock.calls[0][0].chatContext as { fromName?: string; accumulated?: string[] };
-		expect(ctx.fromName).toBeUndefined();
-		expect(ctx.accumulated).toBeUndefined();
+		expect(createRun.mock.calls[0][0].message).toBe(calls[0].message);
 	});
 
 	it('AC2: a NON-cc driver gets the SAME unified envelope (no cc-vs-others ternary anymore)', async () => {
@@ -1985,7 +1942,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 
 	it('parity: a cc @-group message triggers openSession/send (same @-gate as the other drivers)', async () => {
 		const { adapter, calls } = ccAdapter();
-		const openSession = openSessionOf(adapter);
+		const createRun = adapter.createRun;
 		const { ws, sent } = fakeWs();
 		const handler = new MessageHandler(ws, adapter, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
 		setGroupConfig(handler, 1, { mentionRequired: true });
@@ -1993,7 +1950,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 		handler.handle({ type: 'receiveMessage', data: groupMessage(1, 100, 'hey bot', 1, { atUidList: [SELF_UID], name: 'dave' }) } as never);
 		await waitFor(() => calls.length >= 1);
 
-		expect(openSession).toHaveBeenCalled();
+		expect(createRun).toHaveBeenCalled();
 		expect(calls[0].message).toBe('[HuLa 群聊]\n[dave(100)]: hey bot');
 		expect(sent.filter((f) => f.type === WSReqType.THINKING_START).length).toBe(1);
 	});
@@ -2083,7 +2040,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 
 		// finish the turn (EOF backstop) so no timer/session dangles.
 		fs.endStdout();
-		await waitFor(() => getThinkingSession(handler, `aiclaw-${SELF_UID}-room-1`) === undefined);
+		await waitFor(() => core.pendingRuns().length === 0);
 		handler.destroy();
 		core.close();
 	});

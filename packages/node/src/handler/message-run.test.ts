@@ -5,13 +5,11 @@ import { join } from 'node:path';
 import { MessageHandler } from './message.js';
 import { ConversationStore } from '../capability/conversations.js';
 import { WSReqType } from '../stream/protocol.js';
-import type { AgentDriver, AgentEvent, AgentSession, RunDriver } from '../agent/events.js';
+import type { AgentEvent, RunDriver } from '../agent/events.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
-import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
-import type { CcHeadlessSessionStore, StoredCcHeadlessSession } from '../agent/cc/headless-session-store.js';
 
 const homes: string[] = [];
 afterEach(() => { for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
@@ -24,7 +22,7 @@ const message = (id: number): ReceivedMessage => ({
 function setup() {
 	const home = mkdtempSync(join(tmpdir(), 'handler-run-'));
 	homes.push(home);
-	const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']) });
+	const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']), activeProviders: new Map([['42', 'cc']]) });
 	const sent: number[] = [];
 	const frames: Array<{ type: number; data: Record<string, unknown> }> = [];
 	const ws = { isConnected: true, send: vi.fn((type: number, data: Record<string, unknown>) => {
@@ -33,9 +31,9 @@ function setup() {
 		frames.push({ type, data });
 	}) } as unknown as HulaWSClient;
 	let emit: ((event: AgentEvent) => void) | undefined;
-	const close = vi.fn(async () => {}); // close() resolves but does NOT stop this stream.
-	const driver = { type: 'cc', openSession: vi.fn(async () => ({
-		send: (_text: string) => ({ async *[Symbol.asyncIterator]() {
+	const cancel = vi.fn(async () => ({ status: 'unconfirmed' as const, reason: 'stop not proven' }));
+	const createRun = vi.fn((_input: Parameters<RunDriver['createRun']>[0]) => ({
+		events: { async *[Symbol.asyncIterator]() {
 			const queue: AgentEvent[] = [];
 			let wake: (() => void) | undefined;
 			emit = (event) => { queue.push(event); wake?.(); };
@@ -43,10 +41,12 @@ function setup() {
 				if (queue.length) { const event = queue.shift()!; yield event; if (event.type === 'done' || event.type === 'error') return; }
 				else await new Promise<void>((resolve) => { wake = resolve; });
 			}
-		} }), close,
-	}) as AgentSession), finalizeThinking: (s: string) => s } as unknown as AgentDriver & { openSession: ReturnType<typeof vi.fn> };
+		} }, cancel, dispose: vi.fn(async () => {}),
+	}));
+	const driver: RunDriver = { type: 'cc', features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+		connect: async () => {}, disconnect: async () => {}, createRun };
 	const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store);
-	return { store, sent, frames, driver, close, handler, emit: (event: AgentEvent) => emit?.(event) };
+	return { store, sent, frames, driver, createRun, cancel, handler, emit: (event: AgentEvent) => emit?.(event) };
 }
 
 describe('persisted MessageHandler run', () => {
@@ -89,13 +89,13 @@ describe('persisted MessageHandler run', () => {
 	});
 	it.each(['rate_limit_exceeded', 'thinking_members_unavailable'])(
 		'a persisted %s END before START receipt cancels only its exact run', async (error) => {
-			const { handler, store, frames, close } = setup();
+			const { handler, store, frames, cancel } = setup();
 			handler.handle({ type: 'receiveMessage', data: message(7) });
 			await tick();
 			const runId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
 			handler.handle({ type: 'thinkingEnd', data: { fromUid: '42', roomId: '9', thinkingId: 'limited', clientRunId: runId, status: 'error', error } });
 			await tick();
-			expect(close).toHaveBeenCalled();
+			expect(cancel).toHaveBeenCalled();
 			handler.onConnected();
 			handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '7', clientRunId: runId, thinkingId: 'limited' } });
 			expect(frames.filter((f) => f.type === WSReqType.THINKING_START)).toHaveLength(1);
@@ -255,18 +255,18 @@ describe('persisted MessageHandler run', () => {
 		handler.destroy();
 		store.close();
 	});
-	it('holds the room and queue after reset when legacy close has no stop proof', async () => {
-		const { handler, store, sent, driver, close } = setup();
+	it('holds the room and queue after reset when native cancel has no stop proof', async () => {
+		const { handler, store, sent, createRun, cancel } = setup();
 		handler.handle({ type: 'receiveMessage', data: message(1) } as never);
 		await tick();
-		expect(driver.openSession).toHaveBeenCalledTimes(1);
+		expect(createRun).toHaveBeenCalledTimes(1);
 		store.reset('42', '9');
 		await handler.cancelRun('9');
-		expect(close).toHaveBeenCalled();
+		expect(cancel).toHaveBeenCalled();
 		expect(store.get('42', '9')?.state).toBe('stop_unconfirmed');
 		handler.handle({ type: 'receiveMessage', data: message(2) } as never);
 		await tick();
-		expect(driver.openSession).toHaveBeenCalledTimes(1);
+		expect(createRun).toHaveBeenCalledTimes(1);
 		expect(sent.filter((type) => type === WSReqType.THINKING_START)).toHaveLength(1);
 		handler.destroy();
 		await tick();
@@ -274,13 +274,13 @@ describe('persisted MessageHandler run', () => {
 	});
 
 	it('does not flush queued messages when upstream emits error without stop proof', async () => {
-		const { handler, store, driver, emit } = setup();
+		const { handler, store, createRun, emit } = setup();
 		handler.handle({ type: 'receiveMessage', data: message(20) } as never);
 		await tick();
 		handler.handle({ type: 'receiveMessage', data: message(21) } as never);
 		emit({ type: 'error', message: 'upstream failed' });
 		await tick();
-		expect(driver.openSession).toHaveBeenCalledTimes(1);
+		expect(createRun).toHaveBeenCalledTimes(1);
 		expect(store.get('42', '9')?.state).toBe('stop_unconfirmed');
 		expect(store.pendingRuns()).toHaveLength(1);
 		handler.destroy();
@@ -289,13 +289,13 @@ describe('persisted MessageHandler run', () => {
 	});
 
 	it('releases a cleanly completed stream and drains queued room messages', async () => {
-		const { handler, store, driver, emit } = setup();
+		const { handler, store, createRun, emit } = setup();
 		handler.handle({ type: 'receiveMessage', data: message(10) } as never);
 		await tick();
 		handler.handle({ type: 'receiveMessage', data: message(11) } as never);
 		emit({ type: 'done', durationMs: 1 });
 		await tick();
-		expect(driver.openSession).toHaveBeenCalledTimes(2);
+		expect(createRun).toHaveBeenCalledTimes(2);
 		expect(store.pendingRuns()).toHaveLength(1);
 		const secondRunId = store.pendingRuns()[0].runId;
 		await handler.cancelRun('9', 'old-reset-run');

@@ -7,9 +7,6 @@
  * unprefixed/unknown key never resolves and never reaches a capability.
  */
 
-import type { AgentDriver } from '../agent/events.js';
-import type { HulaApiClient } from '../api/hula-api.js';
-
 /** Known session-key prefix → the AgentDriver.type that owns that key namespace.
  *
  * `openclaw:` (REQ-010 S6 Phase-2) routes openclaw agent replies through the same unified CLI path
@@ -41,44 +38,4 @@ export function parseSessionKey(sessionKey: string): { agentType: string; id: st
 		}
 	}
 	return undefined;
-}
-
-/** A supervised agent, narrowed to what session routing needs: its driver, uid, and per-identity api. */
-export interface BindableAgent {
-	driver: AgentDriver;
-	// REQ-029 (#29): uid is an opaque string end-to-end.
-	uid: string;
-	api: HulaApiClient;
-}
-
-/** The resolved binding: the bound identity+room + the per-identity api client to reply through. */
-export interface BoundSession {
-	aiclawUid: string;
-	roomId: string;
-	apiClient: HulaApiClient;
-}
-
-/**
- * REQ-010 S5 — prefix-routed session resolution.
- *
- * Query registered drivers of the known type; only the driver registered for the resolved identity
- * may claim its room. Reject conflicting claims instead of selecting the first same-type driver.
- */
-export function resolveBoundSession(
-	sessionKey: string,
-	agents: ReadonlyArray<BindableAgent>,
-): BoundSession | undefined {
-	const parsed = parseSessionKey(sessionKey);
-	if (!parsed) return undefined;
-
-	// ponytail: scan same-type drivers and their small JSON maps; use a core native-alias index if scale warrants it.
-	let match: BoundSession | undefined;
-	for (const agent of agents) {
-		if (agent.driver.type !== parsed.agentType || !agent.driver.resolveSession) continue;
-		const resolved = agent.driver.resolveSession(parsed.id);
-		if (!resolved || resolved.aiclawUid !== agent.uid) continue;
-		if (match) return undefined; // native id must not select among multiple registered identities
-		match = { aiclawUid: agent.uid, roomId: resolved.roomId, apiClient: agent.api };
-	}
-	return match;
 }

@@ -9,11 +9,10 @@ import { runCapabilityCommand } from '../commands/capability-command.js';
 import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
 import { ConversationStore, type Provider } from './conversations.js';
-import { legacyBridges } from './legacy-bridges.js';
 import { postCapability } from './client.js';
 
 /** Exercises actual CLI→IPC→core→capability routing, not a resolver stub. Upstream agent and HuLa E2E remain separate. */
-describe('four driver legacy bridges through real capability endpoint', () => {
+describe('four native driver bindings through real capability endpoint', () => {
 	const saved = Object.fromEntries(['AICHAT_CAPABILITY_SOCK', 'AICHAT_CONTEXT_KEY', 'OPENCLAW_BIND', 'AICHAT_BIND', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID']
 		.map((name) => [name, process.env[name]]));
 	let home: string | undefined;
@@ -30,10 +29,10 @@ describe('four driver legacy bridges through real capability endpoint', () => {
 		home = mkdtempSync(join(tmpdir(), 'aichat-real-registry-'));
 		const providers = new Map<string, Provider>([['1', 'openclaw'], ['2', 'cc'], ['3', 'codex'], ['4', 'opencode']]);
 		const options = { home, serverNamespace: 'isolated-test', activeUids: new Set(providers.keys()), activeProviders: providers };
-		const store = new ConversationStore(options), bridges = legacyBridges(() => store);
-		const openclaw = bridges.bindTokens.mint('1', '101'), cc = bridges.bindTokens.mint('2', '202');
-		bridges.codex.set('aiclaw-3-room-303', { threadId: 'thread-303' });
-		bridges.opencode.set('aiclaw-4-room-404', { sessionID: 'session-404', directory: '/test' });
+		const store = new ConversationStore(options);
+		const openclaw = store.mintToken('1', '101'), cc = store.mintToken('2', '202');
+		store.registerNative('codex', 'thread-303', '3', '303', { threadId: 'thread-303' });
+		store.registerNative('opencode', 'session-404', '4', '404', { sessionID: 'session-404', directory: '/test' });
 		const written: string[] = [];
 		const api = (uid: string) => ({ supportsMessageReceipts: async () => false, sendMessage: async (room: string) => {
 			written.push(`${uid}:${room}`); return { msgId: '101' };

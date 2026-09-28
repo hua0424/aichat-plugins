@@ -1,11 +1,10 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { AgentEvent, PreparedRun, RunDriver } from '../events.js';
-import type { BindTokenStore } from '../bind-token-store.js';
 import { OpenclawDriver } from './openclaw-driver.js';
 
 const binding = 'aiclaw-9007199254740993-room-9007199254740995';
@@ -46,8 +45,6 @@ class Socket extends EventEmitter {
 function fixture(nativeState?: unknown) {
 	const workspace = mkdtempSync(join(tmpdir(), 'openclaw-native-run-'));
 	const sockets: Socket[] = [];
-	const mint = vi.fn(() => { throw Error('native run must not mint a legacy binding token'); });
-	const store: BindTokenStore = { mint, resolve: vi.fn() };
 	let native = nativeState;
 	const registerNative = vi.fn(async (_id: string, state: { value: unknown }) => { native = state.value; });
 	const input: PreparedRun = {
@@ -69,8 +66,8 @@ function fixture(nativeState?: unknown) {
 		});
 		return socket as unknown as WebSocket;
 	};
-	const driver = () => new OpenclawDriver('ws://localhost:18789', '', store, factory, workspace) as RunDriver;
-	return { input, mint, registerNative, sockets, driver, get native() { return native; },
+	const driver = () => new OpenclawDriver('ws://localhost:18789', '', factory, workspace) as RunDriver;
+	return { input, workspace, registerNative, sockets, driver, get native() { return native; },
 		set native(value: unknown) { native = value; }, cleanup: () => rmSync(workspace, { recursive: true, force: true }) };
 }
 
@@ -85,7 +82,6 @@ describe('native OpenClaw AgentRun (#303)', () => {
 			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
 			const request = socket.agents[0];
 			expect(request.params).toEqual(expect.objectContaining({ message: 'raw user message', sessionKey: oldRef }));
-			expect(f.mint).not.toHaveBeenCalled();
 			expect(f.registerNative).not.toHaveBeenCalled();
 			socket.accept(request, 'gateway-run-old');
 			socket.end('gateway-run-old');
@@ -103,7 +99,6 @@ describe('native OpenClaw AgentRun (#303)', () => {
 			const pending = collect(first.createRun(f.input).events);
 			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
 			const ref = `${freshToken}:${binding}`;
-			expect(f.mint).not.toHaveBeenCalled();
 			expect(f.registerNative).toHaveBeenCalledWith(freshToken, { version: 1, value: { token: freshToken, nativeRef: ref } });
 			expect(socket.agents[0].params.sessionKey).toBe(ref);
 			socket.accept(socket.agents[0], 'gateway-run-1');
@@ -116,8 +111,7 @@ describe('native OpenClaw AgentRun (#303)', () => {
 				const again = collect(restarted.createRun({ ...f.input, runId: 'core-run-2' }).events);
 				await vi.waitFor(() => expect(f.sockets[1].agents).toHaveLength(1));
 				expect(f.sockets[1].agents[0].params.sessionKey).toBe(ref);
-				expect(f.mint).not.toHaveBeenCalled();
-				expect(f.registerNative).toHaveBeenCalledTimes(1);
+					expect(f.registerNative).toHaveBeenCalledTimes(1);
 				f.sockets[1].accept(f.sockets[1].agents[0], 'gateway-run-2');
 				f.sockets[1].end('gateway-run-2');
 				expect((await again).at(-1)?.type).toBe('done');
@@ -275,6 +269,60 @@ describe('native OpenClaw AgentRun (#303)', () => {
 			expect((await collect(run.events)).at(-1)?.type).toBe('error');
 			expect(await run.cancel('failure')).toEqual({ status: 'stopped' });
 			expect(f.sockets[0].agents).toHaveLength(0);
+		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('writes the already prepared system prompt verbatim to AGENTS.md while keeping gateway message pure', async () => {
+		const f = fixture();
+		f.input.systemPrompt = 'prepared {displayName}';
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const pending = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			expect(socket.agents[0].params.message).toBe('raw user message');
+			const agentsPath = join(f.workspace, 'AGENTS.md');
+			expect(existsSync(agentsPath)).toBe(true);
+			expect(readFileSync(agentsPath, 'utf8')).toBe('<!-- aichat:system:begin -->\nprepared {displayName}\n<!-- aichat:system:end -->\n');
+			socket.accept(socket.agents[0], 'prepared-run');
+			socket.end('prepared-run');
+			await pending;
+		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('5-minute backstop unblocks an abandoned native gateway run', async () => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		await driver.connect();
+		vi.useFakeTimers();
+		try {
+			const socket = f.sockets[0];
+			const pending = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], 'abandoned');
+			await Promise.resolve();
+			vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+			expect((await pending).at(-1)).toEqual({ type: 'error', message: expect.any(String) });
+		} finally { vi.useRealTimers(); await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('maps buffered gateway thinking and error frames to native run events', async () => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const run = driver.createRun(f.input);
+			const pending = collect(run.events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], 'stream-run');
+			for (const [seq, delta] of ['foo', 'bar'].entries()) socket.deliver({ type: 'event', event: 'agent',
+				payload: { runId: 'stream-run', seq: seq + 1, stream: 'assistant', ts: Date.now(), data: { delta } } });
+			socket.deliver({ type: 'event', event: 'agent', payload: { runId: 'stream-run', seq: 3,
+				stream: 'lifecycle', ts: Date.now(), data: { phase: 'error', error: 'boom' } } });
+			expect(await pending).toEqual([{ type: 'thinking', text: 'foo' }, { type: 'thinking', text: 'bar' },
+				{ type: 'error', message: 'boom' }]);
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 

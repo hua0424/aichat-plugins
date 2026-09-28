@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { bindingKey, parseBindingKey } from '../agent/bind-token-store.js';
 import { parseSessionKey } from './session-key.js';
 
-export type Provider = 'openclaw' | 'cc' | 'codex' | 'opencode';
+export type Provider = string;
 export type ContextCandidate = { key: string } | { provider: Provider; nativeId: string; runtimeScope?: string };
 export interface NativeAlias { provider: Provider; id: string; runtimeScope?: string }
 export interface ConversationRecord {
@@ -20,7 +20,7 @@ export interface ConversationRecord {
 	pendingRuns?: PendingRun[];
 	nativeAliases: NativeAlias[];
 	/** Original provider store payloads. OpenClaw retains both the bare token and full gateway sessionKey. */
-	nativeState: Partial<Record<Provider, Record<string, unknown>>>;
+	nativeState: Record<Provider, Record<string, unknown>>;
 	/** Offline operator evidence, retained across native state updates and reset for audit. Not proof of owner authentication. */
 	ccCwdConfirmation?: { sessionId: string; cwd: string; generation: number; approvalRef: string; approvalSha256: string; confirmedAt: string };
 	/** Offline owner attestation; never supplied by an agent capability. */
@@ -52,7 +52,7 @@ export interface ConversationStoreOptions {
 	/** Injectable disk failure before rename; used to prove no uncommitted binding becomes visible. */
 	beforePersist?: () => void;
 }
-const PROVIDERS = new Set<Provider>(['openclaw', 'cc', 'codex', 'opencode']);
+const validProvider = (value: unknown): value is Provider => typeof value === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(value);
 const LEGACY = ['bind-tokens.json', 'opencode/sessions.json', 'codex/sessions.json', 'cc/sessions.json'] as const;
 const validId = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 4096;
 const digest = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
@@ -71,6 +71,7 @@ export class ConversationStore {
 
 	constructor(private readonly options: ConversationStoreOptions) {
 		if (!validId(options.serverNamespace)) throw new Error('serverNamespace required');
+		if ([...(options.activeProviders?.values() ?? [])].some((provider) => !validProvider(provider))) throw new Error('invalid provider');
 		this.path = join(options.home, 'conversations.json');
 		const existing = existsSync(this.path);
 		if (existing) {
@@ -462,7 +463,7 @@ export class ConversationStore {
 
 	resolveCandidate(candidate: ContextCandidate): ConversationRecord | undefined {
 		if ('key' in candidate) return validId(candidate.key) ? this.visible(this.byKey.get(candidate.key)) : undefined;
-		if (!PROVIDERS.has(candidate.provider) || !validId(candidate.nativeId)) return undefined;
+		if (!validProvider(candidate.provider) || !validId(candidate.nativeId)) return undefined;
 		if (candidate.runtimeScope !== undefined) return this.visible(this.byAlias.get(aliasKey({
 			provider: candidate.provider, id: candidate.nativeId, runtimeScope: candidate.runtimeScope,
 		})));
@@ -485,7 +486,7 @@ export class ConversationStore {
 
 	resolveLegacy(sessionKey: string): ConversationRecord | undefined {
 		const parsed = parseSessionKey(sessionKey);
-		return parsed && PROVIDERS.has(parsed.agentType as Provider)
+		return parsed && validProvider(parsed.agentType as Provider)
 			? this.resolveCandidate({ provider: parsed.agentType as Provider, nativeId: parsed.id }) : undefined;
 	}
 
@@ -508,7 +509,7 @@ export class ConversationStore {
 	}
 	private assertProvider(provider: Provider, uid: string): void {
 		this.assertActive(uid);
-		if (!PROVIDERS.has(provider) || (this.options.activeProviders?.has(uid) && this.options.activeProviders.get(uid) !== provider)) {
+		if (!validProvider(provider) || (this.options.activeProviders?.has(uid) && this.options.activeProviders.get(uid) !== provider)) {
 			throw new Error('provider does not own activated identity');
 		}
 	}
@@ -541,7 +542,7 @@ export class ConversationStore {
 				r.receipt.generation < 2 || typeof r.receipt.executionPaused !== 'boolean')))
 			throw new Error('invalid reset receipts');
 		if (data.revokedKeys !== undefined && (!Array.isArray(data.revokedKeys) || data.revokedKeys.some((k) => typeof k !== 'string' || !/^[0-9a-f]{64}$/.test(k)))) throw new Error('invalid revoked keys');
-		if (data.revokedAliases !== undefined && (!Array.isArray(data.revokedAliases) || data.revokedAliases.some((a) => !a || !PROVIDERS.has(a.provider) || !validId(a.id) || (a.runtimeScope !== undefined && !validId(a.runtimeScope))))) throw new Error('invalid revoked aliases');
+		if (data.revokedAliases !== undefined && (!Array.isArray(data.revokedAliases) || data.revokedAliases.some((a) => !a || !validProvider(a.provider) || !validId(a.id) || (a.runtimeScope !== undefined && !validId(a.runtimeScope))))) throw new Error('invalid revoked aliases');
 		const ids = new Set<string>(), keys = new Set(data.revokedKeys ?? []), pairs = new Set<string>(),
 			aliases = new Set((data.revokedAliases ?? []).map(aliasKey)), ccSessions = new Set<string>(), runs = new Set<string>();
 		if (keys.size !== (data.revokedKeys?.length ?? 0) || aliases.size !== (data.revokedAliases?.length ?? 0)) throw new Error('duplicate revoked binding');
@@ -578,14 +579,14 @@ export class ConversationStore {
 			if (ids.has(r.conversationId) || keys.has(r.contextKey) || pairs.has(pair)) throw new Error('duplicate conversation binding');
 			ids.add(r.conversationId); keys.add(r.contextKey); pairs.add(pair);
 			for (const alias of r.nativeAliases) {
-				if (!alias || !PROVIDERS.has(alias.provider) || !validId(alias.id) ||
+				if (!alias || !validProvider(alias.provider) || !validId(alias.id) ||
 					(alias.runtimeScope !== undefined && !validId(alias.runtimeScope))) throw new Error('invalid native alias');
 				const key = aliasKey(alias);
 				if (aliases.has(key)) throw new Error('duplicate native alias');
 				aliases.add(key);
 			}
 			for (const [provider, value] of Object.entries(r.nativeState)) {
-				if (!PROVIDERS.has(provider as Provider) || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid native state');
+				if (!validProvider(provider as Provider) || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid native state');
 				const state = value as Record<string, unknown>;
 				if (provider === 'opencode' && (!validId(state.sessionID) || !validId(state.directory))) throw new Error('invalid opencode native state');
 				if (provider === 'codex' && !validId(state.threadId)) throw new Error('invalid codex native state');
