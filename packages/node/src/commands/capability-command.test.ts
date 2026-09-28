@@ -79,7 +79,7 @@ describe('unified CLI capability contract', () => {
 		mocked.mockResolvedValue({ status: 200, body: { ok: true, result: { msgId: '1', roomId: '42' } } });
 		await handleSendMessage(['--content', 'hello', '--request-id', 'send-1', '--json']);
 		expect(mocked.mock.calls[0][1]).toMatchObject({ command: 'send-message', requestId: 'send-1', args: { content: 'hello' } });
-		expect(JSON.parse(output())).toEqual({ ok: true, result: { msgId: '1', roomId: '42' } });
+		expect(JSON.parse(output())).toEqual({ ok: true, requestId: 'send-1', result: { msgId: '1', roomId: '42' } });
 	});
 
 	it('provides JSON stable errors and write IDs without swallowing delivery uncertainty', async () => {
@@ -90,6 +90,22 @@ describe('unified CLI capability contract', () => {
 		await expect(handleSendMessage(['--content', 'hi', '--request-id', 'retry-me', '--json'])).rejects.toThrow('exit');
 		expect(JSON.parse(output())).toMatchObject({ ok: false, code: 'DELIVERY_UNKNOWN', requestId: 'retry-me' });
 		expect(output()).not.toContain('secret transport token');
+	});
+
+	it('never calls an empty or malformed successful node response committed', async () => {
+		for (const msgId of ['', 'not-an-id', '0', 42, undefined]) {
+			mocked.mockResolvedValueOnce({ status: 200, body: { ok: true, result: { msgId } } });
+			await expect(handleSendMessage(['--content', 'hello', '--request-id', 'keep-this', '--json'])).rejects.toThrow('exit');
+			expect(JSON.parse(output())).toMatchObject({ ok: false, code: 'DELIVERY_UNKNOWN', requestId: 'keep-this' });
+		}
+	});
+
+	it('surfaces old-server downgrade without changing the request ID', async () => {
+		mocked.mockResolvedValue({ status: 503, body: { ok: false, code: 'DELIVERY_UNKNOWN',
+			error: 'server does not support durable receipts; result unknown; retain requestId; do not retry automatically' } });
+		await expect(handleSendMessage(['--content', 'hello', '--request-id', 'keep-this', '--json'])).rejects.toThrow('exit');
+		expect(JSON.parse(output())).toMatchObject({ ok: false, code: 'DELIVERY_UNKNOWN', requestId: 'keep-this' });
+		expect(JSON.parse(output()).message).toContain('server lacks durable receipts');
 	});
 
 	it('permits registering a new query at the generic CLI/core seam without changing an adapter', async () => {

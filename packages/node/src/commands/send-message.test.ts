@@ -114,11 +114,12 @@ describe('CLI write request ID', () => {
 	});
 
 	it('generates IDs for writes, but honors an explicit reset ID', async () => {
-		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: { ok: true, result: { reset: false, driverType: 'cc' } } });
+		vi.mocked(postCapability).mockResolvedValueOnce({ status: 200, body: { ok: true, result: { msgId: '91' } } })
+			.mockResolvedValueOnce({ status: 200, body: { ok: true, result: { reset: false, driverType: 'cc' } } });
 		vi.spyOn(console, 'log').mockImplementation(() => {});
 		await handleSendMessage(['--content', 'first']);
 		const id = (vi.mocked(postCapability).mock.calls.at(-1)?.[1] as { requestId: string }).requestId;
-		expect(id).toMatch(/^[\da-f-]{36}$/);
+		expect(id).toMatch(/^r[0-9a-z]+\.[\da-f-]{36}$/);
 		await handleResetSession(['--request-id', 'reset-1']);
 		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({ command: 'reset-session', requestId: 'reset-1' });
 	});
