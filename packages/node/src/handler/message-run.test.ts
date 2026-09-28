@@ -57,6 +57,8 @@ describe('persisted MessageHandler run', () => {
 		const start = frames.find((f) => f.type === WSReqType.THINKING_START)!.data;
 		const runId = start.clientRunId as string;
 		expect(runId).toBe(store.pendingRuns()[0].runId);
+		handler.handle({ type: 'thinkingEnd', data: { fromUid: '42', roomId: '9', status: 'error', error: 'thinking_start_unknown', clientRunId: runId } });
+		expect(store.pendingRuns()[0].runId).toBe(runId); // Unknown transport result does not finalize/cancel the run.
 		handler.onConnected();
 		expect(frames.filter((f) => f.type === WSReqType.THINKING_START).map((f) => f.data.clientRunId)).toEqual([runId, runId]);
 		emit({ type: 'done', durationMs: 1 });

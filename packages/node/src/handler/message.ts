@@ -1113,6 +1113,10 @@ export class MessageHandler {
 			// Run-scoped rejection must name the exact START. An old room-only rejection proves nothing.
 			const pending = data.clientRunId ? this.pendingThinkingStarts.get(data.clientRunId) : undefined;
 			if (pending && String(data.fromUid) === this.selfUid && String(roomId) === pending.session.roomId) {
+				if (error === 'thinking_start_unknown') {
+					console.warn(`[thinking] START unconfirmed; retrying run=${data.clientRunId}`);
+					return; // Transport ambiguity is not a definitive rejection; keep the same bounded run retry.
+				}
 				this.forgetThinkingStart(data.clientRunId!);
 				console.error(`[thinking] START rejected run=${data.clientRunId}: ${error ?? 'unknown'}`);
 				pending.session.finalized = true;
