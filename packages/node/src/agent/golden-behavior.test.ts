@@ -1,7 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ConversationStore } from '../capability/conversations.js';
 import { MessageHandler } from '../handler/message.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
-import type { AgentDriver, AgentSession, AgentEvent } from './events.js';
+import type { AgentEvent, RunDriver } from './events.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 
@@ -72,10 +76,12 @@ function fakeWs() {
 	const sent: Array<{ type: number; data: unknown }> = [];
 	const ws = {
 		isConnected: true,
-		send: vi.fn((type: number, data: unknown) => {
+		onThinkingStart: undefined as undefined | ((data: Record<string, unknown>) => void),
+		send: vi.fn((type: number, data: Record<string, unknown>) => {
 			sent.push({ type, data });
+			if (type === WSReqType.THINKING_START) queueMicrotask(() => ws.onThinkingStart?.(data));
 		}),
-	} as unknown as HulaWSClient & { send: ReturnType<typeof vi.fn> };
+	} as unknown as HulaWSClient & { send: ReturnType<typeof vi.fn>; onThinkingStart?: (data: Record<string, unknown>) => void };
 	return { ws, sent };
 }
 
@@ -108,51 +114,25 @@ interface ChatCall {
 
 function fakeDriver() {
 	const calls: ChatCall[] = [];
-	const driver = {
-		type: 'fake',
-		connect: vi.fn().mockResolvedValue(undefined),
-		disconnect: vi.fn().mockResolvedValue(undefined),
-		openSession: vi.fn(async (): Promise<AgentSession> => {
-			return {
-				send(): AsyncIterable<AgentEvent> {
-					const buffer: AgentEvent[] = [];
-					let done = false;
-					let resolveNext: (() => void) | null = null;
-					const wake = () => {
-						if (resolveNext) {
-							const r = resolveNext;
-							resolveNext = null;
-							r();
-						}
-					};
-					calls.push({
-						push: (ev) => {
-							if (done) return;
-							buffer.push(ev);
-							wake();
-						},
-						finish: () => {
-							if (done) return;
-							done = true;
-							wake();
-						},
-					});
-					return {
-						async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
-							while (true) {
-								while (buffer.length > 0) yield buffer.shift()!;
-								if (done) return;
-								await new Promise<void>((resolve) => {
-									resolveNext = resolve;
-								});
-							}
-						},
-					};
-				},
-				async close() {},
-			};
-		}),
-	} as unknown as AgentDriver;
+	const driver: RunDriver = {
+		type: 'fake', features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+		connect: async () => {}, disconnect: async () => {},
+		createRun: () => {
+			const buffer: AgentEvent[] = [];
+			let done = false;
+			let resolveNext: (() => void) | null = null;
+			const wake = () => { const resolve = resolveNext; resolveNext = null; resolve?.(); };
+			calls.push({ push: (ev) => { if (!done) { buffer.push(ev); wake(); } },
+				finish: () => { done = true; wake(); } });
+			return { events: { async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+				while (true) {
+					while (buffer.length) yield buffer.shift()!;
+					if (done) return;
+					await new Promise<void>((resolve) => { resolveNext = resolve; });
+				}
+			} }, cancel: async () => ({ status: 'unconfirmed', reason: 'fake cannot stop' }), dispose: async () => {} };
+		},
+	};
 	return { driver, calls };
 }
 
@@ -187,6 +167,8 @@ function normalize(sent: Array<{ type: number; data: unknown }>): unknown {
 	return sent.map((frame) => {
 		const data = { ...(frame.data as Record<string, unknown>) };
 		const typeName = WSReqType[frame.type] ?? String(frame.type);
+		delete data.clientRunId;
+		if (frame.type === WSReqType.THINKING_END) data.thinkingId = undefined; // normalize transport receipt; WS outcome remains unchanged
 		if (frame.type === WSReqType.THINKING_END && 'durationMs' in data) {
 			data.durationMs = '<durationMs:number>';
 		}
@@ -198,13 +180,23 @@ function normalize(sent: Array<{ type: number; data: unknown }>): unknown {
 	});
 }
 
+const homes: string[] = [];
+afterEach(() => { for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
+
 describe('REQ-008 #75 golden behavior (MessageHandler WS send sequence)', () => {
 	for (let i = 0; i < SCRIPTS.length; i++) {
 		const script = SCRIPTS[i];
 		it(script.name, async () => {
 			const { driver, calls } = fakeDriver();
 			const { ws, sent } = fakeWs();
-			const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {});
+			const home = mkdtempSync(join(tmpdir(), 'golden-run-'));
+			homes.push(home);
+			const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set([SELF_UID]) });
+			const handler = new MessageHandler(ws, driver, SELF_UID, undefined, { waitMs: 10, maxWaitMs: 50 }, () => {}, () => store);
+			ws.onThinkingStart = (data) => handler.handle({ type: 'thinkingStart', data: {
+				fromUid: SELF_UID, roomId: '1', triggerMsgId: String(i + 1), thinkingId: `tid-${i + 1}`,
+				clientRunId: data.clientRunId,
+			} } as never);
 
 			const roomId = 1;
 			handler.handle({ type: 'receiveMessage', data: humanMessage(roomId, 100, 'hello', i + 1) } as never);

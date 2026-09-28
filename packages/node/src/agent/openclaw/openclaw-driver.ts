@@ -3,10 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { AgentDriver, AgentSession, AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
-import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
-import type { ChatContext } from '../workspace.js';
-import { buildSystemPrompt } from '../prompt-templates.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
 import { errMsg } from '../../util/err.js';
 
@@ -253,14 +250,13 @@ const promptOwners = new Map<string, string>();
 const promptActive = new Map<string, { owner: string; prompt: string; count: number }>();
 const promptWrites = new Map<string, Promise<void>>();
 
-export class OpenclawDriver implements AgentDriver, RunDriver {
+export class OpenclawDriver implements RunDriver {
 	readonly type = 'openclaw';
 	readonly features = { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' } as const;
 
 	private ws: WebSocket | null = null;
 	private url: string;
 	private token: string;
-	private readonly bindTokens: BindTokenStore;
 	private readonly wsFactory: OpenclawSocketFactory;
 	/**
 	 * REQ-018 R1（真机已确认）: openclaw 实际读取的工作区是 `~/.openclaw/workspace/`，会话启动时把其中的
@@ -308,7 +304,6 @@ export class OpenclawDriver implements AgentDriver, RunDriver {
 	constructor(
 		url: string,
 		token: string,
-		bindTokens: BindTokenStore,
 		wsFactory: OpenclawSocketFactory = defaultOpenclawSocketFactory,
 		// REQ-018 R1: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw/workspace).
 		workspaceDir?: string,
@@ -316,7 +311,6 @@ export class OpenclawDriver implements AgentDriver, RunDriver {
 	) {
 		this.url = url;
 		this.token = token;
-		this.bindTokens = bindTokens;
 		this.wsFactory = wsFactory;
 		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw', 'workspace');
 	}
@@ -422,85 +416,9 @@ export class OpenclawDriver implements AgentDriver, RunDriver {
 		return run;
 	}
 
-	/**
-	 * BL-014 (#141) — resolve the openclaw capability session id back to its bound identity+room.
-	 *
-	 * The CLI/exec-env path delivers a BARE opaque node-minted token here (aichat-claw's resolve_exec_env
-	 * hook extracts the token PREFIX out of the compound sessionKey and injects it as OPENCLAW_BIND, the
-	 * CLI emits `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling
-	 * this). So this is an EXACT STORE LOOKUP, NOT a parse and NOT a split.
-	 *
-	 * #141 B+ (regression fix): openSession now hands the gateway a COMPOUND `<token>:<binding>`
-	 * sessionKey (see openSession). resolveSession must NOT split that compound — it looks up the whole
-	 * argument as-is. The only thing that legitimately reaches here is the bare token; a forged plaintext
-	 * binding, OR a compound an attacker appends a binding tail to, is never a stored key → undefined
-	 * (the endpoint then 404s). The compound only legitimately exists gateway-side, inside beginChat.
-	 */
-	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
-		return this.bindTokens.resolve(sessionKey);
-	}
-
-	/**
-	 * AgentDriver hook: strip openclaw's own `NO_REPLY` sentinel + empty/whitespace thinking bodies from
-	 * the reduced thinking content before THINKING_END. openclaw-specific (the sentinel is upstream
-	 * openclaw's built-in contract); other drivers don't implement the hook → their content is verbatim.
-	 */
+	/** Keep gateway-specific NO_REPLY normalization out of the generic message handler. */
 	finalizeThinking(content: string): string {
 		return filterOpenclawThinking(content);
-	}
-
-	/**
-	 * aichatoverview#124 — no per-room store: openclaw's binding IS the sessionKey, so there is
-	 * nothing to reset. No-op, returns false.
-	 */
-	resetSession(): boolean {
-		return false;
-	}
-
-	async openSession(o: {
-		aiclawUid: string;
-		roomId: string;
-		chatContext: ChatContext;
-	}): Promise<AgentSession> {
-		// #161 (ADR-0004): openclaw replies via the unified `aichat send-message` CLI — the in-gateway
-		// aichat-claw `hula_send_message` TOOL was retired. We still hand the gateway a COMPOUND sessionKey
-		// `<token>:<binding>` — the opaque token FIRST, a literal `:`, then the plaintext binding LAST:
-		//   • aichat-claw's resolve_exec_env extracts the token PREFIX → OPENCLAW_BIND → CLI `openclaw:<token>`.
-		//   • the `aiclaw-{uid}-room-{roomId}` binding TAIL is retained for openclaw gateway-side session
-		//     isolation (keeps openclaw's conversation key unique + stable per room).
-		//   • the token is lowercase hex (`[0-9a-f]`, contains no `:`) so the `<token>:<binding>` split is
-		//     unambiguous. (#161 A′: hex is lowercase-native — openclaw lowercases the sessionKey it echoes
-		//     back through resolve_exec_env, and a hex token survives that round-trip; mixed-case would not.)
-		// CONFINEMENT: this compound is used ONLY here, as the gateway `agent` req sessionKey. It is NEVER a
-		// node-internal key — the node-side thinking sessionKey is computed independently from (uid,room)
-		// in the message handler, and resolveSession keys on the BARE token alone (it must NOT split the
-		// compound; a compound arriving at the endpoint = forgery → store miss → undefined).
-		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
-		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
-		const sessionKey = `${token}:${bindingKey(o.aiclawUid, o.roomId)}`;
-
-		// REQ-018: render the unified system prompt once per (per-turn) session and write it into the
-		// openclaw workspace AGENTS.md marked block (openclaw re-reads it per turn). The identity anchor +
-		// persona + reply contract live THERE — the per-turn gateway message stays pure. hash-compare
-		// (syncAgentsMdFile) skips the write when unchanged; a write failure degrades (warn, don't fail).
-		const selfName = o.chatContext.preparedSystemPrompt === undefined && o.chatContext.templates
-			? await o.chatContext.getSelfName?.() : undefined;
-		const systemPrompt = o.chatContext.preparedSystemPrompt ?? (o.chatContext.templates
-			? buildSystemPrompt(o.chatContext.templates, {
-					displayName: selfName,
-					uid: o.aiclawUid,
-					persona: o.chatContext.persona ?? null,
-				})
-			: undefined);
-		if (systemPrompt !== undefined && (o.chatContext.preparedSystemPrompt !== undefined || systemPrompt !== '')) {
-			try {
-				await syncAgentsMdFile(join(this.workspaceDir, 'AGENTS.md'), systemPrompt);
-			} catch (err) {
-				console.warn(`[openclaw] AGENTS.md write failed (degrading: no system prompt this turn): ${errMsg(err)}`);
-			}
-		}
-
-		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink), o.chatContext.assertRunCurrent);
 	}
 
 	async connect(): Promise<void> {
@@ -1067,7 +985,7 @@ export class OpenclawDriver implements AgentDriver, RunDriver {
  * send() returns an async iterable backed by a minimal push→pull queue so events fired by the
  * engine (possibly synchronously, before the consumer awaits) are buffered and never lost.
  */
-class OpenclawSession implements AgentSession {
+class OpenclawSession {
 	private closed = false;
 	/**
 	 * REQ-008 #75 P1-1①: the in-flight stream's `finish` closure, registered when

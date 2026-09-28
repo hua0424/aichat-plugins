@@ -75,6 +75,12 @@ pnpm -r --filter @aichat/node exec aichat activate --token <token>
 pnpm -r --filter @aichat/node exec aichat start
 ```
 
+## 新 agent 接入（#308）
+
+`packages/node/src/agent/events.ts` 定义 `AgentDriver`/`PreparedRun`/`AgentRun`；`descriptor.ts` 的静态 `DRIVER_CONTRACT_VERSION = 1`、能力声明和上下文 transport 与 `commands/start.ts` 的 `descriptors` 装配表是新增类型的入口。原生环境 transport 在 CLI 读取的 `capability/context-descriptors.ts` 一处注册；进程内示例用绑定能力通道，共享 `AICHAT_CONTEXT_KEY` 可走同一通用 CLI。`agent/example-fake.ts` 是**不默认启用**的第五种 adapter 示例；`agent/example-fake.test.ts` 验证收消息、事件、绑定查询、取消声明以及模板由核心准备。将同版本 descriptor 注册在装配表，并在核心能力 registry 注册需要的新查询；不修改通用 CLI 信封、身份路由、handler 的 agent 类型分支或 server 通讯。未知契约版本只隔离相应身份。详细配置、错误、迁移及回退见伞仓 `docs/shared/plugins-driver-development.md`（#308）；运行前按本机实际身份完成激活，上游凭据不写进示例。
+
+旧 CLI 信封和 `OPENCODE_SESSION_ID`、`CODEX_THREAD_ID`、`OPENCLAW_BIND`、`AICHAT_BIND` 环境 transport 仍属于过渡兼容路径；内部 driver bridge 删除不授权删除这些入口。没有实证旧请求退出及过渡发布周期完结前不得移除。driver 不接收 HuLa token/DTO，持久化旧原生历史仍由核心导入，不能用恢复历史数据本身证明上游任务已停止。
+
 ## CLI 消息确认（#307）
 
 `aichat send-message --content "hello" --json` 为本次逻辑发送生成一个 requestId；也可显式使用 `--request-id <id>`。`--json` 成功时返回 `requestId` 和合法 `result.msgId`，失败时输出稳定 `code`，`DELIVERY_UNKNOWN` 保留 requestId。默认文本成功输出仍是原 `Message sent: …` 格式。再次确认只能使用**同一 ID、同一内容、同一绑定身份/房间**；修改正文必须发起新逻辑请求，不能把 unknown 当作未落库，也不要在超过 7 天保护窗口后自动重放旧请求（显式 ID 的创建时间由调用者保管）。

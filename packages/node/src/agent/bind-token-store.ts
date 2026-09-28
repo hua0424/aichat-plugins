@@ -1,7 +1,4 @@
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
-import { AICHAT_HOME } from '../config.js';
-import { readJsonMap, AsyncJsonWriter } from './file-map-store.js';
 
 /**
  * BL-014 (#141) — opaque agent-facing binding token.
@@ -54,9 +51,6 @@ function defaultGenToken(): string {
 	return randomBytes(32).toString('hex');
 }
 
-/** Default location: persists under ~/.aichat/ (a persistent volume) so tokens survive restarts. */
-export const DEFAULT_BIND_TOKENS_PATH = join(AICHAT_HOME, 'bind-tokens.json');
-
 /**
  * In-memory BindTokenStore. Holds the forward map `token → {aiclawUid,roomId}` PLUS a reverse index
  * `bindingKey → token`, so `mint` is STABLE per (uid,room): a second mint of the same pair returns the
@@ -85,7 +79,6 @@ export class InMemoryBindTokenStore implements BindTokenStore {
 		const token = this.genToken().toLowerCase();
 		this.forward.set(token, { aiclawUid, roomId });
 		this.reverse.set(bkey, token);
-		this.afterMint();
 		return token;
 	}
 
@@ -94,61 +87,5 @@ export class InMemoryBindTokenStore implements BindTokenStore {
 		// #161: openclaw lowercases the sessionKey, so normalize the input before lookup (tokens are stored lowercase).
 		const v = this.forward.get(token.toLowerCase());
 		return v ? { aiclawUid: v.aiclawUid, roomId: v.roomId } : undefined;
-	}
-
-	/** Hook: FileBindTokenStore persists here. In-memory is a no-op. */
-	protected afterMint(): void {
-		/* no-op */
-	}
-}
-
-/**
- * File-backed BindTokenStore. Loads once on construction (rebuilding the reverse index), then persists
- * the whole forward map on every mint. The token file is a SENSITIVE credential — persist by staging
- * an owner-only (0600) file then atomically replacing the old file. Corrupt existing data fails closed.
- */
-export class FileBindTokenStore extends InMemoryBindTokenStore {
-	private readonly path: string;
-	// aichatoverview#166: async + serialized + mkdir-once (0600). mint is already low-frequency (only a NEW
-	// (uid,room) persists), so this mainly removes the per-persist sync mkdir + write off the event loop.
-	private readonly writer: AsyncJsonWriter;
-
-	constructor(path: string = DEFAULT_BIND_TOKENS_PATH, genToken?: () => string) {
-		super(genToken);
-		this.path = path;
-		this.writer = new AsyncJsonWriter(path, 0o600);
-		this.load();
-	}
-
-	private load(): void {
-		// Shared read primitive ({} only on missing, throws on corruption); the dual-map + normalization below is
-		// bind-specific (a distinct security path, NOT the session stores' copy).
-		for (const [token, val] of Object.entries(readJsonMap<unknown>(this.path))) {
-			if (!val || typeof val !== 'object') throw new Error(`Invalid bind token entry: ${this.path}`);
-			const b = val as Record<string, unknown>;
-			if (typeof b.aiclawUid !== 'string' || typeof b.roomId !== 'string') {
-				throw new Error(`Invalid bind token entry: ${this.path}`);
-			}
-			// Legacy mixed-case tokens are normalized for OpenClaw's lowercased session key.
-			const key = token.toLowerCase();
-			this.forward.set(key, { aiclawUid: b.aiclawUid, roomId: b.roomId });
-			this.reverse.set(bindingKey(b.aiclawUid, b.roomId), key);
-		}
-	}
-
-	protected override afterMint(): void {
-		this.persist();
-	}
-
-	private persist(): void {
-		const obj: Record<string, Bound> = {};
-		for (const [token, val] of this.forward) obj[token] = val;
-		// SECURITY (BL-014): the token file grants capability identity — locked to owner-only rw (0600) by the writer.
-		this.writer.write(obj);
-	}
-
-	/** Resolve when all queued async persists have drained (tests / graceful shutdown). */
-	whenPersisted(): Promise<void> {
-		return this.writer.whenWritten();
 	}
 }

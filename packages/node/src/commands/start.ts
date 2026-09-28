@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
-import { supportsLegacyReset } from '../agent/legacy-run.js';
+import { createDriver, nativeContext, DRIVER_CONTRACT_VERSION, type DriverDescriptor } from '../agent/descriptor.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
@@ -28,8 +28,7 @@ import {
 	resetSessionCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
-import { ConversationStore, type Provider } from '../capability/conversations.js';
-import { legacyBridges } from '../capability/legacy-bridges.js';
+import { ConversationStore } from '../capability/conversations.js';
 import type { ContextCandidate } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
 import { ensureAichatOnPath } from '../util/path-inject.js';
@@ -106,71 +105,56 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
 	const ccTranscript = new FileCcTranscriptWriter();
 
-	// Drivers keep their native CLI APIs; these thin views all delegate to ONE atomic core record.
-	// Construction is deferred until credentials are verified and the endpoint's single-writer lock is held.
+	// The core owns bindings; native drivers receive only prepared, generation-bound handles.
 	let conversations: ConversationStore | undefined;
-	const bridges = legacyBridges(() => {
-		if (!conversations) throw new Error('conversation bindings not ready');
-		return conversations;
-	});
-	const bindTokenStore = bridges.bindTokens;
+
+	// Static registration: adding an adapter changes this assembly list, not the handler or CLI.
+	const descriptors = new Map<string, DriverDescriptor>([
+		['openclaw', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'openclaw',
+			context: nativeContext('openclaw'),
+			features: { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' },
+			create: () => new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token,
+				undefined, undefined, (id, _workspace, identityId) => {
+					if (!conversations) throw new Error('conversation bindings not ready');
+					conversations.assertOpenclawPromptOwner(id, identityId);
+				}) }],
+		['opencode', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'opencode', workspaceBase: opencodeWorkspaceBase,
+			context: nativeContext('opencode'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			create: (entry) => new OpencodeDriver({
+				server: opencodeServer,
+				assertDirectoryOwner: (id, directory) => {
+					if (!conversations) throw new Error('conversation bindings not ready');
+					conversations.assertOpencodeDirectoryOwner(id, directory);
+				},
+				...(entry.model !== undefined ? { model: entry.model } : {}),
+			}) }],
+		['codex', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'codex', workspaceBase: codexWorkspaceBase,
+			context: nativeContext('codex'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
+			create: (entry) => new CodexDriver({
+				createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
+					config: { developer_instructions: systemPrompt } }),
+				...(entry.model !== undefined ? { model: entry.model } : {}),
+			}) }],
+		['cc', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'cc', workspaceBase: ccWorkspaceBase,
+			context: nativeContext('cc'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			create: () => new CcHeadlessDriver({
+				workspaceBase: ccWorkspaceBase, brokerPort: ccBrokerPort(),
+				registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
+				transcript: ccTranscript,
+			}) }],
+	]);
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
-		buildDriver: (entry) => {
-			if (entry.tool === 'openclaw') {
-				return new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, bindTokenStore,
-					undefined, undefined, (id, _workspace, identityId) => {
-						if (!conversations) throw new Error('conversation bindings not ready');
-						conversations.assertOpenclawPromptOwner(id, identityId);
-					});
-			}
-			if (entry.tool === 'opencode') {
-				return new OpencodeDriver({
-					server: opencodeServer, // 单例由 factory 创建并在全局 shutdown 释放；driver 不停止其他身份的 backend
-					assertDirectoryOwner: (id, directory) => {
-						if (!conversations) throw new Error('conversation bindings not ready');
-						conversations.assertOpencodeDirectoryOwner(id, directory);
-					},
-					...(entry.model !== undefined ? { model: entry.model } : {}),
-				});
-			}
-			if (entry.tool === 'codex') {
-				// Each Codex SDK client spawns its own native exec; core owns the thread and generation.
-				return new CodexDriver({
-					createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
-						config: { developer_instructions: systemPrompt } }),
-					...(entry.model !== undefined ? { model: entry.model } : {}),
-				});
-			}
-			if (entry.tool === 'cc') {
-				// REQ-011 S2: claude-code is NODE-DRIVEN headless. CcHeadlessDriver spawns `claude -p`
-				// (stream-json) per inbound turn on the standard supervised path. The reply
-				// still goes out-of-band via `aichat send-message`; thinking is teed from stdout,
-				// while tool hooks reach the matching turn through the shared registry.
-				// session_id is persisted for cross-turn/restart --resume.
-				return new CcHeadlessDriver({
-					workspaceBase: ccWorkspaceBase,
-					brokerPort: ccBrokerPort(),
-					registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
-					transcript: ccTranscript,
-				});
-			}
-			// 未知 tool 抛错使该身份降级，不影响其它身份。
-			throw new Error('unsupported agent tool: ' + entry.tool);
-		},
+		buildDriver: (entry) => createDriver(entry, descriptors),
 		buildApiClient: (cred) => new HulaApiClient(restBaseUrl, cred.connectionToken),
 		// #193: 上报主机信息时的 workspace 根按 tool 取舍——opencode/codex/cc 各有 workspace base，
 		// openclaw 无 workspace 概念 → undefined（payload 省略 workspaceBase 字段）。
-		workspaceBaseFor: (entry) =>
-			entry.tool === 'opencode'
-				? opencodeWorkspaceBase
-				: entry.tool === 'codex'
-					? codexWorkspaceBase
-					: entry.tool === 'cc'
-						? ccWorkspaceBase
-						: undefined,
+		workspaceBaseFor: (entry) => descriptors.get(entry.tool)?.workspaceBase,
 		buildWs: (cred, hooks) =>
 			new HulaWSClient({
 				url: serverUrl,
@@ -186,8 +170,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
 				if (!conversations) throw new Error('conversation bindings not ready');
 				return conversations;
-			}, driver.type === 'cc' ? ccWorkspaceBase : driver.type === 'codex' ? codexWorkspaceBase
-				: driver.type === 'opencode' ? opencodeWorkspaceBase : undefined),
+			}, descriptors.get(driver.type)?.workspaceBase, registry$),
 	});
 
 	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.
@@ -208,7 +191,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resetSessionCapability((aiclawUid, roomId, requestId, bearer) => {
 			const owner = supervisor.agents.find((a) => a.uid === aiclawUid && a.status !== 'offline');
 			if (!owner || !conversations) return undefined;
-			if (!('createRun' in owner.driver ? owner.driver.features.reset === 'supported' : supportsLegacyReset(owner.driver))) return { driverType: owner.driver.type, reset: false };
+			if (owner.driver.features.reset !== 'supported') return { driverType: owner.driver.type, reset: false };
 			const cancelRunId = conversations.get(aiclawUid, roomId)?.pendingRuns?.[0]?.runId;
 			const record = conversations.reset(aiclawUid, roomId, requestId, bearer);
 			return { driverType: owner.driver.type, reset: true, generation: record.generation,
@@ -244,7 +227,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		await endpoint.listen(capabilitySocketPath());
 		console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
 		await supervisor.start(registry, false);
-		const activeProviders = new Map(supervisor.agents.map((a) => [a.uid, a.driver.type as Provider]));
+		const activeProviders = new Map(supervisor.agents.map((a) => [a.uid, a.driver.type]));
 		if (activeProviders.size !== supervisor.agents.length) throw new Error('duplicate activated identity');
 		conversations = new ConversationStore({
 			home: AICHAT_HOME, serverNamespace: restBaseUrl,

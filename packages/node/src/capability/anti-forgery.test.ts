@@ -1,13 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { CapabilityEndpoint } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
-import { resolveBoundSession, type BindableAgent } from './session-key.js';
-import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { ConversationStore } from './conversations.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { InMemoryBindTokenStore } from '../agent/bind-token-store.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 
 /**
@@ -30,22 +27,21 @@ function fakeApi(tag: string): HulaApiClient {
 
 describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves; minted token does', () => {
 	it('openclaw: a minted token resolves to its real (uid,room); a forged plaintext binding → endpoint 404', async () => {
-		// ONE shared store, as in start.ts. Mint the REAL binding via the driver's openSession.
-		const store = new InMemoryBindTokenStore();
-		// The gateway socket is never opened here — this test only exercises openSession (mint) +
-		// resolveSession (store lookup), so the default ws factory is fine (connect() is not called).
-		const openclaw = new OpenclawDriver('ws://localhost:18789', '', store);
+		const home = mkdtempSync(join(tmpdir(), 'openclaw-antiforgery-'));
+		const core = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['7']),
+			activeProviders: new Map([['7', 'openclaw']]) });
 		const api7 = fakeApi('uid-7');
-		await openclaw.openSession({ aiclawUid: '7', roomId: '42', chatContext: {} });
-		const mintedToken = store.mint('7', '42'); // stable → the exact token openSession minted
-
-		const agents: BindableAgent[] = [{ driver: openclaw, uid: '7', api: api7 } as unknown as BindableAgent];
+		const mintedToken = core.mintToken('7', '42');
 
 		const registry = new CapabilityRegistry();
 		registry.register('send-message', sendMessageCapability());
 		const endpoint = new CapabilityEndpoint({
 			registry,
-			resolve: (sk) => resolveBoundSession(sk, agents),
+			resolve: (sk) => {
+				const candidate = sk.startsWith('openclaw:') ? core.resolveCandidate({ key: sk.slice(9) }) : undefined;
+				return candidate ? { aiclawUid: candidate.identityId, roomId: candidate.roomId, apiClient: api7,
+					conversationId: candidate.conversationId, generation: candidate.generation } : undefined;
+			},
 		});
 
 		// (1) FORGED plaintext binding — what an agent gets by overwriting OPENCLAW_BIND with a guessed
@@ -76,6 +72,8 @@ describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves
 		});
 		expect(compound.status).toBe(404);
 		expect((compound.json as { error: string }).error).toBe('unknown session');
+		core.close();
+		rmSync(home, { recursive: true, force: true });
 	});
 
 	it('cc: a minted token resolves; a forged `cc:aiclaw-…` plaintext binding → endpoint 404', async () => {

@@ -1,6 +1,6 @@
 import type { AgentEntry } from './registry.js';
 import type { AichatCredentials } from './config.js';
-import type { AgentDriver, RunDriver } from './agent/events.js';
+import type { RunDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
@@ -15,7 +15,7 @@ import { collectHostInfo } from './host-info.js';
  */
 export interface SupervisorDeps {
 	resolveCredential: (entry: AgentEntry) => Promise<AichatCredentials>;
-	buildDriver: (entry: AgentEntry) => AgentDriver | RunDriver;
+	buildDriver: (entry: AgentEntry) => RunDriver;
 	buildApiClient: (cred: AichatCredentials) => HulaApiClient;
 	buildWs: (
 		cred: AichatCredentials,
@@ -33,7 +33,7 @@ export interface SupervisorDeps {
 	) => HulaWSClient;
 	buildHandler: (
 		ws: HulaWSClient,
-		driver: AgentDriver | RunDriver,
+		driver: RunDriver,
 		uid: string,
 		api: HulaApiClient,
 		onTokenExpired: () => void,
@@ -90,7 +90,7 @@ export interface SupervisedAgent {
 	// REQ-029 (#29): uid is an opaque string end-to-end.
 	uid: string;
 	status: AgentStatus;
-	driver: AgentDriver | RunDriver;
+	driver: RunDriver;
 	ws: HulaWSClient;
 	handler: MessageHandler;
 	/**
@@ -241,7 +241,7 @@ export class Supervisor {
 	 * 失败时 best-effort disconnect 旧 driver（避免其内部重连定时器泄漏），瞬态且还有次数则退避后重试，
 	 * 否则向上抛（让 start 像以前一样降级该身份）。
 	 */
-	private async connectWithRetry(entry: AgentEntry): Promise<AgentDriver | RunDriver> {
+	private async connectWithRetry(entry: AgentEntry): Promise<RunDriver> {
 		const maxAttempts = this.deps.maxConnectAttempts ?? 5;
 		const backoffMs = this.deps.connectBackoffMs ?? defaultConnectBackoffMs;
 		const delay = this.deps.delay ?? defaultDelay;
