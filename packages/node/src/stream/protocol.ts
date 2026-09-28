@@ -23,6 +23,7 @@ export type WSRespType =
 	// REQ-004: THINKING 协议 + 群配置更新
 	| 'thinkingStart'
 	| 'thinkingEnd'
+	| 'thinkingRejected'
 	| 'groupConfigChange'
 	// #188: 人设变更失效帧（低延迟优化；正确性基础是连接/重连 prewarm 拉取）
 	| 'aiclawPersonaChanged';
@@ -126,17 +127,21 @@ export interface ThinkingStartDTO {
 	roomId: string | number;
 	triggerMsgId: string;
 	thinkingId: string;
+	/** Exact T08 run correlation; older servers omit this and cannot receipt a run-scoped START. */
+	clientRunId?: string;
 }
 
 /** server → client: thinkingEnd 广播 */
 export interface ThinkingEndDTO {
 	fromUid: string | number;
 	roomId: string | number;
-	durationMs: number;
+	durationMs?: number;
 	status: 'complete' | 'error';
 	error?: string;
 	/** server 生成的 thinking 记录 ID（有 thinkingId 时为群广播，无时为直接拒绝） */
 	thinkingId?: string;
+	/** Echoed on direct START rejection so an old rejection cannot terminate the next run. */
+	clientRunId?: string;
 }
 
 /** server → client/plugin: 群配置变更通知 */

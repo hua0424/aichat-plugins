@@ -95,6 +95,20 @@ interface ThinkingSession {
 	run?: { id: string; generation: number; agent: AgentRun; abort: AbortController };
 }
 
+type ThinkingEndFrame = { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string };
+interface PendingThinkingStart {
+	session: ThinkingSession;
+	end?: ThinkingEndFrame;
+	retry: ReturnType<typeof setInterval>;
+	deadline: ReturnType<typeof setTimeout>;
+}
+interface PendingThinkingEnd {
+	session: ThinkingSession;
+	frame: ThinkingEndFrame;
+	retry: ReturnType<typeof setInterval>;
+	deadline: ReturnType<typeof setTimeout>;
+}
+
 /**
  * 最近一次收到的用户消息上下文
  */
@@ -181,6 +195,10 @@ export class MessageHandler {
 
 	// REQ-004: 替换 streaming boolean 为 thinkingSessions Map
 	private thinkingSessions = new Map<string, ThinkingSession>();
+	/** Run-keyed receipts survive room teardown; at most one bounded pending END per run. */
+	private pendingThinkingStarts = new Map<string, PendingThinkingStart>();
+	private pendingThinkingEnds = new Map<string, PendingThinkingEnd>();
+	private readonly START_RECEIPT_TIMEOUT_MS = 30_000;
 
 	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）；REQ-029: key 为字符串 roomId
 	private roomChannels = new Map<string, RoomChannel>();
@@ -268,23 +286,78 @@ export class MessageHandler {
 		}
 	}
 
-	/**
-	 * 单点发送 THINKING_END：thinkingId 兜底 + 帧安全截断（capUtf8Bytes 256KB，server 仍是唯一截断权威）。
-	 * 三条 finalize 路径（timeout/complete/error）共用，帧结构一处维护。error 缺省时不带该字段。
-	 */
-	private sendThinkingEnd(
-		session: ThinkingSession,
-		frame: { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string },
-	): void {
+	private sendThinkingStart(session: ThinkingSession): void {
+		this.ws.send(WSReqType.THINKING_START, {
+			fromUid: this.selfUid,
+			roomId: session.roomId,
+			triggerMsgId: session.triggerMsgId,
+			...(session.run ? { clientRunId: session.run.id } : {}),
+		});
+	}
+
+	/** Reconnect retries only exact run frames; server returns their persisted original result. */
+	onConnected(): void {
+		for (const { session } of this.pendingThinkingStarts.values()) this.sendThinkingStart(session);
+		for (const { session, frame } of this.pendingThinkingEnds.values()) this.emitThinkingEnd(session, frame);
+	}
+
+	private forgetThinkingStart(runId: string): void {
+		const pending = this.pendingThinkingStarts.get(runId);
+		if (!pending) return;
+		clearInterval(pending.retry);
+		clearTimeout(pending.deadline);
+		this.pendingThinkingStarts.delete(runId);
+	}
+
+	private forgetThinkingEnd(runId: string): void {
+		const pending = this.pendingThinkingEnds.get(runId);
+		if (!pending) return;
+		clearInterval(pending.retry);
+		clearTimeout(pending.deadline);
+		this.pendingThinkingEnds.delete(runId);
+	}
+
+	private emitThinkingEnd(session: ThinkingSession, frame: ThinkingEndFrame): void {
 		this.ws.send(WSReqType.THINKING_END, {
 			thinkingId: session.thinkingId || undefined,
-			// #295: 服务端要求 END 显式携带 roomId（认证/房间授权关联），否则拒绝持久化。
+			...(session.run ? { clientRunId: session.run.id } : {}),
 			roomId: session.roomId,
 			durationMs: frame.durationMs,
 			status: frame.status,
 			...(frame.error !== undefined ? { error: frame.error } : {}),
 			content: capUtf8Bytes(frame.content),
 		});
+	}
+
+	/**
+	 * 单点发送 THINKING_END：run-scoped END waits for the exact START receipt, never a room's latest ID.
+	 * 三条 finalize 路径（timeout/complete/error）共用，帧结构一处维护。error 缺省时不带该字段。
+	 */
+	private sendThinkingEnd(
+		session: ThinkingSession,
+		frame: { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string },
+	): void {
+		if (session.run && !session.thinkingId) {
+			const pending = this.pendingThinkingStarts.get(session.run.id);
+			if (!pending) {
+				console.error(`[thinking] START receipt unavailable; END refused run=${session.run.id}`);
+				return;
+			}
+			pending.end = { ...frame, content: capUtf8Bytes(frame.content) };
+			return;
+		}
+		if (session.run && !this.pendingThinkingEnds.has(session.run.id)) {
+			const runId = session.run.id;
+			const retry = setInterval(() => { if (this.ws.isConnected) this.emitThinkingEnd(session, frame); }, 2_000);
+			const deadline = setTimeout(() => {
+				console.error(`[thinking] END confirmation timed out run=${runId} thinking=${session.thinkingId}`);
+				this.forgetThinkingEnd(runId);
+			}, this.START_RECEIPT_TIMEOUT_MS);
+			retry.unref?.();
+			deadline.unref?.();
+			this.pendingThinkingEnds.set(runId, { session, frame, retry, deadline });
+		}
+		this.emitThinkingEnd(session, frame);
 	}
 
 	/**
@@ -432,6 +505,15 @@ export class MessageHandler {
 			case 'thinkingEnd':
 				this.handleThinkingEndBroadcast(msg.data as ThinkingEndDTO);
 				break;
+			case 'thinkingRejected': {
+				const data = msg.data as ThinkingEndDTO;
+				const pending = data.clientRunId ? this.pendingThinkingEnds.get(data.clientRunId) : undefined;
+				if (pending && pending.session.thinkingId === data.thinkingId && pending.session.roomId === String(data.roomId)) {
+					if (data.error !== 'thinking_end_unknown') this.forgetThinkingEnd(data.clientRunId!);
+					console.error(`[thinking] END ${data.error === 'thinking_end_unknown' ? 'unconfirmed; retrying' : 'rejected'} run=${data.clientRunId} thinking=${data.thinkingId}: ${data.error ?? 'unknown'}`);
+				}
+				break;
+			}
 			case 'tokenExpired':
 				// REQ-008 #76: 降级本身份（不退整个进程）。回调必填——监督器为每条身份链路注入。
 				console.error('[handler] Token expired, degrading this identity...');
@@ -778,12 +860,19 @@ export class MessageHandler {
 
 		console.log(`[thinking] start msgId=${msgId} sessionKey=${sessionKey}`);
 
-		// 发送 THINKING_START
-		this.ws.send(WSReqType.THINKING_START, {
-			fromUid: this.selfUid,
-			roomId,
-			triggerMsgId: msgId,
-		});
+		// A retry keeps the T08 runId; never infer a CLI command's run from this room slot.
+		if (session.run) {
+			const runId = session.run.id;
+			const retry = setInterval(() => { if (this.ws.isConnected) this.sendThinkingStart(session); }, 2_000);
+			const deadline = setTimeout(() => {
+				console.error(`[thinking] START receipt timed out; END unavailable run=${runId}`);
+				this.forgetThinkingStart(runId);
+			}, this.START_RECEIPT_TIMEOUT_MS);
+			retry.unref?.();
+			deadline.unref?.();
+			this.pendingThinkingStarts.set(runId, { session, retry, deadline });
+		}
+		this.sendThinkingStart(session);
 
 		// REQ-008 #75: 通过 AgentDriver 抽象消费规范化 AgentEvent 流，再映射成与既有
 		// 完全一致的 WS 发送。openSession 绑定 (aiclawUid, roomId) → sessionKey；
@@ -888,20 +977,22 @@ export class MessageHandler {
 		// REQ-029 (#29): String(roomId) (drop Number()) — inbound roomId may be a >2^53 numeric string.
 		const sessionKey = bindingKey(this.selfUid, String(roomId));
 		const session = this.thinkingSessions.get(sessionKey);
-		if (!session) {
-			console.warn(`[thinking] received thinkingStart broadcast but no active session for ${sessionKey}`);
+		const pending = data.clientRunId ? this.pendingThinkingStarts.get(data.clientRunId) : undefined;
+		const target = pending?.session ?? session;
+		if (!target) return;
+		// A legacy room/trigger receipt cannot prove which run started it (same trigger can replay).
+		if (target.run && (!pending || target.run.id !== data.clientRunId)) return;
+		if (target.roomId !== String(roomId) || target.triggerMsgId !== String(triggerMsgId) || !data.thinkingId) return;
+		if (target.thinkingId && target.thinkingId !== data.thinkingId) {
+			console.error(`[thinking] conflicting START receipt run=${data.clientRunId}`);
 			return;
 		}
-
-		// 校验 triggerMsgId 匹配
-		if (session.triggerMsgId !== triggerMsgId) {
-			console.warn(`[thinking] triggerMsgId mismatch: session=${session.triggerMsgId}, broadcast=${triggerMsgId}`);
-			return;
+		target.thinkingId = data.thinkingId;
+		if (pending) {
+			this.forgetThinkingStart(data.clientRunId!);
+			if (pending.end) this.sendThinkingEnd(target, pending.end);
 		}
-
-		// 回填 thinkingId（S4：仅用于 THINKING_END 携带，不再触发 delta flush）
-		session.thinkingId = data.thinkingId || '';
-		console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
+		console.log(`[thinking] thinkingId backfilled: ${target.thinkingId} for ${sessionKey}`);
 	}
 
 	/**
@@ -1000,15 +1091,42 @@ export class MessageHandler {
 	/** M3: 接收 server 的 thinkingEnd 广播，处理 error 状态触发 autoReply */
 	private handleThinkingEndBroadcast(data: ThinkingEndDTO): void {
 		const { thinkingId, roomId, status, error } = data;
+		const starting = data.clientRunId ? this.pendingThinkingStarts.get(data.clientRunId) : undefined;
+		if (starting && thinkingId && status === 'error' && error && LIMIT_REASONS[error]
+			&& String(data.fromUid) === this.selfUid && String(roomId) === starting.session.roomId) {
+			this.forgetThinkingStart(data.clientRunId!);
+			starting.session.finalized = true;
+			if (starting.session.timeoutId) clearTimeout(starting.session.timeoutId);
+			this.sendAutoReply(starting.session.roomId, LIMIT_REASONS[error]);
+			this.teardownSession(starting.session, starting.session.roomId, true);
+			return;
+		}
+		const ending = data.clientRunId ? this.pendingThinkingEnds.get(data.clientRunId) : undefined;
+		if (ending && thinkingId === ending.session.thinkingId && String(roomId) === ending.session.roomId
+			&& String(data.fromUid) === this.selfUid) {
+			this.forgetThinkingEnd(data.clientRunId!);
+			return; // Persisted terminal ACK for this exact run; never close a later room session.
+		}
 
 		// 无 thinkingId 的是 THINKING_START 直接拒绝
 		if (!thinkingId) {
-			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 session
+			// Run-scoped rejection must name the exact START. An old room-only rejection proves nothing.
+			const pending = data.clientRunId ? this.pendingThinkingStarts.get(data.clientRunId) : undefined;
+			if (pending && String(data.fromUid) === this.selfUid && String(roomId) === pending.session.roomId) {
+				this.forgetThinkingStart(data.clientRunId!);
+				console.error(`[thinking] START rejected run=${data.clientRunId}: ${error ?? 'unknown'}`);
+				pending.session.finalized = true;
+				if (pending.session.timeoutId) clearTimeout(pending.session.timeoutId);
+				this.teardownSession(pending.session, pending.session.roomId, true);
+				if (error && LIMIT_REASONS[error]) this.sendAutoReply(pending.session.roomId, LIMIT_REASONS[error]);
+				return;
+			}
+			// 【M4 降级】server 限流拒绝时可能无 thinkingId，用 roomId 匹配 legacy session only.
 			if (status === 'error' && (error === 'rate_limit_exceeded' || error === 'daily_limit_exceeded')) {
 				if (String(data.fromUid) === String(this.selfUid)) {
 					const sessionKey = bindingKey(this.selfUid, String(roomId));
-					const session = this.thinkingSessions.get(sessionKey);
-					if (session) {
+					const session = pending?.session ?? this.thinkingSessions.get(sessionKey);
+					if (session && (!session.run || pending?.session === session)) {
 						if (session.timeoutId) clearTimeout(session.timeoutId);
 						if (session.run) session.finalized = true;
 						const reason = LIMIT_REASONS[error];
@@ -1025,11 +1143,14 @@ export class MessageHandler {
 		// 查找 active session（可能已被 onThinkingEnd/onError 清理）
 		let session: ThinkingSession | undefined;
 		for (const s of this.thinkingSessions.values()) {
-			if (s.thinkingId === thinkingId) {
+			if (s.thinkingId === thinkingId && s.roomId === String(roomId)
+				&& String(data.fromUid) === this.selfUid
+				&& (!s.run || s.run.id === data.clientRunId)) {
 				session = s;
 				break;
 			}
 		}
+		if (this.getConversations && !session) return;
 
 		if (session?.timeoutId) {
 			clearTimeout(session.timeoutId);
@@ -1082,18 +1203,14 @@ export class MessageHandler {
 			else void session.agentSession?.close();
 			if (!session.finalized) {
 				session.finalized = true;
-				this.ws.send(WSReqType.THINKING_END, {
-					thinkingId: session.thinkingId || undefined,
-					// #295: 同 sendThinkingEnd——服务端要求显式 roomId。
-					roomId: session.roomId,
+				this.sendThinkingEnd(session, {
 					durationMs: Date.now() - session.startTime,
-					status: 'error',
-					error: 'handler_destroyed',
-					// 帧安全截断（256KB）；server 仍是唯一截断权威
-					content: capUtf8Bytes(session.accumulatedContent),
+					status: 'error', error: 'handler_destroyed', content: session.accumulatedContent,
 				});
 			}
 		}
+		for (const runId of this.pendingThinkingStarts.keys()) this.forgetThinkingStart(runId);
+		for (const runId of this.pendingThinkingEnds.keys()) this.forgetThinkingEnd(runId);
 		if (!this.getConversations) this.thinkingSessions.clear();
 		else for (const [key, session] of this.thinkingSessions) {
 			if (!session.run) this.thinkingSessions.delete(key);
