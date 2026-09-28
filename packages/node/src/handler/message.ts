@@ -363,10 +363,9 @@ export class MessageHandler {
 	 * 会话收尾（所有终结路径共用）：可选 best-effort 关闭 driver session（唤醒仍 park 的 for-await）、
 	 * 从 thinkingSessions 删除、flush 待发消息。clean-complete/error 路径不关（迭代器已自然结束）→ closeDriver=false。
 	 */
-	private teardownSession(session: ThinkingSession, roomId: string, closeDriver: boolean): void {
+	private teardownSession(session: ThinkingSession, _roomId: string, closeDriver: boolean): void {
 		if (closeDriver) void this.stopRun(session, 'thinking interrupted');
 		// Local dispose is not proof of upstream termination; releaseRun owns cleanup.
-
 	}
 
 	private releaseRun(session: ThinkingSession): void {
@@ -765,13 +764,11 @@ export class MessageHandler {
 			events: [],
 		};
 
-		// Persist the run slot before emitting THINKING_START or touching the legacy driver.
+		// Persist the run slot before emitting THINKING_START or touching the native driver.
 		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
-		const chatContext = {
+		const workspaceContext = {
 			roomType, roomId, counterpartUid: fromUid, isOwner,
 			workspaceDir: cfg?.workspaceDir, account: cfg?.account,
-			getSelfName: () => this.resolveSelfName(),
-			persona: this.persona, templates: this.templates ?? undefined,
 		};
 		{
 			let begunId: string | undefined;
@@ -780,8 +777,7 @@ export class MessageHandler {
 				const id = randomUUID();
 				const bound = store.beginRun(this.selfUid, roomId, id);
 				begunId = id;
-				// Render the server template once at the core boundary. Legacy adapters only deliver
-				// this prepared value in their existing native injection channel, never render again.
+				// Render server templates once at the core boundary; adapters only inject the prepared prompt.
 				let nameTimer: ReturnType<typeof setTimeout> | undefined;
 				let selfName: string | undefined;
 				try {
@@ -802,11 +798,11 @@ export class MessageHandler {
 					bindToken: this.driver.type === 'cc' ? store.mintToken(this.selfUid, roomId) : undefined,
 					transcriptKey: sessionKey,
 					workspace: this.workspaceBase
-						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, chatContext) : undefined,
+						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, workspaceContext) : undefined,
 					conversation: {
 						id: bound.conversationId, generation: bound.generation,
 						assertCurrent: () => bound.assertCurrent(),
-							nativeState: bound.nativeState[this.driver.type]
+						nativeState: bound.nativeState[this.driver.type]
 							? { version: 1, value: bound.nativeState[this.driver.type] } : undefined,
 						saveNativeState: async (v) => bound.saveNativeState(this.driver.type, v.value as Record<string, unknown>),
 						registerNativeAlias: async (v) => bound.registerNativeAlias(this.driver.type, v.id, v.scope),
@@ -1212,7 +1208,7 @@ export class MessageHandler {
 	/** REQ-004 S2: 仅刷新指定房间的待处理消息，不影响其他房间 */
 	private flushPendingMessages(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
-		if (!channel || (!this.runReady(roomId)) || channel.pendingMessages.length === 0) {
+		if (!channel || !this.runReady(roomId) || channel.pendingMessages.length === 0) {
 			this.maybeEvictRoom(roomId);
 			return;
 		}

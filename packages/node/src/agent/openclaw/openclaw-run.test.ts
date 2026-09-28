@@ -302,9 +302,54 @@ describe('native OpenClaw AgentRun (#303)', () => {
 			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
 			socket.accept(socket.agents[0], 'abandoned');
 			await Promise.resolve();
+			const maps = driver as unknown as { activeChats: Map<string, unknown>; pending: Map<string, unknown>;
+				requestToRunId: Map<string, unknown> };
+			expect(maps.activeChats.size).toBeGreaterThan(0);
 			vi.advanceTimersByTime(5 * 60 * 1000 + 1);
-			expect((await pending).at(-1)).toEqual({ type: 'error', message: expect.any(String) });
+			expect((await pending).at(-1)).toEqual({ type: 'error', message: 'openclaw_chat_timeout' });
+			expect(maps.activeChats.size).toBe(0);
+			expect(maps.pending.size).toBe(0);
+			expect(maps.requestToRunId.size).toBe(0);
 		} finally { vi.useRealTimers(); await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('a normal lifecycle end clears the abandoned-run timer and all gateway maps', async () => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		await driver.connect();
+		vi.useFakeTimers();
+		try {
+			const socket = f.sockets[0];
+			const pending = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], 'completed');
+			socket.end('completed');
+			expect(await pending).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			const maps = driver as unknown as { activeChats: Map<string, unknown>; pending: Map<string, unknown>;
+				requestToRunId: Map<string, unknown> };
+			expect([maps.activeChats.size, maps.pending.size, maps.requestToRunId.size]).toEqual([0, 0, 0]);
+			vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+			expect([maps.activeChats.size, maps.pending.size, maps.requestToRunId.size]).toEqual([0, 0, 0]);
+		} finally { vi.useRealTimers(); await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('native cancel wakes a parked event consumer without a gateway terminal or closing the shared socket', async () => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const run = driver.createRun(f.input);
+			const received: AgentEvent[] = [];
+			const pending = collect(run.events).then((events) => received.push(...events));
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], 'no-terminal');
+			await tick(); // consumer is now parked in the event iterator
+			expect(await run.cancel('reset')).toEqual({ status: 'unconfirmed', reason: expect.any(String) });
+			await Promise.race([pending, new Promise<never>((_, reject) => setTimeout(() => reject(Error('cancel did not wake iterator')), 1000))]);
+			expect(received).toEqual([{ type: 'cancelled', reason: 'OpenClaw stop not confirmed' }]);
+			expect(socket.closed).toBe(false);
+		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 
 	it('maps buffered gateway thinking and error frames to native run events', async () => {

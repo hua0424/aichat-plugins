@@ -27,7 +27,7 @@ describe('four native driver bindings through real capability endpoint', () => {
 	});
 	it('routes each real CLI request to its activated identity and room; rejects inherited conflicting candidates', async () => {
 		home = mkdtempSync(join(tmpdir(), 'aichat-real-registry-'));
-		const providers = new Map<string, Provider>([['1', 'openclaw'], ['2', 'cc'], ['3', 'codex'], ['4', 'opencode']]);
+		const providers = new Map<string, Provider>([['1', 'openclaw'], ['2', 'cc'], ['3', 'codex'], ['4', 'opencode'], ['5', 'fake']]);
 		const options = { home, serverNamespace: 'isolated-test', activeUids: new Set(providers.keys()), activeProviders: providers };
 		const store = new ConversationStore(options);
 		const openclaw = store.mintToken('1', '101'), cc = store.mintToken('2', '202');
@@ -68,6 +68,17 @@ describe('four native driver bindings through real capability endpoint', () => {
 			ok: true, result: { uid: '4', roomId: '404' },
 		});
 		expect(written).toHaveLength(4);
+		// A fifth adapter's universal context key reaches the same CLI/IPC/core query path.
+		const fake = store.getOrCreate('5', '505');
+		delete process.env.OPENCODE_SESSION_ID;
+		process.env.AICHAT_CONTEXT_KEY = fake.contextKey;
+		await runCapabilityCommand('fake-query', ['--json'], JSON.stringify);
+		expect(JSON.parse(vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)).toEqual({
+			ok: true, result: { uid: '5', roomId: '505' },
+		});
+		expect(written).toHaveLength(4);
+		delete process.env.AICHAT_CONTEXT_KEY;
+		process.env.OPENCODE_SESSION_ID = 'session-404';
 		process.env.CODEX_THREAD_ID = 'thread-303';
 		const rejected = await postCapability(socket, { version: 2, contexts: [
 			{ provider: 'opencode', nativeId: 'session-404' }, { provider: 'codex', nativeId: 'thread-303' },

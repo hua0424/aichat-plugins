@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDriver } from './descriptor.js';
+import type { AgentEvent } from './events.js';
 import { fakeDescriptor } from './example-fake.js';
 import { ConversationStore } from '../capability/conversations.js';
 import { CapabilityRegistry } from '../capability/registry.js';
@@ -61,6 +62,12 @@ describe('static fifth adapter contract', () => {
 		expect(() => createDriver(entry, new Map([['fake', { ...fakeDescriptor, contractVersion: 2, create }]])))
 			.toThrow('unsupported driver contract');
 		expect(create).not.toHaveBeenCalled();
+		expect(() => createDriver(entry, new Map([['fake', { ...fakeDescriptor,
+			context: { kind: 'native-env' as const, env: 'UNKNOWN_FAKE_ID' } }]])))
+			.toThrow('native context transport not registered');
+		expect(() => createDriver(entry, new Map([['fake', { ...fakeDescriptor,
+			features: { ...fakeDescriptor.features, reset: 'unsupported' as const } }]])))
+			.toThrow('driver contract mismatch');
 		expect(() => createDriver({ ...entry, tool: 'unknown' }, descriptors)).toThrow('unsupported agent tool');
 	});
 
@@ -92,8 +99,12 @@ describe('static fifth adapter contract', () => {
 			conversation: { id: '1', generation: 1, nativeState: undefined, assertCurrent: () => {},
 				saveNativeState: async () => {}, registerNativeAlias: async () => {} },
 			saveRecovery: async () => {}, capabilities: { invoke: async () => ({}) } };
+		const before = driver.createRun(input);
+		expect(await before.cancel('before start')).toEqual({ status: 'stopped' });
+		const stoppedEvents: AgentEvent[] = [];
+		for await (const event of before.events) stoppedEvents.push(event);
+		expect(stoppedEvents).toEqual([{ type: 'cancelled', reason: 'Cancelled before submission' }]);
 		const run = driver.createRun(input);
-		expect(await run.cancel('before start')).toEqual({ status: 'stopped' });
 		const events = run.events[Symbol.asyncIterator]();
 		expect((await events.next()).value).toEqual({ type: 'thinking', text: 'Received: hello' });
 		expect(await run.cancel('after submission')).toEqual({ status: 'unsupported' });

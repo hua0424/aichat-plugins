@@ -5,6 +5,8 @@ import type { AgentRun, PreparedRun, RunDriver } from './events.js';
 export const fakeDescriptor: DriverDescriptor = {
 	contractVersion: DRIVER_CONTRACT_VERSION,
 	type: 'fake',
+	context: { kind: 'bound-channel' },
+	features: { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' },
 	create: () => new FakeDriver(),
 };
 
@@ -19,6 +21,7 @@ class FakeDriver implements RunDriver {
 			throw new TypeError('Invalid prepared run');
 		let consumed = false;
 		let submitted = false;
+		let cancelled = input.signal.aborted;
 		const events: AgentRun['events'] = {
 			[Symbol.asyncIterator]: () => {
 				if (consumed) throw new Error('AgentRun events can be consumed only once');
@@ -27,7 +30,7 @@ class FakeDriver implements RunDriver {
 			},
 		};
 		async function* execute() {
-			if (input.signal.aborted) { yield { type: 'cancelled' as const, reason: 'Cancelled before submission' }; return; }
+			if (cancelled || input.signal.aborted) { yield { type: 'cancelled' as const, reason: 'Cancelled before submission' }; return; }
 			try {
 				input.conversation.assertCurrent();
 				submitted = true;
@@ -42,8 +45,10 @@ class FakeDriver implements RunDriver {
 		}
 		return {
 			events,
-			async cancel(reason) {
-				return submitted ? { status: 'unsupported' } : { status: 'stopped' };
+			async cancel(_reason) {
+				if (submitted) return { status: 'unsupported' };
+				cancelled = true;
+				return { status: 'stopped' };
 			},
 			async dispose() {},
 		};

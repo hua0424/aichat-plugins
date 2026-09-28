@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
-import { createDriver, DRIVER_CONTRACT_VERSION, type DriverDescriptor } from '../agent/descriptor.js';
+import { createDriver, nativeContext, DRIVER_CONTRACT_VERSION, type DriverDescriptor } from '../agent/descriptor.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
@@ -111,12 +111,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// Static registration: adding an adapter changes this assembly list, not the handler or CLI.
 	const descriptors = new Map<string, DriverDescriptor>([
 		['openclaw', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'openclaw',
+			context: nativeContext('openclaw'),
+			features: { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' },
 			create: () => new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token,
 				undefined, undefined, (id, _workspace, identityId) => {
 					if (!conversations) throw new Error('conversation bindings not ready');
 					conversations.assertOpenclawPromptOwner(id, identityId);
 				}) }],
 		['opencode', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'opencode', workspaceBase: opencodeWorkspaceBase,
+			context: nativeContext('opencode'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
 			create: (entry) => new OpencodeDriver({
 				server: opencodeServer,
 				assertDirectoryOwner: (id, directory) => {
@@ -126,12 +130,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				...(entry.model !== undefined ? { model: entry.model } : {}),
 			}) }],
 		['codex', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'codex', workspaceBase: codexWorkspaceBase,
+			context: nativeContext('codex'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
 			create: (entry) => new CodexDriver({
 				createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
 					config: { developer_instructions: systemPrompt } }),
 				...(entry.model !== undefined ? { model: entry.model } : {}),
 			}) }],
 		['cc', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'cc', workspaceBase: ccWorkspaceBase,
+			context: nativeContext('cc'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
 			create: () => new CcHeadlessDriver({
 				workspaceBase: ccWorkspaceBase, brokerPort: ccBrokerPort(),
 				registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
