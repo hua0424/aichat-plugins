@@ -69,7 +69,7 @@ Key invariant: THINKING_START sends `triggerMsgId`; the server broadcasts back `
 
 ### AgentDriver (`packages/node/src/agent/`)
 
-Every agent backend is one driver directory implementing the unified `AgentDriver` seam (ADR-0001/0003), emitting normalized `AgentEvent`s (`events.ts`): `agent/openclaw/` · `agent/opencode/` · `agent/codex/` · `agent/cc/`. Adding an agent = adding one driver directory; nothing above the seam changes. (The former `ClawAdapter`/`OpenclawAdapter` two-layer shape was melted into `agent/openclaw/openclaw-driver.ts` in aichatoverview#162.)
+Each backend implements the versioned static `AgentDriver`/`AgentRun` contract (`agent/events.ts`, `agent/descriptor.ts`), emitting normalized `AgentEvent`s. The four shipped adapters live under `agent/openclaw/`, `agent/opencode/`, `agent/codex/`, `agent/cc/`; a fifth test-only example is `agent/example-fake.ts`. To add one, register its descriptor at `commands/start.ts` and read the current onboarding, error, config and migration guide at umbrella `docs/shared/plugins-driver-development.md`; core identity routing and the generic CLI remain unchanged.
 
 The openclaw driver connects to the openclaw gateway via WebSocket RPC with device identity signature (v3 payload) + token auth.
 
@@ -106,7 +106,7 @@ Config files (JSONC with `//` comment support):
 ## Key Invariants
 
 1. **Message prefix:** Must NOT use `[SYSTEM]`, `[System Message]`, or similar markers — filtered by openclaw security hardening. The reply contract is no longer prefixed into the per-turn user message (REQ-018, aichatoverview#218 — moved to the drivers' system layer).
-2. **Compound sessionKey (openclaw):** `OpenclawDriver.openSession` builds `<token>:aiclaw-{uid}-room-{roomId}` — opaque token FIRST, then a literal `:`, then the plaintext binding LAST. exec-env's `buildOpenclawExecEnv` extracts the token PREFIX → `OPENCLAW_BIND`; the node's CapabilityEndpoint keys on the BARE token alone (never split the compound — a compound arriving at the endpoint = forgery → store miss). This format is preserved (openclaw gateway-side session isolation); only the retired tools' tail-parsing consumer was removed.
+2. **Compound sessionKey (openclaw):** Core imports and preserves the historical `<token>:aiclaw-{uid}-room-{roomId}` native reference; `OpenclawDriver.createRun` reuses it, or constructs a fresh one from the core-bound context key. The opaque token is first; the native exec-env hook extracts that token into `OPENCLAW_BIND`. CapabilityEndpoint looks up the bare token in core, never derives identity from the plaintext tail. The old gateway-side format remains valid during migration.
 3. **Thinking session lifecycle:** `THINKING_START` → (buffer deltas) → `thinkingId` backfilled → flush buffered deltas → `THINKING_DELTA` stream → `THINKING_END`. Always guard against double-finalization with `session.finalized`.
 4. **AutoReply extra field:** Messages sent with `extra: { autoReply: true }` are skipped by the handler to prevent self-trigger loops.
 5. **AI-to-AI backoff:** After 5 consecutive AI-to-AI rounds, exponential delay kicks in (5s → 15s → 30s). Human messages reset the counter.
