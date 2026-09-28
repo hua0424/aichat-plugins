@@ -35,8 +35,8 @@ describe('four driver legacy bridges through real capability endpoint', () => {
 		bridges.codex.set('aiclaw-3-room-303', { threadId: 'thread-303' });
 		bridges.opencode.set('aiclaw-4-room-404', { sessionID: 'session-404', directory: '/test' });
 		const written: string[] = [];
-		const api = (uid: string) => ({ sendMessage: async (room: string) => {
-			written.push(`${uid}:${room}`); return { msgId: randomUUID() };
+		const api = (uid: string) => ({ supportsMessageReceipts: async () => false, sendMessage: async (room: string) => {
+			written.push(`${uid}:${room}`); return { msgId: '101' };
 		} }) as unknown as HulaApiClient;
 		const apis = new Map([...providers.keys()].map((uid) => [uid, api(uid)]));
 		const bound = (r: ReturnType<typeof store.resolveCandidate>) => r && ({

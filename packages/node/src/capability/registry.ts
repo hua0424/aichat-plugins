@@ -1,5 +1,6 @@
 import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { errMsg } from '../util/err.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /**
  * REQ-010 S1 — capability execution context.
@@ -16,11 +17,24 @@ export interface CapabilityContext {
 	apiClient: HulaApiClient;
 	/** Endpoint-owned reset receipt correlation; never populated from capability args. */
 	requestId?: string;
+	/** Core-resolved generation, not caller-supplied; part of the T15 payload fingerprint. */
+	generation?: number;
+	/** Set only after a successful, explicit T15 capability probe. */
+	receiptSupported?: boolean;
 	resetBearer?: string;
 }
 
 export class CapabilityRejectedError extends Error {}
 export class CapabilityPersistenceError extends Error {}
+export class ReceiptProbeError extends Error {}
+
+/** Timestamp-shaped IDs permit bounded retries, including explicit reuse after restart; syntax is not provenance. */
+export function autoRetrySafe(requestId: string | undefined, now = Date.now()): boolean {
+	const match = /^r([0-9a-z]+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(requestId ?? '');
+	if (!match) return false;
+	const created = Number.parseInt(match[1], 36);
+	return Number.isSafeInteger(created) && created <= now && now - created < 7 * 24 * 60 * 60 * 1000;
+}
 
 /** A node-local capability: pure-ish, gets a bound context + opaque args, returns a JSON result. */
 export type Capability = (ctx: CapabilityContext, args: Record<string, unknown>) => Promise<unknown>;
@@ -57,9 +71,28 @@ export function sendMessageCapability(): Capability {
 			throw new Error('send-message: `content` is required and must be a non-empty string');
 		}
 		const content = raw.trim();
-		const { msgId } = await ctx.apiClient.sendMessage(ctx.roomId, content);
-		if (typeof msgId !== 'string' || !msgId.trim()) throw new Error('send-message: missing committed msgId');
-		return { msgId, roomId: ctx.roomId };
+		try { ctx.receiptSupported = await ctx.apiClient.supportsMessageReceipts(); }
+		catch (err) {
+			if (err instanceof HulaApiRejectedError) throw err;
+			throw new ReceiptProbeError('receipt capability probe unavailable; no write started');
+		}
+		if (ctx.receiptSupported && !ctx.requestId) throw new Error('send-message: missing requestId');
+		// Old server: one legacy attempt, never retry an uncertain write or assume ignored fields work.
+		const attempts = ctx.receiptSupported && autoRetrySafe(ctx.requestId) ? 3 : 1;
+		for (let attempt = 0; attempt < attempts; attempt++) {
+			if (attempt > 0 && !autoRetrySafe(ctx.requestId)) throw new Error('receipt retry window elapsed');
+			try {
+				const { msgId } = ctx.receiptSupported
+					? await ctx.apiClient.sendMessage(ctx.roomId, content, { cliGeneration: ctx.generation }, ctx.requestId)
+					: await ctx.apiClient.sendMessage(ctx.roomId, content);
+				if (!/^\d+$/.test(msgId) || msgId === '0') throw new Error('send-message: missing committed msgId');
+				return { msgId, roomId: ctx.roomId, receiptMode: ctx.receiptSupported ? 'durable' : 'legacy' };
+			} catch (err) {
+				if (err instanceof HulaApiRejectedError || attempt === attempts - 1) throw err;
+				await delay(200 * (attempt + 1));
+			}
+		}
+		throw new Error('send-message: result unknown');
 	};
 }
 

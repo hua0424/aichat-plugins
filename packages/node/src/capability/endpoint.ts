@@ -6,7 +6,7 @@ import { unlinkSync, existsSync, mkdirSync, chmodSync, openSync, writeSync, clos
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
-import { CapabilityPersistenceError, CapabilityRejectedError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
+import { CapabilityPersistenceError, CapabilityRejectedError, ReceiptProbeError, type CapabilityRegistry, type CapabilityContext } from './registry.js';
 import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
 
@@ -73,7 +73,7 @@ export class CapabilityEndpoint {
 	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
 	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
 	/** An unknown result must never be evicted as if the write had not happened. */
-	private readonly unknown = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
+	private readonly unknown = new Map<string, { fingerprint: string; result: CapabilityResponse; since: number; durable: boolean }>();
 	/** Minimal reset receipt survives its own removal of the bound native session. */
 	private readonly resetReceipts = new Map<string, Promise<CapabilityResponse>>();
 	private readonly roomGeneration = new Map<string, number>();
@@ -175,14 +175,14 @@ export class CapabilityEndpoint {
 			return { status: 400, json: { ok: false, code: 'UNSUPPORTED', error: 'unknown command', retryable: false } };
 		}
 
+		const roomKey = JSON.stringify([this.serverNamespace, resolved.aiclawUid, resolved.roomId]);
 		const ctx: CapabilityContext = {
 			aiclawUid: resolved.aiclawUid,
 			roomId: resolved.roomId,
 			apiClient: resolved.apiClient,
-			...(parsed.command === 'reset-session' ? {
-				requestId: parsed.requestId,
-				resetBearer: JSON.stringify(parsed.sessionKey ?? parsed.contexts),
-			} : {}),
+			...(parsed.command === 'send-message' || parsed.command === 'reset-session' ? { requestId: parsed.requestId } : {}),
+			...(parsed.command === 'send-message' ? { generation: generation ?? this.roomGeneration.get(roomKey) ?? 0 } : {}),
+			...(parsed.command === 'reset-session' ? { resetBearer: JSON.stringify(parsed.sessionKey ?? parsed.contexts) } : {}),
 		};
 		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
 		if (write && !parsed.requestId) {
@@ -191,19 +191,22 @@ export class CapabilityEndpoint {
 		// Key is the configured server + resolved identity, never a caller-supplied identity/room.
 		if (parsed.command === 'send-message' && typeof parsed.args.content === 'string') parsed.args.content = parsed.args.content.trim();
 		const key = write ? JSON.stringify([this.serverNamespace, resolved.aiclawUid, parsed.requestId]) : '';
-		const roomKey = JSON.stringify([this.serverNamespace, resolved.aiclawUid, resolved.roomId]);
 		// Only effective business args: never hash bearer/session tokens or ignored caller padding.
 		const fingerprint = write ? createHash('sha256').update(JSON.stringify([
 			parsed.command, resolved.roomId, generation ?? this.roomGeneration.get(roomKey) ?? 0,
 			typeof parsed.args.content === 'string' ? parsed.args.content : null,
 		])).digest('hex') : '';
+		const oldUnknown = this.unknown.get(key);
 		if (write) {
-			const prior = this.inFlight.get(key) ?? this.completed.get(key) ?? this.unknown.get(key);
+			const prior = this.inFlight.get(key) ?? this.completed.get(key) ?? oldUnknown;
 			if (prior) {
 				if (prior.fingerprint !== fingerprint) {
 					return { status: 409, json: { ok: false, code: 'IDEMPOTENCY_CONFLICT', error: 'requestId used with different write', retryable: false } };
 				}
-				return prior.result;
+				// Only explicit T15 support allows confirmation replay; never auto-replay outside 7 days.
+				if (prior !== oldUnknown || parsed.command !== 'send-message' || !oldUnknown?.durable ||
+					Date.now() - oldUnknown.since >= 7 * 24 * 60 * 60 * 1000) return prior.result;
+				this.unknown.delete(key);
 			}
 		}
 		if (parsed.command === 'send-message' &&
@@ -245,19 +248,24 @@ export class CapabilityEndpoint {
 			} catch (err) {
 				// An upstream error may contain a bearer. Log only the stable class, never its raw message.
 				const code = err instanceof HulaApiRejectedError ? err.code
+					: err instanceof ReceiptProbeError ? 'UPSTREAM_FAILED'
 					: err instanceof CapabilityRejectedError ? 'IDENTITY_UNAVAILABLE'
 					: err instanceof CapabilityPersistenceError ? 'PERSISTENCE_FAILED'
 					: write ? 'DELIVERY_UNKNOWN' : 'UPSTREAM_FAILED';
 				console.log(`${loc} err=${code}`);
 				if (err instanceof HulaApiRejectedError || err instanceof CapabilityRejectedError) {
-					return { status: code === 'FORBIDDEN' ? 403 : 400,
+					return { status: code === 'FORBIDDEN' ? 403 : code === 'IDEMPOTENCY_CONFLICT' ? 409 : 400,
 						json: { ok: false, code, error: code === 'FORBIDDEN' ? 'forbidden by API' : 'capability rejected', retryable: false } };
 				}
 				if (err instanceof CapabilityPersistenceError) return { status: 503,
 					json: { ok: false, code, error: 'reset persistence unavailable; retain requestId', retryable: false } };
+				if (err instanceof ReceiptProbeError) return { status: 503,
+					json: { ok: false, code, error: 'receipt probe unavailable; no write started', retryable: true } };
 				// Once a write starts, transport failures cannot establish whether the server committed it.
 				return write
-					? { status: 503, json: { ok: false, code, error: 'write result unknown locally; retain requestId and do not resend automatically', requestId: parsed.requestId, retryable: false } }
+					? { status: 503, json: { ok: false, code, error: ctx.receiptSupported === false
+						? 'server does not support durable receipts; result unknown; retain requestId; do not retry automatically'
+						: 'write result unknown; retain requestId and payload for same-ID confirmation', requestId: parsed.requestId, retryable: false } }
 					: { status: 503, json: { ok: false, code, error: 'upstream query unavailable', retryable: true } };
 			}
 		};
@@ -269,8 +277,9 @@ export class CapabilityEndpoint {
 		if (resetReceiptKey) this.resetReceipts.set(resetReceiptKey, result);
 		void result.then((response) => {
 			this.inFlight.delete(key);
-			if (response.status === 503) {
-				this.unknown.set(key, { fingerprint, result: response });
+			if (response.status === 503 && (response.json as { code?: string }).code === 'DELIVERY_UNKNOWN') {
+				this.unknown.set(key, { fingerprint, result: response,
+					since: oldUnknown?.since ?? Date.now(), durable: parsed.command === 'send-message' && ctx.receiptSupported === true });
 			} else if (response.status === 200) {
 				this.completed.set(key, { fingerprint, result: response });
 			} else if (resetReceiptKey) {

@@ -3,7 +3,7 @@ import { contextDescriptors } from '../capability/context-descriptors.js';
 
 /** Reply only to the room/identity resolved by the node from the agent execution environment. */
 export async function handleSendMessage(args: string[]): Promise<void> {
-	return runCapabilityCommand('send-message', args, (result) => `Message sent: ${JSON.stringify(result)}`, true);
+	return runCapabilityCommand('send-message', args, (result) => `Message sent: ${JSON.stringify({ msgId: result.msgId, ...(result.roomId === undefined ? {} : { roomId: result.roomId }) })}`, true);
 }
 
 /** Descriptor-only candidate collection: no SDK, registry, backend or other identity credentials. */

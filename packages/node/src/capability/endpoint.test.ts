@@ -21,7 +21,7 @@ import { resetSessionCapability } from './registry.js';
  */
 function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Platform; maxWriteIds?: number }) {
 	const sendMessage = vi.fn(async () => ({ msgId: '1' }));
-	const apiClient = { sendMessage } as unknown as HulaApiClient;
+	const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
 	registry.register('send-message', sendMessageCapability());
 	const resolve = vi.fn((_sessionKey: string) => {
@@ -169,8 +169,8 @@ describe('CapabilityEndpoint.handle', () => {
 
 describe('V2 all-candidate binding', () => {
 	function setup() {
-		const sendMessage = vi.fn(async () => ({ msgId: 'ok' }));
-		const apiClient = { sendMessage } as unknown as HulaApiClient;
+		const sendMessage = vi.fn(async () => ({ msgId: '1' }));
+		const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
 		const registry = new CapabilityRegistry();
 		registry.register('send-message', sendMessageCapability());
 		const resolve = vi.fn(() => undefined);
@@ -237,7 +237,7 @@ describe('local write requestId', () => {
 	function setup() {
 		let release!: (id: { msgId: string }) => void;
 		const sendMessage = vi.fn(() => new Promise<{ msgId: string }>((resolve) => { release = resolve; }));
-		const apiClient = { sendMessage } as unknown as HulaApiClient;
+		const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
 		const registry = new CapabilityRegistry();
 		registry.register('send-message', sendMessageCapability());
 		registry.register('reset-session', async () => ({ reset: true }));

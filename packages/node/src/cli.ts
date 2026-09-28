@@ -106,7 +106,9 @@ Commands:
   start                                          Connect and run
   send-message --content <text> [--request-id <id>] Reply to the current chat
                                                  (room + identity are bound automatically
-                                                  from your agent session — never passed in)
+                                                  from your agent session — never passed in;
+                                                  unknown: retain ID + content, do not change ID;
+                                                  no automatic replay beyond 7 days)
   reset-session [--request-id <id>]              Reset this room's agent session (fresh next msg)
   recover-run <runId> --verified-stopped          Offline-only: confirm a manually verified stopped run
                                                  (stop daemon first; NEVER assume restart proves stopped)

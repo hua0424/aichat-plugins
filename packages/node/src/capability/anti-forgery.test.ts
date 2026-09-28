@@ -25,7 +25,7 @@ import type { HulaApiClient } from '../api/hula-api.js';
 
 /** A tagged fake api client so we can assert WHICH identity's client the endpoint would reply through. */
 function fakeApi(tag: string): HulaApiClient {
-	return { sendMessage: vi.fn(async () => ({ msgId: '1' })), __tag: tag } as unknown as HulaApiClient;
+	return { sendMessage: vi.fn(async () => ({ msgId: '1' })), supportsMessageReceipts: async () => false, __tag: tag } as unknown as HulaApiClient;
 }
 
 describe('BL-014 (#141) anti-forgery — forged plaintext binding never resolves; minted token does', () => {

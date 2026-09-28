@@ -69,7 +69,7 @@ describe('FileCodexSessionStore', () => {
 		const resumed = new FileCodexSessionStore(path);
 		const agents = ['1', '2'].map((uid) => ({
 			uid,
-			api: { uid, sendMessage: vi.fn(async () => ({ msgId: 'ack' })) },
+			api: { uid, supportsMessageReceipts: async () => false, sendMessage: vi.fn(async () => ({ msgId: '101' })) },
 			driver: { type: 'codex', resolveSession: (thread: string) => {
 				const binding = resumed.findKeyByThreadId(thread);
 				return binding ? parseBindingKey(binding) : undefined;
