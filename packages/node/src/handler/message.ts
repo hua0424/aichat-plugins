@@ -1092,12 +1092,15 @@ export class MessageHandler {
 	private handleThinkingEndBroadcast(data: ThinkingEndDTO): void {
 		const { thinkingId, roomId, status, error } = data;
 		const starting = data.clientRunId ? this.pendingThinkingStarts.get(data.clientRunId) : undefined;
-		if (starting && thinkingId && status === 'error' && error && LIMIT_REASONS[error]
+		if (starting && thinkingId && (status === 'complete' || status === 'error')
 			&& String(data.fromUid) === this.selfUid && String(roomId) === starting.session.roomId) {
+			// A persisted terminal with this exact run/id is proof START already finished on server,
+			// even if its START receipt was lost. Do not replay START or END against that record.
 			this.forgetThinkingStart(data.clientRunId!);
 			starting.session.finalized = true;
 			if (starting.session.timeoutId) clearTimeout(starting.session.timeoutId);
-			this.sendAutoReply(starting.session.roomId, LIMIT_REASONS[error]);
+			console.warn(`[thinking] START already terminal run=${data.clientRunId} thinking=${thinkingId} status=${status} error=${error ?? ''}`);
+			if (error && LIMIT_REASONS[error]) this.sendAutoReply(starting.session.roomId, LIMIT_REASONS[error]);
 			this.teardownSession(starting.session, starting.session.roomId, true);
 			return;
 		}

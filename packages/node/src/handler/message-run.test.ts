@@ -87,18 +87,36 @@ describe('persisted MessageHandler run', () => {
 		handler.destroy();
 		store.close();
 	});
-	it('a terminal rate-limit END before START receipt cancels only its exact run', async () => {
-		const { handler, store, frames, close } = setup();
-		handler.handle({ type: 'receiveMessage', data: message(7) });
+	it.each(['rate_limit_exceeded', 'thinking_members_unavailable'])(
+		'a persisted %s END before START receipt cancels only its exact run', async (error) => {
+			const { handler, store, frames, close } = setup();
+			handler.handle({ type: 'receiveMessage', data: message(7) });
+			await tick();
+			const runId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
+			handler.handle({ type: 'thinkingEnd', data: { fromUid: '42', roomId: '9', thinkingId: 'limited', clientRunId: runId, status: 'error', error } });
+			await tick();
+			expect(close).toHaveBeenCalled();
+			handler.onConnected();
+			handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '7', clientRunId: runId, thinkingId: 'limited' } });
+			expect(frames.filter((f) => f.type === WSReqType.THINKING_START)).toHaveLength(1);
+			expect(frames.filter((f) => f.type === WSReqType.THINKING_END)).toHaveLength(0);
+			handler.destroy();
+			store.close();
+		},
+	);
+
+	it('drops a buffered END if a persisted terminal arrives before its START receipt', async () => {
+		const { handler, store, frames, emit } = setup();
+		handler.handle({ type: 'receiveMessage', data: message(8) });
 		await tick();
 		const runId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
-		handler.handle({ type: 'thinkingEnd', data: { fromUid: '42', roomId: '9', thinkingId: 'limited', clientRunId: runId, status: 'error', error: 'rate_limit_exceeded' } });
+		emit({ type: 'done', durationMs: 1 });
 		await tick();
-		expect(close).toHaveBeenCalled();
+		handler.handle({ type: 'thinkingEnd', data: { fromUid: '42', roomId: '9', thinkingId: 'terminal', clientRunId: runId, status: 'error', error: 'thinking_members_unavailable' } });
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '8', clientRunId: runId, thinkingId: 'terminal' } });
 		handler.onConnected();
-		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '7', clientRunId: runId, thinkingId: 'limited' } });
-		expect(frames.filter((f) => f.type === WSReqType.THINKING_START)).toHaveLength(1);
 		expect(frames.filter((f) => f.type === WSReqType.THINKING_END)).toHaveLength(0);
+		expect(frames.filter((f) => f.type === WSReqType.THINKING_START)).toHaveLength(1);
 		handler.destroy();
 		store.close();
 	});
