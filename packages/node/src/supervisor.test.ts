@@ -106,6 +106,7 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				built.prewarmPromptTemplatesByUid.set(uid, prewarmPromptTemplates);
 				return {
 					handle: vi.fn(),
+					onConnected: vi.fn(),
 					prewarmGroupConfigs,
 					prewarmPersona,
 					setPromptTemplates,

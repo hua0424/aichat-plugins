@@ -177,6 +177,7 @@ export class Supervisor {
 				// REQ-008 #76 P2: 重连成功 → 回到 online。**但 offline 是 terminal**：
 				// 已降级身份的迟到重连回调不得翻回 online（degrade 已断 ws/driver）。
 				this.markReconnected(cred.uid);
+				ref.handler!.onConnected(); // Re-send only pending exact-run thinking frames after socket recovery.
 				// REQ #26 / BL-015 #140: 首连 + 每次重连主动预热全量群配置。Nacos 重注册窗口内会失败，
 				// 交给 retryAsync 有界退避重试自愈（fire-and-forget，永不 reject，不阻塞 onopen）。
 				// handler 在 onConnected 触发前必已就绪（见 ref 注释），故此处非空断言安全。
