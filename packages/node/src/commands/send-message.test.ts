@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { resolveAgentSessionKey } from './send-message.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { resolveAgentSessionKey, resolveAgentContexts, handleSendMessage } from './send-message.js';
+import { handleResetSession } from './reset-session.js';
+import { postCapability } from '../capability/client.js';
+
+vi.mock('../capability/client.js', () => ({ postCapability: vi.fn() }));
 
 /**
  * REQ-010 S6 Phase-2 — resolveAgentSessionKey now also recognizes OPENCLAW_BIND.
@@ -14,6 +18,7 @@ describe('resolveAgentSessionKey', () => {
 		CODEX_THREAD_ID: process.env.CODEX_THREAD_ID,
 		OPENCLAW_BIND: process.env.OPENCLAW_BIND,
 		AICHAT_BIND: process.env.AICHAT_BIND,
+		AICHAT_CONTEXT_KEY: process.env.AICHAT_CONTEXT_KEY,
 	};
 
 	beforeEach(() => {
@@ -21,6 +26,7 @@ describe('resolveAgentSessionKey', () => {
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
 		delete process.env.AICHAT_BIND;
+		delete process.env.AICHAT_CONTEXT_KEY;
 	});
 
 	afterEach(() => {
@@ -61,5 +67,79 @@ describe('resolveAgentSessionKey', () => {
 
 	it('none set → undefined', () => {
 		expect(resolveAgentSessionKey()).toBeUndefined();
+	});
+
+	it('V2 collects every inherited candidate instead of trusting the first driver', () => {
+		process.env.AICHAT_CONTEXT_KEY = 'opaque-context';
+		process.env.OPENCODE_SESSION_ID = 'ses_x';
+		process.env.CODEX_THREAD_ID = 'thr_y';
+		process.env.OPENCLAW_BIND = 'opaque-openclaw';
+		process.env.AICHAT_BIND = 'opaque-cc';
+		expect(resolveAgentContexts()).toEqual([
+			{ key: 'opaque-context' },
+			{ provider: 'opencode', nativeId: 'ses_x' },
+			{ provider: 'codex', nativeId: 'thr_y' },
+			{ provider: 'openclaw', nativeId: 'opaque-openclaw' },
+			{ provider: 'cc', nativeId: 'opaque-cc' },
+		]);
+	});
+});
+
+describe('CLI write request ID', () => {
+	const originalBind = process.env.AICHAT_BIND;
+	const originalKey = process.env.AICHAT_CONTEXT_KEY;
+	beforeEach(() => {
+		delete process.env.AICHAT_CONTEXT_KEY;
+		delete process.env.OPENCODE_SESSION_ID;
+		delete process.env.CODEX_THREAD_ID;
+		delete process.env.OPENCLAW_BIND;
+		process.env.AICHAT_BIND = 'opaque-token';
+	});
+	afterEach(() => {
+		if (originalBind === undefined) delete process.env.AICHAT_BIND;
+		else process.env.AICHAT_BIND = originalBind;
+		if (originalKey === undefined) delete process.env.AICHAT_CONTEXT_KEY;
+		else process.env.AICHAT_CONTEXT_KEY = originalKey;
+		vi.restoreAllMocks();
+	});
+
+	it('sends an explicit requestId without changing default success output', async () => {
+		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: { ok: true, result: { msgId: '91' } } });
+		const out = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleSendMessage(['--content', ' hi ', '--request-id', 'retry-id']);
+		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({
+			version: 2, contexts: [{ provider: 'cc', nativeId: 'opaque-token' }], command: 'send-message', requestId: 'retry-id', args: { content: 'hi' },
+		});
+		expect(out).toHaveBeenCalledWith('Message sent: {"msgId":"91"}');
+	});
+
+	it('generates IDs for writes, but honors an explicit reset ID', async () => {
+		vi.mocked(postCapability).mockResolvedValueOnce({ status: 200, body: { ok: true, result: { msgId: '91' } } })
+			.mockResolvedValueOnce({ status: 200, body: { ok: true, result: { reset: false, driverType: 'cc' } } });
+		vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleSendMessage(['--content', 'first']);
+		const id = (vi.mocked(postCapability).mock.calls.at(-1)?.[1] as { requestId: string }).requestId;
+		expect(id).toMatch(/^r[0-9a-z]+\.[\da-f-]{36}$/);
+		await handleResetSession(['--request-id', 'reset-1']);
+		expect(vi.mocked(postCapability).mock.calls.at(-1)?.[1]).toMatchObject({ command: 'reset-session', requestId: 'reset-1' });
+	});
+
+	it('reset reports a rotated history without promising execution when old stop is unconfirmed', async () => {
+		vi.mocked(postCapability).mockResolvedValue({ status: 200, body: {
+			ok: true, result: { reset: true, driverType: 'cc', roomId: '9', executionPaused: true },
+		} });
+		const out = vi.spyOn(console, 'log').mockImplementation(() => {});
+		await handleResetSession(['--request-id', 'paused-reset']);
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('旧任务停止未确认，执行仍暂停'));
+		expect(out).not.toHaveBeenCalledWith(expect.stringContaining('下一条消息将开启全新会话'));
+	});
+
+	it('transport errors report the reusable ID rather than silently generating another request', async () => {
+		vi.mocked(postCapability).mockRejectedValue(new Error('timeout'));
+		const out = vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('exit'); });
+		await expect(handleSendMessage(['--content', 'hi', '--request-id', 'retry-id'])).rejects.toThrow('exit');
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('DELIVERY_UNKNOWN'));
+		expect(out).toHaveBeenCalledWith(expect.stringContaining('--request-id retry-id'));
 	});
 });

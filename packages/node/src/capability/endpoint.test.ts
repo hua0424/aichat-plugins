@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, statSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, statSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { postCapability } from './client.js';
 import {
 	CapabilityEndpoint,
 	capabilitySocketPath,
@@ -10,15 +12,16 @@ import {
 	sanitizeLogField,
 } from './endpoint.js';
 import { CapabilityRegistry, sendMessageCapability } from './registry.js';
-import type { HulaApiClient } from '../api/hula-api.js';
+import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
+import { resetSessionCapability } from './registry.js';
 
 /**
  * Build an endpoint wired to a real registry (send-message) + a controllable resolve. The fake
  * apiClient's sendMessage is the observable seam: we assert which roomId it received.
  */
-function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: number; platform?: NodeJS.Platform }) {
-	const sendMessage = vi.fn(async () => ({ msgId: 1 }));
-	const apiClient = { sendMessage } as unknown as HulaApiClient;
+function build(opts?: { resolveRoom?: number | undefined; platform?: NodeJS.Platform; maxWriteIds?: number }) {
+	const sendMessage = vi.fn(async () => ({ msgId: '1' }));
+	const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
 	const registry = new CapabilityRegistry();
 	registry.register('send-message', sendMessageCapability());
 	const resolve = vi.fn((_sessionKey: string) => {
@@ -28,8 +31,8 @@ function build(opts?: { resolveRoom?: number | undefined; idempotencyCap?: numbe
 	const endpoint = new CapabilityEndpoint({
 		registry,
 		resolve,
-		idempotencyCap: opts?.idempotencyCap,
 		platform: opts?.platform,
+		maxWriteIds: opts?.maxWriteIds,
 	});
 	return { endpoint, sendMessage, resolve };
 }
@@ -91,7 +94,7 @@ describe('CapabilityEndpoint.handle', () => {
 		const { endpoint, sendMessage } = build({ resolveRoom: undefined });
 		const res = await endpoint.handle({ body: body() });
 		expect(res.status).toBe(404);
-		expect((res.json as { ok: boolean }).ok).toBe(false);
+		expect(res.json).toMatchObject({ ok: false, code: 'CONTEXT_REVOKED' });
 		expect(sendMessage).not.toHaveBeenCalled();
 	});
 
@@ -100,6 +103,20 @@ describe('CapabilityEndpoint.handle', () => {
 		const res = await endpoint.handle({ body: body({ command: 'no-such-command' }) });
 		expect(res.status).toBe(400);
 		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('errors carry stable codes and never echo a token from upstream failures', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			expect(await endpoint.handle({ body: { version: 2, contexts: [], command: 'send-message' } })).toMatchObject({ status: 400, json: { code: 'INVALID_ARGUMENT', retryable: false } });
+			expect(await endpoint.handle({ body: body({ command: 'no-such-command' }) })).toMatchObject({ status: 400, json: { code: 'UNSUPPORTED', retryable: false } });
+			sendMessage.mockRejectedValueOnce(new HulaApiRejectedError('token=secret', 'FORBIDDEN'));
+			const forbidden = await endpoint.handle({ body: body() });
+			expect(forbidden).toMatchObject({ status: 403, json: { code: 'FORBIDDEN', retryable: false } });
+			expect(JSON.stringify(forbidden)).not.toContain('secret');
+			expect(JSON.stringify(log.mock.calls)).not.toContain('secret');
+		} finally { log.mockRestore(); }
 	});
 
 	it('sessionKey with no known prefix → 400, resolve + capability NOT invoked', async () => {
@@ -120,27 +137,362 @@ describe('CapabilityEndpoint.handle', () => {
 		expect(sendMessage).toHaveBeenCalledOnce();
 	});
 
-	it('idempotency cache is FIFO-bounded: oldest key is evicted once the cap is exceeded', async () => {
-		// cap=3: after driving 4 distinct keys, the first ('k0') must have been evicted.
-		const { endpoint, sendMessage } = build({ resolveRoom: 42, idempotencyCap: 3 });
-		for (let i = 0; i < 4; i++) {
-			await endpoint.handle({ body: body({ idempotencyKey: `k${i}` }) });
+	it('old request IDs remain protected after more than the former 1000-entry cache limit', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		for (let i = 0; i < 1001; i++) {
+			await endpoint.handle({ body: body({ requestId: `k${i}`, idempotencyKey: undefined }) });
 		}
-		expect(sendMessage).toHaveBeenCalledTimes(4);
-		// Re-sending the evicted 'k0' re-invokes (proving it was dropped, i.e. the Map stays bounded).
-		await endpoint.handle({ body: body({ idempotencyKey: 'k0' }) });
-		expect(sendMessage).toHaveBeenCalledTimes(5);
-		// A still-cached key ('k3', the newest) is NOT re-invoked.
-		await endpoint.handle({ body: body({ idempotencyKey: 'k3' }) });
-		expect(sendMessage).toHaveBeenCalledTimes(5);
+		await endpoint.handle({ body: body({ requestId: 'k0', idempotencyKey: undefined }) });
+		expect(sendMessage).toHaveBeenCalledTimes(1001);
+		log.mockRestore();
 	});
 
-	it('capability throw → 500 with error', async () => {
-		const { endpoint } = build({ resolveRoom: 42 });
-		// empty content makes sendMessageCapability throw
+	it('when receipts fill, rejects new IDs without losing an old confirmed result', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42, maxWriteIds: 1 });
+		const first = await endpoint.handle({ body: body({ requestId: 'first', idempotencyKey: undefined }) });
+		const full = await endpoint.handle({ body: body({ requestId: 'new', idempotencyKey: undefined }) });
+		expect(full).toMatchObject({ status: 507, json: { code: 'PERSISTENCE_FAILED' } });
+		expect(await endpoint.handle({ body: body({ requestId: 'first', idempotencyKey: undefined }) })).toEqual(first);
+		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+
+	it('invalid write args → 400, not cached under requestId', async () => {
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
 		const res = await endpoint.handle({ body: body({ args: { content: '' } }) });
-		expect(res.status).toBe(500);
+		expect(res.status).toBe(400);
 		expect((res.json as { ok: boolean }).ok).toBe(false);
+		expect((await endpoint.handle({ body: body() })).status).toBe(200);
+		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+});
+
+describe('V2 all-candidate binding', () => {
+	function setup() {
+		const sendMessage = vi.fn(async () => ({ msgId: '1' }));
+		const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
+		const registry = new CapabilityRegistry();
+		registry.register('send-message', sendMessageCapability());
+		const resolve = vi.fn(() => undefined);
+		const resolveCandidate = vi.fn((candidate: { key?: string; nativeId?: string }) => {
+			const id = candidate.key ?? candidate.nativeId;
+			if (id === 'unknown') return undefined;
+			return { conversationId: id === 'other' ? 'other' : 'conv', generation: id === 'new-generation' ? 2 : 1,
+				aiclawUid: 'owner', roomId: 'room-1', apiClient };
+		});
+		const endpoint = new CapabilityEndpoint({ registry, resolve, resolveCandidate });
+		const request = (contexts: unknown) => ({ version: 2, contexts, command: 'send-message', args: { content: 'hello' }, requestId: randomUUID() });
+		return { endpoint, resolve, resolveCandidate, sendMessage, request };
+	}
+
+	it('resolves all key/native candidates to one conversation and never consults legacy resolver', async () => {
+		const { endpoint, resolve, resolveCandidate, sendMessage, request } = setup();
+		const res = await endpoint.handle({ body: request([{ key: 'bound-key' }, { provider: 'codex', nativeId: 'native-thread', runtimeScope: 'owner' }]) });
+		expect(res.status).toBe(200);
+		expect(resolveCandidate).toHaveBeenCalledTimes(2);
+		expect(resolve).not.toHaveBeenCalled();
+		expect(sendMessage).toHaveBeenCalledWith('room-1', 'hello');
+	});
+
+	it.each([
+		[{ key: 'bound-key' }, { key: 'other' }],
+		[{ key: 'bound-key' }, { provider: 'codex', nativeId: 'unknown' }],
+		[{ key: 'bound-key' }, { key: 'new-generation' }],
+	])('rejects conflicting, unknown, or cross-generation candidates before side effects: %j', async (...contexts) => {
+		const { endpoint, sendMessage, request } = setup();
+		expect(await endpoint.handle({ body: request(contexts) })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT' } });
+		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('rejects empty/overbound/malformed/mixed envelopes and V2 self-reported routing', async () => {
+		const { endpoint, sendMessage, resolveCandidate, request } = setup();
+		for (const invalid of [[], Array(9).fill({ key: 'x' }), [{ key: '' }], [{ key: 'x', provider: 'cc' }],
+			[{ provider: 'cc', nativeId: '' }], [{ provider: 'cc', nativeId: 'x', runtimeScope: 'x'.repeat(257) }]]) {
+			expect((await endpoint.handle({ body: request(invalid) })).status).toBe(400);
+		}
+		for (const extra of [{ sessionKey: 'cc:other' }, { roomId: 'forged' }, { args: { content: 'hello', uid: 'forged' } }, { version: 3 }]) {
+			expect((await endpoint.handle({ body: { ...request([{ key: 'bound-key' }]), ...extra } })).status).toBe(400);
+		}
+		expect(resolveCandidate).not.toHaveBeenCalled();
+		expect(sendMessage).not.toHaveBeenCalled();
+	});
+
+	it('single unknown candidate differs from multi-candidate ambiguity', async () => {
+		const { endpoint, request } = setup();
+		expect(await endpoint.handle({ body: request([{ key: 'unknown' }]) })).toMatchObject({ status: 404, json: { code: 'UNKNOWN_CONTEXT', retryable: false } });
+		expect(await endpoint.handle({ body: request([{ key: 'bound-key' }, { key: 'unknown' }]) })).toMatchObject({ status: 409, json: { code: 'AMBIGUOUS_CONTEXT', retryable: false } });
+	});
+
+	it('fails closed without a production resolver, does not fall back to legacy resolver', async () => {
+		const registry = new CapabilityRegistry();
+		registry.register('send-message', sendMessageCapability());
+		const resolve = vi.fn(() => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }));
+		const endpoint = new CapabilityEndpoint({ registry, resolve });
+		expect(await endpoint.handle({ body: { version: 2, contexts: [{ key: 'not-registered' }], command: 'send-message', requestId: 'id' } })).toMatchObject({ status: 404, json: { code: 'UNKNOWN_CONTEXT' } });
+		expect(resolve).not.toHaveBeenCalled();
+	});
+});
+
+describe('local write requestId', () => {
+	function setup() {
+		let release!: (id: { msgId: string }) => void;
+		const sendMessage = vi.fn(() => new Promise<{ msgId: string }>((resolve) => { release = resolve; }));
+		const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
+		const registry = new CapabilityRegistry();
+		registry.register('send-message', sendMessageCapability());
+		registry.register('reset-session', async () => ({ reset: true }));
+		let reads = 0;
+		registry.register('list-friends', async () => ({ reads: ++reads }));
+		const endpoint = new CapabilityEndpoint({
+			registry,
+			serverNamespace: 'https://server.example',
+			resolve: (sessionKey) => sessionKey === 'opencode:revoked' ? undefined : {
+				aiclawUid: sessionKey === 'cc:other' ? 'other' : 'owner',
+				roomId: sessionKey === 'cc:room2' ? 'room2' : 'room1',
+				apiClient,
+			},
+		});
+		return { endpoint, sendMessage, complete: (id: string) => release({ msgId: id }) };
+	}
+
+	it('query rejection and transport failure have stable codes without leaking upstream secrets', async () => {
+		const registry = new CapabilityRegistry();
+		const query = vi.fn().mockRejectedValueOnce(new HulaApiRejectedError('token=hidden', 'FORBIDDEN'))
+			.mockRejectedValueOnce(new Error('token=hidden'));
+		registry.register('fake-query', query);
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }) });
+		const request = body({ command: 'fake-query', args: {}, requestId: 'same', idempotencyKey: undefined });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			const forbidden = await endpoint.handle({ body: request });
+			const failed = await endpoint.handle({ body: request });
+			expect(forbidden).toMatchObject({ status: 403, json: { code: 'FORBIDDEN', retryable: false } });
+			expect(failed).toMatchObject({ status: 503, json: { code: 'UPSTREAM_FAILED', retryable: true } });
+			expect(JSON.stringify([forbidden, failed, log.mock.calls])).not.toContain('hidden');
+			expect(query).toHaveBeenCalledTimes(2);
+		} finally { log.mockRestore(); }
+	});
+
+	it('fake registered query reruns despite a reused write requestId and cannot return a write receipt', async () => {
+		const registry = new CapabilityRegistry();
+		const fakeQuery = vi.fn(async () => ({ ordinal: fakeQuery.mock.calls.length }));
+		const fakeWrite = vi.fn(async () => ({ msgId: 'committed' }));
+		registry.register('fake-query', fakeQuery);
+		registry.register('send-message', fakeWrite);
+		const endpoint = new CapabilityEndpoint({ registry,
+			resolve: () => ({ aiclawUid: 'owner', roomId: 'room', apiClient: {} as HulaApiClient }) });
+		const requestId = 'shared';
+		const query = body({ command: 'fake-query', args: {}, requestId, idempotencyKey: undefined });
+		expect(await endpoint.handle({ body: query })).toMatchObject({ status: 200, json: { result: { ordinal: 1 } } });
+		expect(await endpoint.handle({ body: body({ requestId, idempotencyKey: undefined }) })).toMatchObject({ status: 200, json: { result: { msgId: 'committed' } } });
+		expect(await endpoint.handle({ body: query })).toMatchObject({ status: 200, json: { result: { ordinal: 2 } } });
+		expect(fakeQuery).toHaveBeenCalledTimes(2);
+		expect(fakeWrite).toHaveBeenCalledOnce();
+	});
+
+	it('registers before invoking: two concurrent callers share a single real resolution/result', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const request = body({ requestId: 'same', idempotencyKey: undefined });
+		const a = endpoint.handle({ body: request });
+		const b = endpoint.handle({ body: request });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+		complete('101');
+		const [first, second] = await Promise.all([a, b]);
+		expect(first).toEqual(second);
+		expect(first.json).toMatchObject({ result: { msgId: '101' } });
+		expect(await endpoint.handle({ body: request })).toEqual(first);
+	});
+
+	it('conflicts on changed payload, room or command, but not ignored padding/token rotation', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const sameId = { requestId: 'one', idempotencyKey: undefined };
+		const first = endpoint.handle({ body: body({ ...sameId, args: { content: 'hi', metadata: { a: 1, b: 2 } } }) });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+		const reordered = endpoint.handle({ body: body({ ...sameId, args: { metadata: { b: 2, a: 1 }, content: 'hi' } }) });
+		for (const mismatch of [
+			{ args: { content: 'changed' } },
+			{ sessionKey: 'cc:room2' },
+			{ command: 'reset-session' },
+		]) {
+			expect((await endpoint.handle({ body: body({ ...sameId, ...mismatch }) })).status).toBe(409);
+		}
+		const otherToken = endpoint.handle({ body: body({ ...sameId, sessionKey: 'opencode:rotated', args: { content: 'hi' } }) });
+		complete('102');
+		expect(await otherToken).toEqual(await first);
+		expect(await reordered).toEqual(await first);
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it('same requestId across identities is independent, while reads never consume or cache a write ID', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const read = body({ command: 'list-friends', requestId: 'shared', idempotencyKey: undefined });
+		expect((await endpoint.handle({ body: read })).json).toMatchObject({ result: { reads: 1 } });
+		const write = body({ requestId: 'shared', idempotencyKey: undefined });
+		const first = endpoint.handle({ body: write });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+		complete('103');
+		await first;
+		expect((await endpoint.handle({ body: read })).json).toMatchObject({ result: { reads: 2 } });
+		const second = endpoint.handle({ body: body({ ...write, sessionKey: 'cc:other' }) });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+		complete('104');
+		expect((await second).json).toMatchObject({ result: { msgId: '104' } });
+	});
+
+	it('never treats an unknown write or revoked binding as an unsubmitted request', async () => {
+		const { endpoint, sendMessage } = setup();
+		sendMessage.mockRejectedValueOnce(new Error('network reset'));
+		const request = body({ requestId: 'uncertain', idempotencyKey: undefined });
+		const first = await endpoint.handle({ body: request });
+		expect(first).toMatchObject({ status: 503, json: { code: 'DELIVERY_UNKNOWN', requestId: 'uncertain' } });
+		expect(await endpoint.handle({ body: request })).toEqual(first);
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+		expect((await endpoint.handle({ body: body({ ...request, sessionKey: 'opencode:revoked' }) })).status).toBe(404);
+	});
+
+	it('reset persistence exceptions use a stable code without exposing stored details', async () => {
+		const registry = new CapabilityRegistry();
+		registry.register('reset-session', resetSessionCapability(() => { throw new Error('token=private'); }));
+		const endpoint = new CapabilityEndpoint({ registry,
+			resolve: () => ({ aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient }) });
+		const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+		try {
+			const out = await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'durable', idempotencyKey: undefined }) });
+			expect(out).toMatchObject({ status: 503, json: { code: 'PERSISTENCE_FAILED', retryable: false } });
+			expect(JSON.stringify([out, log.mock.calls])).not.toContain('private');
+		} finally { log.mockRestore(); }
+	});
+
+	it('reset receipt remains available only for its old key and exact ID after reset revokes the binding', async () => {
+		let active = true;
+		const registry = new CapabilityRegistry();
+		const reset = vi.fn(() => { active = false; return { driverType: 'codex', reset: true }; });
+		registry.register('reset-session', resetSessionCapability(reset));
+		const endpoint = new CapabilityEndpoint({
+			registry,
+			resolve: () => active ? { aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient } : undefined,
+		});
+		const request = body({ command: 'reset-session', args: {}, requestId: 'reset-id', idempotencyKey: undefined });
+		const first = await endpoint.handle({ body: request });
+		expect(first).toMatchObject({ status: 200, json: { result: { reset: true } } });
+		expect(await endpoint.handle({ body: request })).toEqual(first);
+		expect(reset).toHaveBeenCalledOnce();
+		expect((await endpoint.handle({ body: body({ command: 'list-friends', requestId: 'reset-id', idempotencyKey: undefined }) })).status).toBe(404);
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'other', idempotencyKey: undefined }) })).status).toBe(404);
+	});
+
+	it('consults the durable minimal reset receipt after endpoint restart and old bearer revocation', async () => {
+		const receipts = new Map<string, { reset: true; generation: number; executionPaused: boolean }>();
+		let active = true;
+		const registry = new CapabilityRegistry();
+		const reset = vi.fn((uid: string, room: string, requestId?: string, bearer?: string) => {
+			expect([uid, room]).toEqual(['owner', 'room1']);
+			receipts.set(JSON.stringify([bearer, requestId]), { reset: true, generation: 2, executionPaused: true });
+			active = false;
+			return { driverType: 'cc', reset: true, generation: 2, executionPaused: true };
+		});
+		registry.register('reset-session', resetSessionCapability(reset));
+		const deps = {
+			registry, resolve: () => active ? { aiclawUid: 'owner', roomId: 'room1', apiClient: {} as HulaApiClient } : undefined,
+			getResetReceipt: (bearer: string, id: string) => receipts.get(JSON.stringify([bearer, id])),
+		};
+		const request = body({ command: 'reset-session', args: {}, requestId: 'same', idempotencyKey: undefined });
+		expect((await new CapabilityEndpoint(deps).handle({ body: request })).status).toBe(200);
+		const restarted = new CapabilityEndpoint(deps);
+		expect(await restarted.handle({ body: request })).toMatchObject({ status: 200, json: { result: { reset: true, generation: 2, executionPaused: true } } });
+		expect(reset).toHaveBeenCalledOnce();
+		expect((await restarted.handle({ body: body({ ...request, command: 'member-info' }) })).status).toBe(404);
+	});
+
+	it('pauses business writes before cache lookup but permits read and reset control', async () => {
+		let paused = false;
+		const registry = new CapabilityRegistry();
+		const send = vi.fn(async () => ({ msgId: 'once' }));
+		registry.register('send-message', async () => send());
+		registry.register('member-info', async () => ({ visible: true }));
+		registry.register('reset-session', resetSessionCapability(() => ({ driverType: 'cc', reset: true })));
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'u', roomId: 'r', apiClient: {} as HulaApiClient }), isPaused: () => paused });
+		const request = body({ requestId: 'write-1', idempotencyKey: undefined });
+		expect((await endpoint.handle({ body: request })).status).toBe(200);
+		paused = true;
+		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 409, json: { code: 'RUN_STOP_UNCONFIRMED' } });
+		expect(send).toHaveBeenCalledOnce();
+		expect((await endpoint.handle({ body: body({ command: 'member-info' }) })).status).toBe(200);
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'reset-1', idempotencyKey: undefined }) })).status).toBe(200);
+	});
+
+	it('confirmed reset advances the same room generation so old send IDs cannot be replayed', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const request = body({ requestId: 'pre-reset', idempotencyKey: undefined });
+		const pending = endpoint.handle({ body: request });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+		complete('108');
+		await pending;
+		expect((await endpoint.handle({ body: body({ command: 'reset-session', args: {}, requestId: 'reset', idempotencyKey: undefined }) })).status).toBe(200);
+		// setup() registers a reset capability, but only its reset:true result advances generation.
+		expect((await endpoint.handle({ body: request })).status).toBe(409);
+		expect(sendMessage).toHaveBeenCalledOnce();
+	});
+
+	it('definitive server rejection does not poison an ID; a later corrected retry may execute', async () => {
+		const { endpoint, sendMessage } = setup();
+		sendMessage.mockRejectedValueOnce(new HulaApiRejectedError('forbidden', 'FORBIDDEN')).mockResolvedValueOnce({ msgId: '106' });
+		const request = body({ requestId: 'rejected', idempotencyKey: undefined });
+		expect(await endpoint.handle({ body: request })).toMatchObject({ status: 403, json: { code: 'FORBIDDEN' } });
+		expect((await endpoint.handle({ body: request })).status).toBe(200);
+		expect(sendMessage).toHaveBeenCalledTimes(2);
+	});
+
+	it('ignored deep padding cannot recursively crash a valid write', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		let padding: unknown = null;
+		for (let i = 0; i < 3000; i++) padding = { padding };
+		const request = body({ requestId: 'deep', idempotencyKey: undefined, args: { content: 'hi', padding } });
+		const first = endpoint.handle({ body: request });
+		await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+		complete('107');
+		expect((await first).status).toBe(200);
+	});
+
+	it('reset cancellation begins after the HTTP receipt finishes, never inside the reset capability', async () => {
+		let inReset = false;
+		const delivered = vi.fn(() => expect(inReset).toBe(false));
+		const registry = new CapabilityRegistry();
+		registry.register('reset-session', resetSessionCapability(() => {
+			inReset = true;
+			queueMicrotask(() => { inReset = false; });
+			return { driverType: 'cc', reset: true, generation: 2, executionPaused: true };
+		}));
+		const endpoint = new CapabilityEndpoint({ registry, resolve: () => ({ aiclawUid: 'u', roomId: 'r', apiClient: {} as HulaApiClient }), onResetDelivered: delivered });
+		const socket = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-reset-test-${randomUUID()}` : join(mkdtempSync(join(tmpdir(), 'aichat-reset-')), 'capability.sock');
+		await endpoint.listen(socket);
+		try {
+			const receipt = await postCapability(socket, body({ command: 'reset-session', args: {}, requestId: 'reset-http', idempotencyKey: undefined }));
+			expect(receipt).toMatchObject({ status: 200, body: { result: { reset: true, generation: 2, executionPaused: true } } });
+			await vi.waitFor(() => expect(delivered).toHaveBeenCalledOnce());
+		} finally {
+			await endpoint.close();
+			if (process.platform !== 'win32') rmSync(join(socket, '..'), { recursive: true, force: true });
+		}
+	});
+
+	it('HTTP named-pipe requests with the same explicit ID share one backend write', async () => {
+		const { endpoint, sendMessage, complete } = setup();
+		const socket = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-idem-test-${randomUUID()}` : join(mkdtempSync(join(tmpdir(), 'aichat-idem-')), 'capability.sock');
+		await endpoint.listen(socket);
+		try {
+			const payload = body({ requestId: 'http', idempotencyKey: undefined });
+			const a = postCapability(socket, payload);
+			const b = postCapability(socket, payload);
+			await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+			complete('105');
+			const [one, two] = await Promise.all([a, b]);
+			expect(one).toEqual(two);
+			expect(one).toMatchObject({ status: 200, body: { result: { msgId: '105' } } });
+		} finally {
+			await endpoint.close();
+			if (process.platform !== 'win32') rmSync(join(socket, '..'), { recursive: true, force: true });
+		}
 	});
 });
 
@@ -182,13 +534,13 @@ describe('CapabilityEndpoint.handle observability log ([capability])', () => {
 
 	it('capability-throw branch (500) logs one err line with resolved uid/room', async () => {
 		const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-		const { endpoint } = build({ resolveRoom: 42 });
-		// send-message with no content → sendMessageCapability throws → 500 path.
-		const res = await endpoint.handle({ body: body({ args: {} }) });
-		expect(res.status).toBe(500);
+		const { endpoint, sendMessage } = build({ resolveRoom: 42 });
+		sendMessage.mockRejectedValueOnce(new Error('upstream failed'));
+		const res = await endpoint.handle({ body: body() });
+		expect(res.status).toBe(503);
 		const capLines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[capability]'));
 		expect(capLines).toHaveLength(1);
-		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) err=send-message: `content` is required/);
+		expect(capLines[0]).toMatch(/^\[capability\] send-message .+ → \(uid=7, room=42\) err=DELIVERY_UNKNOWN$/);
 	});
 
 	it('prefix-parse-failure branch (400) logs one (unresolved) unknown session key prefix line', async () => {
@@ -290,6 +642,15 @@ describe('prepareSocketPath (platform-aware)', () => {
 		}
 	});
 
+	it.runIf(process.platform !== 'win32')('never removes a pre-existing socket path', () => {
+		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
+		dirs.push(base);
+		const socketPath = join(base, 'capability.sock');
+		writeFileSync(socketPath, 'not owned');
+		prepareSocketPath(socketPath, process.platform);
+		expect(readFileSync(socketPath, 'utf8')).toBe('not owned');
+	});
+
 	it('win32 → NO-OP: parent dir of a missing path is NOT created', () => {
 		const base = mkdtempSync(join(tmpdir(), 'aichat-cap-'));
 		dirs.push(base);
@@ -315,6 +676,47 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		for (const d of dirs.splice(0)) {
 			rmSync(d, { recursive: true, force: true });
 		}
+	});
+
+	it('second endpoint cannot take the same socket/pipe or close the first endpoint', async () => {
+		const socketPath = process.platform === 'win32'
+			? `\\\\.\\pipe\\aichat-double-${randomUUID()}`
+			: join(mkdtempSync(join(tmpdir(), 'aichat-double-')), 'capability.sock');
+		if (process.platform !== 'win32') dirs.push(join(socketPath, '..'));
+		endpoint = build({ resolveRoom: 42 }).endpoint;
+		await endpoint.listen(socketPath);
+		const second = build({ resolveRoom: 99 }).endpoint;
+		await expect(second.listen(socketPath)).rejects.toThrow();
+		await second.close();
+		expect((await postCapability(socketPath, body())).body).toMatchObject({ result: { roomId: 42 } });
+	});
+
+	it('a second socket override cannot bypass the same-home writer lease', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'aichat-same-home-'));
+		dirs.push(home);
+		const one = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-one-${randomUUID()}` : join(home, 'one.sock');
+		const two = process.platform === 'win32' ? `\\\\.\\pipe\\aichat-two-${randomUUID()}` : join(home, 'two.sock');
+		const deps = { registry: new CapabilityRegistry(), resolve: () => undefined, lockHome: home };
+		endpoint = new CapabilityEndpoint(deps);
+		await endpoint.listen(one);
+		const second = new CapabilityEndpoint(deps);
+		await expect(second.listen(two)).rejects.toThrow();
+		await second.close();
+		expect((await postCapability(one, body())).status).toBe(404); // first pipe remains alive
+	});
+
+	it('reclaims only a verifiably dead writer lock and still handles a request', async () => {
+		const socketPath = process.platform === 'win32'
+			? `\\\\.\\pipe\\aichat-restart-${randomUUID()}`
+			: join(mkdtempSync(join(tmpdir(), 'aichat-restart-')), 'capability.sock');
+		if (process.platform !== 'win32') dirs.push(join(socketPath, '..'));
+		const lock = process.platform === 'win32'
+			? join(tmpdir(), `aichat-capability-${createHash('sha256').update(socketPath).digest('hex')}.lock`)
+			: `${socketPath}.lock`;
+		writeFileSync(lock, `9999999:${randomUUID()}`);
+		endpoint = build({ resolveRoom: 42 }).endpoint;
+		await endpoint.listen(socketPath);
+		expect((await postCapability(socketPath, body())).body).toMatchObject({ result: { roomId: 42 } });
 	});
 
 	it.runIf(process.platform !== 'win32')('binds the socket 0600 inside a 0700 parent dir (anti-spoofing)', async () => {

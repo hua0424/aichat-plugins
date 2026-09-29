@@ -2,20 +2,19 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 /**
- * REQ-018 — pure + small IO helpers for the AGENTS.md marked block (codex/openclaw shared).
+ * REQ-018 — pure + small IO helpers for the AGENTS.md marked block.
  *
- * codex exec re-reads the workspace `AGENTS.md` each turn; openclaw reads a file in its workspace
- * (convention `~/.openclaw/AGENTS.md`, adapter_config-configurable in the future — see the openclaw
- * driver's R1 confirmation note). Both drivers render the SAME unified system prompt (identity anchor +
- * persona + reply contract) into this marked block:
+ * Openclaw reads a file in its workspace (convention `~/.openclaw/AGENTS.md`,
+ * adapter_config-configurable in the future — see the openclaw driver's R1 confirmation note).
+ * The legacy Codex driver wrote the same block; native Codex runs now inspect it for
+ * conflicts but pass the prepared prompt via per-run client configuration instead:
  *
  *   <!-- aichat:system:begin -->
  *   <rendered system prompt>
  *   <!-- aichat:system:end -->
  *
- * The markers make upsert idempotent AND shared across drivers: an older block (from the other driver
- * or an older template version) is replaced in place, never duplicated. `syncAgentsMdFile` hash-compares
- * before writing so an unchanged file costs zero IO (codex re-reads per turn).
+ * The markers make openclaw's upsert idempotent. An older block is replaced in place,
+ * never duplicated. `syncAgentsMdFile` skips unchanged writes.
  */
 
 /** Begin marker of the aichat-managed block in AGENTS.md. */

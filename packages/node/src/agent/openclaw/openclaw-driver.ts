@@ -3,10 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { bindingKey, type BindTokenStore } from '../bind-token-store.js';
-import type { ChatContext } from '../workspace.js';
-import { buildSystemPrompt } from '../prompt-templates.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
 import { errMsg } from '../../util/err.js';
 
@@ -247,13 +244,19 @@ const OPENCLAW_CHAT_TIMEOUT_MS = 5 * 60 * 1000;
  * payload) + token auth, negotiates protocol v4, and streams each turn's assistant text as
  * `thinking` AgentEvents with a `done`/`error` terminal.
  */
-export class OpenclawDriver implements AgentDriver {
+// ponytail: one global AGENTS.md scope per workspace; permit multi-identity concurrency only
+// when a pinned gateway proves per-session prompt isolation and provides an isolated injection API.
+const promptOwners = new Map<string, string>();
+const promptActive = new Map<string, { owner: string; prompt: string; count: number }>();
+const promptWrites = new Map<string, Promise<void>>();
+
+export class OpenclawDriver implements RunDriver {
 	readonly type = 'openclaw';
+	readonly features = { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' } as const;
 
 	private ws: WebSocket | null = null;
 	private url: string;
 	private token: string;
-	private readonly bindTokens: BindTokenStore;
 	private readonly wsFactory: OpenclawSocketFactory;
 	/**
 	 * REQ-018 R1（真机已确认）: openclaw 实际读取的工作区是 `~/.openclaw/workspace/`，会话启动时把其中的
@@ -289,6 +292,10 @@ export class OpenclawDriver implements AgentDriver {
 
 	/** Map requestId → runId for linking response to chat */
 	private requestToRunId = new Map<string, string>();
+	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
+	private earlyEvents = new Map<string, GatewayAgentEvent[]>();
+	private earlyOverflow = new Set<string>();
+	private earlyOverflowGlobal = false;
 
 	/** Resolve function for initial connect() promise */
 	private connectResolve: (() => void) | null = null;
@@ -297,96 +304,121 @@ export class OpenclawDriver implements AgentDriver {
 	constructor(
 		url: string,
 		token: string,
-		bindTokens: BindTokenStore,
 		wsFactory: OpenclawSocketFactory = defaultOpenclawSocketFactory,
 		// REQ-018 R1: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw/workspace).
 		workspaceDir?: string,
+		private readonly assertPromptOwner?: (conversationId: string, workspace: string, identityId: string) => void,
 	) {
 		this.url = url;
 		this.token = token;
-		this.bindTokens = bindTokens;
 		this.wsFactory = wsFactory;
 		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw', 'workspace');
 	}
 
-	/**
-	 * BL-014 (#141) — resolve the openclaw capability session id back to its bound identity+room.
-	 *
-	 * The CLI/exec-env path delivers a BARE opaque node-minted token here (aichat-claw's resolve_exec_env
-	 * hook extracts the token PREFIX out of the compound sessionKey and injects it as OPENCLAW_BIND, the
-	 * CLI emits `openclaw:<token>`, and resolveBoundSession strips the `openclaw:` prefix before calling
-	 * this). So this is an EXACT STORE LOOKUP, NOT a parse and NOT a split.
-	 *
-	 * #141 B+ (regression fix): openSession now hands the gateway a COMPOUND `<token>:<binding>`
-	 * sessionKey (see openSession). resolveSession must NOT split that compound — it looks up the whole
-	 * argument as-is. The only thing that legitimately reaches here is the bare token; a forged plaintext
-	 * binding, OR a compound an attacker appends a binding tail to, is never a stored key → undefined
-	 * (the endpoint then 404s). The compound only legitimately exists gateway-side, inside beginChat.
-	 */
-	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
-		return this.bindTokens.resolve(sessionKey);
+	/** Core owns the native gateway key; the legacy binding store is not consulted by this path. */
+	createRun(input: PreparedRun): AgentRun {
+		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
+			!/^aiclaw-\d+-room-\d+$/.test(input.transcriptKey ?? '') ||
+			!(/^[0-9a-f]{64}$/.test(input.contextKey ?? '')) || typeof input.systemPrompt !== 'string')
+			throw new TypeError('Invalid OpenClaw prepared run');
+		let consumed = false, submitted = false, completed = false, cancelled = input.signal.aborted;
+		let session: OpenclawSession | undefined;
+		const workspace = process.platform === 'win32' ? resolve(this.workspaceDir).toLowerCase() : resolve(this.workspaceDir);
+		const onAbort = () => { void run.cancel('aborted'); };
+		input.signal.addEventListener('abort', onAbort, { once: true });
+		const run: AgentRun = {
+			events: { [Symbol.asyncIterator]: () => {
+				if (consumed) throw new Error('OpenClaw run events can be consumed only once');
+				consumed = true;
+				return execute();
+			} },
+			async cancel(reason) {
+				cancelled = true;
+				await session?.close(); // Local stream wake, NOT proof of gateway cancellation.
+				return completed || !submitted ? { status: 'stopped' } :
+					{ status: 'unconfirmed', reason: `${reason}: OpenClaw gateway run stop not verified` };
+			},
+			async dispose() {
+				input.signal.removeEventListener('abort', onAbort);
+				if (!completed) await run.cancel('dispose');
+			},
+		};
+		const execute = async function* (this: OpenclawDriver): AsyncGenerator<AgentEvent> {
+			let held = false;
+			try {
+				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				const previous = input.conversation.nativeState?.value;
+				if (previous !== undefined && (!previous || typeof previous !== 'object' ||
+					!('token' in previous) || typeof previous.token !== 'string' ||
+					!('nativeRef' in previous) || typeof previous.nativeRef !== 'string' ||
+					!previous.nativeRef.startsWith(`${previous.token}:`)))
+					throw new Error('OpenClaw nativeRef invalid; explicit reset required (history retained)');
+				// The old full compound is opaque history. Never derive identity by parsing its tail.
+				const token = previous && typeof previous === 'object' && 'token' in previous
+					? previous.token as string : input.contextKey!;
+				const nativeRef = previous && typeof previous === 'object' && 'nativeRef' in previous
+					? previous.nativeRef as string : `${token}:${input.transcriptKey}`;
+				const identityId = input.promptOwner ?? input.conversation.id;
+				this.assertPromptOwner?.(input.conversation.id, workspace, identityId);
+				const owner = promptOwners.get(workspace);
+				if (owner && owner !== identityId) throw new Error('PROMPT_SCOPE_CONFLICT: shared OpenClaw AGENTS.md belongs to another identity');
+				const active = promptActive.get(workspace);
+				if (active && (active.owner !== identityId || active.prompt !== input.systemPrompt))
+					throw new Error('PROMPT_SCOPE_CONFLICT: active OpenClaw run uses another identity or prompt');
+				promptActive.set(workspace, { owner: identityId, prompt: input.systemPrompt, count: (active?.count ?? 0) + 1 }); held = true;
+				input.conversation.assertCurrent();
+				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				if (!previous) {
+					if (!input.conversation.registerNative) throw new Error('OpenClaw atomic native registration unavailable');
+					await input.conversation.registerNative(token, { version: 1, value: { token, nativeRef } });
+				}
+				// Publish sticky ownership only after core actually owns a native history.
+				promptOwners.set(workspace, identityId);
+				await input.saveRecovery({ version: 1, value: { provider: 'openclaw', runId: input.runId,
+					nativeRef, stopProbe: 'unconfirmed' } });
+				input.conversation.assertCurrent();
+				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				// A shared gateway workspace offers only a mutable AGENTS.md. Failure must block submission,
+				// not silently run under a previous identity's prompt.
+				let writing = promptWrites.get(workspace);
+				if (!writing) {
+					writing = syncAgentsMdFile(join(this.workspaceDir, 'AGENTS.md'), input.systemPrompt).then(() => {});
+					promptWrites.set(workspace, writing);
+					void writing.finally(() => { if (promptWrites.get(workspace) === writing) promptWrites.delete(workspace); }).catch(() => {});
+				}
+				await writing;
+				input.conversation.assertCurrent();
+				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef, sink, () => { submitted = true; }),
+					() => input.conversation.assertCurrent());
+				const stream = session.send(input.message);
+				let terminal: AgentEvent | undefined;
+				for await (const event of stream) {
+					if (cancelled) { yield { type: 'cancelled', reason: 'OpenClaw stop not confirmed' }; return; }
+					if (event.type === 'done' || event.type === 'error' || event.type === 'cancelled') terminal = event;
+					else if (!terminal) yield event;
+				}
+				if (cancelled) yield { type: 'cancelled', reason: 'OpenClaw stop not confirmed' };
+				else if (terminal?.type === 'done') { completed = true; yield terminal; }
+				else yield terminal ?? { type: 'error', message: 'UNEXPECTED_EOF: OpenClaw gateway did not confirm completion' };
+			} catch (error) {
+				yield { type: 'error', message: errMsg(error) };
+			} finally {
+				input.signal.removeEventListener('abort', onAbort);
+				if (held) {
+					const active = promptActive.get(workspace)!;
+					if (active.count === 1) promptActive.delete(workspace);
+					else promptActive.set(workspace, { ...active, count: active.count - 1 });
+				}
+				if (!completed) void session?.close();
+			}
+		}.bind(this);
+		return run;
 	}
 
-	/**
-	 * AgentDriver hook: strip openclaw's own `NO_REPLY` sentinel + empty/whitespace thinking bodies from
-	 * the reduced thinking content before THINKING_END. openclaw-specific (the sentinel is upstream
-	 * openclaw's built-in contract); other drivers don't implement the hook → their content is verbatim.
-	 */
+	/** Keep gateway-specific NO_REPLY normalization out of the generic message handler. */
 	finalizeThinking(content: string): string {
 		return filterOpenclawThinking(content);
-	}
-
-	/**
-	 * aichatoverview#124 — no per-room store: openclaw's binding IS the sessionKey, so there is
-	 * nothing to reset. No-op, returns false.
-	 */
-	resetSession(): boolean {
-		return false;
-	}
-
-	async openSession(o: {
-		aiclawUid: string;
-		roomId: string;
-		chatContext: ChatContext;
-	}): Promise<AgentSession> {
-		// #161 (ADR-0004): openclaw replies via the unified `aichat send-message` CLI — the in-gateway
-		// aichat-claw `hula_send_message` TOOL was retired. We still hand the gateway a COMPOUND sessionKey
-		// `<token>:<binding>` — the opaque token FIRST, a literal `:`, then the plaintext binding LAST:
-		//   • aichat-claw's resolve_exec_env extracts the token PREFIX → OPENCLAW_BIND → CLI `openclaw:<token>`.
-		//   • the `aiclaw-{uid}-room-{roomId}` binding TAIL is retained for openclaw gateway-side session
-		//     isolation (keeps openclaw's conversation key unique + stable per room).
-		//   • the token is lowercase hex (`[0-9a-f]`, contains no `:`) so the `<token>:<binding>` split is
-		//     unambiguous. (#161 A′: hex is lowercase-native — openclaw lowercases the sessionKey it echoes
-		//     back through resolve_exec_env, and a hex token survives that round-trip; mixed-case would not.)
-		// CONFINEMENT: this compound is used ONLY here, as the gateway `agent` req sessionKey. It is NEVER a
-		// node-internal key — the node-side thinking sessionKey is computed independently from (uid,room)
-		// in the message handler, and resolveSession keys on the BARE token alone (it must NOT split the
-		// compound; a compound arriving at the endpoint = forgery → store miss → undefined).
-		// mint() is stable per (uid,room), so the openclaw conversation sessionKey stays constant.
-		const token = this.bindTokens.mint(o.aiclawUid, o.roomId);
-		const sessionKey = `${token}:${bindingKey(o.aiclawUid, o.roomId)}`;
-
-		// REQ-018: render the unified system prompt once per (per-turn) session and write it into the
-		// openclaw workspace AGENTS.md marked block (openclaw re-reads it per turn). The identity anchor +
-		// persona + reply contract live THERE — the per-turn gateway message stays pure. hash-compare
-		// (syncAgentsMdFile) skips the write when unchanged; a write failure degrades (warn, don't fail).
-		const selfName = o.chatContext.templates ? await o.chatContext.getSelfName?.() : undefined;
-		const systemPrompt = o.chatContext.templates
-			? buildSystemPrompt(o.chatContext.templates, {
-					displayName: selfName,
-					uid: o.aiclawUid,
-					persona: o.chatContext.persona ?? null,
-				})
-			: undefined;
-		if (systemPrompt) {
-			try {
-				await syncAgentsMdFile(join(this.workspaceDir, 'AGENTS.md'), systemPrompt);
-			} catch (err) {
-				console.warn(`[openclaw] AGENTS.md write failed (degrading: no system prompt this turn): ${errMsg(err)}`);
-			}
-		}
-
-		return new OpenclawSession((message, sink) => this.beginChat(message, sessionKey, sink));
 	}
 
 	async connect(): Promise<void> {
@@ -418,7 +450,7 @@ export class OpenclawDriver implements AgentDriver {
 	 * Called by an OpenclawSession's send(); the gateway's streamed reply is mapped to the sink by
 	 * processAgentStreamEvent (assistant → thinking, lifecycle end/error → done/error).
 	 */
-	private beginChat(message: string, sessionKey: string, sink: ChatSink): void {
+	private beginChat(message: string, sessionKey: string, sink: ChatSink, onSubmit?: () => void): void {
 		if (!this.connected || !this.ws) {
 			sink.push({ type: 'error', message: 'openclaw gateway not connected' });
 			sink.finish();
@@ -431,7 +463,7 @@ export class OpenclawDriver implements AgentDriver {
 		// aichatoverview#161：回复统一走 CLI（`aichat send-message`），不再引导已退役的
 		// hula_send_message / hula_skip_reply 工具。房间/身份由 exec-env 的 OPENCLAW_BIND 绑定。
 		// REQ-018：per-turn message 是纯用户文本 —— 回复契约 + 身份锚 + 人设已渲染进 openSession 写入的
-		// workspace AGENTS.md（openclaw 每轮重读），不再逐轮给 gateway message 加前缀。
+		// workspace AGENTS.md（legacy openSession 或 native createRun 准备阶段），不再给 gateway message 加前缀。
 		const params = {
 			message,
 			sessionKey,
@@ -470,7 +502,16 @@ export class OpenclawDriver implements AgentDriver {
 		chat.timeout.unref?.();
 		this.activeChats.set(`req:${requestId}`, chat);
 
-		this.ws.send(JSON.stringify(frame));
+		// The frame may start native work synchronously. A local not-connected error above
+		// never marks submission; a send failure after this point has unknown delivery.
+		onSubmit?.();
+		try { this.ws.send(JSON.stringify(frame)); }
+		catch (error) {
+			chat.done = true;
+			sink.push({ type: 'error', message: errMsg(error) });
+			sink.finish();
+			this.cleanupChat(requestId);
+		}
 	}
 
 	// ─── WebSocket lifecycle ───
@@ -610,24 +651,16 @@ export class OpenclawDriver implements AgentDriver {
 
 	private handleAgentEvent(evt: GatewayAgentEvent): void {
 		const chat = this.activeChats.get(`run:${evt.runId}`);
-		if (!chat) {
-			// 可能 runId 还没关联，尝试通过 requestId 查找并关联
-			for (const [reqId, runId] of this.requestToRunId) {
-				if (runId === '' || runId === evt.runId) {
-					this.requestToRunId.set(reqId, evt.runId);
-					const pendingChat = this.activeChats.get(`req:${reqId}`);
-					if (pendingChat) {
-						this.activeChats.set(`run:${evt.runId}`, pendingChat);
-						this.activeChats.delete(`req:${reqId}`);
-						this.processAgentStreamEvent(pendingChat, evt);
-					}
-					return;
-				}
-			}
-			return;
-		}
-
-		this.processAgentStreamEvent(chat, evt);
+		if (chat) { this.processAgentStreamEvent(chat, evt); return; }
+		// A gateway can deliver stream frames before its accepted response. Without the response's
+		// requestId→runId association, guessing the first pending request can cross-route identities.
+		if (![...this.requestToRunId.values()].includes('')) return;
+		if (this.earlyOverflow.has(evt.runId)) return;
+		const buffered = this.earlyEvents.get(evt.runId) ?? [];
+		if (buffered.length >= 64) { this.earlyEvents.delete(evt.runId); this.earlyOverflow.add(evt.runId); return; }
+		if (this.earlyEvents.size >= 16 && !buffered.length) { this.earlyOverflowGlobal = true; return; }
+		buffered.push(evt);
+		this.earlyEvents.set(evt.runId, buffered);
 	}
 
 	private processAgentStreamEvent(chat: PendingChat, evt: GatewayAgentEvent): void {
@@ -806,6 +839,16 @@ export class OpenclawDriver implements AgentDriver {
 		if (chat) {
 			this.activeChats.set(`run:${runId}`, chat);
 			this.activeChats.delete(`req:${requestId}`);
+			if (this.earlyOverflowGlobal || this.earlyOverflow.delete(runId)) {
+				chat.done = true;
+				chat.sink.push({ type: 'error', message: 'OPENCLAW_EARLY_STREAM_OVERFLOW: gateway event correlation incomplete' });
+				chat.sink.finish();
+				this.cleanupChat(requestId);
+				return;
+			}
+			const buffered = this.earlyEvents.get(runId) ?? [];
+			this.earlyEvents.delete(runId);
+			for (const event of buffered) { if (!chat.done) this.processAgentStreamEvent(chat, event); }
 		}
 	}
 
@@ -850,6 +893,9 @@ export class OpenclawDriver implements AgentDriver {
 			this.activeChats.delete(`run:${runId}`);
 		}
 		this.requestToRunId.delete(requestId);
+		if (![...this.requestToRunId.values()].includes('')) {
+			this.earlyEvents.clear(); this.earlyOverflow.clear(); this.earlyOverflowGlobal = false;
+		}
 		this.pending.delete(requestId);
 	}
 
@@ -928,6 +974,9 @@ export class OpenclawDriver implements AgentDriver {
 		}
 		this.activeChats.clear();
 		this.requestToRunId.clear();
+		this.earlyEvents.clear();
+		this.earlyOverflow.clear();
+		this.earlyOverflowGlobal = false;
 	}
 }
 
@@ -936,7 +985,7 @@ export class OpenclawDriver implements AgentDriver {
  * send() returns an async iterable backed by a minimal push→pull queue so events fired by the
  * engine (possibly synchronously, before the consumer awaits) are buffered and never lost.
  */
-class OpenclawSession implements AgentSession {
+class OpenclawSession {
 	private closed = false;
 	/**
 	 * REQ-008 #75 P1-1①: the in-flight stream's `finish` closure, registered when
@@ -952,7 +1001,10 @@ class OpenclawSession implements AgentSession {
 	 * sink send() hands it. The driver builds this closure in openSession (capturing the compound
 	 * sessionKey) so the gateway engine stays encapsulated on the driver.
 	 */
-	constructor(private readonly startChat: (message: string, sink: ChatSink) => void) {}
+	constructor(
+		private readonly startChat: (message: string, sink: ChatSink) => void,
+		private readonly assertRunCurrent?: () => void,
+	) {}
 
 	send(message: string): AsyncIterable<AgentEvent> {
 		const buffer: AgentEvent[] = [];
@@ -985,6 +1037,7 @@ class OpenclawSession implements AgentSession {
 		// REQ-010 S1 / aichatoverview#161: no terminal AgentEvent — the openclaw agent sends its
 		// reply out-of-band by running `aichat send-message` (accounted at the node's
 		// CapabilityEndpoint), so there is no in-stream terminal tool to bridge.
+		this.assertRunCurrent?.();
 		this.startChat(message, { push, finish });
 
 		const isClosed = () => this.closed;

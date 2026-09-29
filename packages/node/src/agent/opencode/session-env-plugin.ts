@@ -15,9 +15,12 @@ export const SessionEnvPlugin: Plugin = async () => ({
 		input: { cwd: string; sessionID?: string; callID?: string },
 		output: { env: Record<string, string> },
 	) => {
-		if (input.sessionID) {
-			output.env.OPENCODE_SESSION_ID = input.sessionID;
-		}
+		// Scope to THIS tool invocation; without a native session no inherited credential may route
+		// a shell command to another identity. Empty overrides suppress process env inheritance.
+		Object.assign(output.env, {
+			OPENCODE_SESSION_ID: input.sessionID ?? '',
+			CODEX_THREAD_ID: '', OPENCLAW_BIND: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '',
+		});
 	},
 });
 

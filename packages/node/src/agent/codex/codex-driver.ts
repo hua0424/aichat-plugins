@@ -1,372 +1,181 @@
-import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, realpath } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { AICHAT_SYSTEM_BEGIN, AICHAT_SYSTEM_END, renderSystemBlock } from '../agents-md.js';
+import { createHash } from 'node:crypto';
 import type { Codex, Thread, ThreadOptions } from '@openai/codex-sdk';
-import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { mapCodexEvent } from './events.js';
-import type { CodexSessionStore } from './session-store.js';
-import { buildSystemPrompt } from '../prompt-templates.js';
-import { syncAgentsMdFile } from '../agents-md.js';
-import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 import { errMsg } from '../../util/err.js';
 
-/**
- * The slice of the codex SDK `Codex` client this driver needs. Injecting an interface (rather than a
- * concrete `Codex`) lets tests pass a fake that scripts `startThread`/`resumeThread`.
- */
 export interface CodexClient {
 	startThread(opts?: ThreadOptions): Thread;
 	resumeThread(id: string, opts?: ThreadOptions): Thread;
 }
-
+export type _CodexSatisfiesClient = Codex extends CodexClient ? true : never;
 export interface CodexDriverDeps {
-	/** The codex client (a real `Codex`, or a fake in tests). */
-	codex: CodexClient;
-	workspaceBase: string;
-	sessionStore: CodexSessionStore;
-	/** Optional model override applied to every thread (e.g. "gpt-5-codex"). */
+	/** A fresh client per run: CLI developer_instructions are client-scoped, not thread-scoped. */
+	createCodex: (systemPrompt: string) => CodexClient;
 	model?: string;
 }
 
-/** Assert at the type boundary that a real `Codex` satisfies the injected `CodexClient`. */
-export type _CodexSatisfiesClient = Codex extends CodexClient ? true : never;
-
-/**
- * REQ-010 S5 — CodexDriver: the THIRD AgentDriver (after openclaw, opencode), backed by
- * `@openai/codex-sdk`.
- *
- * Unlike opencode there is NO shared long-lived server: the SDK spawns a `codex exec` subprocess
- * per turn, so `connect()` is a no-op. Each per-(aiclawUid, roomId) conversation maps to a codex
- * Thread (created lazily on openSession, resumed across restarts via the session store), scoped to a
- * per-conversation workspace `workingDirectory`.
- *
- * THINKING-ONLY: the driver never replies to chat directly. The agent's reasoning/text and tool
- * activity stream out as AgentEvents (text = thinking); the real reply goes out-of-band via the
- * agent running `aichat send-message` in its shell. With no `terminal` event, reduceThinking
- * auto-skips — exactly correct here.
- *
- * env-injection: codex NATIVELY injects `CODEX_THREAD_ID` into its exec shell subprocess, so unlike
- * opencode (shell.env plugin) / openclaw (resolve_exec_env) NO injection hook is needed. The `aichat`
- * CLI reads `CODEX_THREAD_ID` directly; resolveSession reverse-looks-up (aiclaw, room) from the store.
- */
-export class CodexDriver implements AgentDriver {
+/** Native thread binding, recovery, and CODEX_THREAD_ID alias are owned by core. */
+export class CodexDriver implements RunDriver {
 	readonly type = 'codex';
-
-	private readonly codex: CodexClient;
-	private readonly workspaceBase: string;
-	private readonly sessionStore: CodexSessionStore;
-	private readonly model?: string;
-
-	constructor(deps: CodexDriverDeps) {
-		this.codex = deps.codex;
-		this.workspaceBase = deps.workspaceBase;
-		this.sessionStore = deps.sessionStore;
-		this.model = deps.model;
-	}
-
-	async connect(): Promise<void> {
-		// No-op: the codex SDK spawns `codex exec` per turn; there is no shared server to start.
-	}
-
+	readonly features = { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' } as const;
+	private readonly active = new Set<CodexRun>();
+	constructor(private readonly deps: CodexDriverDeps) {}
+	async connect(): Promise<void> {}
 	async disconnect(): Promise<void> {
-		// No-op: no shared server / no per-driver resources. Per-turn stream cleanup is owned by
-		// CodexSession.close() (called by the handler).
+		await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
 	}
-
-	/**
-	 * Map a codex thread id (carried by the `aichat send-message` capability as `CODEX_THREAD_ID`)
-	 * back to the bound HuLa identity+room. Reverse-looks-up the `aiclaw-{uid}-room-{roomId}` key the
-	 * thread id was stored under and parses it. Returns undefined when the id is unknown/unparseable.
-	 */
-	resolveSession(threadId: string): { aiclawUid: string; roomId: string } | undefined {
-		const key = this.sessionStore.findKeyByThreadId(threadId);
-		return key ? parseBindingKey(key) : undefined;
-	}
-
-	/**
-	 * aichatoverview#124 — drop the stored thread for this (uid,room) so the NEXT turn starts a FRESH
-	 * codex thread (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
-	 */
-	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
-		return true;
-	}
-
-	async openSession(o: {
-		aiclawUid: string;
-		roomId: string;
-		chatContext: ChatContext;
-	}): Promise<AgentSession> {
-		const ctx = o.chatContext;
-		// Namespace the workspace by aiclawUid so two identities never collide (reuse opencode's
-		// deriveWorkspaceDir — it already handles group/dm + the `~` expansion).
-		const workingDirectory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
-		await mkdir(workingDirectory, { recursive: true });
-
-		// REQ-018: render the unified system prompt once per (per-turn) session and write it into the
-		// workspace AGENTS.md marked block. codex exec re-reads workspace AGENTS.md each turn, so the
-		// identity anchor + persona + reply contract live THERE — the per-turn user message stays pure.
-		// hash-compare (syncAgentsMdFile) skips the write when unchanged. A write failure degrades to
-		// "no system prompt this turn" (warn, don't fail the turn).
-		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
-		const systemPrompt = ctx.templates
-			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
-			: undefined;
-		if (systemPrompt) {
-			try {
-				await syncAgentsMdFile(join(workingDirectory, 'AGENTS.md'), systemPrompt);
-			} catch (err) {
-				console.warn(`[codex] AGENTS.md write failed (degrading: no system prompt this turn): ${errMsg(err)}`);
-			}
-		}
-
-		const key = bindingKey(o.aiclawUid, o.roomId);
-
-		// codex's default bubblewrap sandbox FAILS in the container → danger-full-access. approvalPolicy
-		// "never" so the agent runs unattended; skipGitRepoCheck so a non-git workspace is fine.
-		const threadOpts: ThreadOptions = {
-			sandboxMode: 'danger-full-access',
-			approvalPolicy: 'never',
-			skipGitRepoCheck: true,
-			workingDirectory,
-			...(this.model ? { model: this.model } : {}),
-		};
-
-		// Lazy resume-or-create: a persisted threadId for this key → resume it; else start a new thread.
-		const stored = this.sessionStore.get(key);
-		const thread = stored
-			? this.codex.resumeThread(stored.threadId, threadOpts)
-			: this.codex.startThread(threadOpts);
-
-		return new CodexSession(
-			thread,
-			key,
-			o.aiclawUid,
-			o.roomId,
-			this.sessionStore,
-			this.codex,
-			threadOpts,
-		);
+	createRun(input: PreparedRun): AgentRun {
+		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
+			!input.workspace || typeof input.systemPrompt !== 'string') throw new TypeError('Invalid Codex prepared run');
+		const run = new CodexRun(input, this.deps, () => this.active.delete(run));
+		this.active.add(run);
+		return run;
 	}
 }
 
-/**
- * One codex conversation (a Thread). `send()` runs one turn and mirrors OpencodeSession's push→pull
- * async-queue bridge: events from `thread.runStreamed()` are pushed into a buffer that the
- * async-iterator consumer pulls from, so events that land before the consumer awaits are never lost.
- */
-class CodexSession implements AgentSession {
-	private closed = false;
-	/** Registered when send() starts; close() calls it to wake a parked consumer. */
-	private closeActive: (() => void) | null = null;
+class CodexRun implements AgentRun {
+	private readonly controller = new AbortController();
+	private consuming = false;
+	private submitted = false;
+	private finished = false;
+	private nativeExited = false;
+	private cancelled = false;
+	private readonly startedAt = Date.now();
+	private readonly onAbort = () => { void this.cancel('aborted'); };
+	constructor(private readonly input: PreparedRun, private readonly deps: CodexDriverDeps,
+		private readonly onFinished: () => void) {}
 
-	constructor(
-		private readonly thread: Thread,
-		private readonly key: string,
-		private readonly aiclawUid: string,
-		private readonly roomId: string,
-		private readonly sessionStore: CodexSessionStore,
-		// Fallback deps (REQ-010 #101 self-heal): when a resumed thread's rollout is gone, the session
-		// invalidates the stale store entry and starts a FRESH thread to retry the turn once.
-		private readonly codex: CodexClient,
-		private readonly threadOpts: ThreadOptions,
-	) {}
+	get events(): AsyncIterable<AgentEvent> {
+		return { [Symbol.asyncIterator]: () => {
+			if (this.consuming) throw new Error('Codex run events can be consumed only once');
+			this.consuming = true;
+			return this.execute();
+		} };
+	}
 
-	send(message: string): AsyncIterable<AgentEvent> {
-		const buffer: AgentEvent[] = [];
-		let done = false;
-		let resolveNext: (() => void) | null = null;
-		const turnStart = Date.now();
-
-		// tool start/end de-dup ledger: at most one 'start' and one 'end' per command_execution item id.
+	private async *execute(): AsyncGenerator<AgentEvent> {
+		const input = this.input;
+		const previous = input.conversation.nativeState?.value;
+		const frozenPrompt = previous && typeof previous === 'object' && 'originalPrompt' in previous
+			? previous.originalPrompt : undefined;
+		const systemPrompt = typeof frozenPrompt === 'string' ? frozenPrompt : input.systemPrompt;
+		const digest = createHash('sha256').update(systemPrompt).digest('hex');
 		const toolStarted = new Set<string>();
 		const toolEnded = new Set<string>();
-
-		// Manual async-iterator handle on the events stream so close() can terminate a parked next().
-		// `streamIter` points at the CURRENTLY-active iterator; on a self-heal retry it is repointed at
-		// the fresh thread's iterator so close()/returnIter() always target the live stream. `iterClosed`
-		// guards against returning the SAME iterator twice, while still letting a new attempt's iterator
-		// be returned (it resets when a new iterator is installed).
-		let streamIter: AsyncIterator<unknown> | null = null;
-		let iterClosed = false;
-		const installIter = (iter: AsyncIterator<unknown>): boolean => {
-			// If close()/finish() already fired before this attempt got its iterator, terminate it now.
-			if (done) {
-				try {
-					void iter.return?.();
-				} catch {
-					/* best-effort */
+		try {
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			input.signal.addEventListener('abort', this.onAbort, { once: true });
+			if (previous !== undefined && (!previous || typeof previous !== 'object' ||
+				!('threadId' in previous) || typeof previous.threadId !== 'string' || !previous.threadId ||
+				('workspace' in previous && previous.workspace !== input.workspace) ||
+				('promptHash' in previous && previous.promptHash !== digest) ||
+				('originalPrompt' in previous && (typeof previous.originalPrompt !== 'string' ||
+					(!('legacyConfirmationRequired' in previous) || previous.legacyConfirmationRequired !== false)))))
+				throw new Error('Codex native thread invalid or original cwd/prompt mismatch; explicit reset required (history retained)');
+			if (previous && typeof previous === 'object' &&
+				(!('workspace' in previous) || !('promptHash' in previous)))
+				throw new Error('CODEX_LEGACY_THREAD_UNVERIFIED: original cwd/persona unknown; owner must verify provenance before resume or explicitly reset');
+			if (frozenPrompt !== undefined && input.systemPrompt !== systemPrompt)
+				console.warn('[codex] updated persona deferred for confirmed legacy thread until explicit reset');
+			const threadId = previous && typeof previous === 'object' && 'threadId' in previous ? previous.threadId as string : undefined;
+			await mkdir(input.workspace!, { recursive: true });
+			// Codex also loads AGENTS.md from ancestor directories, not just the working directory.
+			// The owner may reconcile only an explicitly approved block; never edit any of these files here.
+			const physical = await realpath(input.workspace!);
+			for (let dir = physical; ; dir = dirname(dir)) {
+				let agents = '';
+				try { agents = await readFile(join(dir, 'AGENTS.md'), 'utf8'); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+				const begins = agents.split(AICHAT_SYSTEM_BEGIN).length - 1;
+				const ends = agents.split(AICHAT_SYSTEM_END).length - 1;
+				if ((begins || ends) && (dir !== physical || begins !== 1 || ends !== 1 ||
+					!agents.includes(renderSystemBlock(systemPrompt))))
+					throw new Error('PROMPT_SCOPE_CONFLICT: managed AGENTS.md in workspace or ancestor is unverified');
+				if (dir === dirname(dir)) break;
+			}
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			const opts: ThreadOptions = { sandboxMode: 'danger-full-access', approvalPolicy: 'never',
+				skipGitRepoCheck: true, workingDirectory: input.workspace, ...(this.deps.model ? { model: this.deps.model } : {}) };
+			const codex = this.deps.createCodex(systemPrompt);
+			const thread = threadId ? codex.resumeThread(threadId, opts) : codex.startThread(opts);
+			// Recovery is recorded before the SDK starts codex exec; a crash/abort cannot silently
+			// re-submit this turn. An SDK AbortSignal kills its direct child, not a verified process group.
+			await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId,
+				threadId: threadId ?? null, workspace: input.workspace, stopProbe: 'unknown-after-restart' } });
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			this.submitted = true;
+			const { events } = await thread.runStreamed(input.message, { signal: this.controller.signal });
+			let terminal: AgentEvent | undefined;
+			let registered = threadId !== undefined; // a resumed run already has an atomic native binding
+			for await (const raw of events) {
+				if (this.cancelled) break;
+				if (terminal) continue; // wait for native subprocess EOF before reporting terminal status
+				if (raw.type === 'thread.started' && threadId && raw.thread_id !== threadId)
+					throw new Error('Codex resumed thread changed identity; explicit recovery required');
+				if (raw.type === 'thread.started') {
+					const id = raw.thread_id;
+					if (!id) throw new Error('Codex thread.started missing thread id');
+					if (!input.conversation.registerNative) throw new Error('Codex atomic native registration unavailable');
+					await input.conversation.registerNative(id, { version: 1, value: {
+						...(frozenPrompt !== undefined ? { originalPrompt: systemPrompt, legacyConfirmationRequired: false } : {}),
+						threadId: id, promptHash: digest, workspace: input.workspace,
+					} });
+					await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId,
+						threadId: id, workspace: input.workspace, stopProbe: 'unknown-after-restart' } });
+					registered = true;
+					continue;
 				}
-				return false;
-			}
-			streamIter = iter;
-			iterClosed = false;
-			return true;
-		};
-		const returnIter = () => {
-			if (iterClosed || !streamIter) return;
-			iterClosed = true;
-			try {
-				void streamIter.return?.();
-			} catch {
-				/* best-effort: terminate a parked iter.next() */
-			}
-		};
-
-		const wake = () => {
-			if (resolveNext) {
-				const r = resolveNext;
-				resolveNext = null;
-				r();
-			}
-		};
-		// `pushed` = at least one AgentEvent buffered. The resume failure surfaces BEFORE any event, so
-		// `!pushed` is the safe guard for triggering the self-heal retry (never double-emits).
-		let pushed = false;
-		const push = (ev: AgentEvent) => {
-			if (done) return;
-			pushed = true;
-			buffer.push(ev);
-			wake();
-		};
-		// Error dedup invariant mirrors opencode: the FIRST push+finish wins.
-		const finish = () => {
-			if (done) return;
-			done = true;
-			returnIter();
-			wake();
-		};
-		this.closeActive = finish;
-
-		// Persist the captured thread.started.thread_id under BOTH directions: key→threadId (reuse on
-		// the next turn / restart) and threadId→(uid,room) via findKeyByThreadId (resolveSession).
-		const captureThreadStarted = (raw: unknown) => {
-			const tid = (raw as { thread_id?: unknown }).thread_id;
-			if (typeof tid === 'string' && tid.length > 0) {
-				this.sessionStore.set(this.key, { threadId: tid });
-			}
-		};
-
-		// Map a raw ThreadEvent → at most one buffered AgentEvent, applying tool de-dup and filling the
-		// real durationMs on done. Returns true if the stream should end.
-		const handleRaw = (raw: unknown): boolean => {
-			const t = (raw as { type?: unknown }).type;
-			if (t === 'thread.started') {
-				captureThreadStarted(raw); // NOT an AgentEvent — capture + store, do not yield.
-				return false;
-			}
-
-			const ev = mapCodexEvent(raw);
-			if (!ev) return false;
-
-			if (ev.type === 'tool') {
-				const itemId = extractItemId(raw);
-				const seen = ev.phase === 'start' ? toolStarted : toolEnded;
-				if (itemId) {
-					if (seen.has(itemId)) return false; // duplicate phase for this item → drop
-					seen.add(itemId);
-				}
-				push(ev);
-				return false;
-			}
-			if (ev.type === 'done') {
-				push({ type: 'done', durationMs: Date.now() - turnStart });
-				return true;
-			}
-			if (ev.type === 'error') {
-				push(ev);
-				return true;
-			}
-			// thinking
-			push(ev);
-			return false;
-		};
-
-		// REQ-018: the per-turn message is PURE user text — the reply contract + identity anchor + persona
-		// live in the workspace AGENTS.md (written by openSession); codex exec re-reads it each turn.
-		// Run one turn on the given thread: open its events stream and pump it through handleRaw. May
-		// reject from `runStreamed` (e.g. a dead rollout on resume) — the caller decides whether to retry.
-		const consume = async (thread: Thread): Promise<void> => {
-			const { events } = await thread.runStreamed(message);
-			const iter = (events as AsyncIterable<unknown>)[Symbol.asyncIterator]();
-			if (!installIter(iter)) return; // already closed → installIter terminated the iter
-			while (true) {
-				const { value: raw, done: d } = await iter.next();
-				if (d) break;
-				if (done || this.closed) break;
-				const end = handleRaw(raw);
-				if (end) {
-					finish();
-					break;
-				}
-			}
-		};
-
-		const errOf = (e: unknown) => (errMsg(e));
-
-		void (async () => {
-			try {
-				await consume(this.thread);
-			} catch (err) {
-				// Self-heal: a resumed thread whose rollout is gone rejects before any event. Invalidate the
-				// stale store entry and retry the turn ONCE on a FRESH thread; captureThreadStarted then
-				// stores the new id. Guarded by !pushed so we never retry mid-stream / double-emit.
-				if (isResumeFailure(err) && !pushed) {
-					this.sessionStore.delete(this.key);
-					try {
-						await consume(this.codex.startThread(this.threadOpts));
-					} catch (err2) {
-						push({ type: 'error', message: errOf(err2) });
+				const ev = mapCodexEvent(raw);
+				if (!ev) continue;
+				if (ev.type === 'tool') {
+					const itemId = 'item' in raw && raw.item && typeof raw.item === 'object' && 'id' in raw.item ? raw.item.id : undefined;
+					if (typeof itemId === 'string') {
+						const seen = ev.phase === 'start' ? toolStarted : toolEnded;
+						if (seen.has(itemId)) continue;
+						seen.add(itemId);
 					}
-				} else {
-					push({ type: 'error', message: errOf(err) });
 				}
-			} finally {
-				finish();
+				if (ev.type === 'done' || ev.type === 'error') { terminal = ev; continue; }
+				yield ev;
 			}
-		})();
-
-		const isClosed = () => this.closed;
-
-		return {
-			async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
-				while (true) {
-					while (buffer.length > 0) {
-						yield buffer.shift()!;
-					}
-					if (done || isClosed()) return;
-					await new Promise<void>((resolve) => {
-						resolveNext = resolve;
-					});
-				}
-			},
-		};
+			if (!this.cancelled) this.nativeExited = true; // SDK normal EOF awaited child exitPromise
+			if (this.cancelled) yield { type: 'cancelled', reason: 'Codex process stop unconfirmed' };
+			else if (terminal?.type === 'done' && !registered)
+				yield { type: 'error', message: 'Codex completed without a registered native thread ID' };
+			else if (terminal?.type === 'done') yield { type: 'done', durationMs: Date.now() - this.startedAt };
+			else yield terminal ?? { type: 'error', message: 'Codex stream ended without terminal event' };
+		} catch (error) {
+			yield this.cancelled ? { type: 'cancelled', reason: 'Codex process stop unconfirmed' }
+				: { type: 'error', message: errMsg(error) };
+		} finally {
+			input.signal.removeEventListener('abort', this.onAbort);
+			this.finished = true;
+			if (!this.cancelled || !this.submitted) this.onFinished();
+		}
 	}
 
-	async close(): Promise<void> {
-		this.closed = true;
-		if (this.closeActive) this.closeActive();
+	async cancel(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {
+		if (this.nativeExited) {
+			this.onFinished();
+			return { status: 'stopped' };
+		}
+		this.cancelled = true;
+		this.controller.abort();
+		if (!this.submitted) {
+			if (!this.consuming) this.onFinished();
+			return { status: 'stopped' };
+		}
+		// SDK 0.142.3 forwards signal to spawn(), but does not expose child exit or process-group
+		// verification. iterator.return() only closes the JSONL reader, not the native process.
+		return { status: 'unconfirmed', reason: `${reason}: SDK subprocess/process-group exit not verified` };
 	}
-}
-
-/**
- * True when a `runStreamed` rejection is a "resumed thread no longer exists / is no longer usable"
- * failure — i.e. the codex rollout for the stored threadId is gone (container recreate wiped runtime
- * rollouts, or the thread expired/was cleaned), OR the stored thread was recorded with a DIFFERENT
- * model than codex is now configured with (model-mismatch resume rejection). Real error texts:
- *   `thread/resume failed: no rollout found for thread id <id> (code -32600)`
- *   `This session was recorded with model "gpt-5.1-codex-mini" which is not available...`
- * Matching any of those substrings (case-insensitive) is enough to trigger the self-heal retry:
- * discard the old binding and run the turn on a FRESH thread.
- */
-export function isResumeFailure(err: unknown): boolean {
-	const msg = errMsg(err);
-	return /no rollout found|thread\/resume failed|-32600|this session was recorded with model/i.test(msg);
-}
-
-/** Pull the codex item id out of a raw item.* ThreadEvent, for tool start/end de-dup. */
-function extractItemId(raw: unknown): string | undefined {
-	if (!raw || typeof raw !== 'object') return undefined;
-	const item = (raw as { item?: unknown }).item as { id?: unknown } | undefined;
-	return typeof item?.id === 'string' ? item.id : undefined;
+	async dispose(): Promise<void> {
+		if (!this.finished) await this.cancel('dispose');
+	}
 }

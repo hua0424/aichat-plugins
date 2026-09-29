@@ -6,8 +6,15 @@ import type { HostInfo } from '../host-info.js';
 import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
 
+export class HulaApiRejectedError extends Error {
+	constructor(message: string, readonly code: 'FORBIDDEN' | 'INVALID_ARGUMENT' | 'IDEMPOTENCY_CONFLICT' = 'INVALID_ARGUMENT') {
+		super(message);
+	}
+}
+
 interface ApiResponse {
 	success: boolean;
+	code?: number;
 	data?: unknown;
 	msg?: string;
 }
@@ -21,24 +28,33 @@ export class HulaApiClient {
 		this.token = token;
 	}
 
-	/**
-	 * 发送消息
-	 * @param extra 额外字段（如 { autoReply: true }），server 侧不入库
-	 */
+	/** Probe the actual T15 endpoint: old servers ignoring unknown JSON fields are NOT receipt-capable. */
+	async supportsMessageReceipts(): Promise<boolean> {
+		try {
+			const resp = await this.get('/api/im/chat/msg/receipt-capability', AbortSignal.timeout(5000));
+			return resp.data === 'requestId-v1;retention-min=7d';
+		} catch (err) {
+			if (err instanceof HulaApiRejectedError && /^HuLa API error: 404\b/.test(err.message)) return false;
+			throw err; // No write happened; never infer support from a failed probe.
+		}
+	}
+
+	/** Send one fixed payload; only a confirmed receipt-capable server receives requestId. */
 	async sendMessage(
 		roomId: string,
 		content: string,
-		extra?: Record<string, unknown>
+		extra?: Record<string, unknown>,
+		requestId?: string,
 	): Promise<{ msgId: string }> {
 		const body: Record<string, unknown> = {
 			roomId,
 			msgType: 1, // 文本消息
 			body: { content },
 		};
-		if (extra) {
-			body.extra = extra;
-		}
-		const resp = await this.post('/api/im/chat/msg', body);
+		if (extra) body.extra = extra;
+		if (requestId !== undefined) body.requestId = requestId;
+		// Three attempts + probe + 600ms backoff remain below the CLI's 30s IPC budget.
+		const resp = await this.post('/api/im/chat/msg', body, AbortSignal.timeout(7000));
 		// REQ-029 (#29): msgId 为不透明字符串（server Long 序列化为 string；>2^53 不能 Number()）。
 		const data = resp.data as { message?: { id?: string | number } } | undefined;
 		return { msgId: data?.message?.id == null ? '' : String(data.message.id) };
@@ -278,22 +294,22 @@ export class HulaApiClient {
 
 	// ─── HTTP helpers ───
 
-	private async get(path: string): Promise<ApiResponse> {
+	private async get(path: string, signal?: AbortSignal): Promise<ApiResponse> {
 		const resp = await fetch(`${this.baseUrl}${path}`, {
 			method: 'GET',
-			headers: this.headers(),
+			headers: this.headers(), signal,
 		});
 		return this.parseResponse(resp);
 	}
 
-	private async post(path: string, body: unknown): Promise<ApiResponse> {
+	private async post(path: string, body: unknown, signal?: AbortSignal): Promise<ApiResponse> {
 		const resp = await fetch(`${this.baseUrl}${path}`, {
 			method: 'POST',
 			headers: {
 				...this.headers(),
 				'Content-Type': 'application/json',
 			},
-			body: JSON.stringify(body),
+			body: JSON.stringify(body), signal,
 		});
 		return this.parseResponse(resp);
 	}
@@ -319,11 +335,14 @@ export class HulaApiClient {
 	private async parseResponse(resp: Response): Promise<ApiResponse> {
 		if (!resp.ok) {
 			const text = await resp.text().catch(() => '');
-			throw new Error(`HuLa API error: ${resp.status} ${text.substring(0, 200)}`);
+			const message = `HuLa API error: ${resp.status} ${text.substring(0, 200)}`;
+			throw resp.status < 500 ? new HulaApiRejectedError(message, resp.status === 403 ? 'FORBIDDEN' : 'INVALID_ARGUMENT') : new Error(message);
 		}
 		const json = (await resp.json()) as ApiResponse;
 		if (!json.success) {
-			throw new Error(`HuLa API failed: ${json.msg || 'unknown error'}`);
+			if (json.code === 43061) throw new HulaApiRejectedError('requestId used with different message', 'IDEMPOTENCY_CONFLICT');
+			if (json.code === 43062) throw new Error('durable message result unknown');
+			throw new HulaApiRejectedError(`HuLa API failed: ${json.msg || 'unknown error'}`);
 		}
 		return json;
 	}

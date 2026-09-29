@@ -39,14 +39,16 @@ I let you send a reply into the current chat conversation.
 Run this in bash, with your user-facing reply as the content:
 
 \`\`\`bash
-aichat send-message --content "<your reply to the user>"
+aichat send-message --content "<your reply to the user>" --json
 \`\`\`
 
 ## Important
 
-- ⚠️ Invoking or reading this skill does NOT send anything. A message is sent ONLY when you actually
-  run the bash command \`aichat send-message --content "..."\` yourself. Do NOT claim you sent a
-  message ("已发送"/"sent"/"done") unless you have actually run that command in this turn.
+- ⚠️ Invoking or reading this skill does NOT send anything. Run the bash command
+  \`aichat send-message --content "..." --json\` yourself and check its result before claiming delivery.
+  Only \`ok === true\` confirms success (data in \`result\`). On \`ok === false\`, read
+  \`code\`, \`message\`, and \`retryable\` and report failure instead. For \`DELIVERY_UNKNOWN\`, retain the reported \`requestId\`; the result is
+  unknown, so do not claim delivery or resend automatically. Never print binding credentials.
 - The room and your identity are bound AUTOMATICALLY by the system from your current session.
   NEVER pass a room, recipient, identity, or any "--room"/"--to" argument — there is none.
 - Your normal text output is treated as private thinking/analysis and is NOT shown to the user.
@@ -78,6 +80,15 @@ who to add, and which group members are online.
   status. Default = the current chat's group. To query a DIFFERENT group you've joined, pass
   \`--groupid <id>\` using the **\`id\`** field from \`list-groups\` output (NOT the name or account).
   \`--online\` keeps only online members.
+
+## Machine-readable results
+
+Add \`--json\` to a query for one JSON object: \`{ "ok": true, "result": {} }\` on success or
+\`{ "ok": false, "code": "FORBIDDEN", "message": "...", "retryable": false }\` on failure
+(nonzero exit). The \`result\` value and error fields vary; branch on \`ok\` and \`code\`, not
+just whether output exists. In legacy default output,
+\`list-group-members\` can return \`result.error\` with exit status 0; this is a failure, not a
+successful member list. Use \`--json\` for reliable branching. Do not print binding credentials.
 
 ## Important
 

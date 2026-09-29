@@ -1,5 +1,6 @@
-import type { HulaApiClient } from '../api/hula-api.js';
+import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { errMsg } from '../util/err.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /**
  * REQ-010 S1 — capability execution context.
@@ -14,6 +15,25 @@ export interface CapabilityContext {
 	aiclawUid: string;
 	roomId: string;
 	apiClient: HulaApiClient;
+	/** Endpoint-owned reset receipt correlation; never populated from capability args. */
+	requestId?: string;
+	/** Core-resolved generation, not caller-supplied; part of the T15 payload fingerprint. */
+	generation?: number;
+	/** Set only after a successful, explicit T15 capability probe. */
+	receiptSupported?: boolean;
+	resetBearer?: string;
+}
+
+export class CapabilityRejectedError extends Error {}
+export class CapabilityPersistenceError extends Error {}
+export class ReceiptProbeError extends Error {}
+
+/** Timestamp-shaped IDs permit bounded retries, including explicit reuse after restart; syntax is not provenance. */
+export function autoRetrySafe(requestId: string | undefined, now = Date.now()): boolean {
+	const match = /^r([0-9a-z]+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(requestId ?? '');
+	if (!match) return false;
+	const created = Number.parseInt(match[1], 36);
+	return Number.isSafeInteger(created) && created <= now && now - created < 7 * 24 * 60 * 60 * 1000;
 }
 
 /** A node-local capability: pure-ish, gets a bound context + opaque args, returns a JSON result. */
@@ -51,8 +71,28 @@ export function sendMessageCapability(): Capability {
 			throw new Error('send-message: `content` is required and must be a non-empty string');
 		}
 		const content = raw.trim();
-		const { msgId } = await ctx.apiClient.sendMessage(ctx.roomId, content);
-		return { msgId, roomId: ctx.roomId };
+		try { ctx.receiptSupported = await ctx.apiClient.supportsMessageReceipts(); }
+		catch (err) {
+			if (err instanceof HulaApiRejectedError) throw err;
+			throw new ReceiptProbeError('receipt capability probe unavailable; no write started');
+		}
+		if (ctx.receiptSupported && !ctx.requestId) throw new Error('send-message: missing requestId');
+		// Old server: one legacy attempt, never retry an uncertain write or assume ignored fields work.
+		const attempts = ctx.receiptSupported && autoRetrySafe(ctx.requestId) ? 3 : 1;
+		for (let attempt = 0; attempt < attempts; attempt++) {
+			if (attempt > 0 && !autoRetrySafe(ctx.requestId)) throw new Error('receipt retry window elapsed');
+			try {
+				const { msgId } = ctx.receiptSupported
+					? await ctx.apiClient.sendMessage(ctx.roomId, content, { cliGeneration: ctx.generation }, ctx.requestId)
+					: await ctx.apiClient.sendMessage(ctx.roomId, content);
+				if (!/^\d+$/.test(msgId) || msgId === '0') throw new Error('send-message: missing committed msgId');
+				return { msgId, roomId: ctx.roomId, receiptMode: ctx.receiptSupported ? 'durable' : 'legacy' };
+			} catch (err) {
+				if (err instanceof HulaApiRejectedError || attempt === attempts - 1) throw err;
+				await delay(200 * (attempt + 1));
+			}
+		}
+		throw new Error('send-message: result unknown');
 	};
 }
 
@@ -63,12 +103,19 @@ export function sendMessageCapability(): Capability {
  * was actually reset (false = stateless driver like openclaw, a no-op).
  */
 export function resetSessionCapability(
-	resetFor: (aiclawUid: string, roomId: string) => { driverType: string; reset: boolean } | undefined,
+	resetFor: (aiclawUid: string, roomId: string, requestId?: string, bearer?: string) => { driverType: string; reset: boolean; generation?: number; executionPaused?: boolean; cancelRunId?: string } | undefined,
 ): Capability {
 	return async (ctx) => {
-		const r = resetFor(ctx.aiclawUid, ctx.roomId);
-		if (!r) throw new Error('reset-session: no live agent for this identity');
-		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset };
+		let r: ReturnType<typeof resetFor>;
+		try {
+			r = ctx.requestId === undefined
+				? resetFor(ctx.aiclawUid, ctx.roomId)
+				: resetFor(ctx.aiclawUid, ctx.roomId, ctx.requestId, ctx.resetBearer);
+		} catch { throw new CapabilityPersistenceError('reset receipt persistence unavailable'); }
+		if (!r) throw new CapabilityRejectedError('reset-session: no live agent for this identity');
+		return { roomId: ctx.roomId, driverType: r.driverType, reset: r.reset,
+			...(r.generation === undefined ? {} : { generation: r.generation, executionPaused: r.executionPaused }),
+			...(r.cancelRunId === undefined ? {} : { cancelRunId: r.cancelRunId }) };
 	};
 }
 
@@ -90,7 +137,7 @@ export function memberInfoCapability(): Capability {
 		// is a QUERY TARGET, validated as a non-empty positive-integer string.
 		const uid = typeof raw === 'number' || typeof raw === 'string' ? String(raw) : '';
 		if (!/^\d+$/.test(uid) || uid === '0') {
-			throw new Error('member-info: `uid` is required and must be a positive integer');
+			throw new HulaApiRejectedError('member-info: `uid` is required and must be a positive integer');
 		}
 		const profile = await ctx.apiClient.getMemberInfo(uid);
 		return { uid, profile };
@@ -110,7 +157,7 @@ export function findFriendCapability(): Capability {
 	return async (ctx, args) => {
 		const raw = args.keyword;
 		if (typeof raw !== 'string' || raw.trim().length === 0) {
-			throw new Error('find-friend: `keyword` is required and must be a non-empty string');
+			throw new HulaApiRejectedError('find-friend: `keyword` is required and must be a non-empty string');
 		}
 		const keyword = raw.trim();
 		const users = await ctx.apiClient.searchUsers(keyword);
@@ -148,7 +195,7 @@ export function listGroupMembersCapability(): Capability {
 			// REQ-029 (#29): keep as an opaque numeric string (never Number() — >2^53 corrupts routing).
 			roomId = String(args.groupid);
 			if (!/^\d+$/.test(roomId) || roomId === '0') {
-				throw new Error('list-group-members: invalid --groupid');
+				throw new HulaApiRejectedError('list-group-members: invalid --groupid');
 			}
 		} else {
 			roomId = ctx.roomId;
@@ -158,10 +205,14 @@ export function listGroupMembersCapability(): Capability {
 			const members = await ctx.apiClient.listGroupMembers(roomId, online);
 			return { roomId, online, members };
 		} catch (err) {
-			// node never judges room type; the server is the authority. Pass its structured business
-			// message ("当前不在群聊中" / "未加入该群聊，无法查询成员") through cleanly to the agent
-			// (CLI exit 0 with an `error` field) instead of surfacing it as a hard CLI failure.
-			return { roomId, error: errMsg(err) };
+			// Keep the legacy exit-0 result.error for known business failures, but do not echo
+			// arbitrary server/transport text: it can contain a credential.
+			const message = errMsg(err);
+			const business = /^HuLa API failed: (当前不在群聊中|未加入该群聊，无法查询成员)$/.test(message);
+			const code = message === 'HuLa API failed: 未加入该群聊，无法查询成员' ? 'FORBIDDEN'
+				: err instanceof HulaApiRejectedError ? err.code : 'UPSTREAM_FAILED';
+			return { roomId, error: business ? message : code === 'FORBIDDEN' ? 'forbidden by API' : 'upstream query unavailable',
+				code, retryable: code === 'UPSTREAM_FAILED' };
 		}
 	};
 }
