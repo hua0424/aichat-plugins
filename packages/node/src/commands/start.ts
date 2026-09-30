@@ -3,16 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
 import { MessageHandler } from '../handler/message.js';
+import { createDriver, nativeContext, DRIVER_CONTRACT_VERSION, type DriverDescriptor } from '../agent/descriptor.js';
 import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
-import { FileSessionStore } from '../agent/opencode/session-store.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
-import { FileCodexSessionStore } from '../agent/codex/session-store.js';
 import { Codex } from '@openai/codex-sdk';
 import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
-import { FileBindTokenStore } from '../agent/bind-token-store.js';
-import { FileCcHeadlessSessionStore } from '../agent/cc/headless-session-store.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
@@ -31,9 +28,11 @@ import {
 	resetSessionCapability,
 } from '../capability/registry.js';
 import { CapabilityEndpoint, capabilitySocketPath } from '../capability/endpoint.js';
-import { resolveBoundSession } from '../capability/session-key.js';
+import { ConversationStore } from '../capability/conversations.js';
+import type { ContextCandidate } from '../capability/endpoint.js';
 import { installSkill } from '../capability/skill.js';
 import { ensureAichatOnPath } from '../util/path-inject.js';
+import { errMsg } from '../util/err.js';
 
 /**
  * aichat start — 读取本地配置自动连接。
@@ -93,78 +92,69 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// env-injection plugin (codex natively injects CODEX_THREAD_ID into its exec shell). Its
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
+	// SDK v0.142.3 accepts a per-client env (without inheriting process.env); never mutate global env.
+	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
+		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
 
-	// REQ-011 S2: claude-code is now NODE-DRIVEN headless (CcHeadlessDriver). One shared per-room bridge
-	// routes CC hooks (via the CcBroker) into the active CcHeadlessSession's AgentEvent stream, so cc goes
-	// through the STANDARD supervised path. Built once here and shared by every cc identity's driver + the
-	// broker sink (below). The session store persists (uid,room)→session_id for cross-turn/restart --resume.
+	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
+	// their matching headless turn. Every CC identity's driver and the broker share this registry.
+	// The session store persists (uid,room)→session_id for cross-turn/restart --resume.
 	const ccRegistry = new CcSessionRegistry();
 	const ccWorkspaceBase = join(AICHAT_HOME, 'cc', 'workspace');
 	// REQ-011 S3 (AC5/AC9): one shared per-room transcript writer (inbound + teed CC output), so the owner
 	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
 	const ccTranscript = new FileCcTranscriptWriter();
 
-	// BL-014 (#141): ONE shared opaque bind-token store for the whole node. openclaw/cc drivers mint a
-	// stable token per (uid,room) as the AGENT-FACING binding (OPENCLAW_BIND / AICHAT_BIND); the capability
-	// endpoint + CC broker resolve that token back to (uid,room) here. Persisted (0600) so a token minted
-	// before a restart still resolves. codex/opencode keep their own runtime-id stores (already unforgeable).
-	const bindTokenStore = new FileBindTokenStore();
+	// The core owns bindings; native drivers receive only prepared, generation-bound handles.
+	let conversations: ConversationStore | undefined;
+
+	// Static registration: adding an adapter changes this assembly list, not the handler or CLI.
+	const descriptors = new Map<string, DriverDescriptor>([
+		['openclaw', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'openclaw',
+			context: nativeContext('openclaw'),
+			features: { cancel: 'unsupported', reset: 'supported', promptUpdate: 'per-run' },
+			create: () => new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token,
+				undefined, undefined, (id, _workspace, identityId) => {
+					if (!conversations) throw new Error('conversation bindings not ready');
+					conversations.assertOpenclawPromptOwner(id, identityId);
+				}) }],
+		['opencode', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'opencode', workspaceBase: opencodeWorkspaceBase,
+			context: nativeContext('opencode'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			create: (entry) => new OpencodeDriver({
+				server: opencodeServer,
+				assertDirectoryOwner: (id, directory) => {
+					if (!conversations) throw new Error('conversation bindings not ready');
+					conversations.assertOpencodeDirectoryOwner(id, directory);
+				},
+				...(entry.model !== undefined ? { model: entry.model } : {}),
+			}) }],
+		['codex', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'codex', workspaceBase: codexWorkspaceBase,
+			context: nativeContext('codex'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
+			create: (entry) => new CodexDriver({
+				createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
+					config: { developer_instructions: systemPrompt } }),
+				...(entry.model !== undefined ? { model: entry.model } : {}),
+			}) }],
+		['cc', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'cc', workspaceBase: ccWorkspaceBase,
+			context: nativeContext('cc'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			create: () => new CcHeadlessDriver({
+				workspaceBase: ccWorkspaceBase, brokerPort: ccBrokerPort(),
+				registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
+				transcript: ccTranscript,
+			}) }],
+	]);
 
 	const supervisor = new Supervisor({
 		resolveCredential: (entry) =>
 			resolveAgentCredential(entry, { machineCode: getMachineCode(), httpBase }),
-		buildDriver: (entry) => {
-			if (entry.tool === 'openclaw') {
-				return new OpenclawDriver(clawConfig.gatewayUrl, clawConfig.token, bindTokenStore);
-			}
-			if (entry.tool === 'opencode') {
-				return new OpencodeDriver({
-					server: opencodeServer, // 单例：所有 opencode 身份共享同一 server
-					workspaceBase: opencodeWorkspaceBase,
-					sessionStore: new FileSessionStore(),
-					...(entry.model !== undefined ? { model: entry.model } : {}),
-				});
-			}
-			if (entry.tool === 'codex') {
-				// No shared-server singleton (unlike opencode): the codex SDK spawns `codex exec` per
-				// turn. `new Codex()` omits apiKey/baseUrl → uses the baked ~/.codex/config.toml provider
-				// + auth.json. resolveSession reverse-looks-up the bound (aiclaw, room) by CODEX_THREAD_ID.
-				return new CodexDriver({
-					codex: new Codex(),
-					workspaceBase: codexWorkspaceBase,
-					sessionStore: new FileCodexSessionStore(),
-					...(entry.model !== undefined ? { model: entry.model } : {}),
-				});
-			}
-			if (entry.tool === 'cc') {
-				// REQ-011 S2: claude-code is NODE-DRIVEN headless. CcHeadlessDriver spawns `claude -p`
-				// (stream-json) per inbound turn on the standard supervised path. The reply
-				// still goes out-of-band via the `aichat send-message` CLI; thinking is sourced from CC's
-				// hooks (POSTing to the CcBroker) and bridged into the turn's AgentEvent stream via the
-				// shared per-room registry. session_id is persisted for cross-turn/restart --resume.
-				return new CcHeadlessDriver({
-					workspaceBase: ccWorkspaceBase,
-					brokerPort: ccBrokerPort(),
-					sessionStore: new FileCcHeadlessSessionStore(),
-					bindTokens: bindTokenStore,
-					registry: ccRegistry,
-					transcript: ccTranscript,
-				});
-			}
-			// 未知 tool 抛错使该身份降级，不影响其它身份。
-			throw new Error('unsupported agent tool: ' + entry.tool);
-		},
+		buildDriver: (entry) => createDriver(entry, descriptors),
 		buildApiClient: (cred) => new HulaApiClient(restBaseUrl, cred.connectionToken),
 		// #193: 上报主机信息时的 workspace 根按 tool 取舍——opencode/codex/cc 各有 workspace base，
 		// openclaw 无 workspace 概念 → undefined（payload 省略 workspaceBase 字段）。
-		workspaceBaseFor: (entry) =>
-			entry.tool === 'opencode'
-				? opencodeWorkspaceBase
-				: entry.tool === 'codex'
-					? codexWorkspaceBase
-					: entry.tool === 'cc'
-						? ccWorkspaceBase
-						: undefined,
+		workspaceBaseFor: (entry) => descriptors.get(entry.tool)?.workspaceBase,
 		buildWs: (cred, hooks) =>
 			new HulaWSClient({
 				url: serverUrl,
@@ -177,17 +167,14 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				onAuthError: hooks.onAuthError,
 			}),
 		buildHandler: (ws, driver, uid, api, onTokenExpired) =>
-			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired),
+			new MessageHandler(ws, driver, uid, api, undefined, onTokenExpired, () => {
+				if (!conversations) throw new Error('conversation bindings not ready');
+				return conversations;
+			}, descriptors.get(driver.type)?.workspaceBase, registry$),
 	});
 
-	await supervisor.start(registry);
-
-	// REQ-010 S1: node-local capability endpoint (Flow2). The agent replies by running
-	// `aichat send-message --content "..."`, which POSTs here over a loopback unix socket. resolve()
-	// maps the agent's session key → the bound identity/room/api — room/identity NEVER come from the
-	// CLI args (anti-spoofing). REQ-010 S5: require a KNOWN agent-type prefix and route ONLY to the
-	// driver of that type (no more try-every-driver); resolveBoundSession maps it to the bound
-	// identity/room + that owner uid's per-identity api.
+	// Hold the endpoint's exclusive home lease before any driver can mutate a binding or accept inbound WS.
+	// Core lookup, not the first matching driver, is the only capability routing authority.
 	const registry$ = new CapabilityRegistry();
 	registry$.register('send-message', sendMessageCapability());
 	// REQ-010 S3: read-only query capabilities (token-scoped via the resolved per-identity apiClient)
@@ -197,57 +184,102 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// REQ-010 S4: group query capabilities (list-groups token-scoped; list-group-members server-validated)
 	registry$.register('list-groups', listGroupsCapability());
 	registry$.register('list-group-members', listGroupMembersCapability());
-	// aichatoverview#124: runtime per-room session reset. Identity+room come from the resolved session
-	// (ctx), never args; the closure dispatches to the owning agent's driver.resetSession.
+	// Reset the authoritative record in one commit; legacy driver stores are views of that record.
+	// Never clear a native file before the generation/key rotation has persisted successfully.
 	registry$.register(
 		'reset-session',
-		resetSessionCapability((aiclawUid, roomId) => {
-			const owner = supervisor.agents.find((a) => a.uid === aiclawUid);
-			if (!owner) return undefined;
-			const reset = owner.driver.resetSession?.(aiclawUid, roomId) ?? false;
-			return { driverType: owner.driver.type, reset };
+		resetSessionCapability((aiclawUid, roomId, requestId, bearer) => {
+			const owner = supervisor.agents.find((a) => a.uid === aiclawUid && a.status !== 'offline');
+			if (!owner || !conversations) return undefined;
+			if (owner.driver.features.reset !== 'supported') return { driverType: owner.driver.type, reset: false };
+			const cancelRunId = conversations.get(aiclawUid, roomId)?.pendingRuns?.[0]?.runId;
+			const record = conversations.reset(aiclawUid, roomId, requestId, bearer);
+			return { driverType: owner.driver.type, reset: true, generation: record.generation,
+				executionPaused: record.state === 'stop_unconfirmed', cancelRunId };
 		}),
 	);
+	const bound = (record: ReturnType<ConversationStore['resolveCandidate']>) => {
+		if (!record) return undefined;
+		const agent = supervisor.agents.find((a) => a.uid === record.identityId && a.status !== 'offline');
+		return agent ? { aiclawUid: agent.uid, roomId: record.roomId, apiClient: agent.api,
+			conversationId: record.conversationId, generation: record.generation } : undefined;
+	};
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
-		resolve: (sessionKey) => resolveBoundSession(sessionKey, supervisor.agents),
+		resolve: (sessionKey) => bound(conversations?.resolveLegacy(sessionKey)),
+		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
+			Parameters<ConversationStore['resolveCandidate']>[0])),
+		serverNamespace: restBaseUrl,
+		getResetReceipt: (bearer, id) => conversations?.getResetReceipt(bearer, id),
+		isPaused: (uid, room) => {
+			const state = conversations?.get(uid, room)?.state;
+			return state === 'suspended' || state === 'stop_unconfirmed' || state === 'disabled';
+		},
+		onResetDelivered: (uid, room, oldRunId) => {
+			if (!oldRunId) return; // Do not cancel a newer run that began after reset.
+			const owner = supervisor.agents.find((agent) => agent.uid === uid);
+			void owner?.handler.cancelRun(room, oldRunId).catch((err) => console.error('[reset] cancel failed:', errMsg(err)));
+		},
+		lockHome: AICHAT_HOME,
 	});
-	await endpoint.listen(capabilitySocketPath());
-	console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
-
-	// REQ-011 S2: if any cc identity is registered, start the CC hook broker. CC's headless hooks POST
-	// here; the bridge sink routes each resolved hook into the active CcHeadlessSession's AgentEvent
-	// stream via the shared ccRegistry, so the standard node-driven path renders the panel. BL-014 (#141):
-	// resolve() = the shared opaque bind-token store lookup (CC's hook Authorization: Bearer <token> carries
-	// the same AICHAT_BIND token, so the broker resolves it exactly like CcHeadlessDriver.resolveSession).
-	// Only bound when a cc identity exists (don't bind 9100 otherwise). Closed on shutdown.
 	let ccBroker: CcBroker | null = null;
-	if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
-		ccBroker = new CcBroker({
-			resolve: (token) => bindTokenStore.resolve(token),
-			sink: buildCcBridgeSink(ccRegistry),
-		});
-		await ccBroker.listen(ccBrokerPort());
-		console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
-	}
-
-	// REQ-010 S1: install/refresh the opencode reply skill (best-effort; never blocks startup).
 	try {
-		const written = installSkill();
-		if (written.length > 0) console.log(`[start] Installed aichat-reply skill: ${written.join(', ')}`);
-	} catch {
-		/* best-effort */
+		await endpoint.listen(capabilitySocketPath());
+		console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
+		await supervisor.start(registry, false);
+		const activeProviders = new Map(supervisor.agents.map((a) => [a.uid, a.driver.type]));
+		if (activeProviders.size !== supervisor.agents.length) throw new Error('duplicate activated identity');
+		conversations = new ConversationStore({
+			home: AICHAT_HOME, serverNamespace: restBaseUrl,
+			activeUids: new Set(activeProviders.keys()), activeProviders,
+		});
+
+		// CC hook broker must also be ready before a CC message can reach the driver.
+		if (supervisor.agents.some((a) => a.driver.type === 'cc')) {
+			ccBroker = new CcBroker({
+				resolve: (token) => {
+					const record = conversations?.resolveCandidate({ key: token }) ?? conversations?.resolveToken('cc', token);
+					return record?.adapterInstanceId === 'cc' ? {
+						aiclawUid: record.identityId, roomId: record.roomId, contextKey: record.contextKey,
+					} : undefined;
+				},
+				sink: buildCcBridgeSink(ccRegistry),
+			});
+			await ccBroker.listen(ccBrokerPort());
+			console.log(`[start] CC broker listening on 127.0.0.1:${ccBrokerPort()}`);
+		}
+		// Refreshing the skill is best-effort; transport and bindings must never be best-effort.
+		try {
+			const written = installSkill();
+			if (written.length > 0) console.log(`[start] Installed aichat-reply skill: ${written.join(', ')}`);
+		} catch {
+			/* best-effort */
+		}
+		supervisor.connectInbound();
+	} catch (err) {
+		await supervisor.stop().catch(() => {});
+		await ccBroker?.close().catch(() => {});
+		await opencodeServer.stop().catch(() => {});
+		conversations?.close();
+		await endpoint.close().catch(() => {});
+		throw err;
 	}
 
+	let shuttingDown = false;
 	const shutdown = async () => {
+		if (shuttingDown) return;
+		shuttingDown = true;
 		console.log('\n[start] Shutting down...');
 		// Stop per-identity supervision first, THEN close the shared opencode server. The
 		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
 		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
-		await endpoint.close().catch(() => {});
-		await ccBroker?.close().catch(() => {});
+		// Quiesce every writer before releasing the home lease held by endpoint.close().
 		await supervisor.stop().catch(() => {});
+		await ccBroker?.close().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
+		conversations?.close();
+		await endpoint.close().catch(() => {});
+		// ConversationStore commits each binding synchronously before exposing it; no queued binding writes.
 		process.exit(0);
 	};
 	process.on('SIGINT', shutdown);

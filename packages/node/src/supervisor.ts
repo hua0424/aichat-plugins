@@ -1,6 +1,6 @@
 import type { AgentEntry } from './registry.js';
 import type { AichatCredentials } from './config.js';
-import type { AgentDriver } from './agent/events.js';
+import type { RunDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
@@ -15,7 +15,7 @@ import { collectHostInfo } from './host-info.js';
  */
 export interface SupervisorDeps {
 	resolveCredential: (entry: AgentEntry) => Promise<AichatCredentials>;
-	buildDriver: (entry: AgentEntry) => AgentDriver;
+	buildDriver: (entry: AgentEntry) => RunDriver;
 	buildApiClient: (cred: AichatCredentials) => HulaApiClient;
 	buildWs: (
 		cred: AichatCredentials,
@@ -33,7 +33,7 @@ export interface SupervisorDeps {
 	) => HulaWSClient;
 	buildHandler: (
 		ws: HulaWSClient,
-		driver: AgentDriver,
+		driver: RunDriver,
 		uid: string,
 		api: HulaApiClient,
 		onTokenExpired: () => void,
@@ -90,7 +90,7 @@ export interface SupervisedAgent {
 	// REQ-029 (#29): uid is an opaque string end-to-end.
 	uid: string;
 	status: AgentStatus;
-	driver: AgentDriver;
+	driver: RunDriver;
 	ws: HulaWSClient;
 	handler: MessageHandler;
 	/**
@@ -135,7 +135,7 @@ export class Supervisor {
 	 * supervised —— `agents` 顺序仍 = entries 顺序（便于测试）。onConnected/onDisconnected 在各 driver
 	 * connect 完成（start 返回、supervised 已就绪）之后才由 HuLa ws 触发，故无「startup 窗口内标记丢失」。
 	 */
-	async start(entries: AgentEntry[]): Promise<void> {
+	async start(entries: AgentEntry[], connectInbound = true): Promise<void> {
 		const slots: Array<SupervisedAgent | null> = entries.map(() => null);
 		await Promise.allSettled(
 			entries.map(async (entry, i) => {
@@ -147,6 +147,12 @@ export class Supervisor {
 			}),
 		);
 		this.supervised = slots.filter((s): s is SupervisedAgent => s !== null);
+		if (connectInbound) this.connectInbound();
+	}
+
+	/** The endpoint and imported bindings must be ready before accepting a WS message. */
+	connectInbound(): void {
+		for (const agent of this.supervised) agent.ws.connect();
 	}
 
 	/**
@@ -171,6 +177,7 @@ export class Supervisor {
 				// REQ-008 #76 P2: 重连成功 → 回到 online。**但 offline 是 terminal**：
 				// 已降级身份的迟到重连回调不得翻回 online（degrade 已断 ws/driver）。
 				this.markReconnected(cred.uid);
+				ref.handler!.onConnected(); // Re-send only pending exact-run thinking frames after socket recovery.
 				// REQ #26 / BL-015 #140: 首连 + 每次重连主动预热全量群配置。Nacos 重注册窗口内会失败，
 				// 交给 retryAsync 有界退避重试自愈（fire-and-forget，永不 reject，不阻塞 onopen）。
 				// handler 在 onConnected 触发前必已就绪（见 ref 注释），故此处非空断言安全。
@@ -218,8 +225,6 @@ export class Supervisor {
 		// REQ-018: 把 fail-fast 拉取的模板注入 handler 缓存，供每次 openSession 的 chatContext.templates 读取。
 		ref.handler.setPromptTemplates(templates);
 
-		ws.connect();
-
 		const agent: SupervisedAgent = { entry, uid: cred.uid, status: 'online', driver, ws, handler: ref.handler, api };
 		console.log(`[supervisor] agent uid=${cred.uid} (tool=${entry.tool}) online`);
 		return agent;
@@ -236,7 +241,7 @@ export class Supervisor {
 	 * 失败时 best-effort disconnect 旧 driver（避免其内部重连定时器泄漏），瞬态且还有次数则退避后重试，
 	 * 否则向上抛（让 start 像以前一样降级该身份）。
 	 */
-	private async connectWithRetry(entry: AgentEntry): Promise<AgentDriver> {
+	private async connectWithRetry(entry: AgentEntry): Promise<RunDriver> {
 		const maxAttempts = this.deps.maxConnectAttempts ?? 5;
 		const backoffMs = this.deps.connectBackoffMs ?? defaultConnectBackoffMs;
 		const delay = this.deps.delay ?? defaultDelay;

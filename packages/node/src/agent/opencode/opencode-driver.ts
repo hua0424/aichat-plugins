@@ -1,380 +1,295 @@
-import { mkdir } from 'node:fs/promises';
+import { mkdir, realpath } from 'node:fs/promises';
 import type { OpencodeClient } from '@opencode-ai/sdk';
-import type { AgentDriver, AgentSession, AgentEvent } from '../events.js';
-import { deriveWorkspaceDir, type ChatContext } from '../workspace.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { mapOpencodeEvent } from './events.js';
 import type { OpencodeServerManager } from './server-manager.js';
-import type { SessionStore } from './session-store.js';
-import { buildSystemPrompt } from '../prompt-templates.js';
-import { bindingKey, parseBindingKey } from '../bind-token-store.js';
 import { errMsg } from '../../util/err.js';
 
-/** Parsed `"providerID/modelID"` model override. */
-interface ParsedModel {
-	providerID: string;
-	modelID: string;
+type Model = { providerID: string; modelID: string };
+function parseModel(value?: string): Model | undefined {
+	if (!value) return undefined;
+	const slash = value.indexOf('/');
+	return slash > 0 && slash < value.length - 1
+		? { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) } : undefined;
 }
 
-/** Parse a `"providerID/modelID"` string; returns undefined if unset/malformed. */
-function parseModel(model: string | undefined): ParsedModel | undefined {
-	if (!model) return undefined;
-	const slash = model.indexOf('/');
-	if (slash <= 0 || slash === model.length - 1) return undefined;
-	return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
-}
+// ponytail: conservative directory-wide claim; lift to per-session concurrency after
+// pinned OpenCode runtime proves system prompts are isolated for shared directories.
+const directoryOwners = new WeakMap<OpencodeServerManager, Map<string, string>>();
 
 export interface OpencodeDriverDeps {
 	server: OpencodeServerManager;
-	workspaceBase: string;
-	sessionStore: SessionStore;
-	/** Optional `"providerID/modelID"` model override applied to every prompt. */
 	model?: string;
+	/** Core rejects another conversation's persisted claim on this physical directory. */
+	assertDirectoryOwner?: (conversationId: string, directory: string) => void;
+	/** Abort + status verification budget; default 10 seconds. */
+	cancelTimeoutMs?: number;
 }
 
-/**
- * REQ-008 #77 — OpencodeDriver: an AgentDriver backed by a shared opencode server.
- *
- * ONE OpencodeServerManager (a singleton across all opencode identities) runs a single
- * opencode server; this driver opens per-(aiclawUid, roomId) sessions against it, each
- * scoped to a per-conversation workspace `directory`. Sessions are persisted in the
- * SessionStore for cross-restart reuse.
- *
- * This slice is THINKING-ONLY: it never replies to chat. The agent's reasoning/text and
- * tool activity stream out as AgentEvents; with no `terminal` event, reduceThinking
- * auto-skips (no message is sent), which is exactly correct here.
- */
-export class OpencodeDriver implements AgentDriver {
+/** The factory owns the shared server; a driver owns only its own active turns. */
+export class OpencodeDriver implements RunDriver {
 	readonly type = 'opencode';
-
-	private readonly server: OpencodeServerManager;
-	private readonly workspaceBase: string;
-	private readonly sessionStore: SessionStore;
-	private readonly model?: string;
-
-	constructor(deps: OpencodeDriverDeps) {
-		this.server = deps.server;
-		this.workspaceBase = deps.workspaceBase;
-		this.sessionStore = deps.sessionStore;
-		this.model = deps.model;
+	readonly features = { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' } as const;
+	private readonly active = new Set<OpenCodeRun>();
+	constructor(private readonly deps: OpencodeDriverDeps) {
+		if (deps.cancelTimeoutMs !== undefined && (!Number.isFinite(deps.cancelTimeoutMs) || deps.cancelTimeoutMs < 0))
+			throw new RangeError('Invalid OpenCode cancel timeout');
 	}
-
-	async connect(): Promise<void> {
-		await this.server.ensureStarted();
-	}
-
-	/**
-	 * REQ-010 S1: map an opencode session id (carried by the `aichat send-message` capability as
-	 * its sessionKey) back to the bound HuLa identity+room. Looks up the key this session id was
-	 * stored under (`aiclaw-{uid}-room-{roomId}`) and parses it. Returns undefined if the id is
-	 * unknown or the key is unparseable.
-	 *
-	 * ponytail: this scans THIS driver's in-memory sessionStore. Correct for the PoC's single
-	 * opencode identity. Multiple opencode identities share the sessions.json file on disk but
-	 * have SEPARATE in-memory maps, so a fresh session created by another identity after this
-	 * driver loaded won't resolve here until reload. Upgrade when N>1: a shared session index or a
-	 * per-call reload of the store.
-	 */
-	resolveSession(sessionKey: string): { aiclawUid: string; roomId: string } | undefined {
-		const key = this.sessionStore.findKeyBySessionID(sessionKey);
-		return key ? parseBindingKey(key) : undefined;
-	}
-
-	/**
-	 * aichatoverview#124 — drop the stored session for this (uid,room) so the NEXT turn creates a FRESH
-	 * opencode session (context cleared). Key built FROM THE ARGS. Returns true (this driver is stateful).
-	 */
-	resetSession(aiclawUid: string, roomId: string): boolean {
-		this.sessionStore.delete(bindingKey(aiclawUid, roomId));
-		return true;
-	}
-
+	async connect(): Promise<void> { await this.deps.server.ensureStarted(); }
 	async disconnect(): Promise<void> {
-		// No-op. The shared opencode server is NOT owned by any single driver — it is a
-		// singleton serving N opencode identities, so stopping it here would kill ALL of
-		// them and break the supervisor's per-agent isolation. It is closed only by GLOBAL
-		// shutdown (see start.ts startMultiIdentity). This driver has no other per-driver
-		// resources to release: per-turn SSE subscriptions are owned by OpencodeSession and
-		// closed via AgentSession.close() by the handler.
+		await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
+		// Never restart or stop the backend shared by other identities.
 	}
-
-	// ponytail/TODO(#78): shared-server fault-domain recovery — if the singleton server
-	// crashes, the sessionIDs persisted here become stale. A future slice should detect a
-	// crashed server and lazily rebuild the session on the next openSession/send. Not done
-	// now: no crash detection / retry here.
-	async openSession(o: {
-		aiclawUid: string;
-		roomId: string;
-		chatContext: ChatContext;
-	}): Promise<AgentSession> {
-		const ctx = o.chatContext;
-		// REQ-008 #77 fix: namespace the workspace by aiclawUid so two identities never collide.
-		const directory = deriveWorkspaceDir(this.workspaceBase, o.aiclawUid, ctx);
-		await mkdir(directory, { recursive: true });
-
-		const key = bindingKey(o.aiclawUid, o.roomId);
-		const client = this.server.getClient();
-
-		// Lazy create-or-reuse: a persisted binding for the SAME directory is reusable.
-		// (A binding for a different directory is stale — recreate so the session is scoped
-		// to the current workspace.)
-		const stored = this.sessionStore.get(key);
-		let sessionID: string;
-		if (stored && stored.directory === directory) {
-			sessionID = stored.sessionID;
-		} else {
-			const created = await client.session.create({ query: { directory }, body: { title: key } });
-			const id = (created as { data?: { id?: string } }).data?.id;
-			if (!id) throw new Error('opencode session.create returned no session id');
-			sessionID = id;
-			this.sessionStore.set(key, { sessionID, directory });
-		}
-
-		// REQ-008 #78 P2③ lazy rebuild: if send() fails because the server/session is gone,
-		// drop the stored binding so the NEXT openSession recreates the session, and best-effort
-		// restart the shared server. Lazy rebuild = recover on the next turn, not same-turn retry.
-		// TODO(#78): fuller crash detection / auto-retry (probe + same-turn re-prompt) is a future
-		// refinement; for now we only invalidate so we don't keep prompting a dead session.
-		const onSessionError = () => {
-			this.sessionStore.delete(key);
-			void this.server.restart().catch(() => {
-				/* best-effort: the next openSession's getClient()/ensureStarted() recovers */
-			});
-		};
-
-		// REQ-018: render the unified system prompt once per (per-turn) session from the handler-supplied
-		// templates + persona + resolved display name. The display name is resolved LAZILY via
-		// chatContext.getSelfName (all four drivers share it; called only when templates are present).
-		const selfName = ctx.templates ? await ctx.getSelfName?.() : undefined;
-		const systemPrompt = ctx.templates
-			? buildSystemPrompt(ctx.templates, { displayName: selfName, uid: o.aiclawUid, persona: ctx.persona ?? null })
-			: undefined;
-
-		return new OpencodeSession(client, sessionID, directory, parseModel(this.model), systemPrompt, onSessionError);
+	createRun(input: PreparedRun): AgentRun {
+		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
+			!input.workspace || typeof input.systemPrompt !== 'string') throw new TypeError('Invalid OpenCode prepared run');
+		const run = new OpenCodeRun(input, this.deps, () => this.active.delete(run));
+		this.active.add(run);
+		return run;
 	}
 }
 
-/**
- * One in-flight opencode turn. Mirrors openclaw-driver.ts's push→pull async-queue bridge:
- * SSE events fired by the subscription are pushed into a buffer that the async-iterator
- * consumer pulls from, so events that land before the consumer awaits are never lost.
- *
- * Ordering guarantee: subscribe FIRST, then prompt — so no event between prompt-accepted
- * and the first poll is missed.
- */
-class OpencodeSession implements AgentSession {
-	private closed = false;
-	/** Registered when send() starts; close() calls it to wake a parked consumer. */
-	private closeActive: (() => void) | null = null;
+class OpenCodeRun implements AgentRun {
+	private consuming = false;
+	private submitted = false;
+	private completed = false;
+	private cancelled = false;
+	private disposed = false;
+	private sessionID?: string;
+	private client?: OpencodeClient;
+	private stream?: AsyncIterator<unknown>;
+	private cancelPromise?: Promise<Awaited<ReturnType<AgentRun['cancel']>>>;
+	private wake?: () => void;
+	private handshakeWake?: () => void;
+	private readonly sseController = new AbortController();
+	private readonly promptController = new AbortController();
+	private readonly startedAt = Date.now();
+	private readonly onAbort = () => { void this.cancel('aborted'); };
+	constructor(private readonly input: PreparedRun, private readonly deps: OpencodeDriverDeps,
+		private readonly onFinished: () => void) {}
 
-	constructor(
-		private readonly client: OpencodeClient,
-		private readonly sessionID: string,
-		private readonly directory: string,
-		private readonly model: ParsedModel | undefined,
-		/**
-		 * REQ-018: the fully-rendered unified system prompt (identity anchor + persona + reply
-		 * contract) sent as the prompt body's `system` field. Optional — a turn without templates
-		 * has none (body.system omitted; the user part is the pure message).
-		 */
-		private readonly systemPrompt: string | undefined,
-		/**
-		 * REQ-008 #78 P2③: invoked once when send()'s subscribe/prompt throws (server/session
-		 * gone), AFTER the terminal error has been emitted. The driver wires this to drop the
-		 * stale session binding (lazy rebuild on the next turn) + best-effort restart the server.
-		 */
-		private readonly onSessionError?: () => void,
-	) {}
+	get events(): AsyncIterable<AgentEvent> {
+		return { [Symbol.asyncIterator]: () => {
+			if (this.consuming) throw new Error('OpenCode run events can be consumed only once');
+			this.consuming = true;
+			return this.execute();
+		} };
+	}
 
-	send(message: string): AsyncIterable<AgentEvent> {
-		const buffer: AgentEvent[] = [];
-		let done = false;
-		let resolveNext: (() => void) | null = null;
-		const turnStart = Date.now();
-
-		// tool start/end de-dup ledger: at most one 'start' and one 'end' per callID.
-		// mapOpencodeEvent is stateless per-event; we collapse repeats here.
-		const toolStarted = new Set<string>();
-		const toolEnded = new Set<string>();
-		// opencode parts carry no role, and the USER message's text part (our prompt, reply
-		// instruction included) streams on the same bus — whitelist assistant message ids from
-		// `message.updated` events (emitted before that message's parts) so mapOpencodeEvent
-		// can drop user-message parts from the thinking stream.
-		const assistantMessageIDs = new Set<string>();
-
-		// Manual async-iterator handle on the SSE stream so we can close it externally even
-		// while a consumer is PARKED on iter.next() (a `for await` can't be interrupted).
-		let streamIter: AsyncIterator<unknown> | null = null;
-		let iterReturned = false;
-		const returnIter = () => {
-			if (iterReturned) return; // call return() at most once
-			iterReturned = true;
-			try {
-				void streamIter?.return?.();
-			} catch {
-				/* best-effort: terminate a parked iter.next() / close the subscription */
-			}
+	private async *execute(): AsyncGenerator<AgentEvent> {
+		const input = this.input;
+		const queue: AgentEvent[] = [];
+		let ended = false;
+		let connected = false;
+		let streamEnded = false;
+		let streamFailure: string | undefined;
+		const started = new Set<string>();
+		const finished = new Set<string>();
+		const assistants = new Set<string>();
+		const push = (event: AgentEvent) => { if (!ended) { queue.push(event); this.wake?.(); } };
+		const end = () => { ended = true; this.wake?.(); };
+		const failStream = (message: string) => {
+			streamFailure = message;
+			// The prompt may hang indefinitely on permission/retry. Surface the native error
+			// immediately; core will attempt abort and retain unconfirmed recovery.
+			if (this.submitted) { push({ type: 'error', message }); end(); }
 		};
-
-		const wake = () => {
-			if (resolveNext) {
-				const r = resolveNext;
-				resolveNext = null;
-				r();
+		let pump: Promise<void> | undefined;
+		try {
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			input.signal.addEventListener('abort', this.onAbort, { once: true });
+			const directory = input.workspace!;
+			const previous = input.conversation.nativeState?.value;
+			if (previous !== undefined && (!previous || typeof previous !== 'object' ||
+				!('sessionID' in previous) || typeof previous.sessionID !== 'string' || !previous.sessionID ||
+				!('directory' in previous) || previous.directory !== directory))
+				throw new Error('OpenCode native session/directory mismatch; explicit reset required (history retained)');
+			await mkdir(directory, { recursive: true });
+			const physicalDirectory = await realpath(directory);
+			const ownerKey = process.platform === 'win32' ? physicalDirectory.toLowerCase() : physicalDirectory;
+			this.deps.assertDirectoryOwner?.(input.conversation.id, ownerKey);
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			// Until the pinned runtime proves independently scoped prompts in one directory,
+			// refuse a second conversation instead of silently sharing a mutable scope.
+			let owners = directoryOwners.get(this.deps.server);
+			if (!owners) { owners = new Map(); directoryOwners.set(this.deps.server, owners); }
+			const owner = owners.get(ownerKey);
+			if (owner && owner !== input.conversation.id) throw new Error('PROMPT_SCOPE_CONFLICT: shared OpenCode directory belongs to another conversation');
+			owners.set(ownerKey, input.conversation.id);
+			await this.deps.server.ensureStarted();
+			this.client = this.deps.server.getClient();
+			if (previous && typeof previous === 'object' && 'sessionID' in previous) {
+				this.sessionID = previous.sessionID as string;
+			} else {
+				input.conversation.assertCurrent();
+				if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				const created = await this.client.session.create({ query: { directory }, body: { title: input.conversation.id }, throwOnError: true });
+				const id = created.data?.id;
+				if (!id) throw new Error('OpenCode session.create returned no session id');
+				this.sessionID = id;
+				// A late creation after reset is not allowed to bind a stale generation.
+				input.conversation.assertCurrent();
+				if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				if (!input.conversation.registerNative) throw new Error('OpenCode atomic native registration unavailable');
+				await input.conversation.registerNative(id, { version: 1, value: { sessionID: id, directory } });
 			}
-		};
-		const push = (ev: AgentEvent) => {
-			if (done) return;
-			buffer.push(ev);
-			wake();
-		};
-		// Error dedup invariant: the FIRST push+finish wins. Because push() is a no-op once
-		// `done` is set and finish() runs synchronously right after the first error push
-		// (prompt-rejection path) or right after handleRaw returns true (SSE-error path),
-		// a second error can never be buffered — at most ONE 'error' event reaches the
-		// consumer. finish() also closes the SSE iterator so a parked turn ends promptly.
-		const finish = () => {
-			if (done) return;
-			done = true;
-			returnIter();
-			wake();
-		};
-		this.closeActive = finish;
-
-		// Map a raw SSE event → at most one buffered AgentEvent, applying tool de-dup and
-		// filling the real durationMs on done. Returns true if the stream should end.
-		const handleRaw = (raw: unknown): boolean => {
-			const assistantMsgID = extractAssistantMessageID(raw, this.sessionID);
-			if (assistantMsgID) assistantMessageIDs.add(assistantMsgID);
-			const ev = mapOpencodeEvent(raw, this.sessionID, assistantMessageIDs);
-			if (!ev) return false;
-
-			if (ev.type === 'tool') {
-				const callID = extractCallID(raw);
-				const seen = ev.phase === 'start' ? toolStarted : toolEnded;
-				if (callID) {
-					if (seen.has(callID)) return false; // duplicate phase for this callID → drop
-					seen.add(callID);
-				}
-				push(ev);
-				return false;
-			}
-			if (ev.type === 'done') {
-				push({ type: 'done', durationMs: Date.now() - turnStart });
-				return true;
-			}
-			if (ev.type === 'error') {
-				push(ev);
-				return true;
-			}
-			// thinking
-			push(ev);
-			return false;
-		};
-
-		// REQ-018: the per-turn message is PURE user text — the reply contract + identity anchor + persona
-		// now live in the prompt body's `system` field (rendered from server-fetched templates once per
-		// session). No per-turn role-instruction prefix anymore.
-		// Drive the SDK: subscribe first (avoid the race), then prompt, then pump events.
-		void (async () => {
-			try {
-				const { stream } = await this.client.event.subscribe({ query: { directory: this.directory } });
-
-				// Fire the prompt AFTER subscribing so no early event is missed. We do not await
-				// its completion to drive the loop — completion arrives via session.idle.
-				const promptPromise = this.client.session.prompt({
-					path: { id: this.sessionID },
-					query: { directory: this.directory },
-					body: {
-						parts: [{ type: 'text', text: message }],
-						...(this.systemPrompt ? { system: this.systemPrompt } : {}),
-						...(this.model ? { model: this.model } : {}),
-					},
-				});
-				// Surface a prompt rejection as a terminal error event. push()+finish() are
-				// sequential with no await between them, so once finish() sets `done`, any
-				// later error push (e.g. an SSE session.error) is dropped — single error.
-				promptPromise.then(
-					() => {},
-					(err: unknown) => {
-						push({ type: 'error', message: errMsg(err) });
-						finish();
-						// P2③: prompt rejected (session/server gone) → invalidate for lazy rebuild.
-						this.onSessionError?.();
-					},
-				);
-
-				// Iterate the stream MANUALLY (not `for await`) so finish()/close() can call
-				// streamIter.return() to terminate a parked next() and close the subscription.
-				const iter = stream[Symbol.asyncIterator]();
-				streamIter = iter;
-				if (iterReturned) {
-					// finish()/close() already fired before we stored the iterator → honor it.
-					returnIter();
-				} else {
-					while (true) {
-						const { value: raw, done: d } = await iter.next();
-						if (d) break;
-						if (done || this.closed) break;
-						const end = handleRaw(raw);
-						if (end) {
-							finish();
-							break;
+			// Preserve the precise native locator before any prompt. Neither SSE EOF nor a rejected
+			// request proves that the backend stopped or that its native history was lost.
+			await input.saveRecovery({ version: 1, value: { provider: 'opencode', runId: input.runId,
+				sessionID: this.sessionID, directory, stopProbe: 'unconfirmed' } });
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			const subscribed = await this.client.event.subscribe({ query: { directory }, signal: this.sseController.signal, throwOnError: true });
+			this.stream = subscribed.stream[Symbol.asyncIterator]();
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			const sessionID = this.sessionID!;
+			const client = this.client;
+			const iterator = this.stream;
+			pump = (async () => {
+				try {
+					while (!this.cancelled && !this.disposed) {
+						const next = await iterator.next();
+						if (next.done) { failStream('UNEXPECTED_EOF: OpenCode SSE closed before prompt completion'); break; }
+						const raw = next.value;
+						if ((raw as { type?: unknown } | null)?.type === 'server.connected') {
+							connected = true;
+							this.handshakeWake?.();
+							continue;
 						}
+						const assistantID = assistantMessageID(raw, sessionID);
+						if (assistantID) assistants.add(assistantID);
+						const ev = mapOpencodeEvent(raw, sessionID, assistants);
+						if (!ev) continue;
+						// session.idle is uncorrelated: a delayed idle from an earlier turn
+						// must never complete this HTTP request.
+						if (ev.type === 'done') continue;
+						if (ev.type === 'tool') {
+							const id = toolCallID(raw);
+							const seen = ev.phase === 'start' ? started : finished;
+							if (id && seen.has(id)) continue;
+							if (id) seen.add(id);
+						}
+						if (ev.type === 'error') { failStream(ev.message); break; }
+						push(ev);
 					}
-				}
-			} catch (err) {
-				push({ type: 'error', message: errMsg(err) });
-				// P2③: subscribe (or other setup) threw → invalidate for lazy rebuild on next turn.
-				this.onSessionError?.();
-			} finally {
-				finish();
+				} catch (error) { if (!this.cancelled) failStream(errMsg(error)); }
+				finally { streamEnded = true; this.handshakeWake?.(); }
+			})();
+			// The SDK stream starts its HTTP GET only on iterator.next(). The subscribed
+			// response is not a listener until server.connected reaches the pump.
+			if (!connected && !streamEnded) {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					await Promise.race([
+						new Promise<void>((resolve) => { this.handshakeWake = resolve; }),
+						new Promise<void>((resolve) => { timer = setTimeout(resolve, 10_000); }),
+					]);
+				} finally { if (timer) clearTimeout(timer); this.handshakeWake = undefined; }
 			}
-		})();
-
-		const isClosed = () => this.closed;
-
-		return {
-			async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
-				while (true) {
-					while (buffer.length > 0) {
-						yield buffer.shift()!;
+			if (!connected || streamEnded) throw new Error('OpenCode SSE handshake/subscription unconfirmed; prompt not submitted');
+			input.conversation.assertCurrent();
+			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			// prompt() resolves only for THIS submitted message, unlike uncorrelated
+			// session.idle. Do not await here: stream thinking while HTTP remains active.
+			this.submitted = true;
+			void client.session.prompt({ path: { id: sessionID }, query: { directory },
+				body: { parts: [{ type: 'text', text: input.message }], system: input.systemPrompt,
+					...(parseModel(this.deps.model) ? { model: parseModel(this.deps.model) } : {}) },
+				signal: this.promptController.signal, throwOnError: true }).then(
+				(response) => {
+					if (this.cancelled) return;
+					const info = response.data?.info;
+					if (info?.sessionID !== sessionID || !info.id || info.error) {
+						push({ type: 'error', message: info?.error
+							? `OpenCode assistant error: ${JSON.stringify(info.error)}`
+							: 'OpenCode prompt returned no matching assistant message' });
+						return;
 					}
-					if (done || isClosed()) return;
-					await new Promise<void>((resolve) => {
-						resolveNext = resolve;
-					});
-				}
-			},
-		};
+					push(streamFailure
+						? { type: 'error', message: streamFailure }
+						: { type: 'done', durationMs: Date.now() - this.startedAt });
+				},
+				(error: unknown) => { if (!this.cancelled) push({ type: 'error', message: errMsg(error) }); },
+			).finally(end);
+			while (!ended || queue.length) {
+				if (this.cancelled) { yield { type: 'cancelled', reason: 'OpenCode stop not confirmed' }; return; }
+				if (queue.length) {
+					const ev = queue.shift()!;
+					if (ev.type === 'done') this.completed = true;
+					yield ev;
+					if (ev.type === 'done' || ev.type === 'error') return;
+				} else await new Promise<void>((resolve) => { this.wake = resolve; });
+			}
+			if (!this.cancelled) yield { type: 'error', message: 'UNEXPECTED_EOF' };
+		} catch (error) {
+			yield this.cancelled ? { type: 'cancelled', reason: 'OpenCode stop not confirmed' }
+				: { type: 'error', message: errMsg(error) };
+		} finally {
+			input.signal.removeEventListener('abort', this.onAbort);
+			this.disposed = true;
+			this.sseController.abort();
+			this.promptController.abort();
+			void this.stream?.return?.().catch(() => {});
+			void pump?.catch(() => {});
+			this.onFinished();
+		}
 	}
 
-	async close(): Promise<void> {
-		this.closed = true;
-		// Wake a consumer parked on the await inside the iterator (mirror openclaw-driver).
-		if (this.closeActive) this.closeActive();
+	async cancel(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {
+		if (this.completed) return { status: 'stopped' };
+		this.cancelled = true;
+		this.sseController.abort(); // local subscription only; never proof of native stop
+		this.promptController.abort(); // local HTTP request only; native abort is separate
+		this.wake?.();
+		this.handshakeWake?.();
+		if (!this.submitted) return { status: 'stopped' };
+		return this.cancelPromise ??= this.abortAndVerify(reason);
+	}
+
+	private async abortAndVerify(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {
+		const client = this.client!;
+		const id = this.sessionID!;
+		const directory = this.input.workspace!;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				(async () => {
+					const result = await client.session.abort({ path: { id }, query: { directory }, throwOnError: true });
+					if (result.data !== true) return { status: 'unconfirmed', reason: `${reason}: OpenCode abort not acknowledged` } as const;
+					const status = await client.session.status({ query: { directory }, throwOnError: true });
+					// A status snapshot can precede acceptance of the in-flight promptAsync POST.
+					// Until the pinned server verifies ordering, even abort + idle is not stop proof.
+					return { status: 'unconfirmed', reason: `${reason}: OpenCode abort acknowledged, status=${status.data?.[id]?.type ?? 'unknown'}; submitted turn stop not verified` } as const;
+				})(),
+				new Promise<{ status: 'unconfirmed'; reason: string }>((resolve) => {
+					timer = setTimeout(() => resolve({ status: 'unconfirmed', reason: `${reason}: OpenCode abort/status timed out` }),
+						this.deps.cancelTimeoutMs ?? 10_000);
+				}),
+			]);
+		} catch (error) { return { status: 'unconfirmed', reason: `${reason}: ${errMsg(error)}` }; }
+		finally { if (timer) clearTimeout(timer); }
+	}
+	async dispose(): Promise<void> {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.sseController.abort();
+		this.promptController.abort();
+		// Subscription cleanup alone is NOT upstream cancellation or stop proof.
+		if (!this.completed) await this.cancel('dispose');
+		void this.stream?.return?.().catch(() => {});
+		this.wake?.();
 	}
 }
 
-/** Pull the tool callID out of a message.part.updated raw event, for de-dup. */
-function extractCallID(raw: unknown): string | undefined {
-	if (!raw || typeof raw !== 'object') return undefined;
-	const props = (raw as { properties?: unknown }).properties as { part?: unknown } | undefined;
-	const part = props?.part as { callID?: unknown } | undefined;
+function toolCallID(raw: unknown): string | undefined {
+	const part = (raw as { properties?: { part?: { callID?: unknown } } } | null)?.properties?.part;
 	return typeof part?.callID === 'string' ? part.callID : undefined;
 }
-
-/**
- * Pull the message id out of a `message.updated` raw event for THIS session when it announces
- * an ASSISTANT message (parts carry no role, so this is the only role source). Returns
- * undefined for user messages, other sessions, and non-message.updated events.
- */
-function extractAssistantMessageID(raw: unknown, sessionID: string): string | undefined {
-	if (!raw || typeof raw !== 'object') return undefined;
-	const e = raw as { type?: unknown; properties?: unknown };
-	if (e.type !== 'message.updated') return undefined;
-	const info = (e.properties as { info?: unknown } | undefined)?.info as
-		| { id?: unknown; sessionID?: unknown; role?: unknown }
-		| undefined;
-	if (info?.sessionID !== sessionID || info.role !== 'assistant') return undefined;
-	return typeof info.id === 'string' ? info.id : undefined;
+function assistantMessageID(raw: unknown, sessionID: string): string | undefined {
+	const ev = raw as { type?: unknown; properties?: { info?: { id?: unknown; sessionID?: unknown; role?: unknown } } } | null;
+	const info = ev?.properties?.info;
+	return ev?.type === 'message.updated' && info?.sessionID === sessionID && info.role === 'assistant' &&
+		typeof info.id === 'string' ? info.id : undefined;
 }

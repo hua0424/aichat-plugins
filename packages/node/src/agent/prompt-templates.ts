@@ -54,5 +54,7 @@ export function buildSystemPrompt(templates: AgentPromptTemplates, ctx: SystemPr
 			? templates.personaSection.replaceAll('{persona}', ctx.persona)
 			: '';
 	const contract = templates.replyContract.replaceAll('{reply_command}', REPLY_COMMAND);
-	return [anchor, personaBlock, contract].map((s) => s.trim()).filter((s) => s.length > 0).join('\n');
+	// ponytail: server seed still describes command invocation as delivery; append a safety override until its template is versioned for --json.
+	const cliResult = '发送结果以 CLI --json 输出为准：只在 ok === true 时确认成功（结果在 result）；ok === false 时读 code、message、retryable 并报告失败。DELIVERY_UNKNOWN 表示结果未知，保留 requestId，不自动重发，也不要声称已发送。不要输出绑定凭据。';
+	return [anchor, personaBlock, contract, cliResult].map((s) => s.trim()).filter((s) => s.length > 0).join('\n');
 }

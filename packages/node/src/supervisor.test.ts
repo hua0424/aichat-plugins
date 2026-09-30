@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Supervisor, type SupervisorDeps } from './supervisor.js';
 import type { AgentEntry } from './registry.js';
 import type { AichatCredentials } from './config.js';
-import type { AgentDriver } from './agent/events.js';
+import type { RunDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
@@ -51,7 +51,7 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 			const uid = Number(entry.token.replace(/\D/g, '')) || 1;
 			return { uid, connectionToken: `conn-${uid}`, machineCode: `mc-${uid}`, activatedAt: 'now' };
 		}),
-		buildDriver: vi.fn((entry: AgentEntry): AgentDriver => {
+		buildDriver: vi.fn((entry: AgentEntry): RunDriver => {
 			const connect = vi.fn().mockResolvedValue(undefined);
 			const disconnect = vi.fn().mockResolvedValue(undefined);
 			built.drivers.push({ entry, connect, disconnect });
@@ -59,8 +59,9 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				type: 'mock',
 				connect,
 				disconnect,
-				openSession: vi.fn(),
-			} as unknown as AgentDriver;
+				features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+				createRun: vi.fn(),
+			} as unknown as RunDriver;
 		}),
 		buildApiClient: vi.fn((cred: AichatCredentials): HulaApiClient => {
 			const reportAgentType = vi.fn().mockResolvedValue(undefined);
@@ -106,6 +107,7 @@ function makeDeps(overrides?: Partial<SupervisorDeps>) {
 				built.prewarmPromptTemplatesByUid.set(uid, prewarmPromptTemplates);
 				return {
 					handle: vi.fn(),
+					onConnected: vi.fn(),
 					prewarmGroupConfigs,
 					prewarmPersona,
 					setPromptTemplates,
@@ -161,6 +163,16 @@ describe('Supervisor.start', () => {
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
 
+	it('does not accept inbound WS traffic until the endpoint and bindings are ready', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries, false);
+		expect(sup.agents).toHaveLength(3);
+		expect(built.wsList.every((ws) => ws.connect.mock.calls.length === 0)).toBe(true);
+		sup.connectInbound();
+		expect(built.wsList.every((ws) => ws.connect.mock.calls.length === 1)).toBe(true);
+	});
+
 	it('#166: starts in PARALLEL yet preserves entries order (pre-sized slots, deterministic)', async () => {
 		const completion: number[] = [];
 		const { deps } = makeDeps({
@@ -201,7 +213,7 @@ describe('Supervisor.start', () => {
 
 	it('ISOLATION: a driver.connect() throw for one entry isolates only that entry', async () => {
 		const { deps } = makeDeps({
-			buildDriver: vi.fn((entry: AgentEntry): AgentDriver => {
+			buildDriver: vi.fn((entry: AgentEntry): RunDriver => {
 				const fail = entry.token === 'tok-2';
 				return {
 					type: 'mock',
@@ -209,8 +221,9 @@ describe('Supervisor.start', () => {
 						? vi.fn().mockRejectedValue(new Error('connect boom'))
 						: vi.fn().mockResolvedValue(undefined),
 					disconnect: vi.fn().mockResolvedValue(undefined),
-					openSession: vi.fn(),
-				} as unknown as AgentDriver;
+					features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+					createRun: vi.fn(),
+				} as unknown as RunDriver;
 			}),
 		});
 		const sup = new Supervisor(deps);
@@ -230,7 +243,7 @@ describe('Supervisor connect retry (REQ-008 #79)', () => {
 		const delay = vi.fn(() => Promise.resolve());
 
 		const { deps } = makeDeps({
-			buildDriver: vi.fn((): AgentDriver => {
+			buildDriver: vi.fn((): RunDriver => {
 				attempt++;
 				const willFail = attempt <= 2;
 				const connect = willFail
@@ -239,7 +252,7 @@ describe('Supervisor connect retry (REQ-008 #79)', () => {
 				const disconnect = vi.fn().mockResolvedValue(undefined);
 				connects.push(connect);
 				disconnects.push(disconnect);
-				return { type: 'mock', connect, disconnect, openSession: vi.fn() } as unknown as AgentDriver;
+				return { type: 'mock', connect, disconnect, features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' }, createRun: vi.fn() } as unknown as RunDriver;
 			}),
 			delay,
 			maxConnectAttempts: 5,
@@ -267,13 +280,14 @@ describe('Supervisor connect retry (REQ-008 #79)', () => {
 		const delay = vi.fn(() => Promise.resolve());
 		const { deps } = makeDeps({
 			buildDriver: vi.fn(
-				(): AgentDriver =>
+				(): RunDriver =>
 					({
 						type: 'mock',
 						connect: vi.fn().mockRejectedValue(new Error('boom')),
 						disconnect: vi.fn().mockResolvedValue(undefined),
-						openSession: vi.fn(),
-					}) as unknown as AgentDriver,
+						features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+						createRun: vi.fn(),
+					}) as unknown as RunDriver,
 			),
 			delay,
 			maxConnectAttempts: 5,
@@ -292,13 +306,14 @@ describe('Supervisor connect retry (REQ-008 #79)', () => {
 		const delay = vi.fn(() => Promise.resolve());
 		const { deps } = makeDeps({
 			buildDriver: vi.fn(
-				(): AgentDriver =>
+				(): RunDriver =>
 					({
 						type: 'mock',
 						connect: vi.fn().mockRejectedValue(new Error('gateway starting')),
 						disconnect: vi.fn().mockResolvedValue(undefined),
-						openSession: vi.fn(),
-					}) as unknown as AgentDriver,
+						features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+						createRun: vi.fn(),
+					}) as unknown as RunDriver,
 			),
 			delay,
 			maxConnectAttempts: 3,

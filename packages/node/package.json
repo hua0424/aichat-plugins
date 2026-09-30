@@ -6,10 +6,12 @@
   "bin": {
     "aichat": "dist/cli.js"
   },
+  "files": ["dist/**", "src/agent/cc/native/cc-job-supervisor.rs", "src/agent/cc/native/README.md", "scripts/build-cc-job.mjs", "scripts/verify-cc-job-package.mjs"],
   "scripts": {
     "dev": "tsx watch src/cli.ts -- start",
     "start": "node dist/cli.js start",
-    "build": "tsc",
+    "build": "tsc && node scripts/build-cc-job.mjs",
+    "prepack": "node scripts/verify-cc-job-package.mjs",
     "lint": "tsc --noEmit",
     "test": "vitest",
     "test:run": "vitest run"

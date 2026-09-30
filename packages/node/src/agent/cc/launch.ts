@@ -4,9 +4,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 /**
  * REQ-010 S7 chunk 2 — claude-code (CC) side-channel config generators.
  *
- * CC has no gateway/server: node mirrors a CC turn into the room's thinking panel via claude-code
- * **command hooks** that POST to the node-local broker (`CcBroker`, src/agent/cc/broker.ts), and the
- * owner launches CC by hand with a copy-paste command. This module is the pure-ish generator layer:
+ * CC has no gateway/server: node routes CC tool command hooks to the active headless turn via
+ * the node-local broker (`CcBroker`, src/agent/cc/broker.ts). This module generates:
  *   - `buildCcHooksSettings` / `buildCcSettings` — the `settings.json` CC loads via `--settings`
  *   - `writeCcSettings` — write that settings object into the per-session workspace dir
  * The CCDriver (chunk 3) consumes these; nothing here mints tokens or knows about sessions.
@@ -50,12 +49,13 @@ export interface CcSettings {
 
 /**
  * Build the `curl` command a hook runs: POST the hook JSON (arriving on stdin via `@-`) to the
- * broker with the binding bearer token. `$AICHAT_BIND` expands at hook-run time in CC's env, so the
- * token is never baked into settings.json (settings are per-session but the binding stays in env).
+ * broker with the stable binding token and this spawn's correlation. Both expand from CC's
+ * environment when the hook runs; neither value is baked into settings.json.
  */
 function brokerCurl(brokerPort: number): string {
 	return (
 		`curl -sS -X POST -H "Authorization: Bearer $AICHAT_BIND" ` +
+		`-H "X-Aichat-Run: $AICHAT_CC_RUN" ` +
 		`--data-binary @- http://127.0.0.1:${brokerPort}${BROKER_HOOK_PATH}`
 	);
 }

@@ -13,14 +13,15 @@ import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
  * (inject nothing, never throw).
  */
 describe('buildOpenclawExecEnv', () => {
+	const NO_CONTEXT = { OPENCLAW_BIND: '', OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' };
 	it('agent:main:<token>:<binding> → { OPENCLAW_BIND: <token> } (extracts the token prefix)', () => {
 		expect(
 			buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-140789091499520-room-163347643904512'),
-		).toEqual({ OPENCLAW_BIND: 'TOKEN123' });
+		).toMatchObject({ OPENCLAW_BIND: 'TOKEN123' });
 	});
 
 	it('the canonical example: token prefix + binding tail → the token only', () => {
-		expect(buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-1-room-2')).toEqual({
+		expect(buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-1-room-2')).toMatchObject({
 			OPENCLAW_BIND: 'TOKEN123',
 		});
 	});
@@ -28,38 +29,44 @@ describe('buildOpenclawExecEnv', () => {
 	it('a base64url token (contains - and _) is extracted intact', () => {
 		// the real minted token is base64url (`[A-Za-z0-9_-]`, no `:`), so `-`/`_` inside it must survive.
 		const token = 'aB3-_xYz09-QW_er';
-		expect(buildOpenclawExecEnv(`agent:main:${token}:aiclaw-5-room-9`)).toEqual({
+		expect(buildOpenclawExecEnv(`agent:main:${token}:aiclaw-5-room-9`)).toMatchObject({
 			OPENCLAW_BIND: token,
 		});
 	});
 
+	it('clears foreign inherited contexts in the OpenClaw tool environment', () => {
+		expect(buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-1-room-2')).toMatchObject({
+			OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '',
+		});
+	});
+
 	it('missing / empty / null / undefined → {}', () => {
-		expect(buildOpenclawExecEnv('')).toEqual({});
-		expect(buildOpenclawExecEnv(null)).toEqual({});
-		expect(buildOpenclawExecEnv(undefined)).toEqual({});
+		expect(buildOpenclawExecEnv('')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv(null)).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv(undefined)).toEqual(NO_CONTEXT);
 	});
 
 	it('non agent:main: prefix → {} (do not inject)', () => {
 		// bare compound without the openclaw namespace prefix is not injected
-		expect(buildOpenclawExecEnv('TOKEN123:aiclaw-1-room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:other:TOKEN123:aiclaw-1-room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('foo:bar')).toEqual({});
+		expect(buildOpenclawExecEnv('TOKEN123:aiclaw-1-room-2')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:other:TOKEN123:aiclaw-1-room-2')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('foo:bar')).toEqual(NO_CONTEXT);
 	});
 
 	it('agent:main: prefix but non-compound garbage (no binding suffix) → {} (inject nothing)', () => {
 		// without a well-formed `:aiclaw-\d+-room-\d+` tail there is no compound to split → {}.
-		expect(buildOpenclawExecEnv('agent:main:aiclaw-1-room-')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:main:aiclaw--room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:main:aiclaw-abc-room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:main:notaiclaw-1-room-2')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:main:')).toEqual({});
-		expect(buildOpenclawExecEnv('agent:main:garbage')).toEqual({});
+		expect(buildOpenclawExecEnv('agent:main:aiclaw-1-room-')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:main:aiclaw--room-2')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:main:aiclaw-abc-room-2')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:main:notaiclaw-1-room-2')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:main:')).toEqual(NO_CONTEXT);
+		expect(buildOpenclawExecEnv('agent:main:garbage')).toEqual(NO_CONTEXT);
 	});
 
 	it('never throws on odd input', () => {
 		expect(() => buildOpenclawExecEnv(123 as unknown as string)).not.toThrow();
 		expect(() => buildOpenclawExecEnv({} as unknown as string)).not.toThrow();
-		expect(buildOpenclawExecEnv(123 as unknown as string)).toEqual({});
+		expect(buildOpenclawExecEnv(123 as unknown as string)).toEqual(NO_CONTEXT);
 	});
 });
 

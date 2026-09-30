@@ -7,9 +7,6 @@
  * unprefixed/unknown key never resolves and never reaches a capability.
  */
 
-import type { AgentDriver } from '../agent/events.js';
-import type { HulaApiClient } from '../api/hula-api.js';
-
 /** Known session-key prefix → the AgentDriver.type that owns that key namespace.
  *
  * `openclaw:` (REQ-010 S6 Phase-2) routes openclaw agent replies through the same unified CLI path
@@ -41,47 +38,4 @@ export function parseSessionKey(sessionKey: string): { agentType: string; id: st
 		}
 	}
 	return undefined;
-}
-
-/** A supervised agent, narrowed to what session routing needs: its driver, uid, and per-identity api. */
-export interface BindableAgent {
-	driver: AgentDriver;
-	// REQ-029 (#29): uid is an opaque string end-to-end.
-	uid: string;
-	api: HulaApiClient;
-}
-
-/** The resolved binding: the bound identity+room + the per-identity api client to reply through. */
-export interface BoundSession {
-	aiclawUid: string;
-	roomId: string;
-	apiClient: HulaApiClient;
-}
-
-/**
- * REQ-010 S5 — prefix-routed session resolution.
- *
- * Parse `sessionKey` for a known prefix, then route ONLY to the agent whose `driver.type` matches the
- * prefix's agent type AND implements `resolveSession`. Ask that driver to resolve the (prefix-stripped)
- * id back to its bound `{ aiclawUid, roomId }`, then map to the OWNER agent's api (the agent whose uid
- * equals the resolved `aiclawUid`). This replaces the old try-every-driver loop: an unprefixed/unknown
- * key, or a prefix with no matching/resolving driver, yields `undefined`.
- */
-export function resolveBoundSession(
-	sessionKey: string,
-	agents: ReadonlyArray<BindableAgent>,
-): BoundSession | undefined {
-	const parsed = parseSessionKey(sessionKey);
-	if (!parsed) return undefined;
-
-	const router = agents.find((a) => a.driver.type === parsed.agentType && a.driver.resolveSession);
-	if (!router) return undefined;
-
-	const resolved = router.driver.resolveSession!(parsed.id);
-	if (!resolved) return undefined;
-
-	const owner = agents.find((a) => a.uid === resolved.aiclawUid);
-	if (!owner) return undefined;
-
-	return { aiclawUid: resolved.aiclawUid, roomId: resolved.roomId, apiClient: owner.api };
 }

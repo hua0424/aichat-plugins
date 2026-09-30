@@ -10,11 +10,11 @@ import {
 	resetSessionCapability,
 	type CapabilityContext,
 } from './registry.js';
-import type { HulaApiClient } from '../api/hula-api.js';
+import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 
 function fakeCtx(roomId: number) {
-	const sendMessage = vi.fn(async () => ({ msgId: 42 }));
-	const apiClient = { sendMessage } as unknown as HulaApiClient;
+	const sendMessage = vi.fn(async () => ({ msgId: '42' }));
+	const apiClient = { sendMessage, supportsMessageReceipts: async () => false } as unknown as HulaApiClient;
 	const ctx: CapabilityContext = { aiclawUid: 7, roomId, apiClient };
 	return { ctx, sendMessage };
 }
@@ -25,7 +25,7 @@ describe('sendMessageCapability', () => {
 		const cap = sendMessageCapability();
 		const result = await cap(ctx, { content: 'hello' });
 		expect(sendMessage).toHaveBeenCalledWith(42, 'hello');
-		expect(result).toEqual({ msgId: 42, roomId: 42 });
+		expect(result).toEqual({ msgId: '42', roomId: 42, receiptMode: 'legacy' });
 	});
 
 	it('room comes from ctx, NEVER from args (args.room ignored)', async () => {
@@ -188,13 +188,25 @@ describe('listGroupMembersCapability (REQ-010 S4)', () => {
 		expect(listGroupMembers).not.toHaveBeenCalled();
 	});
 
+	it('preserves legacy error result but identifies API 403 without leaking server detail', async () => {
+		const listGroupMembers = vi.fn(async () => { throw new HulaApiRejectedError('token=private', 'FORBIDDEN'); });
+		expect(await listGroupMembersCapability()(ctxWith(listGroupMembers), {})).toEqual({ roomId: 42,
+			error: 'forbidden by API', code: 'FORBIDDEN', retryable: false });
+	});
+
+	it('classifies a joined-group visibility rejection without confusing it with argument syntax', async () => {
+		const listGroupMembers = vi.fn(async () => { throw new HulaApiRejectedError('HuLa API failed: 未加入该群聊，无法查询成员'); });
+		expect(await listGroupMembersCapability()(ctxWith(listGroupMembers), {})).toEqual({ roomId: 42,
+			error: 'HuLa API failed: 未加入该群聊，无法查询成员', code: 'FORBIDDEN', retryable: false });
+	});
+
 	it('returns { roomId, error } (NOT throw) when apiClient rejects with a business error', async () => {
 		const listGroupMembers = vi.fn(async () => {
 			throw new Error('HuLa API failed: 当前不在群聊中');
 		});
 		const ctx = ctxWith(listGroupMembers, 42);
 		const out = await listGroupMembersCapability()(ctx, {});
-		expect(out).toEqual({ roomId: 42, error: 'HuLa API failed: 当前不在群聊中' });
+		expect(out).toEqual({ roomId: 42, error: 'HuLa API failed: 当前不在群聊中', code: 'UPSTREAM_FAILED', retryable: true });
 	});
 });
 
