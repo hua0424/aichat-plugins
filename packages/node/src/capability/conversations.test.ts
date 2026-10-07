@@ -211,6 +211,41 @@ describe('ConversationStore', () => {
 		expect(store.get('44', '888')?.state).toBe('ready');
 	});
 
+	it('#382: a run-proved non-resumable CC session suspends explainably; only reset reopens it', () => {
+		const root = home(), opts = active(root, { '44': 'cc' });
+		const store = new ConversationStore(opts);
+		store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44', workspace: '/original' });
+		store.beginRun('44', '888', 'run-382');
+		// 标记只能盖在本 run 绑定的原生会话上——错会话拒绝，防伪造暂停。
+		expect(() => store.markCcResumeBroken('run-382', 'other-session')).toThrow('session mismatch');
+		store.markCcResumeBroken('run-382', 'cc-44');
+		expect(suspensionReason(store.get('44', '888'))).toBe('occupied'); // run 未释放：瞬态占用，不是暂停
+		store.finishRun('run-382');
+		const suspended = store.get('44', '888')!;
+		expect(suspended.state).toBe('suspended');
+		expect(suspensionReason(suspended)).toBe('cc-native-history-lost'); // #382 现场形状可解释
+		// 重启后标记语义不丢；reset 后代次+1，标记仅作审计，房间回到 ready（重建入口）。
+		const reopened = new ConversationStore(opts);
+		expect(suspensionReason(reopened.get('44', '888'))).toBe('cc-native-history-lost');
+		reopened.reset('44', '888');
+		const after = reopened.get('44', '888')!;
+		expect(after.state).toBe('ready');
+		expect(suspensionReason(after)).toBeUndefined();
+		expect(after.ccResumeFailure).toEqual({ sessionId: 'cc-44', generation: 1 }); // 审计留存，不再拦路
+	});
+
+	it('#382: rejects a corrupted CC resume failure marker before it can mute a room', () => {
+		const root = home();
+		writeFileSync(join(root, 'conversations.json'), JSON.stringify({ version: 1, sources: {}, records: [{
+			conversationId: 'c3820000-0000-4000-8000-000000000001', serverNamespace: 'http://example.test/api',
+			identityId: '44', roomId: '888', adapterInstanceId: 'cc', generation: 1,
+			contextKey: 'c'.repeat(64), state: 'suspended', nativeAliases: [],
+			nativeState: { cc: { sessionId: 'cc-44', workspace: '/original' } },
+			ccResumeFailure: { sessionId: 'cc-44', generation: 99 },
+		}] }));
+		expect(() => new ConversationStore(active(root, { '44': 'cc' }))).toThrow('invalid CC resume failure marker');
+	});
+
 	it('confirms only frozen legacy Codex provenance atomically; survives restart and rejects agent overrides', () => {
 		let fail = false;
 		const root = home(), opts = active(root, { '22': 'codex' }, () => { if (fail) throw new Error('disk full'); });

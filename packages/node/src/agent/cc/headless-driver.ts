@@ -3,6 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
+import { NATIVE_SESSION_LOST } from '../events.js';
 import { buildCcSettings, writeCcSettings } from './launch.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
 import { errMsg } from '../../util/err.js';
@@ -167,6 +168,7 @@ class CcRun implements AgentRun {
 		let sessionId: string | undefined;
 		let resultError: string | undefined;
 		let resultSeen = false;
+		let initSeen = false;
 		try {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			input.signal.addEventListener('abort', this.onAbort, { once: true });
@@ -182,6 +184,9 @@ class CcRun implements AgentRun {
 				throw new Error('CC original cwd unconfirmed, mismatched or invalid; owner-confirm original cwd offline or reset explicitly');
 			}
 			sessionId = previous && 'sessionId' in previous ? previous.sessionId as string : undefined;
+			// #382: non-empty → this attempt must CONTINUE the persisted session; a pre-init exit then
+			// means the resume itself failed, not a mid-run execution failure.
+			const resumedFrom = sessionId;
 			const argv = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
 				'--include-partial-messages', '--allowedTools', 'Bash(aichat:*)', '--settings', settings];
 			if (input.systemPrompt) argv.push('--append-system-prompt', input.systemPrompt);
@@ -264,7 +269,8 @@ class CcRun implements AgentRun {
 				catch { continue; }
 				if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 				if (obj.type === 'system' && obj.subtype === 'init' && typeof obj.session_id === 'string' && obj.session_id) {
-					sessionId = obj.session_id;
+						sessionId = obj.session_id;
+					initSeen = true; // #382: resume accepted — later failures are execution failures, not "history lost"
 					try {
 						await input.conversation.saveNativeState({ version: 1, value: {
 							...(previous && typeof previous === 'object' && 'sessionId' in previous && previous.sessionId === sessionId
@@ -297,6 +303,12 @@ class CcRun implements AgentRun {
 					}
 				}
 			}
+			// #382: a resume attempt that died BEFORE init with CC's own "No conversation found" wording
+			// (live-observed on a container-rebuilt host whose ~/.claude history was lost) proves the
+			// persisted session non-resumable. Stamp the shared code so the bridge can fail visibly and
+			// move the room into the explainable pause instead of leaving a silent status=2 trace.
+			if (resultError && resumedFrom && !initSeen && /no conversation found/i.test(resultError))
+				resultError = `${NATIVE_SESSION_LOST}: ${resultError}`;
 			if (resultError && !this.groupGone) await this.cancel(resultError);
 			if (this.cancelled && !this.groupGone) yield { type: 'cancelled', reason: 'CC stop unconfirmed' };
 			else if (resultError) yield { type: 'error', message: resultError };

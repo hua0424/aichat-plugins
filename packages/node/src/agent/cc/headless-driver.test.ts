@@ -131,6 +131,29 @@ describe('CC PreparedRun native execution', () => {
 		expect(f.spawnCalls).toHaveLength(1);
 	});
 
+	posix('#382: pre-init resume exit with "No conversation found" is classified; post-init failures stay raw', async () => {
+		// 现场验收 B 形状：ready 会话 --resume 后原生历史已丢，CLI 预热即退出。
+		const lost = fixture();
+		lost.input.conversation.nativeState = { version: 1, value: { sessionId: '99881409', workspace: lost.dir } };
+		const { collected, done } = await lost.start();
+		lost.errors.emit('data', 'No conversation found with session ID: 99881409');
+		lost.groupExit(); lost.close(1);
+		await done;
+		expect(collected).toHaveLength(1);
+		expect((collected[0] as { message: string }).message)
+			.toMatch(/^native_session_lost: claude exited 1: .*No conversation found/);
+		// 正常续会话不受影响：init 已见（resume 被接受）后的执行失败不误分类。
+		const okay = fixture();
+		okay.input.conversation.nativeState = { version: 1, value: { sessionId: 'healthy', workspace: okay.dir } };
+		const { collected: okayEvents, done: okayDone } = await okay.start();
+		okay.line({ type: 'system', subtype: 'init', session_id: 'healthy' });
+		okay.line({ type: 'result', is_error: true, errors: ['boom after resume'] });
+		okay.groupExit(); okay.close(1);
+		await okayDone;
+		const okayError = okayEvents.find((e) => e.type === 'error') as { message: string } | undefined;
+		expect((okayError?.message ?? '').startsWith('native_session_lost:')).toBe(false);
+	});
+
 	posix('does not spawn a never-consumed run during disconnect', async () => {
 		const f = fixture();
 		f.driver.createRun(f.input);

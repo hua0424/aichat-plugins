@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageHandler } from './message.js';
-import { ConversationStore } from '../capability/conversations.js';
+import { ConversationStore, suspensionReason } from '../capability/conversations.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { AgentEvent, RunDriver } from '../agent/events.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
@@ -343,6 +343,90 @@ describe('persisted MessageHandler run', () => {
 		for (let i = 0; i < 30 && !createRun.mock.calls.length; i++) await tick();
 		expect(createRun).toHaveBeenCalled();
 		expect(notices).toHaveLength(1);
+		handler.destroy();
+		await tick();
+		store.close();
+	});
+
+	it('#382: ready CC 会话丢历史续跑失败——反馈与留痕同码、暂停去重、reset 重建可用（真实 CC driver 链路）', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'handler-382-')); homes.push(home);
+		const workspace = join(home, '42', 'dm', '7');
+		// 现场验收 B 形状：ready 记录 {sessionId, workspace} 齐全，但原生 CC 历史已随容器重建丢失。
+		writeFileSync(join(home, 'conversations.json'), JSON.stringify({ version: 1, sources: {}, records: [{
+			conversationId: 'c3820000-0000-4000-8000-000000000003', serverNamespace: 'test',
+			identityId: '42', roomId: '9', adapterInstanceId: 'cc', generation: 1,
+			contextKey: 'e'.repeat(64), state: 'ready', nativeAliases: [],
+			nativeState: { cc: { sessionId: '99881409', workspace } },
+		}] }));
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']),
+			activeProviders: new Map([['42', 'cc']]) });
+		const stderrData: Array<(data: string) => void> = [];
+		const childClose: Array<(code: number | null, signal: string | null) => void> = [];
+		const spawnCalls: Array<readonly string[]> = [];
+		const makeChild = (): CcChild => ({
+			pid: 2238, stdin: { write: () => {}, end: () => {} },
+			stdout: { on: () => {} } as CcChild['stdout'],
+			stderr: { on: (event: string, cb: (...args: never[]) => void) => {
+				if (event === 'data') stderrData.push(cb as (data: string) => void);
+			} } as CcChild['stderr'],
+			on: (event: string, cb: (...args: never[]) => void) => {
+				if (event === 'close') childClose.push(cb as (code: number | null, signal: string | null) => void);
+			}, kill: () => true,
+		});
+		const spawn: CcSpawnFn = (_command, args) => { spawnCalls.push(args); return makeChild(); };
+		const registry = new CcSessionRegistry();
+		const driver = new CcHeadlessDriver({
+			workspaceBase: home, brokerPort: 9100, registerHook: (key, run, push) => registry.registerContext(key, run, push),
+			transcript: { append: () => {} }, spawn, platform: 'linux',
+			kill: (_pid, signal) => { if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
+			firstEventTimeoutMs: 1000, drainMs: 5, killGraceMs: 20,
+		});
+		const notices: string[] = [];
+		const api = { sendMessage: async (_roomId: string, text: string) => { notices.push(text); return { msgId: `n${notices.length}` }; } };
+		const frames: Array<{ type: number; data: Record<string, unknown> }> = [];
+		let runId: string | undefined;
+		const ws = { isConnected: true, send: (type: number, data: Record<string, unknown>) => {
+			frames.push({ type, data });
+			if (type === WSReqType.THINKING_START) runId = data.clientRunId as string;
+		} } as HulaWSClient;
+		const handler = new MessageHandler(ws, driver, '42', api as never, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
+		handler.handle({ type: 'receiveMessage', data: message(70) } as never);
+		for (let i = 0; i < 30 && !spawnCalls.length; i++) await tick();
+		expect(spawnCalls[0]).toContain('--resume');
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '70', thinkingId: 'tid-70', clientRunId: runId } });
+		stderrData.forEach((data) => data('No conversation found with session ID: 99881409'));
+		childClose.forEach((close) => close(1, null));
+		for (let i = 0; i < 30 && !frames.some((f) => f.type === WSReqType.THINKING_END); i++) await tick();
+		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
+		// 留痕（thinking 表 status=2 error）与客户端反馈共用同一分类码——库内与展示一致。
+		const end = frames.find((f) => f.type === WSReqType.THINKING_END)!.data;
+		expect(end).toMatchObject({ roomId: '9', status: 'error' });
+		expect(String(end.error)).toMatch(/^native_session_lost: claude exited 1: .*No conversation found/);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain('续跑失败');
+		expect(notices[0]).toContain('历史已丢失');
+		expect(notices[0]).toContain('reset-session');
+		// 复用 #343 可解释暂停框架：会话挂起，后续消息排队不再拉起注定失败的续会话，也不重复通告。
+		const suspended = store.get('42', '9')!;
+		expect(suspended.state).toBe('suspended');
+		expect(suspensionReason(suspended)).toBe('cc-native-history-lost');
+		handler.handle({ type: 'receiveMessage', data: message(71) } as never);
+		await tick();
+		expect(spawnCalls).toHaveLength(1);
+		expect(notices).toHaveLength(1);
+		// owner reset（重建入口）后房间恢复运行。
+		store.reset('42', '9');
+		handler.handle({ type: 'receiveMessage', data: message(72) } as never);
+		for (let i = 0; i < 30 && spawnCalls.length < 2; i++) await tick();
+		expect(spawnCalls).toHaveLength(2);
+		// 收尾：run2 结束会 flush 排队的 message 71 → run3；逐轮关停直到队清空（每轮新 child 的 close 回调都在 childClose 里）。
+		for (let round = 0; round < 4; round++) {
+			childClose.forEach((close) => close(1, null));
+			for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
+			if (!store.pendingRuns().length) break;
+		}
+		expect(store.pendingRuns()).toHaveLength(0);
+		expect(notices).toHaveLength(1); // 重建后的普通失败不触发暂停通告
 		handler.destroy();
 		await tick();
 		store.close();
