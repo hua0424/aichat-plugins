@@ -2,6 +2,7 @@ import type { WSResponse, ReceivedMessage, ThinkingStartDTO, ThinkingEndDTO, Gro
 import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { RunDriver, AgentEvent } from '../agent/events.js';
+import { NATIVE_SESSION_LOST } from '../agent/events.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
@@ -193,9 +194,20 @@ const LIMIT_REASONS: Record<string, string> = {
 const SUSPENSION_NOTICES: Record<Exclude<SuspensionReason, 'occupied' | 'disabled'>, string> = {
 	'cc-original-cwd-unconfirmed': '助理会话已暂停：原工作目录待 owner 离线核验（confirm-cc-cwd）。你的消息已排队暂不执行，恢复或重置后处理。',
 	'cc-original-cwd-missing': '助理会话已暂停：缺少可核验的原工作目录证据。你的消息已排队暂不执行，owner 核验恢复或重置后处理。',
+	'cc-native-history-lost': '助理会话已暂停：原生 CC 会话历史丢失，无法续接会话。你的消息已排队暂不执行，重试无法恢复，owner 重置会话（reset-session）后重建。',
 	'codex-original-thread-unconfirmed': '助理会话已暂停：原线程待 owner 离线核验（confirm-codex-thread）。你的消息已排队暂不执行，恢复或重置后处理。',
 	'stop-unconfirmed': '助理会话已暂停：上一轮执行停止尚未确认。你的消息已排队暂不执行，确认停止或重置后处理。',
 };
+
+/**
+ * #382: ready 会话真实轮次的续跑失败通告（区别于上方的暂停排队通告）：消息去向必须明确——
+ * 已收到、执行失败、原因分类（与 thinking 表 status=2 留痕共用 NATIVE_SESSION_LOST 码）、不可重试、重建入口。
+ * fail-closed：不伪造续会话、不自动 reset；重置是 owner 的决定。
+ */
+const NATIVE_SESSION_LOST_FAILURE_NOTICE =
+	`助理会话续跑失败：原生 CC 会话历史已丢失，无法续接会话（${NATIVE_SESSION_LOST}）。`
+	+ '你的消息已收到，但本轮未能执行且重试无法恢复；会话已暂停，后续消息将排队暂不执行。'
+	+ '请 owner 重置会话（reset-session）后重新开始。';
 
 /**
  * 消息处理器（REQ-004 Agent Loop 模型）
@@ -939,6 +951,7 @@ export class MessageHandler {
 					continue;
 				} else if (ev.type === 'error') {
 					finalizeError(ev.message);
+					if (ev.message.startsWith(`${NATIVE_SESSION_LOST}:`)) this.nativeSessionLost(session, channel); // #382
 					await this.stopRun(session, ev.message);
 					break;
 				} else if (ev.type === 'cancelled') {
@@ -1209,6 +1222,27 @@ export class MessageHandler {
 		this.sendNotice(roomId, `发言受限：${reason}`);
 	}
 
+	/**
+	 * #382: ready 会话在真实轮次证明不可续（原生 CC 历史丢失，错误码 NATIVE_SESSION_LOST 与
+	 * thinking 表 status=2 留痕同源）——本轮失败对客户端可见，并把会话转入可解释暂停：
+	 * 后续消息复用 #343 的排队通告框架，不再反复拉起注定失败的续会话。
+	 * fail-closed：不伪造续会话、不自动 reset；重建入口 = owner reset-session。
+	 * 标记落库失败则保持既有 error 语义（有留痕、不误报暂停），不额外兜底。
+	 */
+	private nativeSessionLost(session: ThinkingSession, channel: RoomChannel): void {
+		const store = this.getConversations?.();
+		const sessionId = store?.get(this.selfUid, session.roomId)?.nativeState.cc?.sessionId;
+		if (!store || typeof sessionId !== 'string' || !session.run) return;
+		try {
+			store.markCcResumeBroken(session.run.id, sessionId);
+		} catch (error) {
+			console.error(`[handler] cannot record native session loss for room ${session.roomId}: ${errMsg(error)}`);
+			return;
+		}
+		channel.suspendNoticeKey = 'cc-native-history-lost'; // 失败通告即本暂停回合的通告，下一条排队消息不重复刷屏
+		this.sendNotice(session.roomId, NATIVE_SESSION_LOST_FAILURE_NOTICE);
+	}
+
 	/** #343: 发送带 autoReply 标记的系统通告（不会触发 AI 回环）。 */
 	private sendNotice(roomId: string, text: string): void {
 		if (!this.apiClient) {
@@ -1268,12 +1302,15 @@ export class MessageHandler {
 	 * REQ-004 S2: 回收空闲房间通道，防止长生命周期进程下 roomChannels 无界增长。
 	 * 仅当无待处理消息、无缓冲 debounce、无活跃 thinking 会话时回收；
 	 * 下一条消息会按需重建通道（lastCtx 每次收信都会重设）。
+	 * #382: 暂停中的房间不回收——通道持有本暂停回合的通告去重键（suspendNoticeKey），
+	 * 回收会让下一条排队消息重复通告；房间恢复运行后随下一轮 flush 自然回收。
 	 */
 	private maybeEvictRoom(roomId: string): void {
 		const channel = this.roomChannels.get(roomId);
 		if (!channel) return;
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (
+			this.runReady(roomId) &&
 			channel.pendingMessages.length === 0 &&
 			channel.debouncer.pending === 0 &&
 			// REQ-004 S5: 仍持有未注入的群聊上下文时不回收，避免丢失积累上下文

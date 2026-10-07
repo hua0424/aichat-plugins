@@ -25,6 +25,12 @@ export interface ConversationRecord {
 	ccCwdConfirmation?: { sessionId: string; cwd: string; generation: number; approvalRef: string; approvalSha256: string; confirmedAt: string };
 	/** Offline owner attestation; never supplied by an agent capability. */
 	codexThreadConfirmation?: { threadId: string; workspace: string; promptHash: string; generation: number; approvalRef: string; artifactSha256: string; confirmedAt: string };
+	/**
+	 * #382: a live run proved the persisted CC session non-resumable at runtime (native history lost).
+	 * Recorded by the run's own failure; suspends the room once the run is released by finishRun.
+	 * Retained across reset for audit, but inert unless it matches the CURRENT generation and native sessionId.
+	 */
+	ccResumeFailure?: { sessionId: string; generation: number };
 }
 export interface RecoveryData { version: number; value: unknown }
 export interface PendingRun { runId: string; generation: number; startedAt: string; recovery?: RecoveryData }
@@ -71,11 +77,17 @@ const ccCwdPending = (record: ConversationRecord): boolean => {
 	return validId(state?.sessionId) && (state.cwdConfirmationRequired === true || !validId(state.workspace));
 };
 
+/** #382: the room's own run proved its persisted CC session cannot be resumed (native history lost). */
+const ccResumeBroken = (record: ConversationRecord): boolean =>
+	record.ccResumeFailure !== undefined && record.ccResumeFailure.generation === record.generation &&
+	record.ccResumeFailure.sessionId === record.nativeState.cc?.sessionId;
+
 /** #343: 把持久化暂停态翻译成可解释原因，用户通告与运维排查据此区分「可离线核验恢复 / 证据不足 / 停止未确认」。
  * 'occupied' = 会话健康、只是被当前运行占用（正常排队，不通告）；undefined = 可正常触发。 */
 export type SuspensionReason =
 	| 'cc-original-cwd-unconfirmed' // 旧迁移格式：sessionId 已绑定并显式等待 owner 离线核验原 cwd（confirm-cc-cwd）
 	| 'cc-original-cwd-missing' // 前门控残留：sessionId 在场但原 cwd 从未被持久化（#343 现场），需证据或 owner 重置
+	| 'cc-native-history-lost' // #382：ready 会话真实轮次证明不可续（原生历史丢失，No conversation found），重试无法恢复，仅 owner 重置重建
 	| 'codex-original-thread-unconfirmed'
 	| 'stop-unconfirmed'
 	| 'occupied'
@@ -89,6 +101,7 @@ export function suspensionReason(record: ConversationRecord | undefined): Suspen
 	if (ccCwdPending(record)) return record.nativeState.cc?.cwdConfirmationRequired === true
 		? 'cc-original-cwd-unconfirmed' : 'cc-original-cwd-missing';
 	if (codexThreadPending(record)) return 'codex-original-thread-unconfirmed';
+	if (ccResumeBroken(record)) return 'cc-native-history-lost';
 	return undefined;
 }
 
@@ -221,7 +234,7 @@ export class ConversationStore {
 		const record: ConversationRecord = { ...old, generation: old.generation + 1,
 			contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: {},
 			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed'
-				: ccCwdPending(old) || codexThreadPending(old) ? 'ready' : old.state };
+				: ccCwdPending(old) || codexThreadPending(old) || ccResumeBroken(old) ? 'ready' : old.state };
 		const records = this.snapshot.records.some((r) => r.conversationId === old.conversationId)
 			? this.snapshot.records.map((r) => r.conversationId === old.conversationId ? record : r)
 			: [...this.snapshot.records, record];
@@ -298,6 +311,18 @@ export class ConversationStore {
 	}
 
 	markCancelling(runId: string): void { this.updateRunState(runId, 'suspended'); }
+	/**
+	 * #382: a live run proved the persisted CC session non-resumable at runtime (native history lost).
+	 * Only stamps the marker; the room suspends when finishRun releases the run, and only reset reopens it.
+	 */
+	markCcResumeBroken(runId: string, sessionId: string): void {
+		if (!validId(sessionId)) throw new Error('invalid CC session');
+		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
+		if (!record || this.closed) throw new Error('run no longer pending');
+		if (record.adapterInstanceId !== 'cc' || record.nativeState.cc?.sessionId !== sessionId)
+			throw new Error('CC resume failure session mismatch');
+		this.replace({ ...copy(record), ccResumeFailure: { sessionId, generation: record.generation } });
+	}
 	markStopUnconfirmed(runId: string): void { this.updateRunState(runId, 'stop_unconfirmed'); }
 	confirmStopped(runId: string): void { this.finishRun(runId); }
 	finishRun(runId: string): void {
@@ -305,7 +330,8 @@ export class ConversationStore {
 		if (!record || this.closed) throw new Error('run no longer pending');
 		const updated = copy(record);
 		updated.pendingRuns = updated.pendingRuns!.filter((run) => run.runId !== runId);
-		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : ccCwdPending(updated) || codexThreadPending(updated) ? 'suspended' : 'ready';
+		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed'
+			: ccCwdPending(updated) || codexThreadPending(updated) || ccResumeBroken(updated) ? 'suspended' : 'ready';
 		this.replace(updated);
 	}
 	private updateRunState(runId: string, state: 'suspended' | 'stop_unconfirmed'): void {
@@ -602,6 +628,9 @@ export class ConversationStore {
 				r.ccCwdConfirmation.generation > r.generation || !validId(r.ccCwdConfirmation.approvalRef) ||
 				!/^[0-9a-f]{64}$/.test(r.ccCwdConfirmation.approvalSha256) ||
 				!validId(r.ccCwdConfirmation.confirmedAt))) throw new Error('invalid CC cwd confirmation');
+			if (r.ccResumeFailure !== undefined && (!r.ccResumeFailure || !validId(r.ccResumeFailure.sessionId) ||
+				!Number.isSafeInteger(r.ccResumeFailure.generation) || r.ccResumeFailure.generation < 1 ||
+				r.ccResumeFailure.generation > r.generation)) throw new Error('invalid CC resume failure marker');
 			for (const run of r.pendingRuns ?? []) {
 				if (!run || !validId(run.runId) || runs.has(run.runId) || !Number.isSafeInteger(run.generation) ||
 					run.generation < 1 || run.generation > r.generation || !validId(run.startedAt) || Number.isNaN(Date.parse(run.startedAt)))
