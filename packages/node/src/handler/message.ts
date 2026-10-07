@@ -16,7 +16,7 @@ import { errMsg } from '../util/err.js';
 import { randomUUID } from 'node:crypto';
 import type { CapabilityRegistry } from '../capability/registry.js';
 import type { AgentRun, PreparedRun } from '../agent/events.js';
-import type { ConversationStore } from '../capability/conversations.js';
+import { suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -167,6 +167,11 @@ interface RoomChannel {
 	 * 在 rescheduled 轮的思考结束后随 flush 处理——退避窗口内不丢消息。
 	 */
 	antiLoopDelaying: boolean;
+	/**
+	 * #343: 当前暂停回合已通告过的暂停原因（suspensionReason 键）。
+	 * 同一原因只通告一次；房间重新可运行时复位，下一个暂停回合会再次通告。
+	 */
+	suspendNoticeKey?: string;
 }
 
 /** REQ-004 S5: 群聊惰性积累缓冲上限（FIFO） */
@@ -179,6 +184,17 @@ const ACCUMULATED_MESSAGES_CAP = 50;
 const LIMIT_REASONS: Record<string, string> = {
 	rate_limit_exceeded: '发言频率限制，已自动跳过本次响应',
 	daily_limit_exceeded: '今日发言上限已达，已自动跳过本次响应',
+};
+
+/**
+ * #343: 会话暂停原因 → 用户可见通告（含处理入口）。排队不执行的静默会被误认为消息没送达；
+ * 文案保持中性——不承诺可恢复，也不替 owner 做重置决定。
+ */
+const SUSPENSION_NOTICES: Record<Exclude<SuspensionReason, 'occupied' | 'disabled'>, string> = {
+	'cc-original-cwd-unconfirmed': '助理会话已暂停：原工作目录待 owner 离线核验（confirm-cc-cwd）。你的消息已排队暂不执行，恢复或重置后处理。',
+	'cc-original-cwd-missing': '助理会话已暂停：缺少可核验的原工作目录证据。你的消息已排队暂不执行，owner 核验恢复或重置后处理。',
+	'codex-original-thread-unconfirmed': '助理会话已暂停：原线程待 owner 离线核验（confirm-codex-thread）。你的消息已排队暂不执行，恢复或重置后处理。',
+	'stop-unconfirmed': '助理会话已暂停：上一轮执行停止尚未确认。你的消息已排队暂不执行，确认停止或重置后处理。',
 };
 
 /**
@@ -638,11 +654,13 @@ export class MessageHandler {
 		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
 		if (this.thinkingSessions.has(sessionKey) || channel.antiLoopDelaying || !this.runReady(roomId)) {
 			channel.pendingMessages.push(content);
+			this.syncSuspensionNotice(roomId, channel); // #343: 暂停排队必须对用户可见
 			console.log(`[handler] Message queued (thinking active or anti-loop delaying) room=${roomId}, pending: ${channel.pendingMessages.length}`);
 			return;
 		}
 
 		// 7. 正常触发（防循环守卫已移至 triggerAgentLoop 唯一汇聚点，按 BATCH 评估）
+		channel.suspendNoticeKey = undefined; // #343: 房间可运行 → 上一个暂停通告回合结束
 		channel.debouncer.push(content);
 	}
 
@@ -668,6 +686,7 @@ export class MessageHandler {
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (!this.runReady(roomId)) {
 			channel.pendingMessages.push(message);
+			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
 
@@ -719,6 +738,7 @@ export class MessageHandler {
 		if (this.thinkingSessions.has(sessionKey) || !this.runReady(roomId)) {
 			console.warn(`[handler] Thinking session already active or paused for ${sessionKey}`);
 			channel.pendingMessages.push(message);
+			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
 
@@ -829,6 +849,7 @@ export class MessageHandler {
 				}
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
 				channel.pendingMessages.unshift(message);
+					this.syncSuspensionNotice(roomId, channel); // #343: 准备失败常因暂停竞态——通告真实状态
 				console.error(`[handler] run preparation failed for ${sessionKey}: ${errMsg(error)}`);
 				return;
 			}
@@ -1165,14 +1186,37 @@ export class MessageHandler {
 		}
 	}
 
+	/**
+	 * #343: 消息因会话暂停而排队时，向房间发送一次可见通告（原因 + 处理入口），
+	 * 同一暂停回合按原因去重；房间回到可运行状态时在触发路径复位（见 step 7 清除点）。
+	 * busy（occupied/disabled）与无记录房间不通告、只复位键。
+	 */
+	private syncSuspensionNotice(roomId: string, channel: RoomChannel): void {
+		if (!this.getConversations) return;
+		const reason = suspensionReason(this.getConversations().get(this.selfUid, roomId));
+		if (!reason || reason === 'occupied' || reason === 'disabled') {
+			channel.suspendNoticeKey = undefined;
+			return;
+		}
+		if (channel.suspendNoticeKey === reason) return;
+		channel.suspendNoticeKey = reason;
+		console.warn(`[handler] room=${roomId} paused (${reason}); ${channel.pendingMessages.length} message(s) queued without execution`);
+		this.sendNotice(roomId, SUSPENSION_NOTICES[reason]);
+	}
+
 	/** M3: 发送 autoReply（限流/退避触发时调用） */
 	private sendAutoReply(roomId: string, reason: string): void {
+		this.sendNotice(roomId, `发言受限：${reason}`);
+	}
+
+	/** #343: 发送带 autoReply 标记的系统通告（不会触发 AI 回环）。 */
+	private sendNotice(roomId: string, text: string): void {
 		if (!this.apiClient) {
 			console.warn('[anti-loop] autoReply skipped: no internal API client available');
 			return;
 		}
 		this.apiClient
-			.sendMessage(roomId, `发言受限：${reason}`, { autoReply: true })
+			.sendMessage(roomId, text, { autoReply: true })
 			.then((result) => {
 				console.log(`[anti-loop] autoReply sent: msgId=${result.msgId} roomId=${roomId}`);
 			})
