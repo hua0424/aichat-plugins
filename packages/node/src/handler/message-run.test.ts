@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageHandler } from './message.js';
@@ -300,6 +300,49 @@ describe('persisted MessageHandler run', () => {
 		const secondRunId = store.pendingRuns()[0].runId;
 		await handler.cancelRun('9', 'old-reset-run');
 		expect(store.pendingRuns()[0].runId).toBe(secondRunId);
+		handler.destroy();
+		await tick();
+		store.close();
+	});
+
+	it('#343: queues behind a suspended CC conversation with ONE visible pause notice per episode', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'handler-suspend-')); homes.push(home);
+		// #343 现场形状：sessionId 在场、原 cwd 从未持久化 → 挂起，消息排队但此前用户完全看不到原因。
+		writeFileSync(join(home, 'conversations.json'), JSON.stringify({ version: 1, sources: {}, records: [{
+			conversationId: 'c3430000-0000-4000-8000-000000000002', serverNamespace: 'test',
+			identityId: '42', roomId: '9', adapterInstanceId: 'cc', generation: 1,
+			contextKey: 'b'.repeat(64), state: 'suspended', nativeAliases: [{ provider: 'cc', id: 'd'.repeat(64) }],
+			nativeState: { cc: { sessionId: 'old-cc' } },
+		}] }));
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['42']),
+			activeProviders: new Map([['42', 'cc']]) });
+		expect(store.get('42', '9')?.state).toBe('suspended');
+		const notices: Array<{ roomId: string; text: string }> = [];
+		const api = { sendMessage: async (roomId: string, text: string) => { notices.push({ roomId, text }); return { msgId: 'n1' }; } };
+		const createRun = vi.fn(() => ({
+			events: { async *[Symbol.asyncIterator]() { yield { type: 'done' as const, durationMs: 1 }; } },
+			cancel: async () => ({ status: 'stopped' as const }), dispose: async () => {},
+		}));
+		const driver: RunDriver = { type: 'cc', features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			connect: async () => {}, disconnect: async () => {}, createRun };
+		const ws = { isConnected: true, send: vi.fn() } as unknown as HulaWSClient;
+		const handler = new MessageHandler(ws, driver, '42', api as never, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store);
+		handler.handle({ type: 'receiveMessage', data: message(60) } as never);
+		handler.handle({ type: 'receiveMessage', data: message(61) } as never);
+		await tick();
+		// 一个暂停回合只通告一次：原因 + 处理入口，不重复轰炸。
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toMatchObject({ roomId: '9' });
+		expect(notices[0].text).toContain('已暂停');
+		expect(notices[0].text).toContain('原工作目录');
+		expect(notices[0].text).toContain('已排队');
+		expect(createRun).not.toHaveBeenCalled();
+		// owner reset 后房间恢复运行：排队消息随新一轮触发，且不再发暂停通告。
+		store.reset('42', '9');
+		handler.handle({ type: 'receiveMessage', data: message(62) } as never);
+		for (let i = 0; i < 30 && !createRun.mock.calls.length; i++) await tick();
+		expect(createRun).toHaveBeenCalled();
+		expect(notices).toHaveLength(1);
 		handler.destroy();
 		await tick();
 		store.close();

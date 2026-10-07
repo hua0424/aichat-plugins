@@ -60,6 +60,38 @@ const identityKey = (ns: string, uid: string, room: string): string => JSON.stri
 const aliasKey = (a: NativeAlias): string => JSON.stringify([a.provider, a.runtimeScope ?? '', a.id]);
 const copy = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
+const codexThreadPending = (record: ConversationRecord): boolean => {
+	const state = record.nativeState.codex;
+	return validId(state?.threadId) && (!validId(state.workspace) || !isAbsolute(state.workspace) ||
+		!validId(state.promptHash) || !/^[0-9a-f]{64}$/.test(state.promptHash));
+};
+
+const ccCwdPending = (record: ConversationRecord): boolean => {
+	const state = record.nativeState.cc;
+	return validId(state?.sessionId) && (state.cwdConfirmationRequired === true || !validId(state.workspace));
+};
+
+/** #343: 把持久化暂停态翻译成可解释原因，用户通告与运维排查据此区分「可离线核验恢复 / 证据不足 / 停止未确认」。
+ * 'occupied' = 会话健康、只是被当前运行占用（正常排队，不通告）；undefined = 可正常触发。 */
+export type SuspensionReason =
+	| 'cc-original-cwd-unconfirmed' // 旧迁移格式：sessionId 已绑定并显式等待 owner 离线核验原 cwd（confirm-cc-cwd）
+	| 'cc-original-cwd-missing' // 前门控残留：sessionId 在场但原 cwd 从未被持久化（#343 现场），需证据或 owner 重置
+	| 'codex-original-thread-unconfirmed'
+	| 'stop-unconfirmed'
+	| 'occupied'
+	| 'disabled';
+
+export function suspensionReason(record: ConversationRecord | undefined): SuspensionReason | undefined {
+	if (!record || record.state === 'ready') return record?.pendingRuns?.length ? 'occupied' : undefined;
+	if (record.state === 'disabled') return 'disabled';
+	if (record.state === 'stop_unconfirmed') return 'stop-unconfirmed';
+	if (record.pendingRuns?.length) return 'occupied'; // suspended+pendingRuns = 取消进行中的瞬态
+	if (ccCwdPending(record)) return record.nativeState.cc?.cwdConfirmationRequired === true
+		? 'cc-original-cwd-unconfirmed' : 'cc-original-cwd-missing';
+	if (codexThreadPending(record)) return 'codex-original-thread-unconfirmed';
+	return undefined;
+}
+
 /** One synchronous, atomic JSON writer; callers must hold the one-process-per-home lease before construction. */
 export class ConversationStore {
 	private readonly path: string;
@@ -94,9 +126,9 @@ export class ConversationStore {
 		// Persist the legacy CC cwd gate even for snapshots created before this safety check.
 		// A process restart is not evidence that a native run stopped.
 		if (this.snapshot.records.some((r) => (r.pendingRuns?.length && r.state !== 'stop_unconfirmed') ||
-			((this.ccCwdPending(r) || this.codexThreadPending(r)) && r.state === 'ready'))) {
+			((ccCwdPending(r) || codexThreadPending(r)) && r.state === 'ready'))) {
 			this.commit(this.snapshot.records.map((r) => r.pendingRuns?.length ? { ...r, state: 'stop_unconfirmed' }
-				: (this.ccCwdPending(r) || this.codexThreadPending(r)) && r.state === 'ready' ? { ...r, state: 'suspended' } : r));
+				: (ccCwdPending(r) || codexThreadPending(r)) && r.state === 'ready' ? { ...r, state: 'suspended' } : r));
 		}
 	}
 
@@ -189,7 +221,7 @@ export class ConversationStore {
 		const record: ConversationRecord = { ...old, generation: old.generation + 1,
 			contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: {},
 			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed'
-				: this.ccCwdPending(old) || this.codexThreadPending(old) ? 'ready' : old.state };
+				: ccCwdPending(old) || codexThreadPending(old) ? 'ready' : old.state };
 		const records = this.snapshot.records.some((r) => r.conversationId === old.conversationId)
 			? this.snapshot.records.map((r) => r.conversationId === old.conversationId ? record : r)
 			: [...this.snapshot.records, record];
@@ -238,6 +270,7 @@ export class ConversationStore {
 				current(); this.assertProvider(provider, identityId);
 				if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid native state');
 				const updated = copy(current()); this.assertCodexNativeWrite(updated, provider, state);
+				this.assertCcNativeWrite(provider, state);
 				updated.nativeState[provider] = copy(state); this.replace(updated);
 			},
 			registerNativeAlias: (provider, id, runtimeScope) => {
@@ -272,7 +305,7 @@ export class ConversationStore {
 		if (!record || this.closed) throw new Error('run no longer pending');
 		const updated = copy(record);
 		updated.pendingRuns = updated.pendingRuns!.filter((run) => run.runId !== runId);
-		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : this.ccCwdPending(updated) || this.codexThreadPending(updated) ? 'suspended' : 'ready';
+		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed' : ccCwdPending(updated) || codexThreadPending(updated) ? 'suspended' : 'ready';
 		this.replace(updated);
 	}
 	private updateRunState(runId: string, state: 'suspended' | 'stop_unconfirmed'): void {
@@ -303,8 +336,12 @@ export class ConversationStore {
 		if (provider === 'codex' && record.codexThreadConfirmation?.generation === record.generation &&
 			id !== record.codexThreadConfirmation.threadId) throw new Error('Codex confirmed thread cannot change alias');
 		// Claude's sessionId restores --resume but is NOT a CLI capability credential. Only its bind token is.
+		// #343: a resumable session must always be persisted WITH its original absolute cwd — a sessionId
+		// saved alone recreates the unrecoverable suspended-for-missing-cwd state this ticket diagnosed.
 		if (provider === 'cc' && nativeState && 'sessionId' in nativeState) {
-			if (nativeState.sessionId !== id || Object.keys(nativeState).some((k) => k !== 'sessionId')) throw new Error('invalid CC native state');
+			if (nativeState.sessionId !== id || !validId(nativeState.workspace) || !isAbsolute(nativeState.workspace) ||
+				Object.keys(nativeState).some((k) => k !== 'sessionId' && k !== 'workspace'))
+				throw new Error('invalid CC native state; persist sessionId with its absolute original workspace');
 			if (this.snapshot.records.some((r) => r.conversationId !== record.conversationId && r.nativeState.cc?.sessionId === id)) {
 				throw new Error('duplicate CC native session');
 			}
@@ -333,12 +370,6 @@ export class ConversationStore {
 		return copy(record);
 	}
 
-	private codexThreadPending(record: ConversationRecord): boolean {
-		const state = record.nativeState.codex;
-		return validId(state?.threadId) && (!validId(state.workspace) || !isAbsolute(state.workspace) ||
-			!validId(state.promptHash) || !/^[0-9a-f]{64}$/.test(state.promptHash));
-	}
-
 	/** Agent-facing native writes cannot forge or discard an offline-confirmed frozen persona. */
 	private assertCodexNativeWrite(record: ConversationRecord, provider: Provider, state: Record<string, unknown>): void {
 		if (provider !== 'codex') return;
@@ -352,9 +383,13 @@ export class ConversationStore {
 			throw new Error('Codex original prompt requires offline owner confirmation');
 	}
 
-	private ccCwdPending(record: ConversationRecord): boolean {
-		const state = record.nativeState.cc;
-		return validId(state?.sessionId) && (state.cwdConfirmationRequired === true || !validId(state.workspace));
+	/** #343: agent-facing CC native writes cannot persist a resumable session without its original cwd,
+	 * nor re-arm the offline confirmation gate (only legacy import produces cwdConfirmationRequired). */
+	private assertCcNativeWrite(provider: Provider, state: Record<string, unknown>): void {
+		if (provider !== 'cc' || !('sessionId' in state)) return;
+		if (!validId(state.sessionId) || !validId(state.workspace) || !isAbsolute(state.workspace) ||
+			state.cwdConfirmationRequired === true)
+			throw new Error('CC native session must be persisted with its absolute original workspace');
 	}
 
 	/** Offline-only owner approval recording; the caller must independently verify the owner and artifact. */
@@ -368,7 +403,7 @@ export class ConversationStore {
 			record.nativeState.cc?.sessionId !== sessionId || record.pendingRuns?.length)
 			throw new Error('CC confirmation target changed or has a pending run');
 		const state = record.nativeState.cc!;
-		if (!this.ccCwdPending(record)) {
+		if (!ccCwdPending(record)) {
 			if (record.state === 'ready' && state.workspace === cwd &&
 				record.ccCwdConfirmation?.sessionId === sessionId && record.ccCwdConfirmation.generation === generation &&
 				record.ccCwdConfirmation.approvalSha256 === approvalSha256 && record.ccCwdConfirmation.approvalRef === approvalRef) return record;
@@ -404,7 +439,7 @@ export class ConversationStore {
 				record.nativeState.codex?.originalPrompt === originalPrompt) return record;
 			throw new Error('Codex conflicting confirmation');
 		}
-		if (!this.codexThreadPending(record) || record.state !== 'suspended' ||
+		if (!codexThreadPending(record) || record.state !== 'suspended' ||
 			Object.keys(record.nativeState.codex!).length !== 1 || !this.snapshot.sources['codex/sessions.json'])
 			throw new Error('Codex confirmation requires suspended legacy {threadId} state');
 		const updated = copy(record);
