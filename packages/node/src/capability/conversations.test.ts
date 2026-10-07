@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ConversationStore, type Provider } from './conversations.js';
+import { ConversationStore, suspensionReason, type Provider } from './conversations.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -107,6 +107,7 @@ describe('ConversationStore', () => {
 		expect(store.getNative('openclaw', '11', '888')).toEqual({ token, nativeRef: `${token}:aiclaw-11-room-888` });
 		expect(store.getNative('cc', '44', '888')).toEqual({ sessionId: 'cc-44', cwdConfirmationRequired: true });
 		expect(store.get('44', '888')?.state).toBe('suspended');
+		expect(suspensionReason(store.get('44', '888'))).toBe('cc-original-cwd-unconfirmed'); // #343 可核验恢复
 		expect(() => store.mintToken('44', '888')).toThrow('paused');
 		store.confirmCcOriginalCwd('44', '888', 'cc-44', 1, '/original', 'https://example.test/owner-approval', 'f'.repeat(64));
 		expect(store.mintToken('44', '888')).toBe('b'.repeat(64));
@@ -171,14 +172,78 @@ describe('ConversationStore', () => {
 		store.beginRun('44', '888', 'fresh');
 	});
 
-	it('upgrades a preexisting ready snapshot with missing CC cwd to persisted suspended gate', () => {
+	it('upgrades a preexisting ready snapshot with missing CC cwd to persisted suspended gate (#343 field shape)', () => {
 		const root = home(), opts = active(root, { '44': 'cc' });
-		const store = new ConversationStore(opts);
-		store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44' });
+		// #343 现场：前门控迁移把 sessionId 落盘却从未保存原 cwd，state 仍为 ready；重开必须升级为挂起。
+		const snapshot = join(root, 'conversations.json');
+		writeFileSync(snapshot, JSON.stringify({ version: 1, sources: {}, records: [{
+			conversationId: 'c3430000-0000-4000-8000-000000000001', serverNamespace: opts.serverNamespace,
+			identityId: '44', roomId: '888', adapterInstanceId: 'cc', generation: 1,
+			contextKey: 'a'.repeat(64), state: 'ready', nativeAliases: [{ provider: 'cc', id: 'cc-44' }],
+			nativeState: { cc: { sessionId: 'cc-44' } },
+		}] }));
 		const reopened = new ConversationStore(opts);
 		expect(reopened.get('44', '888')?.state).toBe('suspended');
-		expect(JSON.parse(readFileSync(join(root, 'conversations.json'), 'utf8')).records[0].state).toBe('suspended');
+		expect(suspensionReason(reopened.get('44', '888'))).toBe('cc-original-cwd-missing'); // #343 证据不足
+		expect(JSON.parse(readFileSync(snapshot, 'utf8')).records[0].state).toBe('suspended');
 		expect(reopened.reset('44', '888')).toMatchObject({ state: 'ready', nativeState: {}, generation: 2 });
+	});
+
+	it('#343: runtime CC writes must persist the original absolute cwd; pause states stay explainable', () => {
+		const root = home(), opts = active(root, { '44': 'cc' });
+		const store = new ConversationStore(opts);
+		expect(suspensionReason(store.get('44', '888'))).toBeUndefined();
+		// 写边界：可续会话不允许再落成「只有 sessionId」的不可恢复形状（本票诊断的事故根因）。
+		expect(() => store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44' })).toThrow('absolute original workspace');
+		expect(() => store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44', workspace: 'relative/x' })).toThrow('absolute original workspace');
+		const record = store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44', workspace: '/original' });
+		expect(record.state).toBe('ready');
+		expect(suspensionReason(record)).toBeUndefined();
+		const run = store.beginRun('44', '888', 'run-343');
+		expect(suspensionReason(store.get('44', '888'))).toBe('occupied');
+		expect(() => run.saveNativeState('cc', { sessionId: 'cc-44' })).toThrow('absolute original workspace');
+		expect(() => run.saveNativeState('cc', { sessionId: 'cc-44', workspace: '/original', cwdConfirmationRequired: true })).toThrow('absolute original workspace');
+		run.saveNativeState('cc', { sessionId: 'cc-44', workspace: '/moved' });
+		expect(store.getNative('cc', '44', '888')).toEqual({ sessionId: 'cc-44', workspace: '/moved' });
+		store.markStopUnconfirmed('run-343');
+		expect(suspensionReason(store.get('44', '888'))).toBe('stop-unconfirmed');
+		store.confirmStopped('run-343');
+		expect(store.get('44', '888')?.state).toBe('ready');
+	});
+
+	it('#382: a run-proved non-resumable CC session suspends explainably; only reset reopens it', () => {
+		const root = home(), opts = active(root, { '44': 'cc' });
+		const store = new ConversationStore(opts);
+		store.registerNative('cc', 'cc-44', '44', '888', { sessionId: 'cc-44', workspace: '/original' });
+		store.beginRun('44', '888', 'run-382');
+		// 标记只能盖在本 run 绑定的原生会话上——错会话拒绝，防伪造暂停。
+		expect(() => store.markCcResumeBroken('run-382', 'other-session')).toThrow('session mismatch');
+		store.markCcResumeBroken('run-382', 'cc-44');
+		expect(suspensionReason(store.get('44', '888'))).toBe('occupied'); // run 未释放：瞬态占用，不是暂停
+		store.finishRun('run-382');
+		const suspended = store.get('44', '888')!;
+		expect(suspended.state).toBe('suspended');
+		expect(suspensionReason(suspended)).toBe('cc-native-history-lost'); // #382 现场形状可解释
+		// 重启后标记语义不丢；reset 后代次+1，标记仅作审计，房间回到 ready（重建入口）。
+		const reopened = new ConversationStore(opts);
+		expect(suspensionReason(reopened.get('44', '888'))).toBe('cc-native-history-lost');
+		reopened.reset('44', '888');
+		const after = reopened.get('44', '888')!;
+		expect(after.state).toBe('ready');
+		expect(suspensionReason(after)).toBeUndefined();
+		expect(after.ccResumeFailure).toEqual({ sessionId: 'cc-44', generation: 1 }); // 审计留存，不再拦路
+	});
+
+	it('#382: rejects a corrupted CC resume failure marker before it can mute a room', () => {
+		const root = home();
+		writeFileSync(join(root, 'conversations.json'), JSON.stringify({ version: 1, sources: {}, records: [{
+			conversationId: 'c3820000-0000-4000-8000-000000000001', serverNamespace: 'http://example.test/api',
+			identityId: '44', roomId: '888', adapterInstanceId: 'cc', generation: 1,
+			contextKey: 'c'.repeat(64), state: 'suspended', nativeAliases: [],
+			nativeState: { cc: { sessionId: 'cc-44', workspace: '/original' } },
+			ccResumeFailure: { sessionId: 'cc-44', generation: 99 },
+		}] }));
+		expect(() => new ConversationStore(active(root, { '44': 'cc' }))).toThrow('invalid CC resume failure marker');
 	});
 
 	it('confirms only frozen legacy Codex provenance atomically; survives restart and rejects agent overrides', () => {

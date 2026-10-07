@@ -13,6 +13,14 @@ export type AgentEvent =
 	| { type: 'error'; message: string }
 	| { type: 'cancelled'; reason: string };
 
+/**
+ * #382 — error-message prefix a driver stamps when a live run PROVED a persisted native session
+ * non-resumable at runtime (CC `--resume` failing with `No conversation found`: native history lost).
+ * The bridge keys client-visible failure feedback and the explainable pause on this same code,
+ * so the thinking-table trace (status=2 error string) and the room notice always agree.
+ */
+export const NATIVE_SESSION_LOST = 'native_session_lost';
+
 /** Core-owned, generation-bound handles; these methods must reject stale writes. */
 export interface BoundConversation {
 	readonly id: string;
