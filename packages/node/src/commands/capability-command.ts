@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { capabilitySocketPath } from '../capability/endpoint.js';
 import { postCapability } from '../capability/client.js';
-import { resolveAgentContexts } from './send-message.js';
+import { resolveAgentContexts, resolveRunBind } from './send-message.js';
 
-/** All agent-facing capabilities share the V2 envelope and one machine-readable output contract. */
+/** All agent-facing capabilities share the V2/V3 envelope (#404: V3 = V2 + frozen run binding) and one machine-readable output contract. */
 export async function runCapabilityCommand(
 	command: string,
 	argv: string[],
@@ -52,10 +52,16 @@ export async function runCapabilityCommand(
 	}
 	const contexts = resolveAgentContexts();
 	if (!contexts.length) return fail('UNKNOWN_CONTEXT', 'no agent session env (AICHAT_CONTEXT_KEY / OPENCODE_SESSION_ID / CODEX_THREAD_ID / OPENCLAW_BIND / AICHAT_BIND)', json, false);
+	// #404: a frozen per-run binding upgrades this call to the V3 envelope; the token itself is
+	// never logged. An overlong value is rejected client-side rather than sent.
+	const runBinding = resolveRunBind();
+	if (runBinding !== undefined && runBinding.length > 256)
+		return fail('INVALID_ARGUMENT', 'send-message: invalid run binding', json, false);
 	let res: Awaited<ReturnType<typeof postCapability>>;
 	try {
 		res = await postCapability(capabilitySocketPath(), {
-			version: 2, contexts, command, args, ...(write ? { requestId } : {}),
+			version: runBinding === undefined ? 2 : 3, contexts, command, args, ...(write ? { requestId } : {}),
+			...(runBinding === undefined ? {} : { runBinding }),
 		});
 	} catch {
 		const code = write ? 'DELIVERY_UNKNOWN' : 'UPSTREAM_FAILED';

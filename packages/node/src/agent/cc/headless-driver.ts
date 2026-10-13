@@ -72,7 +72,7 @@ export class CcHeadlessDriver implements RunDriver {
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
-			!input.workspace || !input.contextKey || !input.bindToken) throw new TypeError('Invalid CC prepared run');
+			!input.workspace || !input.contextKey || !input.bindToken || !input.replyToken) throw new TypeError('Invalid CC prepared run');
 		const run = new CcRun(input, this.deps, this.transcript, async (workspace) => {
 			await mkdir(workspace, { recursive: true });
 			let path = this.settings.get(workspace);
@@ -192,8 +192,10 @@ class CcRun implements AgentRun {
 			if (input.systemPrompt) argv.push('--append-system-prompt', input.systemPrompt);
 			if (sessionId) argv.push('--resume', sessionId);
 			const attempt = `${input.runId}:${randomUUID()}`;
+			// #404: every run carries exactly one frozen reply binding; the inherited value (if any)
+			// from an outer run env is overwritten, never merged — a late reply can only target A.
 			const env: NodeJS.ProcessEnv = { ...process.env, AICHAT_CONTEXT_KEY: contextKey,
-				AICHAT_BIND: input.bindToken, AICHAT_CC_RUN: attempt, CLAUDE_NON_INTERACTIVE: '1' };
+				AICHAT_BIND: input.bindToken, AICHAT_RUN_BIND: input.replyToken, AICHAT_CC_RUN: attempt, CLAUDE_NON_INTERACTIVE: '1' };
 			delete env.OPENCODE_SESSION_ID;
 			delete env.CODEX_THREAD_ID;
 			delete env.OPENCLAW_BIND;

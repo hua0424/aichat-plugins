@@ -19,6 +19,11 @@ export interface CapabilityContext {
 	requestId?: string;
 	/** Core-resolved generation, not caller-supplied; part of the T15 payload fingerprint. */
 	generation?: number;
+	/**
+	 * #404: core-verified single-round reply target (endpoint-resolved from the V3 run binding).
+	 * Set ONLY by the endpoint — never from capability args (model-claimed IDs stay untrusted).
+	 */
+	replyThinkingId?: string;
 	/** Set only after a successful, explicit T15 capability probe. */
 	receiptSupported?: boolean;
 	resetBearer?: string;
@@ -78,15 +83,21 @@ export function sendMessageCapability(): Capability {
 		}
 		if (ctx.receiptSupported && !ctx.requestId) throw new Error('send-message: missing requestId');
 		// Old server: one legacy attempt, never retry an uncertain write or assume ignored fields work.
+		// #404: only the core-verified target (ctx.replyThinkingId) enters extra.thinkingId — the
+		// server's existing authorized-association transaction consumes it; unassociated sends carry
+		// no thinkingId and count as unknown coverage, never as proof of no reply.
+		const thinkingExtra = ctx.replyThinkingId !== undefined ? { thinkingId: ctx.replyThinkingId } : {};
 		const attempts = ctx.receiptSupported && autoRetrySafe(ctx.requestId) ? 3 : 1;
 		for (let attempt = 0; attempt < attempts; attempt++) {
 			if (attempt > 0 && !autoRetrySafe(ctx.requestId)) throw new Error('receipt retry window elapsed');
 			try {
 				const { msgId } = ctx.receiptSupported
-					? await ctx.apiClient.sendMessage(ctx.roomId, content, { cliGeneration: ctx.generation }, ctx.requestId)
-					: await ctx.apiClient.sendMessage(ctx.roomId, content);
+					? await ctx.apiClient.sendMessage(ctx.roomId, content, { cliGeneration: ctx.generation, ...thinkingExtra }, ctx.requestId)
+					: Object.keys(thinkingExtra).length
+						? await ctx.apiClient.sendMessage(ctx.roomId, content, thinkingExtra)
+						: await ctx.apiClient.sendMessage(ctx.roomId, content);
 				if (!/^\d+$/.test(msgId) || msgId === '0') throw new Error('send-message: missing committed msgId');
-				return { msgId, roomId: ctx.roomId, receiptMode: ctx.receiptSupported ? 'durable' : 'legacy' };
+				return { msgId, roomId: ctx.roomId, receiptMode: ctx.receiptSupported ? 'durable' : 'legacy', ...thinkingExtra };
 			} catch (err) {
 				if (err instanceof HulaApiRejectedError || attempt === attempts - 1) throw err;
 				await delay(200 * (attempt + 1));

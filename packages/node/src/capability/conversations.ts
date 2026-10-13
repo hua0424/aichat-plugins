@@ -18,6 +18,8 @@ export interface ConversationRecord {
 	state: 'ready' | 'suspended' | 'stop_unconfirmed' | 'disabled';
 	/** A reset can leave several older runs awaiting independent stop confirmation. */
 	pendingRuns?: PendingRun[];
+	/** #404: per-run trusted reply bindings (small, bounded, leased); see ReplyBinding. */
+	replyBindings?: ReplyBinding[];
 	nativeAliases: NativeAlias[];
 	/** Original provider store payloads. OpenClaw retains both the bare token and full gateway sessionKey. */
 	nativeState: Record<Provider, Record<string, unknown>>;
@@ -34,10 +36,37 @@ export interface ConversationRecord {
 }
 export interface RecoveryData { version: number; value: unknown }
 export interface PendingRun { runId: string; generation: number; startedAt: string; recovery?: RecoveryData }
+/**
+ * #404: per-run trusted reply binding — the single-flight, immutable single-round target.
+ * Minted opaque at beginRun and persisted BEFORE the caller sees it; `thinkingId` starts empty
+ * and is fixed exactly once by the exact START receipt (empty → one fixed ID; conflict refused).
+ * finishRun releases only the execution slot, never the binding; reset/disabled/expiry invalidate it.
+ */
+export interface ReplyBinding {
+	token: string;
+	runId: string;
+	conversationId: string;
+	serverNamespace: string;
+	generation: number;
+	thinkingId?: string;
+	createdAt: string;
+	expiresAt: string;
+}
+/**
+ * #404: binding lease + capacity, locked by reply-bind tests and recorded in the implement manifest.
+ * 8d covers a normal run plus the existing 7d requestId confirmation window; authorization
+ * expiry/reset still revoke eligibility. Live = unexpired + current generation; only live bindings
+ * count toward the cap, and full capacity refuses new runs explicitly (never silent eviction,
+ * never unbounded growth, never early eviction of a live binding).
+ */
+export const REPLY_BINDING_TTL_MS = 8 * 24 * 60 * 60 * 1000;
+export const REPLY_BINDING_MAX_LIVE_PER_CONVERSATION = 1024;
 export interface BoundConversationRun {
 	readonly conversationId: string;
 	readonly generation: number;
 	readonly contextKey: string;
+	/** #404: frozen opaque reply-binding token for this run (AICHAT_RUN_BIND value), persisted before return. */
+	readonly replyToken: string;
 	readonly nativeState: ConversationRecord['nativeState'];
 	/** Synchronous, side-effect-free gate checked immediately before native submission. */
 	assertCurrent(): void;
@@ -233,6 +262,8 @@ export class ConversationStore {
 		if (!Number.isSafeInteger(old.generation + 1)) throw new Error('generation exhausted');
 		const record: ConversationRecord = { ...old, generation: old.generation + 1,
 			contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: {},
+			// #404: the generation bump supersedes every prior reply binding; drop them in the same commit.
+			replyBindings: [],
 			state: old.pendingRuns?.length || old.state === 'stop_unconfirmed' ? 'stop_unconfirmed'
 				: ccCwdPending(old) || codexThreadPending(old) || ccResumeBroken(old) ? 'ready' : old.state };
 		const records = this.snapshot.records.some((r) => r.conversationId === old.conversationId)
@@ -267,6 +298,19 @@ export class ConversationStore {
 		if (record.state !== 'ready' || record.pendingRuns?.length) throw new Error('conversation paused or occupied');
 		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
 		record.pendingRuns = [{ runId, generation: record.generation, startedAt: new Date().toISOString() }];
+		// #404: mint the opaque reply binding and persist it in the SAME commit as the run slot —
+		// the token becomes visible only after this commit succeeds (disk failure → no usable target).
+		record.replyBindings = this.prunedBindings(record, record.generation);
+		if (record.replyBindings.length >= REPLY_BINDING_MAX_LIVE_PER_CONVERSATION)
+			throw new Error('reply binding capacity exceeded; oldest live binding still valid, refusing new run');
+		const now = new Date();
+		const binding: ReplyBinding = { token: randomBytes(32).toString('hex'), runId,
+			conversationId: record.conversationId, serverNamespace: this.options.serverNamespace,
+			generation: record.generation, createdAt: now.toISOString(),
+			expiresAt: new Date(now.getTime() + REPLY_BINDING_TTL_MS).toISOString() };
+		if ((record.replyBindings ?? []).some((b) => b.token === binding.token || b.runId === runId))
+			throw new Error('duplicate reply binding');
+		record.replyBindings.push(binding);
 		this.replace(record);
 		const generation = record.generation, conversationId = record.conversationId;
 		const current = (): ConversationRecord => {
@@ -278,6 +322,7 @@ export class ConversationStore {
 		};
 		return {
 			conversationId, generation, contextKey: record.contextKey, nativeState: copy(record.nativeState),
+			replyToken: binding.token,
 			assertCurrent: () => { current(); },
 			saveNativeState: (provider, state) => {
 				current(); this.assertProvider(provider, identityId);
@@ -338,6 +383,57 @@ export class ConversationStore {
 		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
 		if (!record || this.closed) throw new Error('run no longer pending');
 		this.replace({ ...copy(record), state });
+	}
+
+	/**
+	 * #404: fix the run's reply binding target from the exact START receipt (empty → one fixed ID).
+	 * Same-ID repeat is idempotent (reconnect rebroadcast); a conflicting ID is refused and the
+	 * binding stays unusable — no error reply is published and no uncommitted target is created.
+	 * A receipt for a released (no longer pending) run is refused: late frames cannot adopt a target.
+	 */
+	confirmReplyBindingThinking(runId: string, thinkingId: string): ReplyBinding {
+		if (!validId(runId) || typeof thinkingId !== 'string' || !thinkingId || thinkingId.length > 128)
+			throw new Error('invalid reply binding confirmation');
+		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
+		if (!record || this.closed) throw new Error('run no longer pending');
+		const binding = (record.replyBindings ?? []).find((b) => b.runId === runId);
+		if (!binding || binding.generation !== record.generation) throw new Error('no live reply binding for run');
+		if (binding.thinkingId !== undefined) {
+			if (binding.thinkingId !== thinkingId) throw new Error('conflicting START receipt for run');
+			return copy(binding);
+		}
+		const updated = copy(record);
+		updated.replyBindings!.find((b) => b.runId === runId)!.thinkingId = thinkingId;
+		this.replace(updated);
+		return copy(updated.replyBindings!.find((b) => b.runId === runId)!);
+	}
+
+	/**
+	 * #404: endpoint-side verification of a CLI-presented run binding. Returns the binding only when
+	 * it is live (current generation), unexpired, names this server namespace, and already carries a
+	 * fixed thinkingId; anything else (unknown/forged/expired/stale/unfixed/cross-namespace) yields
+	 * undefined so the endpoint refuses without dispatch. Read-only: pruning happens on write paths.
+	 */
+	resolveReplyBinding(token: string): ReplyBinding | undefined {
+		if (typeof token !== 'string' || !token) return undefined;
+		const now = Date.now();
+		for (const record of this.snapshot.records) {
+			const binding = (record.replyBindings ?? []).find((b) => b.token === token);
+			if (!binding) continue;
+			if (binding.conversationId !== record.conversationId || binding.generation !== record.generation ||
+				binding.serverNamespace !== this.options.serverNamespace || binding.thinkingId === undefined ||
+				!binding.thinkingId || Number.isNaN(Date.parse(binding.expiresAt)) ||
+				Date.parse(binding.expiresAt) <= now) return undefined;
+			return copy(binding);
+		}
+		return undefined;
+	}
+
+	/** #404: drop only expired or superseded-generation bindings; live ones are never evicted early. */
+	private prunedBindings(record: ConversationRecord, generation: number): ReplyBinding[] {
+		const now = Date.now();
+		return (record.replyBindings ?? []).filter((b) =>
+			b.generation === generation && !Number.isNaN(Date.parse(b.expiresAt)) && Date.parse(b.expiresAt) > now);
 	}
 	private assertRecovery(value: RecoveryData): void {
 		if (!value || !Number.isSafeInteger(value.version) || value.version < 1) throw new Error('invalid recovery');
@@ -605,7 +701,8 @@ export class ConversationStore {
 		if (data.revokedKeys !== undefined && (!Array.isArray(data.revokedKeys) || data.revokedKeys.some((k) => typeof k !== 'string' || !/^[0-9a-f]{64}$/.test(k)))) throw new Error('invalid revoked keys');
 		if (data.revokedAliases !== undefined && (!Array.isArray(data.revokedAliases) || data.revokedAliases.some((a) => !a || !validProvider(a.provider) || !validId(a.id) || (a.runtimeScope !== undefined && !validId(a.runtimeScope))))) throw new Error('invalid revoked aliases');
 		const ids = new Set<string>(), keys = new Set(data.revokedKeys ?? []), pairs = new Set<string>(),
-			aliases = new Set((data.revokedAliases ?? []).map(aliasKey)), ccSessions = new Set<string>(), runs = new Set<string>();
+			aliases = new Set((data.revokedAliases ?? []).map(aliasKey)), ccSessions = new Set<string>(), runs = new Set<string>(),
+			replyTokens = new Set<string>();
 		if (keys.size !== (data.revokedKeys?.length ?? 0) || aliases.size !== (data.revokedAliases?.length ?? 0)) throw new Error('duplicate revoked binding');
 		for (const r of data.records) {
 			if (!r || r.serverNamespace !== this.options.serverNamespace || !validId(r.identityId) || !validId(r.roomId) ||
@@ -639,6 +736,19 @@ export class ConversationStore {
 				runs.add(run.runId);
 			}
 			if (r.state === 'ready' && r.pendingRuns?.some((run) => run.generation !== r.generation)) throw new Error('old run cannot be ready');
+			if (r.replyBindings !== undefined && !Array.isArray(r.replyBindings)) throw new Error('invalid reply bindings');
+			for (const b of r.replyBindings ?? []) {
+				if (!b || typeof b.token !== 'string' || !/^[0-9a-f]{64}$/.test(b.token) ||
+					replyTokens.has(b.token) || !validId(b.runId) || b.conversationId !== r.conversationId ||
+					b.serverNamespace !== this.options.serverNamespace || !Number.isSafeInteger(b.generation) ||
+					b.generation < 1 || b.generation > r.generation ||
+					(b.thinkingId !== undefined && (typeof b.thinkingId !== 'string' || !b.thinkingId || b.thinkingId.length > 128)) ||
+					!validId(b.createdAt) || Number.isNaN(Date.parse(b.createdAt)) ||
+					!validId(b.expiresAt) || Number.isNaN(Date.parse(b.expiresAt)) ||
+					Date.parse(b.expiresAt) <= Date.parse(b.createdAt))
+					throw new Error('invalid reply binding');
+				replyTokens.add(b.token);
+			}
 			const pair = identityKey(r.serverNamespace, r.identityId, r.roomId);
 			if (ids.has(r.conversationId) || keys.has(r.contextKey) || pairs.has(pair)) throw new Error('duplicate conversation binding');
 			ids.add(r.conversationId); keys.add(r.contextKey); pairs.add(pair);

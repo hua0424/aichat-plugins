@@ -225,6 +225,12 @@ export class MessageHandler {
 	private pendingThinkingStarts = new Map<string, PendingThinkingStart>();
 	private pendingThinkingEnds = new Map<string, PendingThinkingEnd>();
 	private readonly START_RECEIPT_TIMEOUT_MS = 30_000;
+	/** #404: START-ready barrier + pending END confirmation bound (production 30s; tests may shrink). */
+	private startReceiptTimeout(): number { return this.receiptTimeoutMs ?? this.START_RECEIPT_TIMEOUT_MS; }
+	/** #404: START-ready barrier waiters, keyed by runId; resolved once by the exact START receipt. */
+	private startWaiters = new Map<string, { resolve: (thinkingId: string | undefined) => void }>();
+	/** Set by destroy(); barrier waiters drop (never re-drive) once torn down. */
+	private destroyed = false;
 
 	// REQ-004 S2: 按房间隔离的处理状态（debouncer / pendingMessages / lastCtx）；REQ-029: key 为字符串 roomId
 	private roomChannels = new Map<string, RoomChannel>();
@@ -283,6 +289,8 @@ export class MessageHandler {
 		private readonly getConversations: () => ConversationStore,
 		private readonly workspaceBase?: string,
 		private readonly capabilityRegistry?: CapabilityRegistry,
+		/** Test seam: bound the START/END receipt windows below production 30s. */
+		private readonly receiptTimeoutMs?: number,
 	) {
 		this.ws = ws;
 		this.driver = driver;
@@ -336,6 +344,25 @@ export class MessageHandler {
 		this.pendingThinkingStarts.delete(runId);
 	}
 
+	/**
+	 * #404: wait for the exact START receipt of one run, bounded by the receipt window.
+	 * Resolves with the fixed thinkingId, or undefined on timeout / conflicting receipt.
+	 */
+	private waitStartReceipt(runId: string): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				this.startWaiters.delete(runId);
+				resolve(undefined);
+			}, this.startReceiptTimeout());
+			timer.unref?.();
+			this.startWaiters.set(runId, { resolve: (thinkingId) => {
+				clearTimeout(timer);
+				this.startWaiters.delete(runId);
+				resolve(thinkingId);
+			} });
+		});
+	}
+
 	private forgetThinkingEnd(runId: string): void {
 		const pending = this.pendingThinkingEnds.get(runId);
 		if (!pending) return;
@@ -379,7 +406,7 @@ export class MessageHandler {
 			const deadline = setTimeout(() => {
 				console.error(`[thinking] END confirmation timed out run=${runId} thinking=${session.thinkingId}`);
 				this.forgetThinkingEnd(runId);
-			}, this.START_RECEIPT_TIMEOUT_MS);
+			}, this.startReceiptTimeout());
 			retry.unref?.();
 			deadline.unref?.();
 			this.pendingThinkingEnds.set(runId, { session, frame, retry, deadline });
@@ -797,6 +824,7 @@ export class MessageHandler {
 		};
 
 		// Persist the run slot before emitting THINKING_START or touching the native driver.
+		// #404: beginRun also mints the opaque per-run reply binding (persisted in the same commit).
 		const cfg = this.groupConfigCache.get(this.selfUid, roomId);
 		const workspaceContext = {
 			roomType, roomId, counterpartUid: fromUid, isOwner,
@@ -828,6 +856,9 @@ export class MessageHandler {
 					runId: id, message: agentEnvelope, systemPrompt,
 					contextKey: bound.contextKey, promptOwner: this.selfUid,
 					bindToken: this.driver.type === 'cc' ? store.mintToken(this.selfUid, roomId) : undefined,
+					// #404: frozen per-run binding; fixed to one thinkingId by the exact START
+					// receipt (barrier below) before the native stream is consumed.
+					replyToken: bound.replyToken,
 					transcriptKey: sessionKey,
 					workspace: this.workspaceBase
 						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, workspaceContext) : undefined,
@@ -893,12 +924,44 @@ export class MessageHandler {
 			const deadline = setTimeout(() => {
 				console.error(`[thinking] START receipt timed out; END unavailable run=${runId}`);
 				this.forgetThinkingStart(runId);
-			}, this.START_RECEIPT_TIMEOUT_MS);
+				this.startWaiters.get(runId)?.resolve(undefined);
+				this.startWaiters.delete(runId);
+			}, this.startReceiptTimeout());
 			retry.unref?.();
 			deadline.unref?.();
 			this.pendingThinkingStarts.set(runId, { session, retry, deadline });
 		}
 		this.sendThinkingStart(session);
+
+		// #404 START-ready barrier: the native stream is consumed only after the exact START
+		// receipt fixes this run's reply binding. Unconfirmed → 0 native submit, 0 reply POST,
+		// no success claim; the run slot is released and the message requeued for a later turn.
+		// The wait reuses the bounded receipt window and never stacks into the CLI budget.
+		if (session.run) {
+			const barrierRun = session.run;
+			const barrierRunId = barrierRun.id;
+			const receiptThinkingId = await this.waitStartReceipt(barrierRunId);
+			if (!receiptThinkingId) {
+				this.forgetThinkingStart(barrierRunId);
+				if (session.timeoutId) clearTimeout(session.timeoutId);
+				// A concurrent teardown may have released the slot already — only release what is
+				// still pending, so a normal destroy/barrier race never logs a false "occupied".
+				try {
+					if (this.getConversations().pendingRuns().some((r) => r.runId === barrierRunId))
+						this.getConversations().finishRun(barrierRunId);
+				} catch (releaseError) { console.error(`[handler] unconfirmed run ${barrierRunId} remains occupied: ${errMsg(releaseError)}`); }
+				try { await barrierRun.agent.dispose(); }
+				catch (disposeError) { console.error(`[handler] unconfirmed run ${barrierRunId} dispose failed: ${errMsg(disposeError)}`); }
+				if (this.thinkingSessions.get(sessionKey) === session) this.thinkingSessions.delete(sessionKey);
+				// The room is ready again (slot released): re-drive the turn through the debouncer
+				// (2s backoff, no hot loop) rather than parking it in pendingMessages.
+				// After teardown the turn is dropped with everything else — never resurrected.
+				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
+				if (!this.destroyed) channel.debouncer.push(message);
+				console.error(`[thinking] START unconfirmed; native run not submitted run=${barrierRunId}`);
+				return;
+			}
+		}
 
 		// Native runs consume only the prepared, generation-bound core input.
 		// done 事件：clean finalize-complete，用 reduceThinking 归约整段事件序列，
@@ -1000,6 +1063,20 @@ export class MessageHandler {
 		if (target.thinkingId && target.thinkingId !== data.thinkingId) {
 			console.error(`[thinking] conflicting START receipt run=${data.clientRunId}`);
 			return;
+		}
+		// #404: fix this run's reply binding from the exact receipt before backfilling. A
+		// conflicting, revoked, or late (run released) confirmation fails the START-ready barrier
+		// (no native submit, no error reply, no uncommitted target) but never blocks the exact
+		// START/END receipt bookkeeping below — a buffered END still flushes with its receipt ID.
+		if (target.run && data.clientRunId) {
+			let bindingFixed = false;
+			try {
+				this.getConversations!().confirmReplyBindingThinking(data.clientRunId, data.thinkingId);
+				bindingFixed = true;
+			} catch (error) {
+				console.error(`[thinking] reply binding confirmation refused run=${data.clientRunId}: ${errMsg(error)}`);
+			}
+			this.startWaiters.get(data.clientRunId)?.resolve(bindingFixed ? data.thinkingId : undefined);
 		}
 		target.thinkingId = data.thinkingId;
 		if (pending) {
@@ -1261,7 +1338,7 @@ export class MessageHandler {
 
 	/** CR-S7: 清理所有 active session（进程退出时调用） */
 	destroy(): void {
-		for (const session of this.thinkingSessions.values()) {
+		this.destroyed = true;		for (const session of this.thinkingSessions.values()) {
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			void this.stopRun(session, 'handler destroyed');
 			if (!session.finalized) {
@@ -1274,6 +1351,12 @@ export class MessageHandler {
 		}
 		for (const runId of this.pendingThinkingStarts.keys()) this.forgetThinkingStart(runId);
 		for (const runId of this.pendingThinkingEnds.keys()) this.forgetThinkingEnd(runId);
+		// #404: fail every barrier waiter so a START receipt can never submit native work after
+		// teardown; the waiters' own failure path releases the run slot without re-driving.
+		for (const [runId, waiter] of this.startWaiters) {
+			this.startWaiters.delete(runId);
+			waiter.resolve(undefined);
+		}
 		// 清理所有房间的待处理队列与定时器；用 cancel 而非 flush，
 		// 避免 teardown 时 flush 重新触发 triggerAgentLoop 复活会话。
 		for (const channel of this.roomChannels.values()) {

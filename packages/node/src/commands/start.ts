@@ -93,8 +93,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 	// SDK v0.142.3 accepts a per-client env (without inheriting process.env); never mutate global env.
+	// #404: AICHAT_RUN_BIND is stripped from the base env (no inherited run value survives) and
+	// re-injected frozen per run by the driver via createCodex's runEnv.
 	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
-		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
+		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
 
 	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
 	// their matching headless turn. Every CC identity's driver and the broker share this registry.
@@ -133,7 +135,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			context: nativeContext('codex'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
 			create: (entry) => new CodexDriver({
-				createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
+				createCodex: (systemPrompt: string, runEnv?: Record<string, string>) => new Codex({ env: { ...codexEnv, ...runEnv },
 					config: { developer_instructions: systemPrompt } }),
 				...(entry.model !== undefined ? { model: entry.model } : {}),
 			}) }],
@@ -209,6 +211,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resolve: (sessionKey) => bound(conversations?.resolveLegacy(sessionKey)),
 		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
 			Parameters<ConversationStore['resolveCandidate']>[0])),
+		// #404: V3 run-binding verification against the same core store (fail closed when unwired).
+		resolveReplyBinding: (token) => {
+			const binding = conversations?.resolveReplyBinding(token);
+			// resolveReplyBinding only returns fixed (thinkingId-bearing) live bindings.
+			return binding?.thinkingId === undefined ? undefined : {
+				token: binding.token, runId: binding.runId, conversationId: binding.conversationId,
+				serverNamespace: binding.serverNamespace, generation: binding.generation,
+				thinkingId: binding.thinkingId,
+			};
+		},
 		serverNamespace: restBaseUrl,
 		getResetReceipt: (bearer, id) => conversations?.getResetReceipt(bearer, id),
 		isPaused: (uid, room) => {

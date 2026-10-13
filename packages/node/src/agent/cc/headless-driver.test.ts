@@ -41,6 +41,7 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 	const controller = new AbortController();
 	const input: PreparedRun = { runId: 'core-run', message: '[HuLa 群聊]\nAlice(1): hi',
 		workspace: dir, transcriptKey: 'aiclaw-5-room-9', contextKey: 'opaque-new-key', bindToken: 'opaque-legacy-alias',
+		replyToken: 'f'.repeat(64),
 		systemPrompt: 'system instructions',
 		conversation: { id: 'opaque-conversation', generation: 1, nativeState: undefined,
 			assertCurrent: vi.fn(), saveNativeState: async (v) => { persisted.push(v); },
@@ -75,6 +76,8 @@ describe('CC PreparedRun native execution', () => {
 		expect(f.spawnCalls[0].args).toContain('system instructions');
 		expect(f.spawnCalls[0].options.env.AICHAT_CONTEXT_KEY).toBe('opaque-new-key');
 		expect(f.spawnCalls[0].options.env.AICHAT_BIND).toBe('opaque-legacy-alias');
+		// #404: exactly one frozen reply binding per run, inherited values never merged.
+		expect(f.spawnCalls[0].options.env.AICHAT_RUN_BIND).toBe('f'.repeat(64));
 		expect(f.spawnCalls[0].options.env.OPENCODE_SESSION_ID).toBeUndefined();
 		expect(JSON.parse(f.writes[0]).message.content[0].text).toBe(f.input.message);
 		expect(f.transcript).toHaveBeenCalledWith('aiclaw-5-room-9', expect.objectContaining({ kind: 'inbound' }));
@@ -91,8 +94,22 @@ describe('CC PreparedRun native execution', () => {
 		expect(f.input.saveRecovery).toHaveBeenCalledWith(expect.objectContaining({ value: expect.objectContaining({ pid: 4242 }) }));
 	});
 
-	posix('does not finish on EOF or close while a descendant survives; cancel remains unconfirmed', async () => {
+	posix('overwrites an inherited AICHAT_RUN_BIND with the frozen per-run token', async () => {
 		const f = fixture();
+		const saved = process.env.AICHAT_RUN_BIND;
+		process.env.AICHAT_RUN_BIND = '0'.repeat(64);
+		try {
+			const { done } = await f.start({ ...f.input, replyToken: 'a'.repeat(64) });
+			expect(f.spawnCalls[0].options.env.AICHAT_RUN_BIND).toBe('a'.repeat(64));
+			f.groupExit(); f.close(0);
+			await done;
+		} finally {
+			if (saved === undefined) delete process.env.AICHAT_RUN_BIND;
+			else process.env.AICHAT_RUN_BIND = saved;
+		}
+	});
+
+	posix('does not finish on EOF or close while a descendant survives; cancel remains unconfirmed', async () => {		const f = fixture();
 		const { run, collected, done } = await f.start();
 		f.line({ type: 'result', is_error: false });
 		f.output.emit('end');

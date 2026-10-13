@@ -283,7 +283,11 @@ describe('ConversationStore', () => {
 		store.finishRun('run');
 		expect(() => store.deleteNative('codex', '22', '888')).toThrow('reset');
 		const restarted = new ConversationStore(active(root, { '22': 'codex' }));
-		expect(restarted.get('22', '888')).toEqual({ ...approved, pendingRuns: [] });
+		// #404: the finished run's unfixed reply binding persists (END-after-run may still use it
+		// while authorized); only reset/expiry/generation change revokes it.
+		expect(restarted.get('22', '888')).toEqual({ ...approved, pendingRuns: [],
+			replyBindings: [expect.objectContaining({ runId: 'run', generation: 1,
+				conversationId: approved.conversationId })] });
 		expect(restarted.resolveLegacy('codex:old-thread')?.conversationId).toBe(approved.conversationId);
 		expect(readFileSync(join(root, 'conversation-backups', 'codex-sessions.json.bak'), 'utf8')).toBe(readFileSync(join(root, 'codex', 'sessions.json'), 'utf8'));
 		expect(restarted.reset('22', '888')).toMatchObject({ state: 'ready', generation: 2, nativeState: {} });
