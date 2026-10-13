@@ -104,6 +104,14 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// re-injected frozen per run by the driver via createCodex's runEnv.
 	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
 		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
+	// #406: per-native-run binding files bridge the node driver and the gateway-side
+	// `before_tool_call` hook (native runId → frozen reply token). The gateway is an
+	// external process, so deploy-time gateway env must point `AICHAT_OPENCLAW_RUNBIND_DIR`
+	// at this same shared dir (node and gateway run as the same uid on the host mount).
+	// Set AFTER the codexEnv snapshot: Codex builds its own frozen run env per run and
+	// must never inherit a run-scoped pointer.
+	const openclawRunBindDir = join(AICHAT_HOME, 'openclaw', 'run-bind');
+	process.env.AICHAT_OPENCLAW_RUNBIND_DIR = openclawRunBindDir;
 
 	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
 	// their matching headless turn. Every CC identity's driver and the broker share this registry.
@@ -126,7 +134,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				undefined, undefined, (id, _workspace, identityId) => {
 					if (!conversations) throw new Error('conversation bindings not ready');
 					conversations.assertOpenclawPromptOwner(id, identityId);
-				}) }],
+				}, openclawRunBindDir) }],
 		['opencode', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'opencode', workspaceBase: opencodeWorkspaceBase,
 			context: nativeContext('opencode'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },

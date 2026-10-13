@@ -17,6 +17,12 @@
  * `openclaw:<token>` capability session key that the node resolves via an EXACT store lookup. Anything
  * that is not a well-formed compound returns `{}` (inject nothing): we never throw and never inject a
  * malformed value, so a missing/odd/non-compound sessionKey is a safe no-op.
+ *
+ * #406 invariant: this path MUST NEVER emit `AICHAT_RUN_BIND`. The gateway spreads
+ * `resolve_exec_env` pluginEnv AFTER `before_tool_call`-adjusted params.env at exec spawn,
+ * so any run key emitted here would clobber the trusted per-run value written by the
+ * `before_tool_call` bridge (run-exec-bridge.ts). The single-round key is owned solely
+ * by that hook; this hook keeps owning only the long-lived session key `OPENCLAW_BIND`.
  */
 
 const AGENT_MAIN_PREFIX = 'agent:main:';
