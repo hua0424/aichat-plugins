@@ -5,6 +5,9 @@ import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
+import {
+	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile,
+} from './run-bind.js';
 import { errMsg } from '../../util/err.js';
 
 /**
@@ -292,6 +295,15 @@ export class OpenclawDriver implements RunDriver {
 
 	/** Map requestId → runId for linking response to chat */
 	private requestToRunId = new Map<string, string>();
+	/**
+	 * #406: frozen per-run reply binding awaiting its accepted native runId, keyed by
+	 * requestId. Published to the gateway-visible file the moment the accepted frame
+	 * names the native run — never before (the gateway assigns the id, so pre-submit
+	 * publish would be a guess), never keyed by room/session "current".
+	 */
+	private pendingRunBinds = new Map<string, { token: string; runId: string; conversationId: string; generation: number }>();
+	/** #406: native runId → owning core runId, for runId-guarded withdrawal at cleanup. */
+	private runBindOwners = new Map<string, string>();
 	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
 	private earlyEvents = new Map<string, GatewayAgentEvent[]>();
 	private earlyOverflow = new Set<string>();
@@ -308,6 +320,13 @@ export class OpenclawDriver implements RunDriver {
 		// REQ-018 R1: openclaw workspace dir for the AGENTS.md system prompt (defaults to ~/.openclaw/workspace).
 		workspaceDir?: string,
 		private readonly assertPromptOwner?: (conversationId: string, workspace: string, identityId: string) => void,
+		/**
+		 * #406: directory holding the per-native-run binding files the gateway-side
+		 * `before_tool_call` hook reads. Defaults to `<AICHAT_HOME>/openclaw/run-bind`
+		 * (node and gateway share the host mount; the gateway needs the same dir via
+		 * `AICHAT_OPENCLAW_RUNBIND_DIR` — deploy-time wiring, see start.ts).
+		 */
+		private readonly runBindDir?: string,
 	) {
 		this.url = url;
 		this.token = token;
@@ -319,7 +338,11 @@ export class OpenclawDriver implements RunDriver {
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
 			!/^aiclaw-\d+-room-\d+$/.test(input.transcriptKey ?? '') ||
-			!(/^[0-9a-f]{64}$/.test(input.contextKey ?? '')) || typeof input.systemPrompt !== 'string')
+			!(/^[0-9a-f]{64}$/.test(input.contextKey ?? '')) || typeof input.systemPrompt !== 'string' ||
+			// #406: the managed path always carries core's frozen reply token; without it the
+			// gateway-side hook could not bind exec sends to this run — fail loudly, never
+			// submit native work whose sends would go out unassociated while claiming association.
+			!/^[0-9a-f]{64}$/.test(input.replyToken ?? ''))
 			throw new TypeError('Invalid OpenClaw prepared run');
 		let consumed = false, submitted = false, completed = false, cancelled = input.signal.aborted;
 		let session: OpenclawSession | undefined;
@@ -389,7 +412,11 @@ export class OpenclawDriver implements RunDriver {
 				await writing;
 				input.conversation.assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
-				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef, sink, () => { submitted = true; }),
+				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef, sink, () => { submitted = true; },
+					// #406: freeze this run's binding for the request; the accepted frame links it
+					// to the exact native runId (publish happens there — never a pre-submit guess).
+					{ token: input.replyToken!, runId: input.runId,
+						conversationId: input.conversation.id, generation: input.conversation.generation }),
 					() => input.conversation.assertCurrent());
 				const stream = session.send(input.message);
 				let terminal: AgentEvent | undefined;
@@ -450,7 +477,8 @@ export class OpenclawDriver implements RunDriver {
 	 * Called by an OpenclawSession's send(); the gateway's streamed reply is mapped to the sink by
 	 * processAgentStreamEvent (assistant → thinking, lifecycle end/error → done/error).
 	 */
-	private beginChat(message: string, sessionKey: string, sink: ChatSink, onSubmit?: () => void): void {
+	private beginChat(message: string, sessionKey: string, sink: ChatSink, onSubmit?: () => void,
+		runBind?: { token: string; runId: string; conversationId: string; generation: number }): void {
 		if (!this.connected || !this.ws) {
 			sink.push({ type: 'error', message: 'openclaw gateway not connected' });
 			sink.finish();
@@ -497,6 +525,7 @@ export class OpenclawDriver implements RunDriver {
 		// 预注册 chat state + 放弃-run 兜底定时（gateway 永不终结本 run 时到点回收三 map，防长稳泄漏）。
 		// .unref()：兜底定时不应单独把进程钉活（正常终结会清它）。
 		this.requestToRunId.set(requestId, '');
+		if (runBind) this.pendingRunBinds.set(requestId, runBind);
 		const chat: PendingChat = { sink, done: false, startTime: Date.now() };
 		chat.timeout = setTimeout(() => this.expireChat(requestId), OPENCLAW_CHAT_TIMEOUT_MS);
 		chat.timeout.unref?.();
@@ -835,6 +864,26 @@ export class OpenclawDriver implements RunDriver {
 
 	private linkRunIdToRequest(requestId: string, runId: string): void {
 		this.requestToRunId.set(requestId, runId);
+		// #406: the gateway just named this request's exact native run — publish its frozen
+		// binding now (first exact moment it exists). Publish failure fails this run loudly:
+		// a turn that cannot prove its binding must never run native work unassociated.
+		const bind = this.pendingRunBinds.get(requestId);
+		this.pendingRunBinds.delete(requestId);
+		if (bind) {
+			const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
+			this.runBindOwners.set(runId, bind.runId);
+			writeOpenclawRunBindFile(dir, runId, { token: bind.token, runId: bind.runId,
+				conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now() })
+				.catch((error) => {
+					const chat = this.findChatByRequestId(requestId);
+					if (chat && !chat.done) {
+						chat.done = true;
+						chat.sink.push({ type: 'error', message: `OpenClaw run-bind publish failed: ${errMsg(error)}` });
+						chat.sink.finish();
+					}
+					this.cleanupChat(requestId);
+				});
+		}
 		const chat = this.activeChats.get(`req:${requestId}`);
 		if (chat) {
 			this.activeChats.set(`run:${runId}`, chat);
@@ -891,8 +940,13 @@ export class OpenclawDriver implements RunDriver {
 		const runId = this.requestToRunId.get(requestId);
 		if (runId) {
 			this.activeChats.delete(`run:${runId}`);
+			// #406: withdraw this native run's file binding best-effort (guarded by core
+			// runId so a next run's overwrite is never removed). Already-spawned execs keep
+			// their frozen env — a valid old binding still routes to A per core rules.
+			this.withdrawRunBind(runId);
 		}
 		this.requestToRunId.delete(requestId);
+		this.pendingRunBinds.delete(requestId);
 		if (![...this.requestToRunId.values()].includes('')) {
 			this.earlyEvents.clear(); this.earlyOverflow.clear(); this.earlyOverflowGlobal = false;
 		}
@@ -905,6 +959,7 @@ export class OpenclawDriver implements RunDriver {
 		const chat = this.activeChats.get(`run:${runId}`);
 		if (chat?.timeout) clearTimeout(chat.timeout);
 		this.activeChats.delete(`run:${runId}`);
+		this.withdrawRunBind(runId);
 		for (const [reqId, rId] of this.requestToRunId) {
 			if (rId === runId) {
 				const reqChat = this.activeChats.get(`req:${reqId}`);
@@ -915,6 +970,19 @@ export class OpenclawDriver implements RunDriver {
 				break;
 			}
 		}
+	}
+
+	/**
+	 * #406: best-effort, runId-guarded withdrawal of a native run's binding file. Runs on
+	 * every cleanup path (normal terminal, error, timeout backstop, disconnect-wake): a
+	 * leftover file only ever carries a core-verified-or-rejected token, never a guess.
+	 */
+	private withdrawRunBind(nativeRunId: string): void {
+		const owner = this.runBindOwners.get(nativeRunId);
+		this.runBindOwners.delete(nativeRunId);
+		if (!nativeRunId) return;
+		const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
+		void removeOpenclawRunBindFile(dir, nativeRunId, owner).catch(() => {});
 	}
 
 	// ─── Reconnect & heartbeat ───
@@ -974,6 +1042,14 @@ export class OpenclawDriver implements RunDriver {
 		}
 		this.activeChats.clear();
 		this.requestToRunId.clear();
+		// #406: disconnect/Error-shutdown also withdraws every published binding (guarded by
+		// owner, best-effort) — a leftover file only ever carries a verified-or-rejected token.
+		for (const [nativeRunId, owner] of this.runBindOwners) {
+			const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
+			void removeOpenclawRunBindFile(dir, nativeRunId, owner).catch(() => {});
+		}
+		this.runBindOwners.clear();
+		this.pendingRunBinds.clear();
 		this.earlyEvents.clear();
 		this.earlyOverflow.clear();
 		this.earlyOverflowGlobal = false;

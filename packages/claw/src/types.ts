@@ -17,10 +17,19 @@ export interface OpenClawPluginApi {
 	 * 注册 openclaw plugin hook（REQ-010 S6 Phase-2 实测可用）。
 	 * `resolve_exec_env` 的真实 handler 签名为 `(event, ctx)`（ctx 是第 2 个参数），
 	 * 返回 `Record<string,string>` 合并进 agent exec 调用的环境变量。
+	 * `before_tool_call` 同为 `api.on` 注册（openclaw 2026.6.5 实装：事件
+	 * `{ toolName, params, runId?, toolCallId? }` + ctx
+	 * `{ toolName, agentId?, sessionKey?, sessionId?, runId?, toolCallId?, channelId? }`，
+	 * 返回 `{ params?, block?, blockReason? }`；handler 可同步可异步）。
 	 */
 	on(
 		event: 'resolve_exec_env',
 		handler: ResolveExecEnvHandler,
+		opts?: { priority?: number },
+	): void;
+	on(
+		event: 'before_tool_call',
+		handler: BeforeToolCallHandler,
 		opts?: { priority?: number },
 	): void;
 }
@@ -42,6 +51,40 @@ export type ResolveExecEnvHandler = (
 	event: { ctx?: ResolveExecEnvCtx; sessionKey?: string | null } | undefined,
 	ctx?: ResolveExecEnvCtx,
 ) => Record<string, string>;
+
+/**
+ * #406 — `before_tool_call` hook 类型（openclaw 2026.6.5 dist 实装形状，只读核验）。
+ * event.runId/toolCallId 来自可信内部 ctx（非模型自报）；params 是规范化后的工具参数
+ * （exec 含 `env?: Record<string,string>`）。返回 `{ params }` 即按原 key 合并覆盖；
+ * 不返回（void）即不干预。形态容忍：缺字段一律按“非 exec/无 run”处理，绝不 throw。
+ */
+export interface BeforeToolCallEvent {
+	toolName?: unknown;
+	params?: unknown;
+	runId?: unknown;
+	toolCallId?: unknown;
+}
+
+export interface BeforeToolCallCtx {
+	toolName?: unknown;
+	agentId?: unknown;
+	sessionKey?: unknown;
+	sessionId?: unknown;
+	runId?: unknown;
+	toolCallId?: unknown;
+	channelId?: unknown;
+}
+
+export interface BeforeToolCallResult {
+	params?: Record<string, unknown>;
+	block?: boolean;
+	blockReason?: string;
+}
+
+export type BeforeToolCallHandler = (
+	event: BeforeToolCallEvent | undefined | null,
+	ctx?: BeforeToolCallCtx | undefined | null,
+) => Promise<BeforeToolCallResult | void> | BeforeToolCallResult | void;
 
 export interface ChannelPlugin {
 	id: string;

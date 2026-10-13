@@ -14,6 +14,11 @@ import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
  */
 describe('buildOpenclawExecEnv', () => {
 	const NO_CONTEXT = { OPENCLAW_BIND: '', OPENCODE_SESSION_ID: '', CODEX_THREAD_ID: '', AICHAT_BIND: '', AICHAT_CONTEXT_KEY: '' };
+	it('#406: never emits AICHAT_RUN_BIND (the before_tool_call bridge owns that key)', () => {
+		for (const sk of ['agent:main:TOKEN123:aiclaw-1-room-2', '', 'garbage', null, undefined]) {
+			expect(buildOpenclawExecEnv(sk as string)).not.toHaveProperty('AICHAT_RUN_BIND');
+		}
+	});
 	it('agent:main:<token>:<binding> → { OPENCLAW_BIND: <token> } (extracts the token prefix)', () => {
 		expect(
 			buildOpenclawExecEnv('agent:main:TOKEN123:aiclaw-140789091499520-room-163347643904512'),
