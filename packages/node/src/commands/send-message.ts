@@ -16,6 +16,17 @@ export function resolveAgentContexts(env: NodeJS.ProcessEnv = process.env): Arra
 	return contexts;
 }
 
+/**
+ * #404: frozen per-run reply-binding token for the V3 envelope. Present only inside a trusted
+ * native run env (drivers inject exactly one); an old CLI ignores it and stays V2 (unassociated).
+ */
+export function resolveRunBind(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const raw = env.AICHAT_RUN_BIND;
+	if (raw === undefined) return undefined;
+	const token = raw.trim();
+	return token ? token : undefined;
+}
+
 /** Legacy single-key accessor retained for old callers; V2 requests use every candidate above. */
 export function resolveAgentSessionKey(): string | undefined {
 	for (const { env, provider } of contextDescriptors) {

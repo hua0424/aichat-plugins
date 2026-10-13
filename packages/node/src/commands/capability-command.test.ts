@@ -10,7 +10,7 @@ import { handleSendMessage } from './send-message.js';
 import { handleResetSession } from './reset-session.js';
 
 vi.mock('../capability/client.js', () => ({ postCapability: vi.fn() }));
-const saved = Object.fromEntries(['AICHAT_CONTEXT_KEY', 'OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND']
+const saved = Object.fromEntries(['AICHAT_CONTEXT_KEY', 'OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND']
 	.map((key) => [key, process.env[key]]));
 const mocked = vi.mocked(postCapability);
 
@@ -113,5 +113,28 @@ describe('unified CLI capability contract', () => {
 		await runCapabilityCommand('fake-read', ['--json'], JSON.stringify);
 		expect(mocked.mock.calls[0][1]).toMatchObject({ version: 2, command: 'fake-read', args: {} });
 		expect(output()).toBe('{"ok":true,"result":{"answer":1}}');
+	});
+
+	it('#404: frozen AICHAT_RUN_BIND upgrades the envelope to V3 without logging the token', async () => {
+		process.env.AICHAT_RUN_BIND = 'a'.repeat(64);
+		mocked.mockResolvedValue({ status: 200, body: { ok: true, result: { msgId: '1', roomId: '42' } } });
+		await handleSendMessage(['--content', 'hello', '--request-id', 'run-1', '--json']);
+		expect(mocked.mock.calls[0][1]).toMatchObject({ version: 3, command: 'send-message',
+			contexts: [{ key: 'secret-context' }], requestId: 'run-1', runBinding: 'a'.repeat(64) });
+		expect(output()).not.toContain('a'.repeat(64));
+	});
+
+	it('#404: without AICHAT_RUN_BIND the CLI stays V2 and claims no association', async () => {
+		mocked.mockResolvedValue({ status: 200, body: { ok: true, result: { msgId: '1', roomId: '42' } } });
+		await handleSendMessage(['--content', 'hello', '--request-id', 'plain-1', '--json']);
+		expect(mocked.mock.calls[0][1]).toMatchObject({ version: 2, command: 'send-message' });
+		expect(mocked.mock.calls[0][1]).not.toHaveProperty('runBinding');
+	});
+
+	it('#404: an overlong run binding is rejected client-side before any IPC', async () => {
+		process.env.AICHAT_RUN_BIND = 'x'.repeat(257);
+		await expect(handleSendMessage(['--content', 'hello', '--request-id', 'bad-1', '--json'])).rejects.toThrow('exit');
+		expect(JSON.parse(output())).toMatchObject({ ok: false, code: 'INVALID_ARGUMENT' });
+		expect(mocked).not.toHaveBeenCalled();
 	});
 });

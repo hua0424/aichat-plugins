@@ -13,8 +13,12 @@ export interface CodexClient {
 }
 export type _CodexSatisfiesClient = Codex extends CodexClient ? true : never;
 export interface CodexDriverDeps {
-	/** A fresh client per run: CLI developer_instructions are client-scoped, not thread-scoped. */
-	createCodex: (systemPrompt: string) => CodexClient;
+	/**
+	 * A fresh client per run: CLI developer_instructions are client-scoped, not thread-scoped.
+	 * #404: runEnv carries exactly the frozen per-run bindings (AICHAT_RUN_BIND); the base env
+	 * (necessary vars minus any inherited run binding) is owned by the caller in start.ts.
+	 */
+	createCodex: (systemPrompt: string, runEnv?: Record<string, string>) => CodexClient;
 	model?: string;
 }
 
@@ -30,7 +34,7 @@ export class CodexDriver implements RunDriver {
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
-			!input.workspace || typeof input.systemPrompt !== 'string') throw new TypeError('Invalid Codex prepared run');
+			!input.workspace || typeof input.systemPrompt !== 'string' || !input.replyToken) throw new TypeError('Invalid Codex prepared run');
 		const run = new CodexRun(input, this.deps, () => this.active.delete(run));
 		this.active.add(run);
 		return run;
@@ -59,6 +63,9 @@ class CodexRun implements AgentRun {
 
 	private async *execute(): AsyncGenerator<AgentEvent> {
 		const input = this.input;
+		// Validated non-empty by createRun; rechecked here for the async boundary.
+		const replyToken = input.replyToken;
+		if (!replyToken) throw new Error('Invalid Codex prepared run');
 		const previous = input.conversation.nativeState?.value;
 		const frozenPrompt = previous && typeof previous === 'object' && 'originalPrompt' in previous
 			? previous.originalPrompt : undefined;
@@ -101,7 +108,7 @@ class CodexRun implements AgentRun {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			const opts: ThreadOptions = { sandboxMode: 'danger-full-access', approvalPolicy: 'never',
 				skipGitRepoCheck: true, workingDirectory: input.workspace, ...(this.deps.model ? { model: this.deps.model } : {}) };
-			const codex = this.deps.createCodex(systemPrompt);
+			const codex = this.deps.createCodex(systemPrompt, { AICHAT_RUN_BIND: replyToken });
 			const thread = threadId ? codex.resumeThread(threadId, opts) : codex.startThread(opts);
 			// Recovery is recorded before the SDK starts codex exec; a crash/abort cannot silently
 			// re-submit this turn. An SDK AbortSignal kills its direct child, not a verified process group.

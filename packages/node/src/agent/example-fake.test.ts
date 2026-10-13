@@ -77,6 +77,12 @@ describe('static fifth adapter contract', () => {
 			f.handler.setPromptTemplates({ identityAnchor: 'You are {displayName} ({uid})',
 				personaSection: '{persona}', replyContract: 'Reply via {reply_command}' });
 			f.handler.handle({ type: 'receiveMessage', data: message } as never);
+			// #404: the prepared stream is consumed only after the exact START receipt.
+			await vi.waitFor(() => expect(f.frames.some((frame) => frame.type === WSReqType.THINKING_START)).toBe(true));
+			const startData = f.frames.find((frame) => frame.type === WSReqType.THINKING_START)!.data as {
+				clientRunId: string; triggerMsgId: string };
+			f.handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9',
+				triggerMsgId: startData.triggerMsgId, thinkingId: 'tid-1', clientRunId: startData.clientRunId } });
 			await vi.waitFor(() => expect(f.observed).toHaveLength(1));
 			await awaitDone(f);
 			expect(f.observed).toEqual([{ identity: '42', room: '9' }]);
@@ -85,6 +91,11 @@ describe('static fifth adapter contract', () => {
 			f.handler.setPromptTemplates({ identityAnchor: 'Changed: {displayName} ({uid})',
 				personaSection: '{persona}', replyContract: 'Reply via {reply_command}' });
 			f.handler.handle({ type: 'receiveMessage', data: { ...message, message: { ...message.message, id: '2' } } } as never);
+			await vi.waitFor(() => expect(f.frames.filter((frame) => frame.type === WSReqType.THINKING_START)).toHaveLength(2));
+			const startData2 = f.frames.filter((frame) => frame.type === WSReqType.THINKING_START).at(-1)!.data as {
+				clientRunId: string; triggerMsgId: string };
+			f.handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9',
+				triggerMsgId: startData2.triggerMsgId, thinkingId: 'tid-2', clientRunId: startData2.clientRunId } });
 			await vi.waitFor(() => expect(f.observed).toHaveLength(2));
 			expect(f.observed[1]).toEqual({ identity: '42', room: '9' });
 			expect(f.prompts).toHaveLength(2);

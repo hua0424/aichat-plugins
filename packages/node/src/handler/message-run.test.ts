@@ -61,8 +61,8 @@ describe('persisted MessageHandler run', () => {
 		expect(store.pendingRuns()[0].runId).toBe(runId); // Unknown transport result does not finalize/cancel the run.
 		handler.onConnected();
 		expect(frames.filter((f) => f.type === WSReqType.THINKING_START).map((f) => f.data.clientRunId)).toEqual([runId, runId]);
-		emit({ type: 'done', durationMs: 1 });
-		await tick();
+		// #404: the native stream is not consumed before the exact START receipt — a driver
+		// event can only exist after submission, so `done` is emitted post-receipt here.
 		expect(frames.some((f) => f.type === WSReqType.THINKING_END)).toBe(false);
 		handler.handle({ type: 'receiveMessage', data: message(2) });
 		await tick();
@@ -72,6 +72,9 @@ describe('persisted MessageHandler run', () => {
 		expect(store.pendingRuns()).toHaveLength(1); // END rejection is not a persisted terminal or room cancellation.
 		expect(frames.some((f) => f.type === WSReqType.THINKING_END)).toBe(false);
 		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '1', thinkingId: 'tid-1', clientRunId: runId } });
+		await tick(); // let the START-ready barrier pass and the native stream start consuming
+		emit({ type: 'done', durationMs: 1 });
+		await tick();
 		expect(frames.filter((f) => f.type === WSReqType.THINKING_END).map((f) => f.data)).toEqual([
 			expect.objectContaining({ thinkingId: 'tid-1', clientRunId: runId, roomId: '9', status: 'complete' }),
 		]);
@@ -127,6 +130,7 @@ describe('persisted MessageHandler run', () => {
 		await tick();
 		const runId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
 		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '3', clientRunId: runId, thinkingId: 'tid-3' } });
+		await tick(); // let the START-ready barrier pass and the native stream start consuming
 		emit({ type: 'done', durationMs: 2 });
 		await tick();
 		handler.handle({ type: 'receiveMessage', data: message(4) });
@@ -189,6 +193,8 @@ describe('persisted MessageHandler run', () => {
 			createRun(input) {
 				input.conversation.assertCurrent();
 				expect(input.bindToken).toBeUndefined();
+				// #404: every prepared run — Codex included — carries the frozen per-run reply token.
+				expect(input.replyToken).toMatch(/^[0-9a-f]{64}$/);
 				expect(input.workspace).toBe(join(home, '42', 'dm', '7'));
 				received.push(input.message);
 				return { events: { async *[Symbol.asyncIterator]() { yield { type: 'done' as const, durationMs: 1 }; } },
@@ -200,6 +206,10 @@ describe('persisted MessageHandler run', () => {
 		handler.handle({ type: 'receiveMessage', data: message(501) } as never);
 		for (let i = 0; i < 30 && !received.length; i++) await tick();
 		expect(received).toEqual(['[HuLa 私聊]\n[user(7)]: message 501']);
+		const codexRunId = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+			.find(([type]) => type === WSReqType.THINKING_START)?.[1].clientRunId as string;
+		// #404: the native stream is consumed only after the exact START receipt.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '501', thinkingId: 'tid-501', clientRunId: codexRunId } });
 		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
 		expect(store.pendingRuns()).toHaveLength(0);
 		handler.destroy();
@@ -240,13 +250,15 @@ describe('persisted MessageHandler run', () => {
 		const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
 		handler.setPromptTemplates({ identityAnchor: 'identity:{uid}', personaSection: 'persona:{persona}', replyContract: 'reply-contract:{reply_command}' });
 		handler.handle({ type: 'receiveMessage', data: message(30) } as never);
+		for (let i = 0; i < 30 && runId === undefined; i++) await tick();
+		// #404 START-ready barrier: the native process spawns only after the exact START receipt.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '30', thinkingId: 'tid-30', clientRunId: runId } });
 		for (let i = 0; i < 30 && !writes.length; i++) await tick();
 		expect(writes).toHaveLength(1);
 		expect(JSON.parse(writes[0].trim()).message.content[0].text).toBe('[HuLa 私聊]\n[user(7)]: message 30');
 		expect(argv.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
 		expect(argv[argv.indexOf('--append-system-prompt') + 1].match(/identity:42/g)).toHaveLength(1);
 		expect(store.pendingRuns()).toHaveLength(1);
-		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '30', thinkingId: 'tid-30', clientRunId: runId } });
 		stdoutData.forEach((data) => data('{"type":"result","is_error":false}\n'));
 		childClose.forEach((close) => close(0, null));
 		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
@@ -274,10 +286,14 @@ describe('persisted MessageHandler run', () => {
 	});
 
 	it('does not flush queued messages when upstream emits error without stop proof', async () => {
-		const { handler, store, createRun, emit } = setup();
+		const { handler, store, createRun, emit, frames } = setup();
 		handler.handle({ type: 'receiveMessage', data: message(20) } as never);
 		await tick();
 		handler.handle({ type: 'receiveMessage', data: message(21) } as never);
+		const errRunId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
+		// #404: driver events are consumed only after the exact START receipt.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '20', thinkingId: 'tid-20', clientRunId: errRunId } });
+		await tick();
 		emit({ type: 'error', message: 'upstream failed' });
 		await tick();
 		expect(createRun).toHaveBeenCalledTimes(1);
@@ -289,10 +305,14 @@ describe('persisted MessageHandler run', () => {
 	});
 
 	it('releases a cleanly completed stream and drains queued room messages', async () => {
-		const { handler, store, createRun, emit } = setup();
+		const { handler, store, createRun, emit, frames } = setup();
 		handler.handle({ type: 'receiveMessage', data: message(10) } as never);
 		await tick();
 		handler.handle({ type: 'receiveMessage', data: message(11) } as never);
+		const doneRunId = frames.find((f) => f.type === WSReqType.THINKING_START)!.data.clientRunId;
+		// #404: driver events are consumed only after the exact START receipt.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '10', thinkingId: 'tid-10', clientRunId: doneRunId } });
+		await tick();
 		emit({ type: 'done', durationMs: 1 });
 		await tick();
 		expect(createRun).toHaveBeenCalledTimes(2);
@@ -391,9 +411,11 @@ describe('persisted MessageHandler run', () => {
 		} } as HulaWSClient;
 		const handler = new MessageHandler(ws, driver, '42', api as never, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
 		handler.handle({ type: 'receiveMessage', data: message(70) } as never);
+		for (let i = 0; i < 30 && runId === undefined; i++) await tick();
+		// #404 START-ready barrier: the native process spawns only after the exact START receipt.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '70', thinkingId: 'tid-70', clientRunId: runId } });
 		for (let i = 0; i < 30 && !spawnCalls.length; i++) await tick();
 		expect(spawnCalls[0]).toContain('--resume');
-		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '70', thinkingId: 'tid-70', clientRunId: runId } });
 		stderrData.forEach((data) => data('No conversation found with session ID: 99881409'));
 		childClose.forEach((close) => close(1, null));
 		for (let i = 0; i < 30 && !frames.some((f) => f.type === WSReqType.THINKING_END); i++) await tick();
@@ -417,13 +439,21 @@ describe('persisted MessageHandler run', () => {
 		// owner reset（重建入口）后房间恢复运行。
 		store.reset('42', '9');
 		handler.handle({ type: 'receiveMessage', data: message(72) } as never);
+		for (let i = 0; i < 30 && frames.filter((f) => f.type === WSReqType.THINKING_START).length < 2; i++) await tick();
+		// #404: post-reset run also waits for its exact START receipt before native submit.
+		handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9', triggerMsgId: '72', thinkingId: 'tid-72', clientRunId: runId } });
 		for (let i = 0; i < 30 && spawnCalls.length < 2; i++) await tick();
 		expect(spawnCalls).toHaveLength(2);
 		// 收尾：run2 结束会 flush 排队的 message 71 → run3；逐轮关停直到队清空（每轮新 child 的 close 回调都在 childClose 里）。
-		for (let round = 0; round < 4; round++) {
+		// #404: 每一轮被 flush 出来后都先等自己的精确 START 回执才会真正提交 native。
+		for (let round = 0; round < 6; round++) {
 			childClose.forEach((close) => close(1, null));
-			for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
+			for (let i = 0; i < 60 && store.pendingRuns().length; i++) await tick();
 			if (!store.pendingRuns().length) break;
+			const starts = frames.filter((f) => f.type === WSReqType.THINKING_START);
+			const latest = starts[starts.length - 1].data as { triggerMsgId: string; clientRunId: string };
+			handler.handle({ type: 'thinkingStart', data: { fromUid: '42', roomId: '9',
+				triggerMsgId: latest.triggerMsgId, thinkingId: `tid-${latest.triggerMsgId}`, clientRunId: latest.clientRunId } });
 		}
 		expect(store.pendingRuns()).toHaveLength(0);
 		expect(notices).toHaveLength(1); // 重建后的普通失败不触发暂停通告

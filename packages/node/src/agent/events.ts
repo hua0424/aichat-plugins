@@ -49,6 +49,12 @@ export interface PreparedRun {
 	promptOwner?: string;
 	/** Existing imported CC bind alias or the newly minted core alias; CLI candidates must agree. */
 	bindToken?: string;
+	/**
+	 * #404: frozen opaque reply-binding token for this run (AICHAT_RUN_BIND value), minted and
+	 * persisted by core at beginRun and fixed to one thinkingId by the exact START receipt before
+	 * native submission. CC/Codex drivers inject it verbatim into the per-run execution env.
+	 */
+	replyToken?: string;
 	/** Legacy transcript file key only; not an authorization source. */
 	transcriptKey?: string;
 	systemPrompt: string;
