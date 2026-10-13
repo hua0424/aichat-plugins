@@ -87,6 +87,13 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	const sessionEnvPluginPath = fileURLToPath(new URL('../agent/opencode/session-env-plugin.js', import.meta.url));
 	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [sessionEnvPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
+	// #405: per-session run-bind files bridge the node driver and the serve-side shell.env
+	// hook (sessionID → frozen reply token). The spawned server inherits this env, so its
+	// hook reads the same dir; the built-in default covers servers started by other means.
+	// Set AFTER the codexEnv snapshot above: Codex builds its own frozen run env per run and
+	// must never inherit an opencode-scoped pointer.
+	const opencodeRunBindDir = join(AICHAT_HOME, 'opencode', 'run-bind');
+	process.env.AICHAT_OPENCODE_RUNBIND_DIR = opencodeRunBindDir;
 
 	// REQ-010 S5: codex needs NO shared server (the SDK spawns `codex exec` per turn) and NO
 	// env-injection plugin (codex natively injects CODEX_THREAD_ID into its exec shell). Its
@@ -125,6 +132,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
 			create: (entry) => new OpencodeDriver({
 				server: opencodeServer,
+				runBindDir: opencodeRunBindDir,
 				assertDirectoryOwner: (id, directory) => {
 					if (!conversations) throw new Error('conversation bindings not ready');
 					conversations.assertOpencodeDirectoryOwner(id, directory);
