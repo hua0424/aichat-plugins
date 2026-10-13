@@ -2,6 +2,8 @@ import { mkdir, realpath } from 'node:fs/promises';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { mapOpencodeEvent } from './events.js';
+import { AncestorChain } from './ancestor-chain.js';
+import { defaultRunBindDir, removeRunBindFile, writeRunBindFile } from './run-bind.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import { errMsg } from '../../util/err.js';
 
@@ -24,6 +26,11 @@ export interface OpencodeDriverDeps {
 	assertDirectoryOwner?: (conversationId: string, directory: string) => void;
 	/** Abort + status verification budget; default 10 seconds. */
 	cancelTimeoutMs?: number;
+	/**
+	 * #405: directory holding the per-session run-bind files the serve-side `shell.env`
+	 * hook reads. Defaults to `<AICHAT_HOME>/opencode/run-bind` (same host, same user).
+	 */
+	runBindDir?: string;
 }
 
 /** The factory owns the shared server; a driver owns only its own active turns. */
@@ -42,7 +49,7 @@ export class OpencodeDriver implements RunDriver {
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
-			!input.workspace || typeof input.systemPrompt !== 'string') throw new TypeError('Invalid OpenCode prepared run');
+			!input.workspace || typeof input.systemPrompt !== 'string' || !input.replyToken) throw new TypeError('Invalid OpenCode prepared run');
 		const run = new OpenCodeRun(input, this.deps, () => this.active.delete(run));
 		this.active.add(run);
 		return run;
@@ -83,6 +90,12 @@ class OpenCodeRun implements AgentRun {
 		let connected = false;
 		let streamEnded = false;
 		let streamFailure: string | undefined;
+		// #405: per-run native ancestor ledger (user → assistant → tool call); the verdict is
+		// rendered when the prompt HTTP call resolves. Spawned shells carry the exact binding
+		// by file regardless; the ledger only decides what a report may CLAIM.
+		const chain = new AncestorChain();
+		const runBindDir = this.deps.runBindDir ?? defaultRunBindDir();
+		let runBindPublished = false;
 		const started = new Set<string>();
 		const finished = new Set<string>();
 		const assistants = new Set<string>();
@@ -140,6 +153,16 @@ class OpenCodeRun implements AgentRun {
 				sessionID: this.sessionID, directory, stopProbe: 'unconfirmed' } });
 			input.conversation.assertCurrent();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+			// #405: publish this run's frozen binding for the session BEFORE any prompt, so the
+			// serve-side shell.env hook resolves this sessionID → exactly this token. Publish
+			// failure fails the run loudly: a turn that cannot prove its binding must never submit
+			// native work whose sends would go out unassociated while claiming association.
+			try {
+				await writeRunBindFile(runBindDir, this.sessionID, { token: input.replyToken!,
+					runId: input.runId, conversationId: input.conversation.id,
+					generation: input.conversation.generation, createdAt: Date.now() });
+			} catch (error) { throw new Error(`OpenCode run-bind publish failed: ${errMsg(error)}`); }
+			runBindPublished = true;
 			const subscribed = await this.client.event.subscribe({ query: { directory }, signal: this.sseController.signal, throwOnError: true });
 			this.stream = subscribed.stream[Symbol.asyncIterator]();
 			input.conversation.assertCurrent();
@@ -160,6 +183,7 @@ class OpenCodeRun implements AgentRun {
 						}
 						const assistantID = assistantMessageID(raw, sessionID);
 						if (assistantID) assistants.add(assistantID);
+						observeAncestor(raw, sessionID, chain);
 						const ev = mapOpencodeEvent(raw, sessionID, assistants);
 						if (!ev) continue;
 						// session.idle is uncorrelated: a delayed idle from an earlier turn
@@ -207,6 +231,23 @@ class OpenCodeRun implements AgentRun {
 							: 'OpenCode prompt returned no matching assistant message' });
 						return;
 					}
+					// #405: prove the completed assistant descends from this run's observed user
+					// message. Conflict fails loudly (never current/latest guessing); missing proof
+					// keeps the declared legacy-unknown posture — sends stay exactly bound by file,
+					// but no report may claim a proven chain. The desensitized record persists for
+					// the native verification report.
+					const verdict = chain.verifyCompletion({ id: info.id, parentID: info.parentID });
+					if (!verdict.ok && verdict.reason === 'conflict') {
+						push({ type: 'error', message: `OpenCode ancestor conflict: ${verdict.detail} — refusing unverified association` });
+						return;
+					}
+					const ancestor = chain.record(verdict.ok);
+					if (!verdict.ok) console.error(`[opencode] run ${input.runId} ancestor unverified (${verdict.detail}); sends stay bound by session file, chain unclaimed`);
+					void input.saveRecovery({ version: 1, value: { provider: 'opencode', runId: input.runId,
+						sessionID, directory, stopProbe: 'unconfirmed',
+						ancestorProof: verdict.ok ? 'verified' : 'unverified',
+						...(!verdict.ok ? { ancestorDetail: verdict.detail } : {}), ancestor } })
+						.catch((error) => console.error(`[opencode] ancestor record not persisted: ${errMsg(error)}`));
 					push(streamFailure
 						? { type: 'error', message: streamFailure }
 						: { type: 'done', durationMs: Date.now() - this.startedAt });
@@ -231,6 +272,11 @@ class OpenCodeRun implements AgentRun {
 			this.disposed = true;
 			this.sseController.abort();
 			this.promptController.abort();
+			// #405: withdraw this session's file binding best-effort. Already-spawned shells
+			// keep their frozen env (a valid old binding still routes to A per core rules); new
+			// shells fall back to fail-closed empty. Guarded by runId so a next run's file is
+			// never removed.
+			if (runBindPublished && this.sessionID) await removeRunBindFile(runBindDir, this.sessionID, input.runId);
 			void this.stream?.return?.().catch(() => {});
 			void pump?.catch(() => {});
 			this.onFinished();
@@ -286,6 +332,27 @@ class OpenCodeRun implements AgentRun {
 function toolCallID(raw: unknown): string | undefined {
 	const part = (raw as { properties?: { part?: { callID?: unknown } } } | null)?.properties?.part;
 	return typeof part?.callID === 'string' ? part.callID : undefined;
+}
+/**
+ * #405: feed raw SSE frames into the per-run ancestor ledger. Session-scoped (the
+ * subscription is shared per directory); stale pre-run replays are filtered by the
+ * ledger's start time, never by "current run" guessing.
+ */
+function observeAncestor(raw: unknown, sessionID: string, chain: AncestorChain): void {
+	const ev = raw as { type?: unknown; properties?: { info?: unknown; part?: unknown } } | null;
+	const props = ev !== null && typeof ev === 'object' ? ev.properties : undefined;
+	if (!props || typeof props !== 'object') return;
+	if (ev?.type === 'message.updated' && props.info !== null && typeof props.info === 'object') {
+		const info = props.info as { id?: unknown; role?: unknown; parentID?: unknown; sessionID?: unknown; time?: unknown };
+		if (info.sessionID !== sessionID) return;
+		const time = info.time !== null && typeof info.time === 'object'
+			? (info.time as { created?: unknown }).created : undefined;
+		chain.observeMessageUpdated({ id: info.id, role: info.role, parentID: info.parentID, timeCreated: time });
+	} else if (ev?.type === 'message.part.updated' && props.part !== null && typeof props.part === 'object') {
+		const part = props.part as { type?: unknown; sessionID?: unknown; messageID?: unknown; callID?: unknown };
+		if (part.type !== 'tool' || part.sessionID !== sessionID) return;
+		chain.observeToolPart({ callID: part.callID, messageID: part.messageID });
+	}
 }
 function assistantMessageID(raw: unknown, sessionID: string): string | undefined {
 	const ev = raw as { type?: unknown; properties?: { info?: { id?: unknown; sessionID?: unknown; role?: unknown } } } | null;
