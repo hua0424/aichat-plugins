@@ -6,10 +6,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import type { AgentEvent, PreparedRun, RunDriver } from '../events.js';
 import { OpenclawDriver } from './openclaw-driver.js';
+import { readOpenclawRunBindFile, writeOpenclawRunBindFile } from './run-bind.js';
 
 const binding = 'aiclaw-9007199254740993-room-9007199254740995';
 const oldToken = 'a'.repeat(64);
 const freshToken = 'b'.repeat(64);
+const replyToken = 'd'.repeat(64);
 const oldRef = `${oldToken}:${binding}`;
 const oldState = { token: oldToken, nativeRef: oldRef };
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -49,7 +51,7 @@ function fixture(nativeState?: unknown) {
 	const registerNative = vi.fn(async (_id: string, state: { value: unknown }) => { native = state.value; });
 	const input: PreparedRun = {
 		runId: 'core-run-1', message: 'raw user message', systemPrompt: 'persona one',
-		contextKey: freshToken, transcriptKey: binding,
+		contextKey: freshToken, transcriptKey: binding, replyToken,
 		conversation: {
 			id: 'core-conversation-1', generation: 1,
 			get nativeState() { return native === undefined ? undefined : { version: 1, value: native }; },
@@ -66,7 +68,8 @@ function fixture(nativeState?: unknown) {
 		});
 		return socket as unknown as WebSocket;
 	};
-	const driver = () => new OpenclawDriver('ws://localhost:18789', '', factory, workspace) as RunDriver;
+	const driver = () => new OpenclawDriver('ws://localhost:18789', '', factory, workspace,
+		undefined, join(workspace, 'run-bind')) as RunDriver;
 	return { input, workspace, registerNative, sockets, driver, get native() { return native; },
 		set native(value: unknown) { native = value; }, cleanup: () => rmSync(workspace, { recursive: true, force: true }) };
 }
@@ -371,8 +374,7 @@ describe('native OpenClaw AgentRun (#303)', () => {
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 
-	it('only the correlated lifecycle end is terminal (accepted and thinking alone are not)', async () => {
-		const f = fixture(oldState);
+	it('only the correlated lifecycle end is terminal (accepted and thinking alone are not)', async () => {		const f = fixture(oldState);
 		const driver = f.driver();
 		try {
 			await driver.connect();
@@ -391,6 +393,61 @@ describe('native OpenClaw AgentRun (#303)', () => {
 			socket.end('this-run');
 			await pending;
 			expect(result).toEqual([{ type: 'thinking', text: 'thought' }, { type: 'done', durationMs: expect.any(Number) }]);
+		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+});
+
+describe('OpenClaw run-bind bridge (#406)', () => {
+	it('refuses a prepared run without the frozen reply token (no silent legacy submit)', () => {
+		const f = fixture();
+		try {
+			const { replyToken: _dropped, ...noToken } = f.input;
+			expect(() => f.driver().createRun(noToken)).toThrow(TypeError);
+		} finally { f.cleanup(); }
+	});
+
+	it('publishes nothing before accepted, the exact frozen token at accepted, and withdraws at end', async () => {
+		const f = fixture();
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const file = join(f.workspace, 'run-bind', 'gateway-run-A.json');
+			const pending = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			// Pre-accepted: the native runId does not exist yet — no file, never a guess.
+			expect(existsSync(file)).toBe(false);
+			socket.accept(socket.agents[0], 'gateway-run-A');
+			await vi.waitFor(async () => expect(await readOpenclawRunBindFile(join(f.workspace, 'run-bind'), 'gateway-run-A'))
+				.toMatchObject({ token: replyToken, runId: 'core-run-1', conversationId: 'core-conversation-1', generation: 1 }));
+			socket.end('gateway-run-A');
+			expect(await pending).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			// Withdrawn (guarded by core runId): late execs from A fall back to fail-closed empty.
+			await vi.waitFor(() => expect(existsSync(file)).toBe(false));
+		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('a second accepted run overwrites with its own token; the first withdrawal keeps it', async () => {
+		const f = fixture();
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const dir = join(f.workspace, 'run-bind');
+			const secondToken = 'e'.repeat(64);
+			const first = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], 'gateway-run-shared');
+			await vi.waitFor(async () => expect(await readOpenclawRunBindFile(dir, 'gateway-run-shared'))
+				.toMatchObject({ runId: 'core-run-1' }));
+			// Run B reuses the same native run id (gateway-side reuse): its publish wins …
+			await writeOpenclawRunBindFile(dir, 'gateway-run-shared',
+				{ token: secondToken, runId: 'core-run-2', conversationId: 'core-conversation-1', generation: 1, createdAt: Date.now() });
+			socket.end('gateway-run-shared');
+			expect(await first).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			// … and run A's guarded withdrawal must NOT remove B's binding.
+			await tick(); await tick();
+			expect(await readOpenclawRunBindFile(dir, 'gateway-run-shared')).toMatchObject({ runId: 'core-run-2', token: secondToken });
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 });

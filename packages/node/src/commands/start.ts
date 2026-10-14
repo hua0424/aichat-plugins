@@ -87,14 +87,31 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	const sessionEnvPluginPath = fileURLToPath(new URL('../agent/opencode/session-env-plugin.js', import.meta.url));
 	const opencodeServer = new OpencodeServerManager(defaultServerManagerDeps(), { pluginPaths: [sessionEnvPluginPath] });
 	const opencodeWorkspaceBase = join(AICHAT_HOME, 'opencode', 'workspace');
+	// #405: per-session run-bind files bridge the node driver and the serve-side shell.env
+	// hook (sessionID → frozen reply token). The spawned server inherits this env, so its
+	// hook reads the same dir; the built-in default covers servers started by other means.
+	// Set AFTER the codexEnv snapshot above: Codex builds its own frozen run env per run and
+	// must never inherit an opencode-scoped pointer.
+	const opencodeRunBindDir = join(AICHAT_HOME, 'opencode', 'run-bind');
+	process.env.AICHAT_OPENCODE_RUNBIND_DIR = opencodeRunBindDir;
 
 	// REQ-010 S5: codex needs NO shared server (the SDK spawns `codex exec` per turn) and NO
 	// env-injection plugin (codex natively injects CODEX_THREAD_ID into its exec shell). Its
 	// per-conversation workspaces live under ~/.aichat/codex/workspace, mirroring opencode's layout.
 	const codexWorkspaceBase = join(AICHAT_HOME, 'codex', 'workspace');
 	// SDK v0.142.3 accepts a per-client env (without inheriting process.env); never mutate global env.
+	// #404: AICHAT_RUN_BIND is stripped from the base env (no inherited run value survives) and
+	// re-injected frozen per run by the driver via createCodex's runEnv.
 	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
-		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
+		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
+	// #406: per-native-run binding files bridge the node driver and the gateway-side
+	// `before_tool_call` hook (native runId → frozen reply token). The gateway is an
+	// external process, so deploy-time gateway env must point `AICHAT_OPENCLAW_RUNBIND_DIR`
+	// at this same shared dir (node and gateway run as the same uid on the host mount).
+	// Set AFTER the codexEnv snapshot: Codex builds its own frozen run env per run and
+	// must never inherit a run-scoped pointer.
+	const openclawRunBindDir = join(AICHAT_HOME, 'openclaw', 'run-bind');
+	process.env.AICHAT_OPENCLAW_RUNBIND_DIR = openclawRunBindDir;
 
 	// REQ-011 S2 / #293: one shared identity+room+spawn bridge routes CC tool hooks into only
 	// their matching headless turn. Every CC identity's driver and the broker share this registry.
@@ -117,12 +134,13 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				undefined, undefined, (id, _workspace, identityId) => {
 					if (!conversations) throw new Error('conversation bindings not ready');
 					conversations.assertOpenclawPromptOwner(id, identityId);
-				}) }],
+				}, openclawRunBindDir) }],
 		['opencode', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'opencode', workspaceBase: opencodeWorkspaceBase,
 			context: nativeContext('opencode'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
 			create: (entry) => new OpencodeDriver({
 				server: opencodeServer,
+				runBindDir: opencodeRunBindDir,
 				assertDirectoryOwner: (id, directory) => {
 					if (!conversations) throw new Error('conversation bindings not ready');
 					conversations.assertOpencodeDirectoryOwner(id, directory);
@@ -133,7 +151,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 			context: nativeContext('codex'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
 			create: (entry) => new CodexDriver({
-				createCodex: (systemPrompt: string) => new Codex({ env: codexEnv,
+				createCodex: (systemPrompt: string, runEnv?: Record<string, string>) => new Codex({ env: { ...codexEnv, ...runEnv },
 					config: { developer_instructions: systemPrompt } }),
 				...(entry.model !== undefined ? { model: entry.model } : {}),
 			}) }],
@@ -209,6 +227,16 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resolve: (sessionKey) => bound(conversations?.resolveLegacy(sessionKey)),
 		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
 			Parameters<ConversationStore['resolveCandidate']>[0])),
+		// #404: V3 run-binding verification against the same core store (fail closed when unwired).
+		resolveReplyBinding: (token) => {
+			const binding = conversations?.resolveReplyBinding(token);
+			// resolveReplyBinding only returns fixed (thinkingId-bearing) live bindings.
+			return binding?.thinkingId === undefined ? undefined : {
+				token: binding.token, runId: binding.runId, conversationId: binding.conversationId,
+				serverNamespace: binding.serverNamespace, generation: binding.generation,
+				thinkingId: binding.thinkingId,
+			};
+		},
 		serverNamespace: restBaseUrl,
 		getResetReceipt: (bearer, id) => conversations?.getResetReceipt(bearer, id),
 		isPaused: (uid, room) => {

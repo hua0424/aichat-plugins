@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { AgentEvent, PreparedRun } from '../events.js';
 import type { OpencodeServerManager } from './server-manager.js';
 import { OpencodeDriver } from './opencode-driver.js';
+import { readRunBindFile } from './run-bind.js';
+
+const REPLY_TOKEN = 'f'.repeat(64);
 
 function fixture(native?: unknown) {
 	const events: unknown[] = [];
@@ -19,9 +25,9 @@ function fixture(native?: unknown) {
 		},
 	};
 	const create = vi.fn(async () => ({ data: { id: 's1' } }));
-	let resolvePrompt!: (result: { data: { info: { id: string; sessionID: string; error?: unknown } } }) => void;
-	const prompt = vi.fn(() => new Promise<{ data: { info: { id: string; sessionID: string; error?: unknown } } }>((resolve) => { resolvePrompt = resolve; }));
-	const complete = (error?: unknown) => resolvePrompt({ data: { info: { id: 'assistant-message', sessionID: 's1', ...(error ? { error } : {}) } } });
+	let resolvePrompt!: (result: { data: { info: { id: string; sessionID: string; parentID?: string; error?: unknown } } }) => void;
+	const prompt = vi.fn(() => new Promise<{ data: { info: { id: string; sessionID: string; parentID?: string; error?: unknown } } }>((resolve) => { resolvePrompt = resolve; }));
+	const complete = (error?: unknown, parentID?: string) => resolvePrompt({ data: { info: { id: 'assistant-message', sessionID: 's1', ...(parentID === undefined ? {} : { parentID }), ...(error ? { error } : {}) } } });
 	const abort = vi.fn(async () => ({ data: true }));
 	const status = vi.fn(async () => ({ data: { s1: { type: 'idle' } } }));
 	const subscribe = vi.fn(async () => ({ stream }));
@@ -31,13 +37,15 @@ function fixture(native?: unknown) {
 	const saveRecovery = vi.fn(async () => {});
 	const registerNative = vi.fn(async (_id: string, value: { value: unknown }) => { state = value.value; });
 	const input = { runId: 'r1', message: 'hello', workspace: '/tmp/oc-native-test', systemPrompt: 'persona 1', signal: new AbortController().signal,
+		replyToken: REPLY_TOKEN,
 		conversation: { id: 'conversation-1', generation: 1, get nativeState() { return state === undefined ? undefined : { version: 1, value: state }; },
 			assertCurrent: vi.fn(), saveNativeState: vi.fn(), registerNativeAlias: vi.fn(), registerNative },
 		saveRecovery, capabilities: { invoke: vi.fn() }, contextKey: 'context' } as PreparedRun;
-	const driver = new OpencodeDriver({ server, model: 'vendor/model', cancelTimeoutMs: 50 });
-	const cleanup = () => { closed = true; notify?.(); };
+	const runBindDir = mkdtempSync(join(tmpdir(), 'oc-driver-bind-'));
+	const driver = new OpencodeDriver({ server, model: 'vendor/model', cancelTimeoutMs: 50, runBindDir });
+	const cleanup = () => { closed = true; notify?.(); rmSync(runBindDir, { recursive: true, force: true }); };
 	return { driver, input, create, prompt, complete, abort, status, subscribe, server, saveRecovery, registerNative,
-		emit, cleanup, get state() { return state; } };
+		emit, cleanup, runBindDir, get state() { return state; } };
 }
 
 async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
@@ -242,6 +250,85 @@ describe('native OpenCode AgentRun', () => {
 		release();
 		expect(await pending).toEqual([{ type: 'cancelled', reason: 'Cancelled before submission' }]);
 		expect(f.prompt).not.toHaveBeenCalled();
+		f.cleanup();
+	});
+
+	it('#405 createRun without a frozen replyToken is rejected (no silent legacy send)', async () => {
+		const f = fixture();
+		const unbound = { ...f.input } as Partial<PreparedRun>;
+		delete unbound.replyToken;
+		expect(() => f.driver.createRun(unbound as PreparedRun)).toThrow(TypeError);
+		f.cleanup();
+	});
+
+	it('#405 publishes the frozen binding before prompt and withdraws it after the run', async () => {
+		const f = fixture();
+		const pending = collect(f.driver.createRun(f.input).events);
+		await vi.waitFor(() => expect(f.prompt).toHaveBeenCalled());
+		const published = await readRunBindFile(f.runBindDir, 's1');
+		expect(published).toMatchObject({ token: REPLY_TOKEN, runId: 'r1', conversationId: 'conversation-1', generation: 1 });
+		f.emit({ type: 'session.idle', properties: { sessionID: 's1' } });
+		f.complete();
+		expect((await pending).at(-1)).toMatchObject({ type: 'done' });
+		expect(await readRunBindFile(f.runBindDir, 's1')).toBeUndefined();
+		f.cleanup();
+	});
+
+	it('#405 publish failure fails the run before any native submission', async () => {
+		const f = fixture();
+		// Deterministic I/O failure: a path blocked by a regular file (ENOTDIR on mkdir).
+		const blocker = join(f.runBindDir, 'blocker');
+		writeFileSync(blocker, 'x');
+		const blocked = new OpencodeDriver({ server: f.server as unknown as OpencodeServerManager,
+			runBindDir: join(blocker, 'sub'), cancelTimeoutMs: 50 });
+		// Must surface, never fall back to legacy.
+		expect(await collect(blocked.createRun(f.input).events))
+			.toEqual([{ type: 'error', message: expect.stringContaining('run-bind publish failed') }]);
+		expect(f.prompt).not.toHaveBeenCalled();
+		f.cleanup();
+	});
+
+	it('#405 verified ancestor chain persists a verified proof at completion', async () => {
+		const f = fixture();
+		const pending = collect(f.driver.createRun(f.input).events);
+		await vi.waitFor(() => expect(f.prompt).toHaveBeenCalled());
+		f.emit({ type: 'message.updated', properties: { info: { id: 'U1', sessionID: 's1', role: 'user' } } });
+		f.emit({ type: 'message.updated', properties: { info: { id: 'A1', sessionID: 's1', role: 'assistant', parentID: 'U1' } } });
+		f.emit({ type: 'message.part.updated', properties: { part: { type: 'tool', sessionID: 's1', messageID: 'A1', callID: 'c1', tool: 'bash', state: { status: 'completed' } } } });
+		await tick();
+		f.complete(undefined, 'U1');
+		expect((await pending).at(-1)).toMatchObject({ type: 'done' });
+		expect(f.saveRecovery).toHaveBeenCalledWith({ version: 1, value: expect.objectContaining({
+			ancestorProof: 'verified', ancestor: expect.objectContaining({ assistants: 1, toolCalls: 1, verified: true }) }) });
+		f.cleanup();
+	});
+
+	it('#405 ancestor conflict fails the turn instead of guessing current/latest', async () => {
+		const f = fixture();
+		const pending = collect(f.driver.createRun(f.input).events);
+		await vi.waitFor(() => expect(f.prompt).toHaveBeenCalled());
+		f.emit({ type: 'message.updated', properties: { info: { id: 'U1', sessionID: 's1', role: 'user' } } });
+		f.emit({ type: 'message.updated', properties: { info: { id: 'A1', sessionID: 's1', role: 'assistant', parentID: 'U1' } } });
+		await tick();
+		f.complete(undefined, 'U_FOREIGN');
+		expect(await pending).toEqual([{ type: 'error', message: expect.stringContaining('ancestor conflict') }]);
+		// Conflict withdraws the file binding too: nothing further may send as this run.
+		expect(await readRunBindFile(f.runBindDir, 's1')).toBeUndefined();
+		f.cleanup();
+	});
+
+	it('#405 missing proof completes as declared-unverified, binding intact, chain unclaimed', async () => {
+		const f = fixture();
+		const pending = collect(f.driver.createRun(f.input).events);
+		await vi.waitFor(() => expect(f.prompt).toHaveBeenCalled());
+		// No user message observed (event gap): the send path stays exactly bound by file,
+		// but completion records unverified rather than claiming a proven chain.
+		f.emit({ type: 'message.updated', properties: { info: { id: 'A1', sessionID: 's1', role: 'assistant', parentID: 'U1' } } });
+		await tick();
+		f.complete(undefined, 'U1');
+		expect((await pending).at(-1)).toMatchObject({ type: 'done' });
+		expect(f.saveRecovery).toHaveBeenCalledWith({ version: 1, value: expect.objectContaining({
+			ancestorProof: 'unverified', ancestorDetail: 'no-user-message-observed' }) });
 		f.cleanup();
 	});
 });

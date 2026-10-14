@@ -14,6 +14,8 @@ import { parseSessionKey } from './session-key.js';
 type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
 export type ContextCandidate = { key: string } | { provider: string; nativeId: string; runtimeScope?: string };
 export type ResolvedCandidate = Resolved & { conversationId: string; generation: number };
+/** #404: core-verified single-round reply target; endpoint compares it against the resolved binding. */
+export type ResolvedReplyBinding = { token: string; runId: string; conversationId: string; serverNamespace: string; generation: number; thinkingId: string };
 
 export interface CapabilityEndpointDeps {
 	registry: CapabilityRegistry;
@@ -21,6 +23,8 @@ export interface CapabilityEndpointDeps {
 	resolve: (sessionKey: string) => Resolved | undefined;
 	/** Core-owned exact candidate lookup; all V2 candidates must resolve to the same binding. */
 	resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
+	/** #404: core-owned reply-binding verification for V3 run-bound sends; absent verifier fails closed. */
+	resolveReplyBinding?: (token: string) => ResolvedReplyBinding | undefined;
 	/** All endpoints using the same AICHAT_HOME share one writer lock, even with different socket overrides. */
 	lockHome?: string;
 	/** Namespaces request IDs to this configured server, not another backend. */
@@ -41,6 +45,8 @@ export interface CapabilityEndpointDeps {
 interface CapabilityRequest {
 	sessionKey?: string;
 	contexts?: ContextCandidate[];
+	/** #404: V3-only opaque per-run reply-binding token (AICHAT_RUN_BIND value). */
+	runBinding?: string;
 	command: string;
 	args: Record<string, unknown>;
 	requestId?: string;
@@ -69,6 +75,7 @@ export class CapabilityEndpoint {
 	private readonly registry: CapabilityRegistry;
 	private readonly resolve: (sessionKey: string) => Resolved | undefined;
 	private readonly resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
+	private readonly resolveReplyBinding?: (token: string) => ResolvedReplyBinding | undefined;
 	/** In-flight writes remain registered until resolution, even when completed receipts reach the cap. */
 	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
 	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
@@ -96,6 +103,7 @@ export class CapabilityEndpoint {
 		this.registry = deps.registry;
 		this.resolve = deps.resolve;
 		this.resolveCandidate = deps.resolveCandidate;
+		this.resolveReplyBinding = deps.resolveReplyBinding;
 		this.serverNamespace = deps.serverNamespace ?? '';
 		this.lockHome = deps.lockHome;
 		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
@@ -117,7 +125,7 @@ export class CapabilityEndpoint {
 			return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'bad request: invalid body', retryable: false } };
 		}
 
-		const logKey = parsed.sessionKey ? maskSessionKey(parsed.sessionKey) : '<v2>';
+		const logKey = parsed.sessionKey ? maskSessionKey(parsed.sessionKey) : parsed.runBinding !== undefined ? '<v3>' : '<v2>';
 		// Legacy callers keep their exact original prefix and resolution contract.
 		if (parsed.sessionKey && !parseSessionKey(parsed.sessionKey)) {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session key prefix`);
@@ -162,6 +170,32 @@ export class CapabilityEndpoint {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
 			return { status: 404, json: { ok: false, code: parsed.sessionKey ? 'CONTEXT_REVOKED' : 'UNKNOWN_CONTEXT', error: 'unknown session', retryable: false } };
 		}
+		// #404: a run-bound (V3) send must present a live core-verified binding for the SAME
+		// conversation+generation the contexts resolved to. Anything else — unknown, forged,
+		// expired, stale-generation, unfixed, cross-namespace, or inconsistent with the resolved
+		// binding — is refused here with zero dispatch (no registry invoke, no business HTTP),
+		// and never silently downgraded to an unassociated legacy send.
+		let replyThinkingId: string | undefined;
+		let replyRunId: string | undefined;
+		if (parsed.runBinding !== undefined) {
+			if (!parsed.contexts) {
+				return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'run binding requires version 3 contexts', retryable: false } };
+			}
+			if (!this.resolveReplyBinding) {
+				return { status: 400, json: { ok: false, code: 'INVALID_ARGUMENT', error: 'run binding verification unavailable', retryable: false } };
+			}
+			let verified: ResolvedReplyBinding | undefined;
+			try { verified = this.resolveReplyBinding(parsed.runBinding); } catch { /* broken index must fail closed */ }
+			const boundConversation = resolved as ResolvedCandidate;
+			if (!verified || !verified.thinkingId || !boundConversation.conversationId ||
+				verified.conversationId !== boundConversation.conversationId ||
+				verified.generation !== generation || verified.serverNamespace !== this.serverNamespace) {
+				console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}) err=run binding rejected`);
+				return { status: 403, json: { ok: false, code: 'FORBIDDEN', error: 'run binding rejected', retryable: false } };
+			}
+			replyThinkingId = verified.thinkingId;
+			replyRunId = verified.runId;
+		}
 		if (parsed.command === 'send-message' && this.isPaused?.(resolved.aiclawUid, resolved.roomId)) {
 			return { status: 409, json: { ok: false, code: 'RUN_STOP_UNCONFIRMED', error: 'conversation execution paused pending stop confirmation', retryable: true } };
 		}
@@ -182,6 +216,8 @@ export class CapabilityEndpoint {
 			apiClient: resolved.apiClient,
 			...(parsed.command === 'send-message' || parsed.command === 'reset-session' ? { requestId: parsed.requestId } : {}),
 			...(parsed.command === 'send-message' ? { generation: generation ?? this.roomGeneration.get(roomKey) ?? 0 } : {}),
+			// #404: core-verified single-round target only; never populated from capability args.
+			...(parsed.command === 'send-message' && replyThinkingId !== undefined ? { replyThinkingId } : {}),
 			...(parsed.command === 'reset-session' ? { resetBearer: JSON.stringify(parsed.sessionKey ?? parsed.contexts) } : {}),
 		};
 		const write = parsed.command === 'send-message' || parsed.command === 'reset-session';
@@ -192,9 +228,13 @@ export class CapabilityEndpoint {
 		if (parsed.command === 'send-message' && typeof parsed.args.content === 'string') parsed.args.content = parsed.args.content.trim();
 		const key = write ? JSON.stringify([this.serverNamespace, resolved.aiclawUid, parsed.requestId]) : '';
 		// Only effective business args: never hash bearer/session tokens or ignored caller padding.
+		// #404: the fingerprint pins the fixed run target, so the same requestId + same payload keeps
+		// the same msgId/thinkingId across retry/restart, while another run reusing the ID conflicts.
 		const fingerprint = write ? createHash('sha256').update(JSON.stringify([
 			parsed.command, resolved.roomId, generation ?? this.roomGeneration.get(roomKey) ?? 0,
 			typeof parsed.args.content === 'string' ? parsed.args.content : null,
+			...(parsed.command === 'send-message' && replyRunId !== undefined && replyThinkingId !== undefined
+				? [replyRunId, replyThinkingId] : []),
 		])).digest('hex') : '';
 		const oldUnknown = this.unknown.get(key);
 		if (write) {
@@ -222,7 +262,8 @@ export class CapabilityEndpoint {
 		}
 
 		// No args (may contain message content), requestId or unmasked sessionKey in logs.
-		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId})`;
+		// #404: run-bound sends log the marker (never the token or thinkingId).
+		const loc = `[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (uid=${resolved.aiclawUid}, room=${resolved.roomId}${replyThinkingId !== undefined ? ', run=bound' : ''})`;
 		const execute = async (): Promise<CapabilityResponse> => {
 			try {
 				const result = await this.registry.invoke(parsed.command, ctx, parsed.args);
@@ -428,29 +469,45 @@ function parseBody(body: unknown): CapabilityRequest | undefined {
 	if (b.args !== undefined && (b.args === null || typeof b.args !== 'object' || Array.isArray(b.args))) return undefined;
 	const args = (b.args ?? {}) as Record<string, unknown>;
 	const requestId = (b.requestId ?? b.idempotencyKey) as string | undefined;
-	if (b.version === 2) {
+	if (b.version === 2 || b.version === 3) {
 		if (b.sessionKey !== undefined || !Array.isArray(b.contexts) || b.contexts.length < 1 || b.contexts.length > 8 ||
 			['uid', 'room', 'roomId', 'aiclawUid', 'identityId'].some((field) => field in b)) return undefined;
-		const contexts: ContextCandidate[] = [];
-		for (const item of b.contexts) {
-			if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
-			const c = item as Record<string, unknown>;
-			if ('key' in c) {
-				if (Object.keys(c).length !== 1 || typeof c.key !== 'string' || !c.key || c.key.length > 256) return undefined;
-				contexts.push({ key: c.key });
-			} else {
-				if (Object.keys(c).some((field) => !['provider', 'nativeId', 'runtimeScope'].includes(field)) ||
-					typeof c.provider !== 'string' || !c.provider || c.provider.length > 32 ||
-					typeof c.nativeId !== 'string' || !c.nativeId || c.nativeId.length > 512 ||
-					(c.runtimeScope !== undefined && (typeof c.runtimeScope !== 'string' || !c.runtimeScope || c.runtimeScope.length > 256))) return undefined;
-				contexts.push({ provider: c.provider, nativeId: c.nativeId, ...(c.runtimeScope === undefined ? {} : { runtimeScope: c.runtimeScope as string }) });
-			}
-		}
+		const contexts = parseContexts(b.contexts);
+		if (!contexts) return undefined;
+		// #404: V3 carries the opaque per-run reply binding alongside the existing contexts.
+		// An old node parses only version 2 / legacy sessionKey, so a V3 body there is rejected
+		// before any resolution or dispatch (explicit refusal, zero business HTTP). A new node
+		// parses V3 strictly but keeps V2 compatible — without claiming an association for it.
+		let runBinding: string | undefined;
+		if (b.version === 3) {
+			if (typeof b.runBinding !== 'string' || !b.runBinding || b.runBinding.length > 256) return undefined;
+			runBinding = b.runBinding;
+		} else if (b.runBinding !== undefined) return undefined;
 		if (b.command === 'send-message' && ['uid', 'room', 'roomId', 'aiclawUid', 'identityId', 'fromUid'].some((field) => field in args)) return undefined;
-		return { contexts, command: b.command, args, requestId };
+		return { contexts, command: b.command, args, requestId, ...(runBinding === undefined ? {} : { runBinding }) };
 	}
 	if (b.version !== undefined || b.contexts !== undefined || typeof b.sessionKey !== 'string' || !b.sessionKey || b.sessionKey.length > 512) return undefined;
 	return { sessionKey: b.sessionKey, command: b.command, args, requestId };
+}
+
+/** Shared V2/V3 context-candidate shape validation. */
+function parseContexts(raw: unknown[]): ContextCandidate[] | undefined {
+	const contexts: ContextCandidate[] = [];
+	for (const item of raw) {
+		if (!item || typeof item !== 'object' || Array.isArray(item)) return undefined;
+		const c = item as Record<string, unknown>;
+		if ('key' in c) {
+			if (Object.keys(c).length !== 1 || typeof c.key !== 'string' || !c.key || c.key.length > 256) return undefined;
+			contexts.push({ key: c.key });
+		} else {
+			if (Object.keys(c).some((field) => !['provider', 'nativeId', 'runtimeScope'].includes(field)) ||
+				typeof c.provider !== 'string' || !c.provider || c.provider.length > 32 ||
+				typeof c.nativeId !== 'string' || !c.nativeId || c.nativeId.length > 512 ||
+				(c.runtimeScope !== undefined && (typeof c.runtimeScope !== 'string' || !c.runtimeScope || c.runtimeScope.length > 256))) return undefined;
+			contexts.push({ provider: c.provider, nativeId: c.nativeId, ...(c.runtimeScope === undefined ? {} : { runtimeScope: c.runtimeScope as string }) });
+		}
+	}
+	return contexts;
 }
 
 /**

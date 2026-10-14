@@ -16,6 +16,7 @@ function fixture(state?: unknown) {
 	const saveRecovery = vi.fn(async () => {});
 	const input: PreparedRun = {
 		runId: 'run-1', message: 'original user text', workspace, systemPrompt: 'persona 1',
+		replyToken: 'b'.repeat(64),
 		conversation: { id: 'c1', generation: 1, get nativeState() { return nativeState === undefined ? undefined : { version: 1, value: nativeState }; },
 			assertCurrent() {}, saveNativeState, registerNativeAlias, registerNative },
 		saveRecovery, capabilities: { async invoke() {} }, signal: new AbortController().signal,
@@ -48,7 +49,7 @@ describe('Codex native AgentRun', () => {
 		try {
 			const driver = new CodexDriver({ createCodex: s.createCodex });
 			const result = await collect(driver.createRun(f.input).events);
-			expect(s.createCodex).toHaveBeenCalledWith('persona 1');
+			expect(s.createCodex).toHaveBeenCalledWith('persona 1', { AICHAT_RUN_BIND: 'b'.repeat(64) });
 			expect(s.startThread).toHaveBeenCalledWith(expect.objectContaining({ workingDirectory: f.workspace }));
 			expect(s.runStreamed).toHaveBeenCalledWith('original user text', { signal: expect.any(AbortSignal) });
 			expect(f.state).toEqual({ threadId: 'thread-1', promptHash: expect.any(String), workspace: f.workspace });
@@ -79,7 +80,7 @@ describe('Codex native AgentRun', () => {
 			const events = await collect(new CodexDriver({ createCodex: s.createCodex }).createRun(f.input).events);
 			expect(events.at(-1)?.type).toBe('done');
 			expect(s.resumeThread).toHaveBeenCalledWith('old-thread', expect.objectContaining({ workingDirectory: f.workspace }));
-			expect(s.createCodex).toHaveBeenCalledWith(originalPrompt);
+			expect(s.createCodex).toHaveBeenCalledWith(originalPrompt, { AICHAT_RUN_BIND: 'b'.repeat(64) });
 			expect(f.state).toEqual(state);
 			expect(s.startThread).not.toHaveBeenCalled();
 		} finally { f.cleanup(); }
@@ -221,9 +222,14 @@ describe('Codex native AgentRun', () => {
 		const f = fixture(); const s = sdk();
 		try {
 			const other = fixture(); other.input.workspace = f.workspace; other.input.systemPrompt = 'persona 2';
+			other.input.replyToken = 'c'.repeat(64);
 			await Promise.all([collect(new CodexDriver({ createCodex: s.createCodex }).createRun(f.input).events),
 				collect(new CodexDriver({ createCodex: s.createCodex }).createRun(other.input).events)]);
 			expect(s.createCodex.mock.calls.map(([prompt]) => prompt).sort()).toEqual(['persona 1', 'persona 2']);
+			// #404: each run freezes its own binding; no shared or inherited run value.
+			expect(s.createCodex.mock.calls.map(([, env]) => env)).toEqual(expect.arrayContaining([
+				{ AICHAT_RUN_BIND: 'b'.repeat(64) }, { AICHAT_RUN_BIND: 'c'.repeat(64) }]));
+			expect(s.createCodex.mock.calls).toHaveLength(2);
 			expect(existsSync(join(f.workspace, 'AGENTS.md'))).toBe(false);
 			other.cleanup();
 		} finally { f.cleanup(); }
