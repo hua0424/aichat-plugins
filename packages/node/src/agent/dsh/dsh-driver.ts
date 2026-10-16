@@ -212,6 +212,16 @@ class DshRun implements AgentRun {
 			delete env.OPENCLAW_BIND;
 			delete env.AICHAT_BIND;
 			delete env.AICHAT_CC_RUN;
+			// #421: dsh core strips AICHAT_CONTEXT_KEY from the tool env and injects its
+			// own DSH_SESSION_ID, so the CLI's only context candidate is
+			// {provider:'dsh',nativeId:<session id>} — resolvable ONLY via a registered
+			// native alias (provider candidates resolve byAlias; siblings
+			// opencode/codex/openclaw all registerNative, dsh never did).
+			// Re-announce the resumed id before spawn: the alias persisted by the turn
+			// that created it covers the steady state, but a conversation adopted
+			// from a pre-fix core (nativeState without alias) would otherwise race
+			// its own session event.
+			if (sessionId) await input.conversation.registerNativeAlias({ id: sessionId });
 			await input.saveRecovery({ version: 1, value: { provider: 'dsh', runId: input.runId,
 				sessionId: sessionId ?? null, workspace, stopProbe: 'unknown-after-restart' } });
 			input.conversation.assertCurrent();
@@ -271,7 +281,13 @@ class DshRun implements AgentRun {
 				switch (mapped.kind) {
 					case 'session': {
 						try {
-							await input.conversation.saveNativeState({ version: 1, value: {
+							// #421: atomically bind alias + state (opencode/codex/openclaw
+							// registerNative idiom) — saveNativeState alone leaves
+							// nativeAliases empty and the CLI's DSH_SESSION_ID candidate
+							// permanently unresolvable (endpoint UNKNOWN_CONTEXT).
+							if (!input.conversation.registerNative)
+								throw new Error('DSH atomic native registration unavailable');
+							await input.conversation.registerNative(mapped.sessionId, { version: 1, value: {
 								sessionId: mapped.sessionId, workspace, promptHash: digest,
 							} });
 							await input.saveRecovery({ version: 1, value: { provider: 'dsh', runId: input.runId,
