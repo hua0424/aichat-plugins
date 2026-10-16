@@ -9,7 +9,8 @@ import { WSReqType } from '../stream/protocol.js';
 import type { ReceivedMessage } from '../stream/protocol.js';
 import realAiclawGroupPush from './__fixtures__/real-aiclaw-group-push.json' assert { type: 'json' };
 import { CcHeadlessDriver, type CcChild, type CcSpawnFn } from '../agent/cc/headless-driver.js';
-import { ConversationStore } from '../capability/conversations.js';
+import { DshHeadlessDriver, type DshSpawnFn } from '../agent/dsh/dsh-driver.js';
+import { ConversationStore, suspensionReason } from '../capability/conversations.js';
 import { CcSessionRegistry } from '../agent/cc/sink.js';
 import type { CcTranscriptRecord } from '../agent/cc/transcript.js';
 import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
@@ -2068,5 +2069,109 @@ describe('MessageHandler REQ-029 (#29): >2^53 roomId precision', () => {
 		const start = sent.find((f) => f.type === WSReqType.THINKING_START)!.data as Record<string, unknown>;
 		expect(start.roomId).toBe(bigRoom);
 		expect(start.roomId).not.toBe(9007199254740992);
+	});
+});
+
+// ─── #424: DSH 人设-hash 门 + reset 提示链 ───
+
+describe('MessageHandler DSH persona-hash gate notices (#424)', () => {
+	function setup424(driverType: string, previous: string | null, next: string | null) {
+		const home = mkdtempSync(join(tmpdir(), 'msg-424-'));
+		ccTmpDirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set([SELF_UID]),
+			activeProviders: new Map([[SELF_UID, driverType]]) });
+		if (driverType === 'dsh') {
+			const seed = store.beginRun(SELF_UID, '9', 'seed-424');
+			seed.saveNativeState('dsh', { sessionId: 'sess-1', promptHash: 'stale-prompt-hash' });
+			store.finishRun('seed-424');
+			store.getOrCreate(SELF_UID, '10'); // unbound room: no stale session, never notified
+		}
+		const notices: Array<{ roomId: string; text: string }> = [];
+		const apiClient = {
+			getSelfPersona: vi.fn(async () => next),
+			sendMessage: vi.fn(async (roomId: string, text: string) => {
+				notices.push({ roomId: String(roomId), text });
+				return { msgId: 'notice-1' };
+			}),
+		} as unknown as import('../api/hula-api.js').HulaApiClient;
+		const { ws, sent } = fakeWs();
+		const adapter = { type: driverType,
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
+			connect: async () => {}, disconnect: async () => {}, createRun: vi.fn() } as unknown as RunDriver;
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, { waitMs: 5, maxWaitMs: 30 }, () => {}, () => store);
+		setPersona(handler, previous);
+		return { handler, notices, sent, store };
+	}
+
+	it('人设变更帧 → 仅 DSH 绑定房间收到显式 reset 通知', async () => {
+		const { handler, notices } = setup424('dsh', '老人设', '新人设');
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: SELF_UID } } as never);
+		await waitFor(() => notices.length > 0);
+		expect(notices.map((n) => n.roomId)).toEqual(['9']);
+		expect(notices[0].text).toContain('人设已变更');
+		expect(notices[0].text).toContain('reset-session');
+		expect(getPersona(handler)).toBe('新人设');
+	});
+
+	it('同值重存 → 缓存刷新但不打扰聊天室', async () => {
+		const { handler, notices } = setup424('dsh', '同一个人设', '同一个人设');
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: SELF_UID } } as never);
+		await new Promise((r) => setTimeout(r, 30));
+		expect(getPersona(handler)).toBe('同一个人设');
+		expect(notices).toEqual([]);
+	});
+
+	it('非 DSH driver → 人设照常刷新，不发 DSH 通知', async () => {
+		const { handler, notices } = setup424('fake', '老人设', '新人设');
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: SELF_UID } } as never);
+		await new Promise((r) => setTimeout(r, 30));
+		expect(getPersona(handler)).toBe('新人设');
+		expect(notices).toEqual([]);
+	});
+
+	it('跨身份帧 → 缓存与通知都不动', async () => {
+		const { handler, notices } = setup424('dsh', '老人设', '新人设');
+		handler.handle({ type: 'aiclawPersonaChanged', data: { aiclawUid: 'other' } } as never);
+		await new Promise((r) => setTimeout(r, 30));
+		expect(getPersona(handler)).toBe('老人设');
+		expect(notices).toEqual([]);
+	});
+
+	it('旧会话撞门被拒 → 当轮失败 + reset 通知 + 房间暂停，且 spawn 从未发生', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'msg-424-dsh-'));
+		ccTmpDirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set([SELF_UID]),
+			activeProviders: new Map([[SELF_UID, 'dsh']]) });
+		const seed = store.beginRun(SELF_UID, '9', 'seed-424');
+		seed.saveNativeState('dsh', { sessionId: 'sess-1', promptHash: 'stale-prompt-hash' });
+		store.finishRun('seed-424');
+		const notices: Array<{ roomId: string; text: string }> = [];
+		const apiClient = {
+			getSelfPersona: async () => '新人设',
+			sendMessage: async (roomId: string, text: string) => {
+				notices.push({ roomId: String(roomId), text });
+				return { msgId: 'notice-1' };
+			},
+		} as unknown as import('../api/hula-api.js').HulaApiClient;
+		const spawn = vi.fn((): never => { throw new Error('DSH spawn must not run for a drifted session'); });
+		const driver = new DshHeadlessDriver({ spawn: spawn as unknown as DshSpawnFn });
+		const { ws, sent } = fakeWs();
+		const handler = new MessageHandler(ws, driver, SELF_UID, apiClient, { waitMs: 5, maxWaitMs: 30 }, () => {}, () => store, home);
+
+		handler.handle({ type: 'receiveMessage', data: humanMessage(9, 100, 'hi', 1) } as never);
+		await waitFor(() => sent.some((f) => f.type === WSReqType.THINKING_END));
+		const end = sent.find((f) => f.type === WSReqType.THINKING_END)!.data as Record<string, unknown>;
+		expect(end.status).toBe('error');
+		expect(String(end.error)).toContain('explicit reset required');
+		expect(spawn).not.toHaveBeenCalled();
+		expect(notices).toHaveLength(1);
+		expect(notices[0].roomId).toBe('9');
+		expect(notices[0].text).toContain('reset-session');
+		expect(suspensionReason(store.get(SELF_UID, '9'))).toBe('stop-unconfirmed');
+		handler.destroy();
+		// destroy() stops runs fire-and-forget — let the never-submitted DSH run
+		// release before closing the store, or close wins the race with benign noise.
+		await new Promise((r) => setTimeout(r, 20));
+		store.close();
 	});
 });

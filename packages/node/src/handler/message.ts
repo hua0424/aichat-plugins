@@ -3,6 +3,7 @@ import type { HulaWSClient } from '../server/hula-ws.js';
 import { WSReqType } from '../stream/protocol.js';
 import type { RunDriver, AgentEvent } from '../agent/events.js';
 import { NATIVE_SESSION_LOST } from '../agent/events.js';
+import { isDshDriftGateError } from '../agent/dsh/dsh-driver.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
@@ -208,6 +209,15 @@ const NATIVE_SESSION_LOST_FAILURE_NOTICE =
 	`助理会话续跑失败：原生 CC 会话历史已丢失，无法续接会话（${NATIVE_SESSION_LOST}）。`
 	+ '你的消息已收到，但本轮未能执行且重试无法恢复；会话已暂停，后续消息将排队暂不执行。'
 	+ '请 owner 重置会话（reset-session）后重新开始。';
+
+/**
+ * #424: DSH 人设-hash 门的用户可见通告（两处共用：人设变更帧到达时的主动通知、
+ * 旧会话撞门被拒时当轮的失败提示）。fail-closed：不断言暂停状态、不自动 reset；
+ * 新会话以新人设生效，历史保留在 DSH 侧（driver 无删除路径）。
+ */
+const DSH_PERSONA_CHANGED_NOTICE =
+	'人设已变更：旧会话绑定的是上一版人设，不会静默切换，旧会话续跑会被拒绝。'
+	+ '请 owner 显式重置会话（reset-session），重置后新会话将以新人设生效（历史记录保留）。';
 
 /**
  * 消息处理器（REQ-004 Agent Loop 模型）
@@ -1037,7 +1047,12 @@ export class MessageHandler {
 				}
 			}
 		} catch (err) {
-			finalizeError(errMsg(err));
+			const message = errMsg(err);
+			finalizeError(message);
+			// #424: the DSH prompt-hash gate rejects pre-submit (nothing ran, nothing
+			// to stop) — surface the explicit-reset notice at the point of need.
+			// The fail-closed pause below still parks later turns until owner reset-session rebuilds.
+			if (isDshDriftGateError(message)) this.sendNotice(roomId, DSH_PERSONA_CHANGED_NOTICE);
 			if (session.run) this.getConversations!().markStopUnconfirmed(session.run.id);
 		} finally {
 			void session.run!.agent.dispose();
@@ -1159,11 +1174,27 @@ export class MessageHandler {
 		if (!this.apiClient) return;
 		try {
 			const persona = await this.apiClient.getSelfPersona();
+			const previous = this.persona;
 			this.persona = persona;
 			console.log(`[persona] refreshed after aiclawPersonaChanged for aiclaw ${this.selfUid}: ${persona === null ? '(none)' : `${persona.length} chars`}`);
+			// #424: the persona behind the DSH frozen prompt actually changed (not a
+			// same-value re-save) — proactively notify the related chatrooms that
+			// their old sessions are now stale and need an explicit owner reset.
+			if (previous !== persona) this.notifyDshPersonaChanged();
 		} catch (err) {
 			console.warn(`[persona] refetch failed for aiclaw ${this.selfUid}, keeping old cache:`, errMsg(err));
 		}
+	}
+
+	/**
+	 * #424: persona-change fan-out, DSH-bound rooms only. Other drivers take the
+	 * new prompt next round (codex freezes per-thread by design, #224), so only
+	 * DSH rooms hold sessions the prompt-hash gate will reject.
+	 */
+	private notifyDshPersonaChanged(): void {
+		if (!this.getConversations || this.driver.type !== 'dsh') return;
+		for (const roomId of this.getConversations().roomsWithNativeSession(this.selfUid, 'dsh'))
+			this.sendNotice(roomId, DSH_PERSONA_CHANGED_NOTICE);
 	}
 
 	/** M3: 群配置变更通知处理 */

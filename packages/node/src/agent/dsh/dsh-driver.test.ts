@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DshHeadlessDriver, DSH_EXPECTED_VERSION, type DshChild, type DshHeadlessDriverDeps, type DshSpawnOptions } from './dsh-driver.js';
+import { DshHeadlessDriver, DSH_DRIFT_GATE_MESSAGE, DSH_EXPECTED_VERSION, isDshDriftGateError, type DshChild, type DshHeadlessDriverDeps, type DshSpawnOptions } from './dsh-driver.js';
 import type { AgentEvent, PreparedRun } from '../events.js';
 import { ConversationStore } from '../../capability/conversations.js';
 import { resolveAgentContexts } from '../../commands/send-message.js';
@@ -239,6 +239,13 @@ describe('DSH PreparedRun native execution', () => {
 			expect(turn2.collected.at(-1)).toEqual({ type: 'done', durationMs: expect.any(Number) });
 			expect(after.nativelyRegistered).toEqual([{ id: 'session-new', state: { version: 1, value: {
 				sessionId: 'session-new', workspace: after.dir, promptHash: promptHash('system instructions') } } }]);
+		});
+
+		it('isDshDriftGateError classifies exactly the gate rejection for the handler notice', () => {
+			expect(isDshDriftGateError(new Error(DSH_DRIFT_GATE_MESSAGE))).toBe(false); // Error object, not the message
+			expect(isDshDriftGateError(DSH_DRIFT_GATE_MESSAGE)).toBe(true);
+			expect(isDshDriftGateError('Codex native thread invalid or original cwd/prompt mismatch; explicit reset required (history retained)')).toBe(false);
+			expect(isDshDriftGateError('')).toBe(false);
 		});
 	});
 
