@@ -271,7 +271,14 @@ class DshRun implements AgentRun {
 			while (true) {
 				const notice = await this.next();
 				if (notice.type === 'failure') { failed = notice.message; break; }
-				if (notice.type === 'close') { closeCode = notice.code; break; }
+				if (notice.type === 'close') {
+					// #423 (cc-driver analog): child close alone never proves stop — a
+					// surviving descendant keeps the group alive, so the run reports
+					// unconfirmed (core pauses the session) instead of claiming done.
+					if (!this.groupGone) failed = 'DSH process group exit unconfirmed';
+					else closeCode = notice.code;
+					break;
+				}
 				if (notice.type !== 'line') continue;
 				let obj: unknown;
 				try { obj = JSON.parse(notice.text); }
