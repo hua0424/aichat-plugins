@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DshHeadlessDriver, DSH_EXPECTED_VERSION, type DshChild, type DshHeadlessDriverDeps, type DshSpawnOptions } from './dsh-driver.js';
 import type { AgentEvent, PreparedRun } from '../events.js';
+import { ConversationStore } from '../../capability/conversations.js';
+import { resolveAgentContexts } from '../../commands/send-message.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -41,6 +43,8 @@ function fixture(overrides: Partial<DshHeadlessDriverDeps> = {}) {
 		return child;
 	}, kill, platform: 'linux', firstEventTimeoutMs: 500, stopTimeoutMs: 180, killGraceMs: 10, ...overrides });
 	const persisted: Array<unknown> = [];
+	const aliased: Array<unknown> = [];
+	const nativelyRegistered: Array<{ id: string; state: unknown }> = [];
 	const recovered: Array<unknown> = [];
 	const controller = new AbortController();
 	const input: PreparedRun = { runId: 'core-run', message: '[HuLa 私聊]\nAlice(1): hi',
@@ -48,7 +52,8 @@ function fixture(overrides: Partial<DshHeadlessDriverDeps> = {}) {
 		systemPrompt: 'system instructions',
 		conversation: { id: 'opaque-conversation', generation: 1, nativeState: undefined,
 			assertCurrent: vi.fn(), saveNativeState: async (v) => { persisted.push(v); },
-			registerNativeAlias: vi.fn(async () => {}) },
+			registerNativeAlias: vi.fn(async (v) => { aliased.push(v); }),
+			registerNative: vi.fn(async (id, state) => { nativelyRegistered.push({ id, state }); }) },
 		saveRecovery: vi.fn(async (v) => { recovered.push(v); }),
 		capabilities: { invoke: vi.fn(async () => {}) }, signal: controller.signal };
 	const start = async (runInput = input) => {
@@ -59,7 +64,7 @@ function fixture(overrides: Partial<DshHeadlessDriverDeps> = {}) {
 		return { run, collected, done };
 	};
 	return { dir, driver, input, controller, start, spawnCalls, output, errors, process, writes,
-		persisted, recovered, kill,
+		persisted, aliased, nativelyRegistered, recovered, kill,
 		groupExit: () => { groupAlive = false; }, close: (code: number | null) => { process.emit('close', code, null); },
 		line: (value: object) => output.emit('data', `${JSON.stringify(value)}\n`) };
 }
@@ -111,8 +116,10 @@ describe('DSH PreparedRun native execution', () => {
 				// intact final adds no bytes beyond the streamed text — yielded once, not twice.
 				{ type: 'done', durationMs: expect.any(Number) },
 			]);
-			expect(f.persisted).toEqual([{ version: 1, value: { sessionId: 'session-1',
-				workspace: f.dir, promptHash: promptHash('system instructions') } }]);
+			expect(f.persisted).toEqual([]);
+			// #421: session binds alias + state atomically (never state alone).
+			expect(f.nativelyRegistered).toEqual([{ id: 'session-1', state: { version: 1, value: { sessionId: 'session-1',
+				workspace: f.dir, promptHash: promptHash('system instructions') } } }]);
 			expect(f.recovered[0]).toEqual(expect.objectContaining({ value: expect.objectContaining({ provider: 'dsh' }) }));
 		} finally {
 			if (saved === undefined) delete process.env.OPENCODE_SESSION_ID;
@@ -141,6 +148,9 @@ describe('DSH PreparedRun native execution', () => {
 		const { collected, done } = await f.start();
 		expect(f.spawnCalls[0].args).toEqual(['--profile', 'headless', '--json', '--session-id', 'historical-id', '-']);
 		expect(f.spawnCalls[0].options.env.DSH_SESSION_ID).toBe('historical-id');
+		// #421: the resumed id is re-announced before spawn, so a CLI send that
+		// lands before the session event still resolves via byAlias.
+		expect(f.input.conversation.registerNativeAlias).toHaveBeenCalledWith({ id: 'historical-id' });
 		f.line({ type: 'session', sessionId: 'historical-id', cwd: f.dir });
 		f.line({ type: 'final', text: 'again' });
 		f.line({ type: 'status', phase: 'turn_end', turn: 2, reason: { kind: 'completed' } });
@@ -195,5 +205,105 @@ describe('DSH PreparedRun native execution', () => {
 		expect(() => f.driver.createRun({ ...f.input, workspace: undefined })).toThrow('Invalid DSH prepared run');
 		expect(() => f.driver.createRun({ ...f.input, contextKey: undefined })).toThrow('Invalid DSH prepared run');
 		expect(() => f.driver.createRun({ ...f.input, replyToken: undefined })).toThrow('Invalid DSH prepared run');
+	});
+
+	// #421 dead-lock proof against a REAL core store (not mocks): dsh core strips
+	// AICHAT_CONTEXT_KEY from the tool env, so the CLI's only candidate is
+	// {provider:'dsh',nativeId:<DSH_SESSION_ID>} — it must resolve byAlias to the
+	// run's conversation, or every send-message ends in UNKNOWN_CONTEXT.
+	describe('#421 DSH_SESSION_ID candidate resolves to the run conversation', () => {
+		const uid = '217369059208704', room = '217369063403008';
+		function liveHarness() {
+			const dir = mkdtempSync(join(tmpdir(), 'dsh-alias-'));
+			dirs.push(dir);
+			const ws = join(dir, 'ws');
+			const store = new ConversationStore({ home: dir, serverNamespace: 'http://example.test/api',
+				activeUids: new Set([uid]), activeProviders: new Map([[uid, 'dsh']]) });
+			const output = new EventEmitter();
+			const errors = new EventEmitter();
+			const proc = new EventEmitter();
+			const writes: string[] = [];
+			let groupAlive = true;
+			const child = Object.assign(proc, {
+				pid: 4242,
+				stdin: { write: (s: string) => { writes.push(s); }, end: vi.fn() },
+				stdout: output, stderr: errors, kill: vi.fn(() => true),
+			}) as unknown as DshChild;
+			const kill = (pid: number, signal?: NodeJS.Signals | number) => {
+				if (pid !== -4242) throw new Error('wrong group');
+				if (signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+			};
+			const spawnCalls: Array<{ cmd: string; args: readonly string[]; options: DshSpawnOptions }> = [];
+			const driver = new DshHeadlessDriver({ spawn: (cmd, args, options) => {
+				spawnCalls.push({ cmd, args, options });
+				return child;
+			}, kill, platform: 'linux', firstEventTimeoutMs: 500, stopTimeoutMs: 180, killGraceMs: 10 });
+			// Wire exactly like MessageHandler: provider-narrowed nativeState + bound methods.
+			const prepared = (runId: string, dshState: unknown) => {
+				const bound = store.beginRun(uid, room, runId);
+				const controller = new AbortController();
+				const input: PreparedRun = { runId, message: 'hi', workspace: ws,
+					contextKey: bound.contextKey, replyToken: bound.replyToken, systemPrompt: 'persona',
+					conversation: { id: bound.conversationId, generation: bound.generation,
+						...(dshState === undefined ? {} : { nativeState: { version: 1, value: dshState } }),
+						assertCurrent: () => bound.assertCurrent(),
+						saveNativeState: async (v) => bound.saveNativeState('dsh', v.value as Record<string, unknown>),
+						registerNativeAlias: async (v) => bound.registerNativeAlias('dsh', v.id, v.scope),
+						registerNative: async (id, state) => bound.registerNative('dsh', id, state.value as Record<string, unknown>) },
+					saveRecovery: async (v) => bound.saveRecovery(v),
+					capabilities: { invoke: vi.fn(async () => {}) }, signal: controller.signal };
+				return { bound, input };
+			};
+			const line = (value: object) => output.emit('data', `${JSON.stringify(value)}\n`);
+			return { dir, ws, store, driver, spawnCalls, output, proc, writes, prepared, line,
+				finish: () => { groupAlive = false; proc.emit('close', 0, null); } };
+		}
+
+		it('first turn: CLI candidate resolves after the session event', async () => {
+			const h = liveHarness();
+			const { bound, input } = h.prepared('run-1', undefined);
+			const run = h.driver.createRun(input);
+			const collected: AgentEvent[] = [];
+			const done = (async () => { for await (const event of run.events) collected.push(event); })();
+			for (let i = 0; i < 30 && !h.spawnCalls.length; i++) await tick();
+			expect(h.spawnCalls.length).toBe(1);
+			h.line({ type: 'session', sessionId: 'session-7ca937ff', cwd: h.ws });
+			for (let i = 0; i < 100 && !h.store.resolveCandidate({ provider: 'dsh', nativeId: 'session-7ca937ff' }); i++) await tick();
+			// Exactly what the CLI posts when AICHAT_CONTEXT_KEY was stripped:
+			const contexts = resolveAgentContexts({ DSH_SESSION_ID: 'session-7ca937ff' } as NodeJS.ProcessEnv);
+			expect(contexts).toEqual([{ provider: 'dsh', nativeId: 'session-7ca937ff' }]);
+			expect(h.store.resolveCandidates(contexts)?.conversationId).toBe(bound.conversationId);
+			h.line({ type: 'final', text: 'reply' });
+			h.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			h.finish();
+			await done;
+			expect(collected[collected.length - 1]).toEqual({ type: 'done', durationMs: expect.any(Number) });
+		});
+
+		it('resume adopts a pre-fix core (state without alias): candidate resolves before spawn', async () => {
+			const h = liveHarness();
+			// Pre-fix shape: nativeState persisted, nativeAliases empty → unresolvable.
+			const seed = h.store.beginRun(uid, room, 'run-0');
+			const legacy = { sessionId: 'legacy-session', workspace: h.ws, promptHash: promptHash('persona') };
+			seed.saveNativeState('dsh', legacy);
+			h.store.finishRun('run-0');
+			expect(h.store.resolveCandidate({ provider: 'dsh', nativeId: 'legacy-session' })).toBeUndefined();
+			const { bound, input } = h.prepared('run-1', legacy);
+			const run = h.driver.createRun(input);
+			const collected: AgentEvent[] = [];
+			const done = (async () => { for await (const event of run.events) collected.push(event); })();
+			for (let i = 0; i < 30 && !h.spawnCalls.length; i++) await tick();
+			expect(h.spawnCalls.length).toBe(1);
+			// No session line emitted yet — the pre-spawn re-announce already fixed it.
+			expect(h.store.resolveCandidates(
+				resolveAgentContexts({ DSH_SESSION_ID: 'legacy-session' } as NodeJS.ProcessEnv),
+			)?.conversationId).toBe(bound.conversationId);
+			h.line({ type: 'session', sessionId: 'legacy-session', cwd: h.ws });
+			h.line({ type: 'final', text: 'again' });
+			h.line({ type: 'status', phase: 'turn_end', turn: 2, reason: { kind: 'completed' } });
+			h.finish();
+			await done;
+			expect(collected[collected.length - 1]).toEqual({ type: 'done', durationMs: expect.any(Number) });
+		});
 	});
 });
