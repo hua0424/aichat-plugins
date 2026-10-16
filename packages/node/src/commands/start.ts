@@ -10,6 +10,7 @@ import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/openco
 import { CodexDriver } from '../agent/codex/codex-driver.js';
 import { Codex } from '@openai/codex-sdk';
 import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import { DshHeadlessDriver } from '../agent/dsh/dsh-driver.js';
 import { CcBroker, ccBrokerPort } from '../agent/cc/broker.js';
 import { CcSessionRegistry, buildCcBridgeSink } from '../agent/cc/sink.js';
 import { FileCcTranscriptWriter } from '../agent/cc/transcript.js';
@@ -103,7 +104,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// #404: AICHAT_RUN_BIND is stripped from the base env (no inherited run value survives) and
 	// re-injected frozen per run by the driver via createCodex's runEnv.
 	const codexEnv = Object.fromEntries(Object.entries(process.env).filter(([name, value]) =>
-		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
+		value !== undefined && !['OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'DSH_SESSION_ID', 'AICHAT_RUN_BIND', 'AICHAT_CONTEXT_KEY', 'AICHAT_CC_RUN'].includes(name))) as Record<string, string>;
 	// #406: per-native-run binding files bridge the node driver and the gateway-side
 	// `before_tool_call` hook (native runId → frozen reply token). The gateway is an
 	// external process, so deploy-time gateway env must point `AICHAT_OPENCLAW_RUNBIND_DIR`
@@ -118,6 +119,11 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	// The session store persists (uid,room)→session_id for cross-turn/restart --resume.
 	const ccRegistry = new CcSessionRegistry();
 	const ccWorkspaceBase = join(AICHAT_HOME, 'cc', 'workspace');
+	// #418: DSH headless shares one home layout (~/.aichat/dsh/home by deploy) with per-identity
+	// conversation workspaces below; cwd == workspace per run. Deploy owns DSH_HOME — inherit
+	// here, never invent a second home. The driver itself strips sibling providers' env.
+	if (!process.env.DSH_HOME) process.env.DSH_HOME = join(AICHAT_HOME, 'dsh', 'home');
+	const dshWorkspaceBase = join(AICHAT_HOME, 'dsh', 'workspace');
 	// REQ-011 S3 (AC5/AC9): one shared per-room transcript writer (inbound + teed CC output), so the owner
 	// can read a headless CC turn's full session offline (~/.aichat/cc/transcripts/<binding>.jsonl).
 	const ccTranscript = new FileCcTranscriptWriter();
@@ -163,6 +169,10 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 				registerHook: (key, attempt, push) => ccRegistry.registerContext(key, attempt, push),
 				transcript: ccTranscript,
 			}) }],
+		['dsh', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'dsh', workspaceBase: dshWorkspaceBase,
+			context: nativeContext('dsh'),
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
+			create: () => new DshHeadlessDriver() }],
 	]);
 
 	const supervisor = new Supervisor({

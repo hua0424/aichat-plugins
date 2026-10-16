@@ -4,4 +4,5 @@ export const contextDescriptors = [
 	{ env: 'CODEX_THREAD_ID', provider: 'codex' },
 	{ env: 'OPENCLAW_BIND', provider: 'openclaw' },
 	{ env: 'AICHAT_BIND', provider: 'cc' },
+	{ env: 'DSH_SESSION_ID', provider: 'dsh' },
 ] as const;
