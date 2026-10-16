@@ -13,7 +13,7 @@ import { postCapability } from './client.js';
 
 /** Exercises actual CLI→IPC→core→capability routing, not a resolver stub. Upstream agent and HuLa E2E remain separate. */
 describe('four native driver bindings through real capability endpoint', () => {
-	const saved = Object.fromEntries(['AICHAT_CAPABILITY_SOCK', 'AICHAT_CONTEXT_KEY', 'OPENCLAW_BIND', 'AICHAT_BIND', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID']
+	const saved = Object.fromEntries(['AICHAT_CAPABILITY_SOCK', 'AICHAT_CONTEXT_KEY', 'OPENCLAW_BIND', 'AICHAT_BIND', 'DSH_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID']
 		.map((name) => [name, process.env[name]]));
 	let home: string | undefined;
 	let endpoint: CapabilityEndpoint | undefined;
@@ -57,7 +57,7 @@ describe('four native driver bindings through real capability endpoint', () => {
 			['OPENCLAW_BIND', openclaw], ['AICHAT_BIND', cc], ['CODEX_THREAD_ID', 'thread-303'],
 			['OPENCODE_SESSION_ID', 'session-404'],
 		]) {
-			for (const candidate of ['OPENCLAW_BIND', 'AICHAT_BIND', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID']) delete process.env[candidate];
+			for (const candidate of ['OPENCLAW_BIND', 'AICHAT_BIND', 'DSH_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCODE_SESSION_ID']) delete process.env[candidate];
 			process.env[name] = value;
 			await handleSendMessage(['--content', 'real IPC bridge']);
 		}

@@ -18,6 +18,7 @@ describe('resolveAgentSessionKey', () => {
 		CODEX_THREAD_ID: process.env.CODEX_THREAD_ID,
 		OPENCLAW_BIND: process.env.OPENCLAW_BIND,
 		AICHAT_BIND: process.env.AICHAT_BIND,
+		DSH_SESSION_ID: process.env.DSH_SESSION_ID,
 		AICHAT_CONTEXT_KEY: process.env.AICHAT_CONTEXT_KEY,
 	};
 
@@ -26,6 +27,7 @@ describe('resolveAgentSessionKey', () => {
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
 		delete process.env.AICHAT_BIND;
+		delete process.env.DSH_SESSION_ID;
 		delete process.env.AICHAT_CONTEXT_KEY;
 	});
 
@@ -75,12 +77,14 @@ describe('resolveAgentSessionKey', () => {
 		process.env.CODEX_THREAD_ID = 'thr_y';
 		process.env.OPENCLAW_BIND = 'opaque-openclaw';
 		process.env.AICHAT_BIND = 'opaque-cc';
+		process.env.DSH_SESSION_ID = 'session-dsh';
 		expect(resolveAgentContexts()).toEqual([
 			{ key: 'opaque-context' },
 			{ provider: 'opencode', nativeId: 'ses_x' },
 			{ provider: 'codex', nativeId: 'thr_y' },
 			{ provider: 'openclaw', nativeId: 'opaque-openclaw' },
 			{ provider: 'cc', nativeId: 'opaque-cc' },
+			{ provider: 'dsh', nativeId: 'session-dsh' },
 		]);
 	});
 });
@@ -88,11 +92,13 @@ describe('resolveAgentSessionKey', () => {
 describe('CLI write request ID', () => {
 	const originalBind = process.env.AICHAT_BIND;
 	const originalKey = process.env.AICHAT_CONTEXT_KEY;
+	const originalDsh = process.env.DSH_SESSION_ID;
 	beforeEach(() => {
 		delete process.env.AICHAT_CONTEXT_KEY;
 		delete process.env.OPENCODE_SESSION_ID;
 		delete process.env.CODEX_THREAD_ID;
 		delete process.env.OPENCLAW_BIND;
+		delete process.env.DSH_SESSION_ID;
 		process.env.AICHAT_BIND = 'opaque-token';
 	});
 	afterEach(() => {
@@ -100,6 +106,8 @@ describe('CLI write request ID', () => {
 		else process.env.AICHAT_BIND = originalBind;
 		if (originalKey === undefined) delete process.env.AICHAT_CONTEXT_KEY;
 		else process.env.AICHAT_CONTEXT_KEY = originalKey;
+		if (originalDsh === undefined) delete process.env.DSH_SESSION_ID;
+		else process.env.DSH_SESSION_ID = originalDsh;
 		vi.restoreAllMocks();
 	});
 
