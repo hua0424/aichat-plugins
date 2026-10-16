@@ -166,7 +166,84 @@ describe('DSH PreparedRun native execution', () => {
 			.toThrow('explicit reset required');
 	});
 
+	// #422: same-room multi-turn continuity, workspace-mismatch refusal, and
+	// reset-then-fresh through the driver's own persisted shape (no new
+	// production code — #421 already resumes via --session-id, rejects drift
+	// pre-spawn, and never deletes native history; these lock the behavior).
+	describe('#422 continue/reset', () => {
+		it('continues the same session across turns through its own persisted state', async () => {
+			const first = fixture();
+			const turn1 = await first.start();
+			first.line({ type: 'session', sessionId: 'session-continue', cwd: first.dir });
+			first.line({ type: 'final', text: 'round one' });
+			first.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			first.groupExit(); first.close(0);
+			await turn1.done;
+			expect(turn1.collected.at(-1)).toEqual({ type: 'done', durationMs: expect.any(Number) });
+			// Core persists exactly what registerNative stored; the next turn
+			// resumes it verbatim — same session id on the wire and in env.
+			const stored = first.nativelyRegistered[0].state as { version: number; value: unknown };
+			const second = fixture();
+			second.input.workspace = first.dir; // same room → same workspace
+			second.input.conversation.nativeState = { version: 1, value: (stored as { value: unknown }).value };
+			const turn2 = await second.start();
+			expect(second.spawnCalls[0].args).toEqual(
+				['--profile', 'headless', '--json', '--session-id', 'session-continue', '-']);
+			expect(second.spawnCalls[0].options.env.DSH_SESSION_ID).toBe('session-continue');
+			second.line({ type: 'session', sessionId: 'session-continue', cwd: first.dir });
+			second.line({ type: 'final', text: 'round two' });
+			second.line({ type: 'status', phase: 'turn_end', turn: 2, reason: { kind: 'completed' } });
+			second.groupExit(); second.close(0);
+			await turn2.done;
+			expect(turn2.collected.at(-1)).toEqual({ type: 'done', durationMs: expect.any(Number) });
+		});
+
+		it('rejects workspace drift and malformed state without spawning', async () => {
+			const moved = fixture();
+			moved.input.conversation.nativeState = { version: 1, value: { sessionId: 'historical-id',
+				workspace: '/some/other/dir', promptHash: promptHash('system instructions') } };
+			const movedRun = moved.driver.createRun(moved.input);
+			await expect((async () => { for await (const _ of movedRun.events); })()).rejects
+				.toThrow('explicit reset required');
+			expect(moved.spawnCalls.length).toBe(0);
+
+			const malformed = fixture();
+			malformed.input.conversation.nativeState = { version: 1, value: { workspace: malformed.dir } };
+			const malformedRun = malformed.driver.createRun(malformed.input);
+			await expect((async () => { for await (const _ of malformedRun.events); })()).rejects
+				.toThrow('explicit reset required');
+			expect(malformed.spawnCalls.length).toBe(0);
+		});
+
+		it('starts a fresh session after reset without re-announcing the old id', async () => {
+			const before = fixture();
+			const turn1 = await before.start();
+			before.line({ type: 'session', sessionId: 'session-old', cwd: before.dir });
+			before.line({ type: 'final', text: 'before reset' });
+			before.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			before.groupExit(); before.close(0);
+			await turn1.done;
+			// Core reset bumps the generation and clears nativeState/aliases; the
+			// next run carries no session, so no --session-id and no stale Alias.
+			// Old native history stays on dsh disk — the driver has no delete path.
+			const after = fixture();
+			const turn2 = await after.start();
+			expect(after.spawnCalls[0].args).toEqual(['--profile', 'headless', '--json', '-']);
+			expect(after.spawnCalls[0].options.env.DSH_SESSION_ID).toBeUndefined();
+			expect(after.aliased.length).toBe(0);
+			after.line({ type: 'session', sessionId: 'session-new', cwd: after.dir });
+			after.line({ type: 'final', text: 'after reset' });
+			after.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			after.groupExit(); after.close(0);
+			await turn2.done;
+			expect(turn2.collected.at(-1)).toEqual({ type: 'done', durationMs: expect.any(Number) });
+			expect(after.nativelyRegistered).toEqual([{ id: 'session-new', state: { version: 1, value: {
+				sessionId: 'session-new', workspace: after.dir, promptHash: promptHash('system instructions') } } }]);
+		});
+	});
+
 	it('an error line never terminates the run by itself; verdict comes from exit + turn_end', async () => {
+
 		const f = fixture();
 		const { collected, done } = await f.start();
 		f.line({ type: 'session', sessionId: 'session-1', cwd: f.dir });
