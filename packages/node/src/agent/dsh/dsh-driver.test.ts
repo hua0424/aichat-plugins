@@ -277,6 +277,59 @@ describe('DSH PreparedRun native execution', () => {
 			expect.objectContaining({ type: 'error', message: 'UNEXPECTED_EOF' }));
 	});
 
+	// #423: cancel is bounded (SIGTERM → SIGKILL → unconfirmed, never a false
+	// stopped) and a surviving process group never reports done — core pauses
+	// the session on the unconfirmed status; unpaired tool ends stay visible.
+	describe('#423 cancel/failure honest reporting', () => {
+		it('does not finish on close while a descendant survives; cancel stays unconfirmed', async () => {
+			const f = fixture();
+			const { run, collected, done } = await f.start();
+			f.line({ type: 'session', sessionId: 'session-1', cwd: f.dir });
+			f.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			f.close(0); // group still alive: no groupExit()
+			await done;
+			expect(collected).toEqual([{ type: 'cancelled', reason: 'DSH stop unconfirmed' }]);
+			expect(await run.cancel('probe')).toEqual(expect.objectContaining({ status: 'unconfirmed' }));
+			expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM');
+			expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGKILL');
+		});
+
+		it('confirms stop only on child close plus group exit, yielding honest cancelled', async () => {
+			const f = fixture();
+			const { run, collected, done } = await f.start();
+			const stop = run.cancel('reset');
+			f.groupExit();
+			await tick();
+			f.close(null);
+			expect(await stop).toEqual({ status: 'stopped' });
+			await done;
+			expect(collected).toEqual([{ type: 'cancelled', reason: 'DSH cancelled' }]);
+			expect(f.spawnCalls).toHaveLength(1);
+		});
+
+		it('first-event watchdog cannot turn a live process into a success', async () => {
+			const f = fixture({ firstEventTimeoutMs: 5, stopTimeoutMs: 40, killGraceMs: 5 });
+			const { collected, done } = await f.start();
+			await done;
+			expect(collected).toEqual([{ type: 'cancelled', reason: 'DSH stop unconfirmed' }]);
+			expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM');
+			expect(f.spawnCalls).toHaveLength(1);
+		});
+
+		it('keeps an unpaired tool end visible instead of dropping it', async () => {
+			const f = fixture();
+			const { collected, done } = await f.start();
+			f.line({ type: 'session', sessionId: 'session-1', cwd: f.dir });
+			f.line({ type: 'tool_result', status: 'completed', result: 'ok' });
+			f.line({ type: 'final', text: 'answer' });
+			f.line({ type: 'status', phase: 'turn_end', turn: 1, reason: { kind: 'completed' } });
+			f.groupExit(); f.close(0);
+			await done;
+			expect(collected).toContainEqual({ type: 'tool', name: 'unknown', phase: 'end' });
+			expect(collected.at(-1)).toEqual({ type: 'done', durationMs: expect.any(Number) });
+		});
+	});
+
 	it('rejects invalid prepared runs', () => {
 		const f = fixture();
 		expect(() => f.driver.createRun({ ...f.input, workspace: undefined })).toThrow('Invalid DSH prepared run');
