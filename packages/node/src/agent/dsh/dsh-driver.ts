@@ -13,6 +13,24 @@ export const DSH_EXPECTED_VERSION = '0.2.0-rc.2';
 /** Native env key carrying the DSH session id (mirrors OPENCODE_SESSION_ID / CODEX_THREAD_ID). */
 export const DSH_SESSION_ENV = 'DSH_SESSION_ID';
 
+/**
+ * #424 prompt-hash gate rejection (codex frozen-prompt analog): a persona or
+ * workspace change never silently drifts an old session — the pre-spawn gate
+ * rejects the turn and the owner resets explicitly (history retained, the
+ * driver has no delete path). The handler classifies this exact message to
+ * surface the user-facing reset notice (see isDshDriftGateError).
+ */
+export const DSH_DRIFT_GATE_MESSAGE =
+	'DSH native session invalid or persona/workspace mismatch; explicit reset required (history retained)';
+
+/**
+ * #424 handler-side classifier for the pre-spawn prompt-hash gate rejection.
+ * Kept next to the message so the two cannot drift apart.
+ */
+export function isDshDriftGateError(message: unknown): boolean {
+	return typeof message === 'string' && message.includes(DSH_DRIFT_GATE_MESSAGE);
+}
+
 interface ReadableStreamish {
 	on(event: 'data', listener: (chunk: Buffer | string) => void): void;
 	on(event: 'end' | 'close', listener: () => void): void;
@@ -176,7 +194,7 @@ class DshRun implements AgentRun {
 			!('sessionId' in previous) || typeof previous.sessionId !== 'string' || !previous.sessionId ||
 			('workspace' in previous && previous.workspace !== workspace) ||
 			('promptHash' in previous && previous.promptHash !== digest)))
-			throw new Error('DSH native session invalid or persona/workspace mismatch; explicit reset required (history retained)');
+			throw new Error(DSH_DRIFT_GATE_MESSAGE);
 		const sessionId = previous && typeof previous === 'object' && 'sessionId' in previous
 			? previous.sessionId as string : undefined;
 		// Accumulators for the lossless-final rule: final text is yielded only when it
