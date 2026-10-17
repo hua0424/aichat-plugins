@@ -444,4 +444,26 @@ describe('ConversationStore', () => {
 		expect(() => store.registerNative('codex', 'late', '11', '1', { threadId: 'late' })).toThrow('closed');
 		expect(store.resolveLegacy('codex:late')).toBeUndefined();
 	});
+
+	// #424: persona-change fan-out lists only rooms holding a live session of the provider.
+	it('roomsWithNativeSession returns only rooms with a string sessionId for the identity+provider', () => {
+		const root = home(), opts = active(root, { '11': 'dsh', '22': 'dsh', '33': 'codex' });
+		const store = new ConversationStore(opts);
+		const bound = store.beginRun('11', '9', 'run-1');
+		bound.saveNativeState('dsh', { sessionId: 'sess-1', promptHash: 'old' });
+		store.finishRun('run-1');
+		store.getOrCreate('11', '10'); // unbound: no native session, never notified
+		const other = store.beginRun('22', '9', 'run-2');
+		other.saveNativeState('dsh', { sessionId: 'sess-2', promptHash: 'old' });
+		store.finishRun('run-2');
+		const codexRoom = store.beginRun('33', '11', 'run-3');
+		codexRoom.saveNativeState('codex', { threadId: 'thread-1' });
+		store.finishRun('run-3');
+		expect(store.roomsWithNativeSession('11', 'dsh')).toEqual(['9']);
+		expect(store.roomsWithNativeSession('22', 'dsh')).toEqual(['9']);
+		expect(store.roomsWithNativeSession('11', 'cc')).toEqual([]);
+		expect(store.roomsWithNativeSession('nobody', 'dsh')).toEqual([]);
+		// codex binds by threadId, not sessionId — correctly absent from the sessionId-shaped listing
+		expect(store.roomsWithNativeSession('33', 'codex')).toEqual([]);
+	});
 });

@@ -182,6 +182,23 @@ export class ConversationStore {
 		return record ? copy(record) : undefined;
 	}
 
+	/**
+	 * #424: roomIds of one identity whose persisted native state binds a live
+	 * session of `provider` (string `sessionId` present). Used to notify the
+	 * related chatrooms when the persona behind the frozen prompt changes —
+	 * only bound rooms hold a stale session; unbound rooms build fresh next turn.
+	 */
+	roomsWithNativeSession(identityId: string, provider: Provider): string[] {
+		const rooms: string[] = [];
+		for (const record of this.snapshot.records) {
+			if (record.identityId !== identityId) continue;
+			const state = record.nativeState[provider];
+			if (state && typeof state === 'object' && 'sessionId' in state && typeof state.sessionId === 'string' && state.sessionId)
+				rooms.push(record.roomId);
+		}
+		return rooms;
+	}
+
 	/** Old OpenClaw records have no workspace locator: conservatively claim the global prompt
 	 * across conversations, including pending recovery retained after reset/restart. */
 	assertOpenclawPromptOwner(conversationId: string, identityId: string): void {

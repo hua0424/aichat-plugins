@@ -10,7 +10,7 @@ import { handleSendMessage } from './send-message.js';
 import { handleResetSession } from './reset-session.js';
 
 vi.mock('../capability/client.js', () => ({ postCapability: vi.fn() }));
-const saved = Object.fromEntries(['AICHAT_CONTEXT_KEY', 'OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'AICHAT_RUN_BIND']
+const saved = Object.fromEntries(['AICHAT_CONTEXT_KEY', 'OPENCODE_SESSION_ID', 'CODEX_THREAD_ID', 'OPENCLAW_BIND', 'AICHAT_BIND', 'DSH_SESSION_ID', 'AICHAT_RUN_BIND']
 	.map((key) => [key, process.env[key]]));
 const mocked = vi.mocked(postCapability);
 
