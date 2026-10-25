@@ -24,6 +24,50 @@ export interface HulaWSClientOptions {
 	pingIntervalMs?: number;
 	/** #152 距上次收到任意入站帧超过此阈值即判定半开、强制 terminate 触发重连（默认 60s）。 */
 	deadAfterMs?: number;
+	/**
+	 * #459 TCP/TLS 已建连但 upgrade 迟迟不结束时的等待预算（默认 10s）。
+	 *
+	 * 依据：同一 DC/内网的 upgrade 正常在 ms 级完成；既有事故证据（#152/#184）里的失败形态是
+	 * 立即 ECONNREFUSED 或网关 200/5xx，而不是慢握手，所以 10s 已能容忍网关启动期的 GC/Nacos
+	 * 注册抖动，同时保证一次恢复周期有界：最坏 10s 握手 + 5s body（见下）+ 最高 30s 退避。
+	 * 超时走 ws 的 'error'('Opening handshake has timed out') → 既有 'close' → backoff 重连，
+	 * 不新增重试框架。
+	 */
+	handshakeTimeoutMs?: number;
+	/**
+	 * #459 非 101 响应的 **body** 读取预算（默认 5s）。
+	 *
+	 * 依据：gateway 的错误包装 body（{success:false,code:406,…}）不足 1KB、单包即到；5s 是
+	 * 5× 单包 RTT/GC 余量。超时按「body 不完整」处理（见 classifyHandshakeFailure）：不拿截断
+	 * body 的业务 code 判 permanent，只允许 HTTP 状态码 401/403/406 短路，其余按 transient
+	 * 退避重试，避免 body 一直不结束时恢复链路永久悬挂（#459 复现候选之一）。
+	 */
+	handshakeBodyTimeoutMs?: number;
+	/** #459 重连退避起点（测试可注入小值；生产缺省 1000ms，曲线与既有实现一致）。 */
+	reconnectBaseDelayMs?: number;
+	/** #459 重连退避上限（测试可注入小值；生产缺省 30000ms，曲线与既有实现一致）。 */
+	maxReconnectDelayMs?: number;
+}
+
+/** #459 握手等待预算（见 HulaWSClientOptions.handshakeTimeoutMs 的依据）。 */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+/** #459 非 101 响应 body 读取预算（见 HulaWSClientOptions.handshakeBodyTimeoutMs 的依据）。 */
+const DEFAULT_HANDSHAKE_BODY_TIMEOUT_MS = 5_000;
+/** 既有重连曲线起点/上限（#459 只把它们变成可注入，数值与行为不变）。 */
+const DEFAULT_RECONNECT_BASE_DELAY_MS = 1_000;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
+
+/**
+ * #459 日志里的目标端点：去掉 userinfo/query/hash，只留 scheme://host/path。
+ * token/clientId 走 header 与 sub-protocol，但配置里的 URL 仍可能带凭据参数 —— 日志永不回显。
+ */
+function sanitizeEndpoint(raw: string): string {
+	try {
+		const u = new URL(raw);
+		return `${u.protocol}//${u.host}${u.pathname}`;
+	} catch {
+		return '<unparsable-url>';
+	}
 }
 
 /**
@@ -36,9 +80,16 @@ export class HulaWSClient {
 	private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private watchdogTimer: ReturnType<typeof setInterval> | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-	private reconnectDelay = 1000;
-	private maxReconnectDelay = 30000;
+	private reconnectDelay: number;
+	private readonly maxReconnectDelay: number;
 	private closed = false;
+	/** #459 目标端点（已去凭据）与连接代次，二者只用于可归属的恢复日志。 */
+	private readonly endpoint: string;
+	private connectAttempt = 0;
+	/** #459 close() 代次，用于丢弃「停止之后才回来」的异步分类结果。 */
+	private stopEpoch = 0;
+	private readonly handshakeTimeoutMs: number;
+	private readonly handshakeBodyTimeoutMs: number;
 	/** #152 上次收到任意入站帧（open/pong/message）的时刻；看门狗据此判定半开。 */
 	private lastAliveAt = 0;
 	private readonly pingIntervalMs: number;
@@ -58,6 +109,11 @@ export class HulaWSClient {
 	constructor(options: HulaWSClientOptions) {
 		this.options = options;
 		this.pingIntervalMs = options.pingIntervalMs ?? 30000;
+		this.reconnectDelay = options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS;
+		this.maxReconnectDelay = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
+		this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+		this.handshakeBodyTimeoutMs = options.handshakeBodyTimeoutMs ?? DEFAULT_HANDSHAKE_BODY_TIMEOUT_MS;
+		this.endpoint = sanitizeEndpoint(options.url);
 		let deadAfterMs = options.deadAfterMs ?? 60000;
 		// P1-5: deadAfterMs must exceed pingIntervalMs, otherwise the watchdog declares
 		// the connection dead before a single ping round-trip can refresh liveness —
@@ -85,18 +141,31 @@ export class HulaWSClient {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
-		console.log(`[hula-ws] Connecting to ${this.options.url}...`);
+		const previous = this.ws;
+		// #459 上一代握手分类未定就换连接：旧代次的收口必须作废，不能作用到新连接。
+		this.handshakeFailurePending = false;
+		this.connectAttempt += 1;
+		this.log('connecting', `attempt=${this.connectAttempt}`);
 
 		// CR-M1: token 走 header，clientId 走 sub-protocol，不再暴露在 URL query 中
-		this.ws = new WebSocket(
+		// #459 handshakeTimeout：TCP 已建连但 upgrade 不结束时由 ws 自己 abort（'Opening handshake
+		// has timed out'），落回既有 'error' → 'close' → backoff 重连，不新增重试框架。
+		const ws = new WebSocket(
 			this.options.url,
 			['aiclaw-v1', `clientId_${this.options.clientId}`],
-			{ headers: { 'Token': this.options.token } }
+			{ headers: { 'Token': this.options.token }, handshakeTimeout: this.handshakeTimeoutMs }
 		);
+		this.ws = ws;
 
-		this.ws.on('open', () => {
-			console.log('[hula-ws] Connected');
-			this.reconnectDelay = 1000;
+		// #459 代次守卫：旧 socket 的任何迟到事件（open/message/pong/close/error/握手响应）都不得
+		// 触碰当前连接 —— 否则旧 'close' 会停掉新连接的心跳、旧 'message' 会重复投递、旧响应
+		// 会把当前连接判成 permanent。事件处理只在 ws 仍是 this.ws 时生效。
+		const isCurrent = (): boolean => this.ws === ws;
+
+		ws.on('open', () => {
+			if (!isCurrent()) return;
+			this.log('connected', `attempt=${this.connectAttempt}`);
+			this.reconnectDelay = this.options.reconnectBaseDelayMs ?? DEFAULT_RECONNECT_BASE_DELAY_MS;
 			// #184 a successful connect resets the transient-handshake counter so a later burst
 			// after recovery does not false-alarm the threshold WARN.
 			this.transientHandshakeCount = 0;
@@ -110,16 +179,19 @@ export class HulaWSClient {
 		// non-101 status. Registering this listener suppresses ws's fallback 'error' emit for
 		// handshake failures (ws@8.19 verified), so ALL handshake classification lives here now.
 		// res is the http.IncomingMessage — statusCode is sync; body chunks arrive via 'data'/'end'.
-		this.ws.on('unexpected-response', (_req, res) => {
-			this.handleHandshakeFailure(res);
+		ws.on('unexpected-response', (_req, res) => {
+			if (!isCurrent()) return;
+			this.handleHandshakeFailure(ws, res);
 		});
 
 		// #152 ws 协议层 pong（对我们主动 ping 的回应）证明本端 socket 仍活
-		this.ws.on('pong', () => {
+		ws.on('pong', () => {
+			if (!isCurrent()) return;
 			this.lastAliveAt = Date.now();
 		});
 
-		this.ws.on('message', (data) => {
+		ws.on('message', (data) => {
+			if (!isCurrent()) return;
 			// #152 任意入站帧都证明连接存活，避免慢速但正常的流量被误杀
 			this.lastAliveAt = Date.now();
 			try {
@@ -130,8 +202,9 @@ export class HulaWSClient {
 			}
 		});
 
-		this.ws.on('close', (code, reason) => {
-			console.log(`[hula-ws] Disconnected: code=${code}, reason=${reason.toString()}`);
+		ws.on('close', (code, reason) => {
+			if (!isCurrent()) return;
+			this.log('disconnected', `code=${code} reason=${reason.toString()}`);
 			this.stopHeartbeat();
 			this.stopWatchdog();
 			this.options.onDisconnected?.();
@@ -144,16 +217,25 @@ export class HulaWSClient {
 			this.scheduleReconnect();
 		});
 
-		this.ws.on('error', (err) => {
-			console.error('[hula-ws] Error:', err.message);
+		ws.on('error', (err) => {
+			if (!isCurrent()) return;
+			console.error(`[hula-ws] uid=${this.options.uid ?? '?'} stage=disconnected endpoint=${this.endpoint} Error: ${err.message}`);
 			// P1-2 + #184: any WS error means this connection is going down — stop the liveness
 			// timers so no interval survives on a dead/erroring socket. Handshake (non-101) failures
 			// are now handled by 'unexpected-response' (registering that listener suppresses ws's
 			// fallback 'error' for handshakes in ws@8.19+), so this handler only sees transport-level
-			// errors (ECONNRESET/ECONNREFUSED/etc.). The follow-up 'close'(1006) drives scheduleReconnect.
+			// errors (ECONNRESET/ECONNREFUSED/handshake timeout/etc.). The follow-up 'close'(1006)
+			// drives scheduleReconnect.
 			this.stopHeartbeat();
 			this.stopWatchdog();
 		});
+
+		// #459 一个身份同一时刻只保留一个当前连接：新 socket 就位后再 terminate 上一代，
+		// 使上一代的迟到事件因代次不匹配被丢弃（旧实现会让两个连接短暂并行服务同一身份）。
+		if (previous && previous !== ws && previous.readyState !== WebSocket.CLOSED) {
+			this.log('retrying', 'terminating superseded socket before new attempt');
+			previous.terminate();
+		}
 	}
 
 	/**
@@ -165,8 +247,12 @@ export class HulaWSClient {
 	 * HTTP 200 + JSON body {success:false,code:406,msg:"token已过期"}；旧实现只从 'error' 的
 	 * err.message 解析 "Unexpected server response: 200"，把 200 当 transient rewarm 无限重试
 	 * （生产 codex 静默重试 43 分钟）。这里读 body 拿业务 code 来区分 permanent / transient。
+	 *
+	 * #459 body 读取有界：旧实现完全依赖 'end'/'error'；网关把响应头发完却永不结束 body 时，
+	 * handshakeFailurePending 永久为 true → 'close' 永不重连 → 恢复链路永久悬挂。超时后按
+	 * 「body 不完整」分类（partial body 不可信，只允许 HTTP 状态码短路 permanent），再走既有 transient 路径。
 	 */
-	private handleHandshakeFailure(res: IncomingMessage): void {
+	private handleHandshakeFailure(ws: WebSocket, res: IncomingMessage): void {
 		const statusCode = res.statusCode ?? 0;
 		// 握手失败的 socket 已废，立刻停活性定时器（与 'close' 路径一致）。
 		this.stopHeartbeat();
@@ -175,18 +261,34 @@ export class HulaWSClient {
 
 		const chunks: Buffer[] = [];
 		let classified = false;
-		const classifyOnce = (): void => {
+		let bodyTimer: ReturnType<typeof setTimeout> | null = null;
+		const classifyOnce = (bodyComplete: boolean, how: string): void => {
 			if (classified) return;
 			classified = true;
+			if (bodyTimer) {
+				clearTimeout(bodyTimer);
+				bodyTimer = null;
+			}
 			const bodyText = Buffer.concat(chunks).toString('utf8');
-			void this.classifyHandshakeFailure(statusCode, bodyText, res).catch((e) =>
+			if (!bodyComplete) {
+				console.warn(
+					`[hula-ws] uid=${this.options.uid ?? '?'} stage=handshake endpoint=${this.endpoint} ` +
+						`http=${statusCode} body incomplete (${how}) — classification uses http status only`,
+				);
+			}
+			void this.classifyHandshakeFailure(ws, statusCode, bodyText, res, bodyComplete).catch((e) =>
 				console.error('[hula-ws] classifyHandshakeFailure failed:', e),
 			);
 		};
+		bodyTimer = setTimeout(() => classifyOnce(false, `no body end within ${this.handshakeBodyTimeoutMs}ms`), this.handshakeBodyTimeoutMs);
+		// body 定时器不应阻止进程退出（与既有 heartbeat/重连定时器不同：它只等待收尾，不承担业务）。
+		bodyTimer.unref?.();
 		res.on('data', (c: Buffer) => chunks.push(c));
-		res.on('end', classifyOnce);
-		// 响应体读取异常（截断等）→ 用已收到的部分（可能为空）按 transient 分类，不阻塞重连。
-		res.on('error', classifyOnce);
+		res.on('end', () => classifyOnce(true, 'end'));
+		// 响应体读取异常（截断等）→ 用已收到的部分按 transient 分类，不阻塞重连。
+		res.on('error', () => classifyOnce(false, 'body error'));
+		// 连接在 body 读完前被 abort 时 IncomingMessage 只 emit 'aborted'，不保证 'end'。
+		res.on('aborted', () => classifyOnce(false, 'aborted'));
 	}
 
 	/**
@@ -199,13 +301,30 @@ export class HulaWSClient {
 	 * #184(b) P2:读完 body、分类后调 res.socket?.destroy() 释放底层 socket（防泄漏）；
 	 * transient 分支显式调 onDisconnected?.()——握手失败瞬态窗口里 supervisor 不能虚报 online。
 	 * permanent 分支走 onAuthError→degrade 不受影响。
+	 *
+	 * #459 收口守卫：body 读取期间可能已经换过代次（重连成功）或已 close()（supervisor 停止/
+	 * degrade）。旧代次的迟到分类必须只做资源清理，不得触碰当前状态——否则迟到 permanent 会把
+	 * 重新健康的连接永久断路（而不是停止实例），迟到 transient 会给新连接再排一个重连定时器。
+	 * body 不完整（超时/abort/读错误）时不得用截断 body 的业务 code 判 permanent，只承认 HTTP 状态码。
 	 */
 	private async classifyHandshakeFailure(
+		ws: WebSocket,
 		statusCode: number,
 		bodyText: string,
 		res: IncomingMessage,
+		bodyComplete: boolean,
 	): Promise<void> {
 		const uid = this.options.uid ?? '?';
+		// 兜底释放底层 socket（各路径都可能在分类前后被 close/换代）。
+		res.socket?.destroy();
+		if (this.ws !== ws || this.closed) {
+			this.log(
+				this.closed ? 'stopped' : 'retrying',
+				`ignoring late handshake result http=${statusCode} from superseded connection`,
+			);
+			// 旧代次的 pending 闸门已不属于当前状态，只有当前连接才解除（connect() 换代会重置它）。
+			return;
+		}
 		// 分类一旦落定，解除 'close' 的 pending 闸门。
 		this.handshakeFailurePending = false;
 
@@ -213,7 +332,7 @@ export class HulaWSClient {
 		// Note: 用具名类型而非 `as typeof biz` —— 后者会被控制流分析窄化成 `null`。
 		type BizError = { success?: unknown; code?: unknown; msg?: unknown };
 		let biz: BizError | null = null;
-		if (bodyText) {
+		if (bodyComplete && bodyText) {
 			try {
 				const p = JSON.parse(bodyText);
 				if (p && typeof p === 'object') biz = p as BizError;
@@ -233,17 +352,14 @@ export class HulaWSClient {
 			PERMANENT_HTTP_STATUSES.has(String(statusCode)) ||
 			(bodyBizCode !== null && PERMANENT_BIZ_CODES.has(bodyBizCode));
 
-		// #184(b) P2a:body 已读完、分类已定，释放底层 socket（防泄漏）。res 是 IncomingMessage，
-		// socket 可选链；body 已收完，destroy 不影响分类。
-		res.socket?.destroy();
-
 		if (permanent) {
 			const bizCode = bodyBizCode !== null ? String(bodyBizCode) : '';
 			const bizMsg = biz && typeof biz.msg === 'string' ? biz.msg : '';
 			const bodySnip = bodyText.slice(0, 200);
 			// manager 裁决：WARN 级以上上报，含身份 uid + http status + 业务 code + msg（静默 43 分钟的教训）。
+			// #459 追加 stage/endpoint：恢复链路的每条日志都能定位到「哪个身份、打哪个端点、卡在哪一步」。
 			console.warn(
-				`[hula-ws] Permanent handshake failure uid=${uid} http=${statusCode}` +
+				`[hula-ws] Permanent handshake failure uid=${uid} stage=handshake endpoint=${this.endpoint} http=${statusCode}` +
 					(bizCode ? ` bizCode=${bizCode}` : '') +
 					(bizMsg ? ` msg=${bizMsg}` : '') +
 					(bodyText ? ` body=${bodySnip}` : '') +
@@ -255,10 +371,13 @@ export class HulaWSClient {
 				clearTimeout(this.reconnectTimer);
 				this.reconnectTimer = null;
 			}
+			const stopEpoch = this.stopEpoch;
 			if (this.options.onAuthError) {
 				try {
 					const canRetry = await this.options.onAuthError();
-					if (canRetry) {
+					// #459 onAuthError 期间实例可能已被 close() 停掉、或已经换了新代次——不得把
+					// 已停止的实例拉回重连，也不得替新连接再排一个定时器。
+					if (canRetry && this.stopEpoch === stopEpoch && this.ws === ws) {
 						// 上层刷新了凭据 → 解除断路、回到 backoff 重连（保留旧 401+refresh 语义）。
 						this.closed = false;
 						this.scheduleReconnect();
@@ -276,10 +395,10 @@ export class HulaWSClient {
 		const count = this.transientHandshakeCount;
 		const threshold = HulaWSClient.TRANSIENT_HANDSHAKE_WARN_THRESHOLD;
 		console.warn(
-			`[hula-ws] Transient handshake failure uid=${uid} http=${statusCode}` +
+			`[hula-ws] uid=${uid} stage=handshake endpoint=${this.endpoint} http=${statusCode}` +
 				` count=${count}/${threshold}` +
 				(bodyText ? ` body=${bodyText.slice(0, 120)}` : ' body=<empty>') +
-				' — will retry via backoff',
+				' — transient handshake failure, will retry via backoff',
 		);
 		if (count >= threshold) {
 			console.warn(
@@ -306,11 +425,16 @@ export class HulaWSClient {
 
 	close(): void {
 		this.closed = true;
+		// #459 stop 代次：异步分类（等 body / 等 onAuthError）回来时据此判断「实例已被停掉」，
+		// 不得把已停止的实例重新排上重连定时器。
+		this.stopEpoch += 1;
 		this.stopHeartbeat();
 		this.stopWatchdog();
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
 		}
+		this.log('stopped', 'closed by caller — reconnect disabled');
 		this.ws?.close();
 	}
 
@@ -365,17 +489,32 @@ export class HulaWSClient {
 		}
 	}
 
+	/**
+	 * #459 恢复链路的统一日志：uid + stage + endpoint + 细节。
+	 * 旧日志只有 '[hula-ws] Reconnecting in …' 之类的无归属行，多身份/多端点时无法判断是谁在恢复；
+	 * 事故复盘（#152 静默 43 分钟）要求每条恢复日志都能归属到身份与阶段。
+	 */
+	private log(stage: string, detail?: string): void {
+		console.log(
+			`[hula-ws] uid=${this.options.uid ?? '?'} stage=${stage} endpoint=${this.endpoint}` +
+				(detail ? ` ${detail}` : ''),
+		);
+	}
+
 	private scheduleReconnect(): void {
+		// #459 已停止的实例不得再排重连（close()/degrade 之后迟到的 close/分类事件会走到这里）。
+		if (this.closed) return;
 		// P1-4: only ONE reconnect pending at a time. Two 'close'/error events (or
 		// error + close) could otherwise stack parallel reconnect timers.
 		if (this.reconnectTimer) {
 			return;
 		}
-		console.log(`[hula-ws] Reconnecting in ${this.reconnectDelay}ms...`);
+		const delay = this.reconnectDelay;
+		this.log('retrying', `in ${delay}ms`);
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
 			this.connect();
-		}, this.reconnectDelay);
+		}, delay);
 		this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
 	}
 }

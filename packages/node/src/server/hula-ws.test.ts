@@ -554,14 +554,19 @@ describe('HulaWSClient handshake 200 circuit breaker (#184)', () => {
 		const { client, ws } = makeClient({ uid: 'u-7' });
 		ws.emit('open');
 
+		// #459 每次重连都是新一代 socket：后续失败必须打在**当前**连接上。旧 mock 的迟到事件
+		// 会被代次守卫丢弃（这是「旧连接的迟到事件不得干扰新连接」的同一语义），所以每轮都要
+		// 重新取最新实例，否则计数不会累加。
+		let current = ws;
 		// default threshold is 10
 		for (let i = 0; i < 10; i++) {
 			const res = mockRes(502, '');
-			ws.emit('unexpected-response', {}, res);
+			current.emit('unexpected-response', {}, res);
 			res.fire();
-			ws.emit('close', 1006, Buffer.from('bad-gw'));
+			current.emit('close', 1006, Buffer.from('bad-gw'));
 			// advance past the backoff so the next attempt's ws is the current one
 			vi.advanceTimersByTime(1000 << i > 30000 ? 30000 : 1000 << i);
+			current = hoisted.instances[hoisted.instances.length - 1] as MockWs;
 		}
 
 		const logged = warn.mock.calls.flat().join(' ');
@@ -579,30 +584,33 @@ describe('HulaWSClient handshake 200 circuit breaker (#184)', () => {
 		const { ws } = makeClient({ uid: 'u-9' });
 		ws.emit('open');
 
-		// 3 transient failures (below threshold of 10)
+		// 3 transient failures (below threshold of 10) — each on the live generation (#459)
+		let current = ws;
 		for (let i = 0; i < 3; i++) {
 			const res = mockRes(503, '');
-			ws.emit('unexpected-response', {}, res);
+			current.emit('unexpected-response', {}, res);
 			res.fire();
-			ws.emit('close', 1006, Buffer.from('unavail'));
+			current.emit('close', 1006, Buffer.from('unavail'));
 			vi.advanceTimersByTime(Math.min(1000 << i, 30000));
+			current = hoisted.instances[hoisted.instances.length - 1] as MockWs;
 		}
 
 		// a fresh connect succeeds → 'open' resets the transient counter
-		const recovered = hoisted.instances[hoisted.instances.length - 1] as MockWs;
-		recovered.emit('open');
+		current.emit('open');
 		warn.mockClear();
 
 		// now another 3 transient failures (post-reset) — below threshold, no alert
 		for (let i = 0; i < 3; i++) {
 			const res = mockRes(503, '');
-			recovered.emit('unexpected-response', {}, res);
+			current.emit('unexpected-response', {}, res);
 			res.fire();
-			recovered.emit('close', 1006, Buffer.from('unavail'));
+			current.emit('close', 1006, Buffer.from('unavail'));
 			vi.advanceTimersByTime(Math.min(1000 << i, 30000));
+			current = hoisted.instances[hoisted.instances.length - 1] as MockWs;
 		}
 
 		const logged = warn.mock.calls.flat().join(' ');
+		expect(logged).toContain('count='); // classification really ran (guards against a vacuous pass)
 		expect(logged).not.toContain('suspected gateway');
 	});
 
@@ -887,5 +895,137 @@ describe('HulaWSClient handshake whitelist (#184b P1 — gateway real shapes)', 
 		// does not call it (contrast with the transient branch, which does)
 		ws.emit('close', 1006, Buffer.from('auth-fatal'));
 		expect(onDisconnected).toHaveBeenCalled(); // fires once via the close handler, not from classify
+	});
+});
+
+// #459 connection generations. Every retry must be a NEW socket, and nothing belonging to an
+// old socket may steer the current one: a late 'close' must not stop the new heartbeat or stack
+// another reconnect timer, a late 'message' must not be re-delivered, and a late handshake
+// classification (body read asynchronously!) must not circuit-break or re-schedule the live
+// connection. Real-socket coverage lives in hula-ws-reconnect.test.ts; these are the races.
+describe('HulaWSClient connection generations (#459)', () => {
+	beforeEach(() => {
+		hoisted.instances.length = 0;
+	});
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it('reconnect creates a new socket and terminates the superseded one', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client } = makeClient();
+		const ws1 = hoisted.instances[0] as MockWs;
+		ws1.emit('open');
+
+		client.connect();
+		const ws2 = hoisted.instances[1] as MockWs;
+		expect(hoisted.instances.length).toBe(2);
+		expect(ws1.terminate).toHaveBeenCalledTimes(1);
+		expect(client.isConnected).toBe(true); // ws2 is the live one
+	});
+
+	it('late close/message from the superseded socket must not disturb the new connection', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client, onMessage, onDisconnected } = makeClient();
+		const ws1 = hoisted.instances[0] as MockWs;
+		ws1.emit('open');
+		client.connect();
+		const ws2 = hoisted.instances[1] as MockWs;
+		ws2.emit('open');
+		onMessage.mockClear();
+		onDisconnected.mockClear();
+
+		// 旧连接迟到的入站帧/关闭事件
+		ws1.emit('message', Buffer.from(JSON.stringify({ type: 'receiveMessage', data: { msgId: 'old' } })));
+		ws1.emit('close', 1006, Buffer.from('stale'));
+
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(onDisconnected).not.toHaveBeenCalled();
+		expect(client.isConnected).toBe(true);
+
+		// 新连接的心跳仍在跑（旧 close 没有 stopHeartbeat 到新连接）；同时喂 pong 免得看门狗把它当半开
+		ws2.send.mockClear();
+		for (let t = 0; t < 25000; t += 1000) {
+			ws2.emit('pong');
+			vi.advanceTimersByTime(1000);
+		}
+		expect(ws2.send).toHaveBeenCalled();
+	});
+
+	it('late permanent handshake result for a superseded socket must not circuit-break the live one', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws1 = hoisted.instances[0] as MockWs;
+		ws1.emit('open');
+
+		// 旧连接的 body 还没读完就换代了
+		const res1 = mockRes(200, JSON.stringify({ success: false, code: 406, msg: 'token已过期' }));
+		ws1.emit('unexpected-response', {}, res1);
+		client.connect();
+		const ws2 = hoisted.instances[1] as MockWs;
+		ws2.emit('open');
+
+		// 旧 body 迟到落定 → 必须被丢弃
+		res1.fire();
+		expect(client.closed).toBe(false);
+		expect(onAuthError).not.toHaveBeenCalled();
+		expect(client.isConnected).toBe(true);
+	});
+
+	it('late transient handshake result for a superseded socket must not schedule an extra reconnect', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client } = makeClient();
+		const ws1 = hoisted.instances[0] as MockWs;
+		ws1.emit('open');
+
+		const res1 = mockRes(503, '');
+		ws1.emit('unexpected-response', {}, res1);
+		client.connect();
+		const ws2 = hoisted.instances[1] as MockWs;
+		ws2.emit('open');
+
+		res1.fire();
+		// 只推进到 base 退避（1000ms）之上、ws2 看门狗 deadAfterMs(3000) 之下：
+		// 旧连接若真排了重连，这里就会多出一代。
+		vi.advanceTimersByTime(2000);
+		expect(hoisted.instances.length).toBe(2);
+	});
+
+	it('close() while a handshake body is pending → late result cannot revive the stopped instance', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const onAuthError = vi.fn(async () => false);
+		const { client } = makeClient({ onAuthError });
+		const ws = hoisted.instances[0] as MockWs;
+		ws.emit('open');
+
+		const res = mockRes(200, JSON.stringify({ success: false, code: 406, msg: 'token已过期' }));
+		ws.emit('unexpected-response', {}, res);
+		client.close();
+		res.fire();
+
+		expect(client.closed).toBe(true);
+		expect(onAuthError).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(60000);
+		expect(hoisted.instances.length).toBe(1); // 停止后绝不重连
+	});
+
+	it('close() then a late close event → no reconnect is scheduled', () => {
+		vi.useFakeTimers();
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const { client } = makeClient();
+		const ws = hoisted.instances[0] as MockWs;
+		ws.emit('open');
+
+		client.close();
+		ws.emit('close', 1006, Buffer.from('late'));
+		vi.advanceTimersByTime(60000);
+		expect(hoisted.instances.length).toBe(1);
 	});
 });
