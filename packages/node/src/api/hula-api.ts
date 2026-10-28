@@ -171,6 +171,49 @@ export class HulaApiClient {
 	}
 
 	/**
+	 * aichatoverview#484 (T3): aiclaw 群配置的「当前事实」读。
+	 *
+	 * 与 {@link getGroupConfig} 的差别：server 端 `/current` 绕开 Redis 配置缓存并做一致读，
+	 * 返回显式 outcome，使下面三种情况不再混为一个 `{}`：
+	 *   - `PRESENT` + `configured=false` → 无配置行的合法默认（approved 视为 false）；
+	 *   - `PRESENT` + `configured=true` → 真实配置行（含显式 approved/workspaceDir）；
+	 *   - `NOT_ACCESSIBLE` → 群不存在/已解散/自己不在群/助理已退群，调用方应精准停用该 room。
+	 * 异常（超时/5xx/格式错）照常抛出，**不**降级成 NOT_ACCESSIBLE。
+	 */
+	async getGroupConfigCurrent(
+		aiclawUid: string,
+		roomId: string,
+	): Promise<
+		| { outcome: 'PRESENT'; configured: boolean; config: Record<string, unknown> }
+		| { outcome: 'NOT_ACCESSIBLE' }
+	> {
+		const resp = await this.get(
+			`/api/im/aiclaw/group/config/current?aiclawUid=${aiclawUid}&roomId=${roomId}`,
+		);
+		const data = resp.data as Record<string, unknown> | undefined | null;
+		if (!data || typeof data !== 'object') {
+			// 形状不对是真实错误，不能当作「无配置」放行
+			throw new Error('aiclaw group config current: 响应缺少 data');
+		}
+		const outcome = data.outcome;
+		if (outcome === 'NOT_ACCESSIBLE') {
+			return { outcome: 'NOT_ACCESSIBLE' };
+		}
+		if (outcome !== 'PRESENT') {
+			throw new Error(`aiclaw group config current: 未知 outcome ${String(outcome)}`);
+		}
+		const config = data.config;
+		if (!config || typeof config !== 'object') {
+			throw new Error('aiclaw group config current: PRESENT 缺少 config');
+		}
+		return {
+			outcome: 'PRESENT',
+			configured: data.configured === true,
+			config: config as Record<string, unknown>,
+		};
+	}
+
+	/**
 	 * 获取 aiclaw 群配置
 	 */
 	async getGroupConfig(aiclawUid: string, roomId: string): Promise<Record<string, unknown>> {
@@ -189,6 +232,8 @@ export class HulaApiClient {
 			respondToAi?: number;
 			rateLimitPerMinute?: number;
 			dailyLimit?: number;
+			/** aichatoverview#484: explicit approval (0/1). 缺省按未批准处理。 */
+			approved?: number;
 			/** REQ-009 #85: owner-configured absolute host workspace path (empty/absent → derive default). */
 			workspaceDir?: string;
 			/** REQ-009 #85: the group's human-readable group number ("groupkey"). */
@@ -203,6 +248,7 @@ export class HulaApiClient {
 			respondToAi: item.respondToAi === undefined ? undefined : Number(item.respondToAi),
 			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
 			dailyLimit: item.dailyLimit === undefined ? undefined : Number(item.dailyLimit),
+			approved: item.approved === undefined || item.approved === null ? undefined : Number(item.approved),
 			// REQ-009 #85: server serializes these under exactly these names. Use `== null` to catch
 			// BOTH JSON null (workspace_dir 默认 NULL) AND undefined — else String(null) → the literal
 			// string "null", which deriveWorkspaceDir treats as an absolute override and feeds opencode

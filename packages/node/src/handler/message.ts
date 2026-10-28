@@ -258,6 +258,10 @@ export class MessageHandler {
 	// REQ-004 M3: 防循环守卫 + 群配置缓存
 	private antiLoopGuard: AntiLoopGuard;
 	private groupConfigCache: GroupConfigCache;
+	// aichatoverview#484: 同 room 配置当前读单飞（避免提示风暴叠加请求）
+	private configRefreshInFlight = new Map<string, Promise<void>>();
+	// aichatoverview#484: 读期间又到提示 → 允许再补跑一轮，但不无限追
+	private configRefreshTrailing = new Set<string>();
 
 	// REQ-004 M3: 内嵌 HulaApiClient（仅用于 autoReply / CLI）
 	private apiClient: HulaApiClient | null = null;
@@ -1118,6 +1122,8 @@ export class MessageHandler {
 				respondToAi: Boolean(item.respondToAi),
 				rateLimitPerMinute: item.rateLimitPerMinute ?? 0,
 				dailyLimit: item.dailyLimit ?? 0,
+				// aichatoverview#484: 显式 approved；缺省按未批准（不因字段缺失放行）
+				approved: Number(item.approved ?? 0) === 1,
 				// REQ-009 #85: carry owner workspace override + groupkey through the cache.
 				workspaceDir: item.workspaceDir,
 				account: item.account,
@@ -1197,17 +1203,79 @@ export class MessageHandler {
 			this.sendNotice(roomId, DSH_PERSONA_CHANGED_NOTICE);
 	}
 
-	/** M3: 群配置变更通知处理 */
+	/**
+	 * M3: 群配置变更通知处理。
+	 *
+	 * aichatoverview#484 (T3)：通知只作「可能过期」提示，**不再直接应用载荷**。
+	 * 旧包/乱序提示会把已批准的 approved、已撤销的 workspaceDir 覆盖回旧值，而插件无法判断版本。
+	 * 因此这里只 {@link GroupConfigCache.markStale} 并触发一次有界当前读（{@link refreshGroupConfig}）。
+	 */
 	private handleGroupConfigChange(data: GroupConfigChangeDTO): void {
 		// REQ-029 (#29): compare/store ids as opaque strings (inbound may be numeric string or number).
 		if (String(data.aiclawUid) !== this.selfUid) return;
-		// REQ-009 #85: workspaceDir rides inside config; account rides on the outer message.
-		this.groupConfigCache.set(this.selfUid, String(data.roomId), {
-			...data.config,
-			workspaceDir: data.config.workspaceDir,
-			account: data.account,
+		const roomId = String(data.roomId);
+		this.groupConfigCache.markStale(this.selfUid, roomId);
+		void this.refreshGroupConfig(roomId).catch((err) => {
+			// 保留上次读到的值并保持 stale；下一轮提示/重连仍有机会重试
+			console.warn(`[config] refresh failed roomId=${roomId} err=${errMsg(err)}`);
 		});
-		console.log(`[config] update roomId=${data.roomId} rateLimit=${data.config.rateLimitPerMinute} respondToAi=${data.config.respondToAi}`);
+	}
+
+	/**
+	 * aichatoverview#484 (T3)：读一次 (aiclaw, room) 的当前配置事实。
+	 *
+	 * 有界性：同一 room 单飞（{@link configRefreshInFlight}），提示风暴不会叠加并发请求；
+	 * 代次不符的慢响应直接丢弃，不让旧快照盖回更新的事实；读期间又收到提示时最多再补跑一轮
+	 * （{@link configRefreshTrailing}），避免「读一半的旧结果被丢 → 一直停在 stale」但不无限追。
+	 * NOT_ACCESSIBLE 精准停用该 room，不波及其它 room 的合法缓存。
+	 */
+	private refreshGroupConfig(roomId: string): Promise<void> {
+		if (!this.apiClient) return Promise.resolve();
+		const existing = this.configRefreshInFlight.get(roomId);
+		if (existing) return existing;
+		const task = this.readGroupConfigOnce(roomId)
+			.catch((err) => {
+				// 保留上次读到的值并保持 stale；下一轮提示/重连仍有机会重试
+				console.warn(`[config] refresh failed roomId=${roomId} err=${errMsg(err)}`);
+			})
+			.finally(() => {
+				this.configRefreshInFlight.delete(roomId);
+				if (!this.groupConfigCache.isStale(this.selfUid, roomId)) return;
+				if (this.configRefreshTrailing.has(roomId)) return;
+				this.configRefreshTrailing.add(roomId);
+				void this.refreshGroupConfig(roomId).finally(() => this.configRefreshTrailing.delete(roomId));
+			});
+		this.configRefreshInFlight.set(roomId, task);
+		return task;
+	}
+
+	/** 单次当前读：不发请求风暴，也不在这里重试。 */
+	private async readGroupConfigOnce(roomId: string): Promise<void> {
+		const generation = this.groupConfigCache.generationOf(this.selfUid, roomId);
+		const result = await this.apiClient!.getGroupConfigCurrent(this.selfUid, roomId);
+		if (result.outcome === 'NOT_ACCESSIBLE') {
+			this.groupConfigCache.delete(this.selfUid, roomId);
+			console.log(`[config] not accessible roomId=${roomId} → 精准移除该 room 配置`);
+			return;
+		}
+		const cfg = result.config;
+		const applied = this.groupConfigCache.set(
+			this.selfUid,
+			roomId,
+			{
+				rateLimitPerMinute: Number(cfg.rateLimitPerMinute ?? 0),
+				mentionRequired: Boolean(cfg.mentionRequired),
+				dailyLimit: Number(cfg.dailyLimit ?? 0),
+				respondToAi: Boolean(cfg.respondToAi),
+				approved: Number(cfg.approved ?? 0) === 1,
+				workspaceDir: cfg.workspaceDir == null ? undefined : String(cfg.workspaceDir),
+				account: cfg.account == null ? undefined : String(cfg.account),
+			},
+			generation,
+		);
+		console.log(
+			`[config] refreshed roomId=${roomId} configured=${result.configured} approved=${Number(cfg.approved ?? 0) === 1} applied=${applied}`,
+		);
 	}
 
 	/** M3: 接收 server 的 thinkingEnd 广播，处理 error 状态触发 autoReply */

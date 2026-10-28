@@ -196,6 +196,7 @@ function getCachedConfig(
 			respondToAi: boolean;
 			rateLimitPerMinute: number;
 			dailyLimit: number;
+			approved: boolean;
 			workspaceDir?: string;
 			account?: string;
 	  }
@@ -222,7 +223,12 @@ function setPersona(handler: MessageHandler, persona: string | null): void {
 	handler.persona = persona;
 }
 
-/** 向 handler 注入一条群配置（mentionRequired 等） */
+/**
+ * 向 handler 注入一条群配置（mentionRequired 等）。
+ *
+ * aichatoverview#484 (T3)：WS `groupConfigChange` 已改成「只提示过期 + 触发当前读」，不再应用载荷；
+ * 因此白盒布置直接写 cache，WS 提示路径由 groupConfigHint 系列用例单独覆盖。
+ */
 function setGroupConfig(
 	handler: MessageHandler,
 	roomId: number,
@@ -231,27 +237,24 @@ function setGroupConfig(
 		respondToAi?: boolean;
 		rateLimitPerMinute?: number;
 		dailyLimit?: number;
+		/** aichatoverview#484: explicit approval (缺省按未批准，与服务端默认一致). */
+		approved?: boolean;
 		/** REQ-009 #85: owner workspace override (rides inside config). */
 		workspaceDir?: string;
 		/** REQ-009 #85: group human-readable groupkey (rides on the outer message). */
 		account?: string;
 	},
 ): void {
-	handler.handle({
-		type: 'groupConfigChange',
-		data: {
-			aiclawUid: SELF_UID,
-			roomId,
-			...(config.account !== undefined ? { account: config.account } : {}),
-			config: {
-				rateLimitPerMinute: config.rateLimitPerMinute ?? 0,
-				mentionRequired: config.mentionRequired ?? true,
-				dailyLimit: config.dailyLimit ?? 0,
-				respondToAi: config.respondToAi ?? false,
-				...(config.workspaceDir !== undefined ? { workspaceDir: config.workspaceDir } : {}),
-			},
-		},
-	} as never);
+	// @ts-expect-error 访问私有字段做白盒布置
+	handler.groupConfigCache.set(SELF_UID, String(roomId), {
+		rateLimitPerMinute: config.rateLimitPerMinute ?? 0,
+		mentionRequired: config.mentionRequired ?? true,
+		dailyLimit: config.dailyLimit ?? 0,
+		respondToAi: config.respondToAi ?? false,
+		approved: config.approved ?? false,
+		...(config.workspaceDir !== undefined ? { workspaceDir: config.workspaceDir } : {}),
+		...(config.account !== undefined ? { account: config.account } : {}),
+	});
 }
 
 async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
@@ -1577,6 +1580,191 @@ describe('MessageHandler.prewarmGroupConfigs (REQ #26)', () => {
 		await expect(handler.prewarmGroupConfigs()).resolves.toBeUndefined();
 
 		expect(getCachedConfig(handler, 10)).toBeUndefined();
+	});
+});
+
+describe('MessageHandler groupConfigChange → 当前读 (#484)', () => {
+	/** fake HulaApiClient：提供 listSelfGroupConfigs + getGroupConfigCurrent，记录当前读调用 */
+	function fakeCurrentApi(impl: (roomId: string) => Promise<unknown>) {
+		const getGroupConfigCurrent = vi.fn(async (_uid: string, roomId: string) => impl(roomId));
+		const listSelfGroupConfigs = vi.fn(async () => []);
+		const apiClient = { getGroupConfigCurrent, listSelfGroupConfigs } as unknown as import('../api/hula-api.js').HulaApiClient & {
+			getGroupConfigCurrent: ReturnType<typeof vi.fn>;
+		};
+		return { apiClient, getGroupConfigCurrent };
+	}
+
+	/** 发一条真实的 groupConfigChange 提示（旧载荷故意带错误值，验证不被应用）。 */
+	function sendHint(handler: MessageHandler, roomId: number, approved = 0): void {
+		handler.handle({
+			type: 'groupConfigChange',
+			data: {
+				aiclawUid: SELF_UID,
+				roomId,
+				account: 'stale-account',
+				config: {
+					rateLimitPerMinute: 999,
+					mentionRequired: false,
+					dailyLimit: 999,
+					respondToAi: true,
+					approved,
+					workspaceDir: '/stale/dir',
+				},
+			},
+		} as never);
+	}
+
+	function currentPresent(overrides: Record<string, unknown> = {}) {
+		return {
+			outcome: 'PRESENT',
+			configured: true,
+			config: {
+				aiclawUid: SELF_UID,
+				roomId: '9',
+				rateLimitPerMinute: 5,
+				mentionRequired: true,
+				dailyLimit: 100,
+				respondToAi: false,
+				approved: 1,
+				workspaceDir: '/srv/proj',
+				account: '888888',
+				...overrides,
+			},
+		};
+	}
+
+	it('提示不应用载荷，真实值来自一次当前读', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient, getGroupConfigCurrent } = fakeCurrentApi(async () => currentPresent());
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { mentionRequired: false, approved: false });
+
+		sendHint(handler, 1);
+		await waitFor(() => getCachedConfig(handler, 1)?.approved === true);
+
+		expect(getGroupConfigCurrent).toHaveBeenCalledWith(SELF_UID, '1');
+		const cfg = getCachedConfig(handler, 1);
+		// 旧载荷里的 999/'/stale/dir'/approved=0 一个都没落库。
+		expect(cfg).toMatchObject({
+			rateLimitPerMinute: 5,
+			dailyLimit: 100,
+			mentionRequired: true,
+			respondToAi: false,
+			approved: true,
+			workspaceDir: '/srv/proj',
+			account: '888888',
+		});
+	});
+
+	it('撤权已校准后到达的旧 grant 提示不会恢复旧权限', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeCurrentApi(async () => currentPresent({ approved: 0, workspaceDir: null }));
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { approved: true });
+
+		// 旧载荷声称 approved=1 —— 必须被当前读(approved=0)覆盖。
+		sendHint(handler, 1, 1);
+		await waitFor(() => getCachedConfig(handler, 1)?.approved === false);
+
+		expect(getCachedConfig(handler, 1)?.approved).toBe(false);
+		expect(getCachedConfig(handler, 1)?.workspaceDir).toBeUndefined();
+	});
+
+	it('NOT_ACCESSIBLE 精准移除该 room，不波及其它 room', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeCurrentApi(async (roomId) =>
+			roomId === '1' ? { outcome: 'NOT_ACCESSIBLE' } : currentPresent(),
+		);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { approved: true });
+		setGroupConfig(handler, 2, { approved: true, rateLimitPerMinute: 3 });
+
+		sendHint(handler, 1);
+		await waitFor(() => getCachedConfig(handler, 1) === undefined);
+
+		expect(getCachedConfig(handler, 1)).toBeUndefined();
+		expect(getCachedConfig(handler, 2)).toMatchObject({ approved: true, rateLimitPerMinute: 3 });
+	});
+
+	it('当前读失败 → 保留上次值并标记过期（不假称已校准）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const { apiClient } = fakeCurrentApi(async () => {
+			throw new Error('503 service unavailable');
+		});
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { approved: true, rateLimitPerMinute: 7 });
+
+		sendHint(handler, 1);
+		await waitFor(() => {
+			// @ts-expect-error 白盒断言：仍标记过期
+			return handler.groupConfigCache.isStale(SELF_UID, '1') === true;
+		});
+
+		expect(getCachedConfig(handler, 1)).toMatchObject({ approved: true, rateLimitPerMinute: 7 });
+		// @ts-expect-error 白盒断言
+		expect(handler.groupConfigCache.isStale(SELF_UID, '1')).toBe(true);
+	});
+
+	it('提示风暴合并为单飞：同 room 不叠加并发当前读', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const pending: Array<(v: unknown) => void> = [];
+		const { apiClient, getGroupConfigCurrent } = fakeCurrentApi(
+			() => new Promise((resolve) => {
+				pending.push(resolve);
+			}),
+		);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { approved: false });
+
+		sendHint(handler, 1);
+		sendHint(handler, 1);
+		sendHint(handler, 1);
+		await waitFor(() => pending.length === 1);
+		// 三条提示只换来一次在飞请求。
+		expect(getGroupConfigCurrent).toHaveBeenCalledTimes(1);
+
+		pending[0](currentPresent());
+		await new Promise((r) => setTimeout(r, 10));
+
+		// 读期间代次已推进 → 结果按代次丢弃，但最多再补跑一轮（不是三条各跑一次）。
+		expect(getGroupConfigCurrent).toHaveBeenCalledTimes(2);
+	});
+
+	it('提示期间到达的结果按代次丢弃（旧快照不得盖回）', async () => {
+		const { adapter } = fakeAdapter();
+		const { ws } = fakeWs();
+		const pending: Array<(v: unknown) => void> = [];
+		const { apiClient } = fakeCurrentApi(
+			() => new Promise((resolve) => {
+				pending.push(resolve);
+			}),
+		);
+		const handler = new MessageHandler(ws, adapter, SELF_UID, apiClient, undefined, () => {});
+		setGroupConfig(handler, 1, { approved: false });
+
+		// 第一次读在飞时再收一条提示 → 代次推进；首轮结果必须被丢弃。
+		sendHint(handler, 1);
+		await waitFor(() => pending.length === 1);
+		sendHint(handler, 1);
+		pending[0](currentPresent({ approved: 1 }));
+		await new Promise((r) => setTimeout(r, 20));
+
+		// 首轮的 approved=1 被丢弃：值仍是布置时的 false。
+		expect(getCachedConfig(handler, 1)?.approved).toBe(false);
+
+		// 补跑的读取返回当前事实 → 应用并清除过期标记。
+		await waitFor(() => pending.length === 2);
+		pending[1](currentPresent({ approved: 0 }));
+		await waitFor(() => {
+			// @ts-expect-error 白盒断言
+			return handler.groupConfigCache.isStale(SELF_UID, '1') === false;
+		});
+		expect(getCachedConfig(handler, 1)?.approved).toBe(false);
 	});
 });
 
