@@ -93,7 +93,26 @@ interface ThinkingSession {
 	events: AgentEvent[];
 	/** #299: persisted run owns the room until upstream termination is proven. */
 	run?: { id: string; generation: number; agent: AgentRun; abort: AbortController };
+	/**
+	 * aichatoverview#485 (T4): the server authorization generation read when this input was
+	 * enqueued. Frozen here so a queued/retried turn can never be re-stamped with a newer
+	 * generation at START time — the server re-derives it from current facts and rejects a stale one.
+	 */
+	authorizationEpoch?: string;
 }
+
+/**
+ * aichatoverview#485 (T4): START admission outcome for one exact run.
+ * `admitted` — the server persisted the record under a matching authorization generation.
+ * `rejected` — a definitive server-side refusal (revoked/stale/not approved/room gone): the run is
+ *   terminally dead and must never be re-driven, re-queued or revived by a late receipt or reconnect.
+ * `unknown` — transport ambiguity (no receipt in the window): nothing was proven either way, so the
+ *   turn stays re-drivable within its bounded retry budget.
+ */
+type StartOutcome =
+	| { status: 'admitted'; thinkingId: string }
+	| { status: 'rejected'; error: string }
+	| { status: 'unknown' };
 
 type ThinkingEndFrame = { durationMs: number | undefined; status: 'complete' | 'error'; error?: string; content: string };
 interface PendingThinkingStart {
@@ -101,12 +120,29 @@ interface PendingThinkingStart {
 	end?: ThinkingEndFrame;
 	retry: ReturnType<typeof setInterval>;
 	deadline: ReturnType<typeof setTimeout>;
+	/**
+	 * aichatoverview#485 (T4): a definitive admission refusal that arrived before the START-ready
+	 * barrier registered its waiter. Kept on the pending entry so the barrier reads the refusal
+	 * instead of mistaking it for transport ambiguity (which would requeue a dead input).
+	 */
+	rejected?: string;
 }
 interface PendingThinkingEnd {
 	session: ThinkingSession;
 	frame: ThinkingEndFrame;
 	retry: ReturnType<typeof setInterval>;
 	deadline: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * aichatoverview#485 (T4): server-side authorization refusals from the admission seam.
+ * `room_not_accessible` is the room-level refusal; the rest are `authorization_*` reasons.
+ * These are definitive: retrying the same input cannot succeed (the permission already changed).
+ */
+const ADMISSION_DENIAL_PREFIX = 'authorization_';
+function isAdmissionDenial(error: string | undefined): boolean {
+	if (!error) return false;
+	return error.startsWith(ADMISSION_DENIAL_PREFIX) || error === 'room_not_accessible';
 }
 
 /**
@@ -134,6 +170,12 @@ interface LastMessageContext {
 	 * 主人私聊 → workspace/owner；非主人私聊 → workspace/<对端uid>。
 	 */
 	isOwner: boolean;
+	/**
+	 * aichatoverview#485 (T4): the authorization generation read from the group config cache at
+	 * the moment THIS triggering input arrived. Frozen with the input: a queued turn keeps the
+	 * generation it was enqueued under, so a later approval cannot retroactively authorize it.
+	 */
+	authorizationEpoch?: string;
 }
 
 /**
@@ -238,7 +280,7 @@ export class MessageHandler {
 	/** #404: START-ready barrier + pending END confirmation bound (production 30s; tests may shrink). */
 	private startReceiptTimeout(): number { return this.receiptTimeoutMs ?? this.START_RECEIPT_TIMEOUT_MS; }
 	/** #404: START-ready barrier waiters, keyed by runId; resolved once by the exact START receipt. */
-	private startWaiters = new Map<string, { resolve: (thinkingId: string | undefined) => void }>();
+	private startWaiters = new Map<string, { resolve: (outcome: StartOutcome) => void }>();
 	/** Set by destroy(); barrier waiters drop (never re-drive) once torn down. */
 	private destroyed = false;
 
@@ -341,6 +383,9 @@ export class MessageHandler {
 			roomId: session.roomId,
 			triggerMsgId: session.triggerMsgId,
 			...(session.run ? { clientRunId: session.run.id } : {}),
+			// aichatoverview#485 (T4): declare which authorization generation this input belongs to.
+			// The server re-derives it from current facts; a mismatch is a definitive refusal.
+			...(session.authorizationEpoch ? { authorizationEpoch: session.authorizationEpoch } : {}),
 		});
 	}
 
@@ -360,19 +405,20 @@ export class MessageHandler {
 
 	/**
 	 * #404: wait for the exact START receipt of one run, bounded by the receipt window.
-	 * Resolves with the fixed thinkingId, or undefined on timeout / conflicting receipt.
+	 * aichatoverview#485 (T4): resolves with a typed admission outcome — a definitive server
+	 * refusal is NOT the same as a missing receipt, and must never be retried.
 	 */
-	private waitStartReceipt(runId: string): Promise<string | undefined> {
+	private waitStartReceipt(runId: string): Promise<StartOutcome> {
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				this.startWaiters.delete(runId);
-				resolve(undefined);
+				resolve({ status: 'unknown' });
 			}, this.startReceiptTimeout());
 			timer.unref?.();
-			this.startWaiters.set(runId, { resolve: (thinkingId) => {
+			this.startWaiters.set(runId, { resolve: (outcome) => {
 				clearTimeout(timer);
 				this.startWaiters.delete(runId);
-				resolve(thinkingId);
+				resolve(outcome);
 			} });
 		});
 	}
@@ -684,7 +730,10 @@ export class MessageHandler {
 		const isOwner = data.message.aiclaw?.isOwner === true;
 		// REQ-011 S3: cache the sender display name so the cc channel push can attribute the current message.
 		const fromName = data.fromUser.name ?? 'unknown';
-		channel.lastCtx = { roomId, fromUid, fromName, msgId, roomType: roomType ?? 1, isOwner };
+		// aichatoverview#485 (T4): freeze the authorization generation this input arrived under.
+		// The generation belongs to the INPUT, never to the moment a queued turn finally starts.
+		const authorizationEpoch = this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch;
+		channel.lastCtx = { roomId, fromUid, fromName, msgId, roomType: roomType ?? 1, isOwner, authorizationEpoch };
 
 		// REQ-146: redact any `url:` line before previewing — media injections now embed a short-lived
 		// signed download URL that must NEVER reach node logs.
@@ -735,7 +784,7 @@ export class MessageHandler {
 			return;
 		}
 
-		const { msgId, roomType, fromUid, isOwner } = channel.lastCtx;
+		const { msgId, roomType, fromUid, isOwner, authorizationEpoch } = channel.lastCtx;
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (!this.runReady(roomId)) {
 			channel.pendingMessages.push(message);
@@ -835,6 +884,8 @@ export class MessageHandler {
 			accumulatedContent: '',
 			finalized: false,
 			events: [],
+			// aichatoverview#485 (T4): the input's generation travels with the run, never re-read at START.
+			authorizationEpoch,
 		};
 
 		// Persist the run slot before emitting THINKING_START or touching the native driver.
@@ -938,7 +989,7 @@ export class MessageHandler {
 			const deadline = setTimeout(() => {
 				console.error(`[thinking] START receipt timed out; END unavailable run=${runId}`);
 				this.forgetThinkingStart(runId);
-				this.startWaiters.get(runId)?.resolve(undefined);
+				this.startWaiters.get(runId)?.resolve({ status: 'unknown' });
 				this.startWaiters.delete(runId);
 			}, this.startReceiptTimeout());
 			retry.unref?.();
@@ -951,13 +1002,22 @@ export class MessageHandler {
 		// receipt fixes this run's reply binding. Unconfirmed → 0 native submit, 0 reply POST,
 		// no success claim; the run slot is released and the message requeued for a later turn.
 		// The wait reuses the bounded receipt window and never stacks into the CLI budget.
+		// aichatoverview#485 (T4): a definitive refusal is terminal — it is never requeued, never
+		// retried on reconnect, and never revived by a late receipt. Only transport ambiguity
+		// (unknown) stays re-drivable, within the same bounded receipt window.
 		if (session.run) {
 			const barrierRun = session.run;
 			const barrierRunId = barrierRun.id;
-			const receiptThinkingId = await this.waitStartReceipt(barrierRunId);
-			if (!receiptThinkingId) {
+			// A refusal can land between emitting START and registering the waiter; the pending entry
+			// keeps it so this read sees the refusal instead of falling through to transport ambiguity.
+			const early = this.pendingThinkingStarts.get(barrierRunId)?.rejected;
+			const outcome: StartOutcome = early
+				? { status: 'rejected', error: early }
+				: await this.waitStartReceipt(barrierRunId);
+			if (outcome.status !== 'admitted') {
 				this.forgetThinkingStart(barrierRunId);
 				if (session.timeoutId) clearTimeout(session.timeoutId);
+				session.finalized = true;
 				// A concurrent teardown may have released the slot already — only release what is
 				// still pending, so a normal destroy/barrier race never logs a false "occupied".
 				try {
@@ -967,8 +1027,15 @@ export class MessageHandler {
 				try { await barrierRun.agent.dispose(); }
 				catch (disposeError) { console.error(`[handler] unconfirmed run ${barrierRunId} dispose failed: ${errMsg(disposeError)}`); }
 				if (this.thinkingSessions.get(sessionKey) === session) this.thinkingSessions.delete(sessionKey);
-				// The room is ready again (slot released): re-drive the turn through the debouncer
-				// (2s backoff, no hot loop) rather than parking it in pendingMessages.
+				if (outcome.status === 'rejected') {
+					// The authorization/approval behind this input is gone: the batch is spent for good.
+					// Do NOT repush the debouncer — a retried turn would just be refused again, and
+					// re-adding the message would let a later approval look like it authorized THIS input.
+					console.error(`[thinking] START refused (${outcome.error}); native run not submitted, input dropped run=${barrierRunId}`);
+					return;
+				}
+				// Transport ambiguity: the room is ready again (slot released), re-drive the turn
+				// through the debouncer (2s backoff, no hot loop) rather than parking it in pendingMessages.
 				// After teardown the turn is dropped with everything else — never resurrected.
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
 				if (!this.destroyed) channel.debouncer.push(message);
@@ -1095,7 +1162,9 @@ export class MessageHandler {
 			} catch (error) {
 				console.error(`[thinking] reply binding confirmation refused run=${data.clientRunId}: ${errMsg(error)}`);
 			}
-			this.startWaiters.get(data.clientRunId)?.resolve(bindingFixed ? data.thinkingId : undefined);
+			this.startWaiters.get(data.clientRunId)?.resolve(
+				bindingFixed ? { status: 'admitted', thinkingId: data.thinkingId } : { status: 'unknown' },
+			);
 		}
 		target.thinkingId = data.thinkingId;
 		if (pending) {
@@ -1127,6 +1196,9 @@ export class MessageHandler {
 				// REQ-009 #85: carry owner workspace override + groupkey through the cache.
 				workspaceDir: item.workspaceDir,
 				account: item.account,
+				// aichatoverview#485 (T4): the server now stamps every read; an input captured from this
+				// prewarmed row carries the generation it was read under, not the one current at START.
+				authorizationEpoch: item.authorizationEpoch,
 			});
 		}
 		console.log(`[config] prewarmed ${list.length} group config(s) for aiclaw ${this.selfUid}`);
@@ -1270,6 +1342,10 @@ export class MessageHandler {
 				approved: Number(cfg.approved ?? 0) === 1,
 				workspaceDir: cfg.workspaceDir == null ? undefined : String(cfg.workspaceDir),
 				account: cfg.account == null ? undefined : String(cfg.account),
+				// aichatoverview#485 (T4): the generation this current-read saw. Only this path has it —
+				// listSelfConfigs carries no epoch, so startup prewarm leaves it undefined (fail-closed
+				// for group runs: the server then re-derives and compares against its own current facts).
+				authorizationEpoch: result.authorizationEpoch,
 			},
 			generation,
 		);
@@ -1309,6 +1385,25 @@ export class MessageHandler {
 				if (error === 'thinking_start_unknown') {
 					console.warn(`[thinking] START unconfirmed; retrying run=${data.clientRunId}`);
 					return; // Transport ambiguity is not a definitive rejection; keep the same bounded run retry.
+				}
+				// aichatoverview#485 (T4): an authorization/approval refusal is terminal for this exact
+				// input. Hand it to the START-ready barrier as a typed rejection — the barrier releases the
+				// slot, disposes the un-submitted run and DROPS the input (no requeue, no reopen on approval).
+				// No stopRun here: nothing native was ever submitted, so there is no stop to confirm.
+				const waiter = data.clientRunId ? this.startWaiters.get(data.clientRunId) : undefined;
+				if (isAdmissionDenial(error)) {
+					if (waiter) {
+						// The START-ready barrier is waiting: it releases the slot, disposes the un-submitted
+						// run and drops the input. No stopRun here — nothing native was ever submitted.
+						waiter.resolve({ status: 'rejected', error: error! });
+						return;
+					}
+					// Barrier not registered yet: park the refusal on the pending entry so it is read as a
+					// definitive rejection rather than as transport ambiguity (which would requeue it).
+					pending.rejected = error!;
+					this.forgetThinkingStart(data.clientRunId!);
+					console.error(`[thinking] START refused before barrier run=${data.clientRunId}: ${error}`);
+					return;
 				}
 				this.forgetThinkingStart(data.clientRunId!);
 				console.error(`[thinking] START rejected run=${data.clientRunId}: ${error ?? 'unknown'}`);
@@ -1454,7 +1549,7 @@ export class MessageHandler {
 		// teardown; the waiters' own failure path releases the run slot without re-driving.
 		for (const [runId, waiter] of this.startWaiters) {
 			this.startWaiters.delete(runId);
-			waiter.resolve(undefined);
+			waiter.resolve({ status: 'unknown' });
 		}
 		// 清理所有房间的待处理队列与定时器；用 cancel 而非 flush，
 		// 避免 teardown 时 flush 重新触发 triggerAgentLoop 复活会话。
