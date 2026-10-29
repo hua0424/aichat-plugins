@@ -184,7 +184,14 @@ export class HulaApiClient {
 		aiclawUid: string,
 		roomId: string,
 	): Promise<
-		| { outcome: 'PRESENT'; configured: boolean; config: Record<string, unknown> }
+		| {
+				outcome: 'PRESENT';
+				configured: boolean;
+				config: Record<string, unknown>;
+				/** aichatoverview#485: the authorization generation this read saw. Not a permission — the
+				 * server re-derives it from current facts and refuses inputs stamped with a stale one. */
+				authorizationEpoch?: string;
+		  }
 		| { outcome: 'NOT_ACCESSIBLE' }
 	> {
 		const resp = await this.get(
@@ -210,6 +217,8 @@ export class HulaApiClient {
 			outcome: 'PRESENT',
 			configured: data.configured === true,
 			config: config as Record<string, unknown>,
+			authorizationEpoch:
+				typeof data.authorizationEpoch === 'string' && data.authorizationEpoch ? data.authorizationEpoch : undefined,
 		};
 	}
 
@@ -238,6 +247,8 @@ export class HulaApiClient {
 			workspaceDir?: string;
 			/** REQ-009 #85: the group's human-readable group number ("groupkey"). */
 			account?: string;
+			/** aichatoverview#485 (T4): authorization generation of this row's current facts. */
+			authorizationEpoch?: string;
 		}>
 	> {
 		const resp = await this.get('/api/im/aiclaw/group/config/list');
@@ -249,6 +260,8 @@ export class HulaApiClient {
 			rateLimitPerMinute: item.rateLimitPerMinute === undefined ? undefined : Number(item.rateLimitPerMinute),
 			dailyLimit: item.dailyLimit === undefined ? undefined : Number(item.dailyLimit),
 			approved: item.approved === undefined || item.approved === null ? undefined : Number(item.approved),
+			authorizationEpoch:
+				typeof item.authorizationEpoch === 'string' && item.authorizationEpoch ? item.authorizationEpoch : undefined,
 			// REQ-009 #85: server serializes these under exactly these names. Use `== null` to catch
 			// BOTH JSON null (workspace_dir 默认 NULL) AND undefined — else String(null) → the literal
 			// string "null", which deriveWorkspaceDir treats as an absolute override and feeds opencode

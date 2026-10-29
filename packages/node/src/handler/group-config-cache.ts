@@ -30,6 +30,13 @@ export interface GroupConfig {
 	 * stable, human-readable path on the host. Falls back to roomId when missing.
 	 */
 	account?: string;
+	/**
+	 * aichatoverview#485 (T4): the server's authorization generation this record was read under.
+	 * It is NOT a permission — it names *which* authorization context the input belonged to, so a
+	 * run started later cannot be re-stamped with a newer generation: START carries this value and
+	 * the server re-derives it from current facts and rejects on mismatch.
+	 */
+	authorizationEpoch?: string;
 }
 
 interface Entry {
@@ -78,6 +85,8 @@ export class GroupConfigCache {
 			// REQ-009 #85: carry workspaceDir/account through as-is when present, else undefined.
 			workspaceDir: config.workspaceDir,
 			account: config.account,
+			// aichatoverview#485: same passthrough for the server-derived authorization generation.
+			authorizationEpoch: config.authorizationEpoch,
 		};
 		this.cache.set(key, {
 			config: normalized,
