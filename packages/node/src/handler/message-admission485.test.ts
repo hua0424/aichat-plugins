@@ -163,4 +163,62 @@ describe('#485 group run admission (client half)', () => {
 		handler.destroy();
 		store.close();
 	});
+
+	it('drops the input when a refusal wins the race against the START-ready barrier', async () => {
+		// The refusal is delivered re-entrantly from inside ws.send, i.e. after the pending entry is
+		// registered but before the barrier has a waiter: the exact window the parked-refusal path covers.
+		const home = mkdtempSync(join(tmpdir(), 'handler-admission-race-'));
+		homes.push(home);
+		const store = new ConversationStore({
+			home,
+			serverNamespace: 'test',
+			activeUids: new Set(['42']),
+			activeProviders: new Map([['42', 'cc']]),
+		});
+		const frames: Array<{ type: number; data: Record<string, unknown> }> = [];
+		let submissions = 0;
+		let handler: MessageHandler | undefined;
+		const ws = {
+			isConnected: true,
+			send: vi.fn((type: number, data: Record<string, unknown>) => {
+				frames.push({ type, data });
+				if (type === WSReqType.THINKING_START && data.clientRunId) {
+					handler!.handle({
+						type: 'thinkingEnd',
+						data: {
+							fromUid: '42',
+							roomId: '9',
+							status: 'error',
+							error: 'authorization_stale',
+							clientRunId: data.clientRunId,
+						},
+					});
+				}
+			}),
+		} as unknown as HulaWSClient;
+		const driver: RunDriver = {
+			type: 'cc',
+			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
+			connect: async () => {},
+			disconnect: async () => {},
+			createRun: vi.fn(() => ({
+				events: {
+					async *[Symbol.asyncIterator](): AsyncGenerator<AgentEvent> {
+						submissions += 1;
+						yield { type: 'done', durationMs: 1 };
+					},
+				},
+				cancel: async () => ({ status: 'stopped' as const }),
+				dispose: async () => {},
+			})),
+		};
+		handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store);
+		handler.handle({ type: 'receiveMessage', data: message(5) });
+		for (let i = 0; i < 20; i++) await tick();
+		expect(submissions).toBe(0); // never submitted: the refusal was read, not lost as ambiguity
+		expect(store.pendingRuns()).toHaveLength(0); // slot released
+		expect(startFrames(frames)).toHaveLength(1); // no requeue of the refused input
+		handler.destroy();
+		store.close();
+	});
 });

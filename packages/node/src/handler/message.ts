@@ -1342,9 +1342,10 @@ export class MessageHandler {
 				approved: Number(cfg.approved ?? 0) === 1,
 				workspaceDir: cfg.workspaceDir == null ? undefined : String(cfg.workspaceDir),
 				account: cfg.account == null ? undefined : String(cfg.account),
-				// aichatoverview#485 (T4): the generation this current-read saw. Only this path has it —
-				// listSelfConfigs carries no epoch, so startup prewarm leaves it undefined (fail-closed
-				// for group runs: the server then re-derives and compares against its own current facts).
+				// aichatoverview#485 (T4): the generation this current-read saw. Both read paths carry it —
+				// this one and startup prewarm (listSelfConfigs) — so a queued input's stamp matches the
+				// cache entry the accept path would use. Absent means the server did not stamp the answer;
+				// the server then re-derives from its own current facts and compares (fail-closed).
 				authorizationEpoch: result.authorizationEpoch,
 			},
 			generation,
@@ -1398,10 +1399,11 @@ export class MessageHandler {
 						waiter.resolve({ status: 'rejected', error: error! });
 						return;
 					}
-					// Barrier not registered yet: park the refusal on the pending entry so it is read as a
-					// definitive rejection rather than as transport ambiguity (which would requeue it).
+					// The refusal won the race against the barrier: park it on the pending entry so the
+					// barrier reads a definitive rejection instead of transport ambiguity. The entry must
+					// stay put — deleting it here would drop the refusal and the barrier would requeue dead
+					// input; the existing START deadline still bounds how long a parked refusal can live.
 					pending.rejected = error!;
-					this.forgetThinkingStart(data.clientRunId!);
 					console.error(`[thinking] START refused before barrier run=${data.clientRunId}: ${error}`);
 					return;
 				}
