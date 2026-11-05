@@ -74,6 +74,42 @@ export interface AgentRun {
 	dispose(): Promise<void>;
 }
 
+/** Read-only native discovery is separate from chat runs and core's send-message capabilities. */
+export interface AgentCapability {
+	id: string;
+	kind: 'model' | 'skill' | 'command';
+	name: string;
+	description?: string;
+	supported: boolean;
+	executable: boolean;
+	reason?: string;
+	defaultVisibility: 'public' | 'hidden';
+	scope: 'workspace' | 'conversation' | 'instance';
+	parameters: Array<{ name: string; type: string; required: boolean }>;
+}
+export interface AgentCapabilityCatalog {
+	version: string;
+	framework: string;
+	runtimeVersion: string;
+	capabilities: AgentCapability[];
+}
+export interface AgentCapabilityContext {
+	/** Prepared by core from trusted room context, never supplied directly by the UI. */
+	workspace?: string;
+	signal: AbortSignal;
+}
+export interface AgentCapabilityInvocation extends AgentCapabilityContext {
+	capabilityId: string;
+	parameters?: Record<string, unknown>;
+	catalogVersion: string;
+}
+export interface AgentCapabilityResult {
+	status: 'completed' | 'failed' | 'unsupported' | 'unknown';
+	text?: string;
+	nativeResult?: unknown;
+	error?: string;
+}
+
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
 export interface AgentDriver {
 	readonly type: string;
@@ -83,6 +119,9 @@ export interface AgentDriver {
 		promptUpdate: 'per-run' | 'new-session';
 	};
 	connect(): Promise<void>;
+	/** Absence means unsupported; never infer support from the framework name. */
+	discoverCapabilities?(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog>;
+	executeCapability?(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult>;
 	createRun(input: PreparedRun): AgentRun;
 	disconnect(): Promise<void>;
 	/** Preserve provider-specific thinking presentation without an identity-routing branch. */

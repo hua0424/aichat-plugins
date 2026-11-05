@@ -1,3 +1,22 @@
+import type { AgentCapabilityCatalog, AgentCapabilityResult } from '../agent/events.js';
+
+/** Server-authorized context; UI parameters are never interpreted as host paths. */
+export interface AgentCommandRequest {
+	requestId: string;
+	roomId: string;
+	aiclawUid: string;
+	operation: 'discover' | 'invoke';
+	capabilityId?: string;
+	parameters?: Record<string, unknown>;
+	catalogVersion?: string;
+	context: { roomType: 1 | 2; counterpartUid?: string; isOwner?: boolean; workspaceDir?: string; account?: string };
+}
+export interface AgentCommandResponse extends AgentCapabilityResult {
+	requestId: string;
+	roomId: string;
+	catalog?: AgentCapabilityCatalog;
+}
+
 /**
  * WS 请求类型（plugins → server）
  * 与 HuLa-Server WSReqTypeEnum 对应
@@ -18,6 +37,7 @@ export enum WSReqType {
  */
 export type WSRespType =
 	| 'receiveMessage'
+	| 'agentCommand'
 	| 'aiclawAuthRequest'
 	| 'tokenExpired'
 	// REQ-004: THINKING 协议 + 群配置更新
@@ -109,6 +129,8 @@ export interface ReceivedMessage {
 		 * 3=IMG / 4=FILE MediaMessageBody）。
 		 */
 		body: ReceivedMessageBody;
+		/** Trusted server-originated feedback markers, including persisted history projections. */
+		extra?: { autoReply?: boolean; commandFeedback?: string; [key: string]: unknown };
 		/**
 		 * REQ-008 #77: aiclaw 扩展信息，server 仅在推送给 aiclaw 用户时附加（私聊带；群聊缺省）。
 		 * `isOwner` = 发送者是否为本 aiclaw 的主人（server 算 senderUid==ownerUid）。
