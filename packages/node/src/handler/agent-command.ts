@@ -21,6 +21,7 @@ export class AgentCommandHandler {
   const ctx = raw.context;
   if ((raw.operation !== 'discover' && raw.operation !== 'invoke') || !object(ctx) ||
    (ctx.roomType !== 1 && ctx.roomType !== 2) ||
+    (raw.reconcileOnly !== undefined && typeof raw.reconcileOnly !== 'boolean') ||
    ['counterpartUid', 'workspaceDir', 'account', 'authorizationEpoch'].some((key) => ctx[key] !== undefined && typeof ctx[key] !== 'string') ||
    (ctx.isOwner !== undefined && typeof ctx.isOwner !== 'boolean') ||
    (ctx.roomType === 2 && (typeof ctx.isOwner !== 'boolean' || !id(ctx.counterpartUid))) ||
@@ -31,7 +32,9 @@ export class AgentCommandHandler {
   catch { return fail('invalid_request'); }
   const fingerprint = JSON.stringify([request.roomId, request.operation, request.capabilityId, request.catalogVersion,
    request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch]);
-  const prior = this.requests.get(request.requestId);
+  // An internal evidence query must bypass an in-flight invocation promise/cache.
+   if (request.reconcileOnly) return this.execute(request);
+   const prior = this.requests.get(request.requestId);
   if (prior) {
    if (prior.fingerprint !== fingerprint) return fail('request_id_conflict');
    // A completed watchdog promise may precede a persisted reconciliation. Re-read the same journal, never resubmit.
@@ -53,6 +56,7 @@ export class AgentCommandHandler {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let execution: CapabilityExecution | undefined, timedOut = false, accepted = false;
   const mutation = isMutation(request.operation, request.capabilityId);
+   if (request.reconcileOnly && (!mutation || !this.preparation)) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
   try {
    const workspace = this.workspaceBase ? deriveWorkspaceDir(this.workspaceBase, this.selfUid, { ...request.context, roomId: request.roomId }) : undefined;
    const context = { workspace, signal: abort.signal };
@@ -60,6 +64,7 @@ export class AgentCommandHandler {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
     const prepared = await this.preparation.prepare(request, workspace);
     if ('receipt' in prepared) return { ...prepared.receipt, ...correlation };
+     if (request.reconcileOnly) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
     execution = { ...prepared.execution, emit: async (event) => {
      if (event.type === 'receipt' && event.receipt.status === 'accepted') {
       accepted = true;

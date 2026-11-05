@@ -8,6 +8,18 @@ import type { AgentDriver, AgentCapabilityInvocation, NativeTurnEvent } from '..
 import type { HulaWSClient } from '../server/hula-ws.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 const dirs: string[] = [];
+it('never turns an internal reconcileOnly request with missing journal into a native mutation', async () => {
+ const home = mkdtempSync(join(tmpdir(), 'missing-control-')); dirs.push(home);
+ const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode']]) });
+ const executeCapability = vi.fn(async () => ({ status: 'completed' as const })), report = vi.fn(async () => {});
+ const handler = new MessageHandler({ send: vi.fn(), isConnected: true } as unknown as HulaWSClient, { type: 'opencode', executeCapability } as unknown as AgentDriver,
+  'u', { reportAgentCommandResult: report } as unknown as HulaApiClient, undefined, () => {}, () => store, home);
+ handler.handle({ type: 'agentCommand', data: { requestId: 'missing', roomId: 'room', aiclawUid: 'u', operation: 'invoke', capabilityId: 'skill:probe', catalogVersion: 'v', parameters: {}, reconcileOnly: true,
+  context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch' } } });
+ await vi.waitFor(() => expect(report).toHaveBeenCalledWith(expect.objectContaining({ status: 'unknown' })));
+ expect(executeCapability).not.toHaveBeenCalled(); expect(store.get('u', 'room')).toBeUndefined();
+ handler.destroy();
+});
 it.each([false, true])('reconciles a bound durable unknown with restart=%s and settles only its existing lifecycle', async (restart) => {
  const home = mkdtempSync(join(tmpdir(), 'restart-control-')); dirs.push(home);
  const options = { home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) };

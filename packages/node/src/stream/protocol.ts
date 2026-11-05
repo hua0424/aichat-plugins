@@ -6,6 +6,8 @@ export interface AgentCommandRequest {
 	roomId: string;
 	aiclawUid: string;
 	operation: 'discover' | 'invoke';
+	/** Server-internal evidence query; never submit when the local journal is absent. */
+	reconcileOnly?: boolean;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;
 	catalogVersion?: string;

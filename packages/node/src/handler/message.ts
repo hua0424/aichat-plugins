@@ -274,7 +274,7 @@ export class MessageHandler {
 	private readonly agentCommands: AgentCommandHandler;
 	private readonly nativeBindings = new Map<string, Promise<{ token: string; runId: string; thinkingId: string }>>();
 	private readonly nativeThinking = new Map<string, ThinkingSession>();
-	private readonly nativeTerminal = new Set<string>();
+	private readonly nativeTerminal = new Map<string, { token: string; runId: string; thinkingId: string } | null>();
 	// REQ-029 (#29): selfUid is an opaque string end-to-end.
 	private selfUid: string;
 
@@ -390,9 +390,18 @@ export class MessageHandler {
 	}
 
 	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
-		if (!workspace || !request.context.authorizationEpoch) throw new Error('trusted execution context required');
+		if (!workspace || !request.context.authorizationEpoch) {
+			if (request.reconcileOnly) return { receipt: { status: 'unknown', error: 'native_request_failed' } };
+			throw new Error('trusted execution context required');
+		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch])).digest('hex');
+		if (request.reconcileOnly) {
+			// Evidence queries never create journal state: absent/mismatched entries stay unknown.
+			const existing = store.getControl(this.selfUid, room, request.requestId);
+			if (!existing || existing.fingerprint !== fingerprint || existing.authorizationEpoch !== epoch)
+				return { receipt: { status: 'unknown', error: 'native_request_failed' } };
+		}
 		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
 		if (!prepared.fresh) {
 			const entry = prepared.entry;
@@ -471,6 +480,11 @@ export class MessageHandler {
 
 	private bindCommandTurn(request: AgentCommandRequest, turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }> {
 		const key = this.nativeKey(turn.conversationId, turn.generation, turn.nativeRef);
+		if (this.nativeTerminal.has(key)) {
+			const completed = this.nativeTerminal.get(key);
+			return completed && this.getConversations().resolveReplyBinding(completed.token)
+				? Promise.resolve(completed) : Promise.reject(new Error('completed native binding unavailable'));
+		}
 		const existing = this.nativeBindings.get(key);
 		if (existing) return existing;
 		const pending = (async () => {
@@ -504,7 +518,7 @@ export class MessageHandler {
 		if (!session || this.nativeTerminal.has(key)) return;
 		if (turn.event) { session.events.push(turn.event); if (turn.event.type === 'thinking') session.accumulatedContent += turn.event.text; }
 		if (turn.phase === 'bound') return;
-		this.nativeTerminal.add(key); session.finalized = true;
+		this.nativeTerminal.set(key, null); session.finalized = true;
 		this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: turn.phase === 'completed' ? 'complete' : 'error',
 			...(turn.phase !== 'completed' ? { error: 'native_request_failed' } : {}), content: session.accumulatedContent });
 		this.releaseRun(session);
@@ -620,7 +634,13 @@ export class MessageHandler {
 		if (!session.run || this.thinkingSessions.get(session.sessionKey) !== session) return;
 		const store = this.getConversations!();
 		try {
+			const binding = store.get(this.selfUid, session.roomId)?.replyBindings?.find((b) => b.runId === session.run!.id);
 			store.finishRun(session.run.id);
+			for (const [key, value] of this.nativeThinking) if (value === session) {
+				// Keep only immutable, leased attachment facts, never transcript/agent/prompt or completed promises.
+				this.nativeTerminal.set(key, binding?.thinkingId ? { token: binding.token, runId: binding.runId, thinkingId: binding.thinkingId } : null);
+				this.nativeThinking.delete(key); this.nativeBindings.delete(key);
+			}
 			this.thinkingSessions.delete(session.sessionKey);
 			this.flushPendingMessages(session.roomId);
 		} catch (error) {
