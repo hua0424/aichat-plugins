@@ -6,10 +6,12 @@ export interface AgentCommandRequest {
 	roomId: string;
 	aiclawUid: string;
 	operation: 'discover' | 'invoke';
+	/** Server-internal evidence query; never submit when the local journal is absent. */
+	reconcileOnly?: boolean;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;
 	catalogVersion?: string;
-	context: { roomType: 1 | 2; counterpartUid?: string; isOwner?: boolean; workspaceDir?: string; account?: string };
+	context: { roomType: 1 | 2; counterpartUid?: string; isOwner?: boolean; workspaceDir?: string; account?: string; authorizationEpoch?: string };
 }
 export interface AgentCommandResponse extends AgentCapabilityResult {
 	requestId: string;

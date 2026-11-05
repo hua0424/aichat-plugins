@@ -25,6 +25,8 @@ export interface CapabilityEndpointDeps {
 	resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
 	/** #404: core-owned reply-binding verification for V3 run-bound sends; absent verifier fails closed. */
 	resolveReplyBinding?: (token: string) => ResolvedReplyBinding | undefined;
+	/** Exact-token-only retired-generation settlement; never general alias resolution. */
+	resolveReplyContext?: (token: string, candidates: readonly ContextCandidate[]) => ResolvedCandidate | undefined;
 	/** All endpoints using the same AICHAT_HOME share one writer lock, even with different socket overrides. */
 	lockHome?: string;
 	/** Namespaces request IDs to this configured server, not another backend. */
@@ -76,6 +78,7 @@ export class CapabilityEndpoint {
 	private readonly resolve: (sessionKey: string) => Resolved | undefined;
 	private readonly resolveCandidate?: (candidate: ContextCandidate) => ResolvedCandidate | undefined;
 	private readonly resolveReplyBinding?: (token: string) => ResolvedReplyBinding | undefined;
+	private readonly resolveReplyContext?: CapabilityEndpointDeps['resolveReplyContext'];
 	/** In-flight writes remain registered until resolution, even when completed receipts reach the cap. */
 	private readonly inFlight = new Map<string, { fingerprint: string; result: Promise<CapabilityResponse> }>();
 	private readonly completed = new Map<string, { fingerprint: string; result: CapabilityResponse }>();
@@ -104,6 +107,7 @@ export class CapabilityEndpoint {
 		this.resolve = deps.resolve;
 		this.resolveCandidate = deps.resolveCandidate;
 		this.resolveReplyBinding = deps.resolveReplyBinding;
+		this.resolveReplyContext = deps.resolveReplyContext;
 		this.serverNamespace = deps.serverNamespace ?? '';
 		this.lockHome = deps.lockHome;
 		this.maxWriteIds = deps.maxWriteIds ?? 100_000;
@@ -146,7 +150,13 @@ export class CapabilityEndpoint {
 		}
 		let resolved: Resolved | undefined;
 		let generation: number | undefined;
-		if (parsed.contexts) {
+		let exactReply: ResolvedCandidate | undefined;
+		if (parsed.command === 'send-message' && parsed.runBinding && parsed.contexts) {
+			try { exactReply = this.resolveReplyContext?.(parsed.runBinding, parsed.contexts); } catch { /* fail closed below */ }
+		}
+		if (exactReply) {
+			resolved = exactReply; generation = exactReply.generation;
+		} else if (parsed.contexts) {
 			let first: ResolvedCandidate | undefined;
 			for (const candidate of parsed.contexts) {
 				let current: ResolvedCandidate | undefined;
