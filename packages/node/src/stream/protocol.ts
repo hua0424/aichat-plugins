@@ -9,7 +9,7 @@ export interface AgentCommandRequest {
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;
 	catalogVersion?: string;
-	context: { roomType: 1 | 2; counterpartUid?: string; isOwner?: boolean; workspaceDir?: string; account?: string };
+	context: { roomType: 1 | 2; counterpartUid?: string; isOwner?: boolean; workspaceDir?: string; account?: string; authorizationEpoch?: string };
 }
 export interface AgentCommandResponse extends AgentCapabilityResult {
 	requestId: string;

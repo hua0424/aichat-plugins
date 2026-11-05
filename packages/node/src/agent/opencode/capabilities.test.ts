@@ -21,6 +21,23 @@ function fixture() {
 }
 
 describe('OpenCode native capability boundary', () => {
+	it('pages the entire native model inventory and binds versions to inventory, not page/query', async () => {
+		const { driver, workspace, client } = fixture();
+		client.provider.list.mockResolvedValue({ data: { all: [{ id: 'vendor', name: 'Vendor', env: [], models:
+			Object.fromEntries(Array.from({ length: 8944 }, (_, i) => [`m${i}`, { id: `m${i}`, name: `Model ${i}` }])) }], connected: [], default: {} } });
+		const ctx = { workspace, signal: new AbortController().signal };
+		const first = await driver.discoverCapabilities({ ...ctx, capabilityId: 'model.set' });
+		const next = await driver.discoverCapabilities({ ...ctx, capabilityId: 'model.set', parameters: { offset: 100 } });
+		expect(first.models).toMatchObject({ total: 8944, offset: 0, nextOffset: 100 });
+		expect(first.models!.items).toHaveLength(100);
+		expect(first.models!.items[0].connected).toBe(false);
+		expect(next.version).toBe(first.version);
+		expect(next.models!.items[0]).not.toEqual(first.models!.items[0]);
+		const end = await driver.discoverCapabilities({ ...ctx, capabilityId: 'model.set', parameters: { offset: 9000 } });
+		expect(end.models!.items).toEqual([]);
+		client.provider.list.mockResolvedValue({ data: { all: [], connected: [], default: {} } });
+		expect((await driver.discoverCapabilities(ctx)).version).not.toBe(first.version);
+	});
 	it('prepares a new trusted workspace before discovery and binds catalogs to the native instance', async () => {
 		const { driver, workspace, server, client } = fixture();
 		expect(existsSync(workspace)).toBe(false);
@@ -78,13 +95,14 @@ describe('OpenCode native capability boundary', () => {
 		const catalog = await driver.discoverCapabilities({ workspace: workspace, signal: new AbortController().signal });
 		expect(catalog.framework).toBe('opencode');
 		expect(catalog.runtimeVersion).toBe('1.17.9');
-		expect(catalog.capabilities).toEqual([
+		expect(catalog.capabilities).toHaveLength(6);
+		expect(catalog.capabilities).toEqual(expect.arrayContaining([
 			expect.objectContaining({ id: 'model.list', supported: true, executable: true, defaultVisibility: 'public', parameters: [] }),
 			expect.objectContaining({ id: 'skill:review', supported: true, executable: false, defaultVisibility: 'public' }),
 			expect.objectContaining({ id: 'command:audit', supported: true, executable: false, defaultVisibility: 'hidden',
 				description: 'Audit project Native argument hints only; requiredness unavailable; execution not connected.',
 				parameters: [{ name: '$1', type: 'string', required: false }, { name: '$ARGUMENTS', type: 'string', required: false }] }),
-		]);
+		]));
 		expect(JSON.stringify(catalog)).not.toMatch(/private|secret instructions|\/workspace/);
 		expect(client.app.skills).toHaveBeenCalledWith({ directory: workspace }, expect.objectContaining({ throwOnError: true }));
 		const other = await driver.discoverCapabilities({ workspace: join(workspace, 'other'), signal: new AbortController().signal });

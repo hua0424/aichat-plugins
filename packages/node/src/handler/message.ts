@@ -16,7 +16,9 @@ import { buildAgentInjection, isFeedbackMessage } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
 import { buildSystemPrompt, type AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type { AgentCommandRequest } from '../stream/protocol.js';
+import type { CapabilityExecution, AgentCapabilityResult, NativeTurnEvent, NativeRef } from '../agent/events.js';
 import type { CapabilityRegistry } from '../capability/registry.js';
 import type { AgentRun, PreparedRun } from '../agent/events.js';
 import { suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
@@ -270,6 +272,9 @@ export class MessageHandler {
 	private ws: HulaWSClient;
 	private driver: RunDriver;
 	private readonly agentCommands: AgentCommandHandler;
+	private readonly nativeBindings = new Map<string, Promise<{ token: string; runId: string; thinkingId: string }>>();
+	private readonly nativeThinking = new Map<string, ThinkingSession>();
+	private readonly nativeTerminal = new Set<string>();
 	// REQ-029 (#29): selfUid is an opaque string end-to-end.
 	private selfUid: string;
 
@@ -352,7 +357,7 @@ export class MessageHandler {
 	) {
 		this.ws = ws;
 		this.driver = driver;
-		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase);
+		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, { prepare: (request, workspace) => this.prepareCommand(request, workspace) });
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
 		this.groupConfigCache = new GroupConfigCache();
@@ -380,11 +385,136 @@ export class MessageHandler {
 		}
 	}
 
+	private nativeKey(conversationId: string, generation: number, ref: NativeRef): string {
+		return JSON.stringify([conversationId, generation, ref.sessionId, ref.turnId ?? ref.inputId ?? ref.messageId]);
+	}
+
+	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
+		if (!workspace || !request.context.authorizationEpoch) throw new Error('trusted execution context required');
+		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
+		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch])).digest('hex');
+		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
+		if (!prepared.fresh) {
+			const entry = prepared.entry;
+			const receipt = entry.receipt ?? store.recordControl(this.selfUid, room, request.requestId,
+				{ status: 'unknown', phase: 'outcome', error: 'native_request_failed', generation: String(entry.generation), nativeRef: entry.nativeRef });
+			if (!['accepted', 'unknown'].includes(receipt.status) || !this.driver.executeCapability) {
+				this.settleRecoveredControl(request, receipt, entry.generation); return { receipt };
+			}
+			// Journal identity was checked above. This branch has no execution/mutation handles.
+			const recovered = await this.driver.executeCapability({ workspace, signal: AbortSignal.timeout(10_000), capabilityId: request.capabilityId!,
+				catalogVersion: request.catalogVersion!, parameters: request.parameters,
+				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt } });
+			const persisted = store.recordControl(this.selfUid, room, request.requestId, recovered);
+			this.settleRecoveredControl(request, persisted, entry.generation);
+			return { receipt: persisted };
+		}
+		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
+		const assertCurrent = () => { store.assertGeneration(this.selfUid, room, generation); };
+		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
+		const execution: CapabilityExecution = {
+			requestId: request.requestId, systemPrompt, contextKey: record.contextKey, promptOwner: this.selfUid, authorizationEpoch: epoch,
+			selectedModel: record.selectedModel,
+			getSelectedModel: () => store.assertGeneration(this.selfUid, room, generation).selectedModel,
+			conversation: { id: record.conversationId, generation, assertCurrent,
+				nativeState: record.nativeState[this.driver.type] ? { version: 1, value: record.nativeState[this.driver.type] } : undefined,
+				saveNativeState: async (state) => { assertCurrent(); store.saveControlNativeState(this.selfUid, room, generation, this.driver.type, state.value as Record<string, unknown>); },
+				registerNativeAlias: async (alias) => { assertCurrent(); store.registerNative(this.driver.type, alias.id, this.selfUid, room, undefined, alias.scope); },
+				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
+			},
+			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, request.requestId, value),
+			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref); },
+			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
+			replaceSession: async (id, state) => {
+				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>);
+				const key = bindingKey(this.selfUid, room), old = this.thinkingSessions.get(key);
+				if (old?.run?.generation === generation) {
+					this.thinkingSessions.delete(key); old.sessionKey = `${key}:retired:${generation}`; this.thinkingSessions.set(old.sessionKey, old);
+				}
+				return next.generation;
+			},
+			bindTurn: (turn) => this.bindCommandTurn(request, turn),
+			emit: async (event) => {
+				if (event.type === 'turn') { this.settleCommandTurn(event.turn); return; }
+				const receipt = store.recordControl(this.selfUid, room, request.requestId, event.receipt);
+				// Reporting must not block native SSE, START-ready or shell hooks; server CAS orders receipts.
+				void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
+					.catch(() => console.error('[command] control receipt publication failed; retained for explicit query'));
+			},
+		};
+		return { execution };
+	}
+
+	private settleRecoveredControl(request: AgentCommandRequest, receipt: AgentCapabilityResult, generation: number): void {
+		const ref = receipt.nativeRef;
+		if (!['completed', 'failed'].includes(receipt.status) || !ref?.inputId || ref.parentId !== ref.inputId || !ref.messageId) return;
+		const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
+		if (!record) return;
+		const key = this.nativeKey(record.conversationId, generation, ref);
+		if (!this.nativeThinking.has(key)) {
+			const matches = (record.pendingRuns ?? []).filter((run) => {
+				const value = run.recovery?.value as Partial<NativeRef> | undefined;
+				return run.generation === generation && value?.sessionId === ref.sessionId && value.inputId === ref.inputId;
+			});
+			if (matches.length !== 1) return;
+			const pending = matches[0], binding = record.replyBindings?.find((b) => b.runId === pending.runId);
+			if (!binding?.thinkingId || binding.authorizationEpoch !== request.context.authorizationEpoch || !store.resolveReplyBinding(binding.token)) return;
+			const agent: AgentRun = { events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => ({ status: 'unsupported' }), dispose: async () => {} };
+			const session: ThinkingSession = { sessionKey: `native:${key}`, thinkingId: binding.thinkingId, roomId: request.roomId, triggerMsgId: '',
+				startTime: Date.parse(pending.startedAt), accumulatedContent: '', finalized: false, events: [], authorizationEpoch: binding.authorizationEpoch,
+				run: { id: pending.runId, generation, agent, abort: new AbortController() } };
+			this.nativeThinking.set(key, session); this.thinkingSessions.set(session.sessionKey, session);
+		}
+		this.settleCommandTurn({ eventId: `${request.requestId}:recovered`, conversationId: record.conversationId, generation, nativeRef: ref,
+			requestIds: [request.requestId], relation: 'attached', phase: receipt.status === 'completed' ? 'completed' : 'failed' });
+	}
+
+	private bindCommandTurn(request: AgentCommandRequest, turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }> {
+		const key = this.nativeKey(turn.conversationId, turn.generation, turn.nativeRef);
+		const existing = this.nativeBindings.get(key);
+		if (existing) return existing;
+		const pending = (async () => {
+			const store = this.getConversations();
+			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
+			if (record.conversationId !== turn.conversationId || !turn.nativeRef.messageId || !turn.nativeRef.inputId || turn.nativeRef.parentId !== turn.nativeRef.inputId) throw new Error('native turn association unconfirmed');
+			const runId = randomUUID();
+			const bound = store.beginRun(this.selfUid, request.roomId, runId, { authorizationEpoch: request.context.authorizationEpoch, nativeTurn: turn.nativeRef });
+			// This lifecycle is created AFTER native proof; it does not submit another AgentRun.
+			const agent: AgentRun = { events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => ({ status: 'unsupported' }), dispose: async () => {} };
+			const session: ThinkingSession = { sessionKey: `native:${key}`, thinkingId: '', roomId: request.roomId, triggerMsgId: '',
+				startTime: Date.now(), accumulatedContent: '', finalized: false, events: [], authorizationEpoch: request.context.authorizationEpoch,
+				run: { id: runId, generation: turn.generation, agent, abort: new AbortController() } };
+			this.nativeThinking.set(key, session); this.thinkingSessions.set(session.sessionKey, session);
+			const retry = setInterval(() => { if (this.ws.isConnected) this.sendThinkingStart(session); }, 2_000); retry.unref?.();
+			const deadline = setTimeout(() => { this.forgetThinkingStart(runId); }, this.startReceiptTimeout()); deadline.unref?.();
+			this.pendingThinkingStarts.set(runId, { session, retry, deadline });
+			const receipt = this.waitStartReceipt(runId); this.sendThinkingStart(session);
+			const outcome = await receipt;
+			if (outcome.status !== 'admitted') {
+				this.forgetThinkingStart(runId); store.markStopUnconfirmed(runId);
+				throw new Error('native START receipt unconfirmed');
+			}
+			return { token: bound.replyToken, runId, thinkingId: outcome.thinkingId };
+		})();
+		this.nativeBindings.set(key, pending);
+		return pending;
+	}
+	private settleCommandTurn(turn: NativeTurnEvent): void {
+		const key = this.nativeKey(turn.conversationId, turn.generation, turn.nativeRef), session = this.nativeThinking.get(key);
+		if (!session || this.nativeTerminal.has(key)) return;
+		if (turn.event) { session.events.push(turn.event); if (turn.event.type === 'thinking') session.accumulatedContent += turn.event.text; }
+		if (turn.phase === 'bound') return;
+		this.nativeTerminal.add(key); session.finalized = true;
+		this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: turn.phase === 'completed' ? 'complete' : 'error',
+			...(turn.phase !== 'completed' ? { error: 'native_request_failed' } : {}), content: session.accumulatedContent });
+		this.releaseRun(session);
+	}
+
 	private sendThinkingStart(session: ThinkingSession): void {
 		this.ws.send(WSReqType.THINKING_START, {
 			fromUid: this.selfUid,
 			roomId: session.roomId,
-			triggerMsgId: session.triggerMsgId,
+			triggerMsgId: session.triggerMsgId || undefined,
 			...(session.run ? { clientRunId: session.run.id } : {}),
 			// aichatoverview#485 (T4): declare which authorization generation this input belongs to.
 			// The server re-derives it from current facts; a mismatch is a definitive refusal.
@@ -532,10 +662,14 @@ export class MessageHandler {
 		}
 	}
 
+	private canSettleGeneration(roomId: string, generation: number): boolean {
+		const r = this.getConversations().get(this.selfUid, roomId);
+		return r?.generation === generation || r?.detachedGenerations?.includes(generation) === true;
+	}
 	private runReady(roomId: string): boolean {
 		if (!this.getConversations) return true;
 		const record = this.getConversations().get(this.selfUid, roomId);
-		return !record || (record.state === 'ready' && !record.pendingRuns?.length);
+		return !record || (record.state === 'ready' && !record.pendingRuns?.some((run) => !record.detachedGenerations?.includes(run.generation)));
 	}
 
 	/**
@@ -903,7 +1037,7 @@ export class MessageHandler {
 			try {
 				const store = this.getConversations();
 				const id = randomUUID();
-				const bound = store.beginRun(this.selfUid, roomId, id);
+				const bound = store.beginRun(this.selfUid, roomId, id, { authorizationEpoch });
 				begunId = id;
 				// Render server templates once at the core boundary; adapters only inject the prepared prompt.
 				let nameTimer: ReturnType<typeof setTimeout> | undefined;
@@ -927,6 +1061,15 @@ export class MessageHandler {
 					// #404: frozen per-run binding; fixed to one thinkingId by the exact START
 					// receipt (barrier below) before the native stream is consumed.
 					replyToken: bound.replyToken,
+					get replyThinkingId() { return session.thinkingId || undefined; },
+					selectedModel: store.get(this.selfUid, roomId)?.selectedModel,
+					getSelectedModel: () => store.assertGeneration(this.selfUid, roomId, bound.generation).selectedModel,
+					onNativeBound: (ref) => {
+						const key = this.nativeKey(bound.conversationId, bound.generation, ref);
+						if (!session.thinkingId) throw new Error('START not ready');
+						this.nativeBindings.set(key, Promise.resolve({ token: bound.replyToken, runId: id, thinkingId: session.thinkingId }));
+						this.nativeThinking.set(key, session);
+					},
 					transcriptKey: sessionKey,
 					workspace: this.workspaceBase
 						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, workspaceContext) : undefined,
@@ -1083,7 +1226,7 @@ export class MessageHandler {
 			const stream = session.run!.agent.events;
 			for await (const ev of stream) {
 				// Reset invalidates a generation even if its HTTP-response cancellation callback has not run yet.
-				if (session.run && this.getConversations!().get(this.selfUid, roomId)?.generation !== session.run.generation) {
+				if (session.run && !this.canSettleGeneration(roomId, session.run.generation)) {
 					session.finalized = true;
 					await this.stopRun(session, 'stale generation');
 					break;
@@ -1099,7 +1242,8 @@ export class MessageHandler {
 				} else if (ev.type === 'error') {
 					finalizeError(ev.message);
 					if (ev.message.startsWith(`${NATIVE_SESSION_LOST}:`)) this.nativeSessionLost(session, channel); // #382
-					await this.stopRun(session, ev.message);
+					if (ev.message.startsWith('NATIVE_OUTCOME_UNKNOWN:')) this.getConversations().markStopUnconfirmed(session.run!.id);
+					else await this.stopRun(session, ev.message);
 					break;
 				} else if (ev.type === 'cancelled') {
 					finalizeError(ev.reason);
@@ -1112,7 +1256,7 @@ export class MessageHandler {
 				// reduceThinking's accounting at done.
 			}
 			if (session.run && !session.finalized) {
-				if (runDone && this.getConversations!().get(this.selfUid, roomId)?.generation === session.run.generation) {
+				if (runDone && this.canSettleGeneration(roomId, session.run.generation)) {
 					finalizeComplete();
 					this.releaseRun(session); // done AND stream return: bridge must prove upstream terminal.
 				} else {
@@ -1148,7 +1292,7 @@ export class MessageHandler {
 		if (!target) return;
 		// A legacy room/trigger receipt cannot prove which run started it (same trigger can replay).
 		if (target.run && (!pending || target.run.id !== data.clientRunId)) return;
-		if (target.roomId !== String(roomId) || target.triggerMsgId !== String(triggerMsgId) || !data.thinkingId) return;
+		if (target.roomId !== String(roomId) || target.triggerMsgId !== String(triggerMsgId ?? '') || !data.thinkingId) return;
 		if (target.thinkingId && target.thinkingId !== data.thinkingId) {
 			console.error(`[thinking] conflicting START receipt run=${data.clientRunId}`);
 			return;

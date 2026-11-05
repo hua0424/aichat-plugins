@@ -3,6 +3,14 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { isAbsolute, join, resolve } from 'node:path';
 import { bindingKey, parseBindingKey } from '../agent/bind-token-store.js';
 import { parseSessionKey } from './session-key.js';
+import type { AgentCapabilityResult, NativeRef } from '../agent/events.js';
+
+export interface ControlEntry {
+ requestId: string; fingerprint: string; authorizationEpoch: string; generation: number;
+ state: 'prepared' | 'submitted' | 'settled'; nativeRef?: NativeRef; receipt?: AgentCapabilityResult; recovery?: RecoveryData;
+}
+const executionRuns = (r: ConversationRecord) => (r.pendingRuns ?? []).filter((run) =>
+ !r.detachedGenerations?.includes(run.generation));
 
 export type Provider = string;
 export type ContextCandidate = { key: string } | { provider: Provider; nativeId: string; runtimeScope?: string };
@@ -33,6 +41,10 @@ export interface ConversationRecord {
 	 * Retained across reset for audit, but inert unless it matches the CURRENT generation and native sessionId.
 	 */
 	ccResumeFailure?: { sessionId: string; generation: number };
+	controls?: ControlEntry[];
+	selectedModel?: { providerID: string; modelID: string };
+	/** Only explicit native fresh-session reset detaches old execution, never legacy reset. */
+	detachedGenerations?: number[];
 }
 export interface RecoveryData { version: number; value: unknown }
 export interface PendingRun { runId: string; generation: number; startedAt: string; recovery?: RecoveryData }
@@ -51,6 +63,8 @@ export interface ReplyBinding {
 	thinkingId?: string;
 	createdAt: string;
 	expiresAt: string;
+	authorizationEpoch?: string;
+	nativeAliases?: NativeAlias[];
 }
 /**
  * #404: binding lease + capacity, locked by reply-bind tests and recorded in the implement manifest.
@@ -123,7 +137,7 @@ export type SuspensionReason =
 	| 'disabled';
 
 export function suspensionReason(record: ConversationRecord | undefined): SuspensionReason | undefined {
-	if (!record || record.state === 'ready') return record?.pendingRuns?.length ? 'occupied' : undefined;
+	if (!record || record.state === 'ready') return record && executionRuns(record).length ? 'occupied' : undefined;
 	if (record.state === 'disabled') return 'disabled';
 	if (record.state === 'stop_unconfirmed') return 'stop-unconfirmed';
 	if (record.pendingRuns?.length) return 'occupied'; // suspended+pendingRuns = 取消进行中的瞬态
@@ -167,9 +181,9 @@ export class ConversationStore {
 		}
 		// Persist the legacy CC cwd gate even for snapshots created before this safety check.
 		// A process restart is not evidence that a native run stopped.
-		if (this.snapshot.records.some((r) => (r.pendingRuns?.length && r.state !== 'stop_unconfirmed') ||
+		if (this.snapshot.records.some((r) => (executionRuns(r).length && r.state !== 'stop_unconfirmed') ||
 			((ccCwdPending(r) || codexThreadPending(r)) && r.state === 'ready'))) {
-			this.commit(this.snapshot.records.map((r) => r.pendingRuns?.length ? { ...r, state: 'stop_unconfirmed' }
+			this.commit(this.snapshot.records.map((r) => executionRuns(r).length ? { ...r, state: 'stop_unconfirmed' }
 				: (ccCwdPending(r) || codexThreadPending(r)) && r.state === 'ready' ? { ...r, state: 'suspended' } : r));
 		}
 	}
@@ -297,6 +311,99 @@ export class ConversationStore {
 		return copy(record);
 	}
 
+	/** Native controls share this store's atomic writer; there is deliberately no mutation retry queue. */
+	prepareControl(uid: string, room: string, requestId: string, fingerprint: string, authorizationEpoch: string): { fresh: boolean; entry: ControlEntry } {
+		if (![requestId, fingerprint, authorizationEpoch].every(validId)) throw new Error('invalid control');
+		const r = this.getOrCreate(uid, room);
+		const prior = r.controls?.find((c) => c.requestId === requestId);
+		if (prior) {
+			if (prior.fingerprint !== fingerprint || prior.authorizationEpoch !== authorizationEpoch) throw new Error('request_id_conflict');
+			return { fresh: false, entry: copy(prior) };
+		}
+		// ponytail: JSON snapshots retain 10000 lifetime mutation tombstones per conversation; require explicit archival before raising this full-write ceiling.
+		if ((r.controls?.length ?? 0) >= 10000) throw new Error('control_journal_capacity');
+		const entry: ControlEntry = { requestId, fingerprint, authorizationEpoch, generation: r.generation, state: 'prepared' };
+		r.controls = [...(r.controls ?? []), entry]; this.replace(r);
+		return { fresh: true, entry: copy(entry) };
+	}
+	getControl(uid: string, room: string, requestId: string): ControlEntry | undefined {
+		return this.get(uid, room)?.controls?.find((c) => c.requestId === requestId);
+	}
+	private controlRecord(uid: string, room: string, requestId: string): { r: ConversationRecord; c: ControlEntry } {
+		const r = this.get(uid, room), c = r?.controls?.find((item) => item.requestId === requestId);
+		if (!r || !c) throw new Error('control not prepared');
+		return { r, c };
+	}
+	submitControl(uid: string, room: string, requestId: string, ref?: NativeRef): void {
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (ref) c.nativeRef = copy(ref);
+		c.state = 'submitted'; this.replace(r);
+	}
+	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
+		this.assertRecovery(recovery);
+		const { r, c } = this.controlRecord(uid, room, requestId); c.recovery = copy(recovery); this.replace(r);
+	}
+	recordControl(uid: string, room: string, requestId: string, result: AgentCapabilityResult): AgentCapabilityResult {
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		const old = c.receipt;
+		if (old && !['accepted', 'unknown'].includes(old.status)) return copy(old);
+		if (result.generation !== undefined && result.generation !== String(c.generation)) throw new Error('control generation conflict');
+		if (c.nativeRef && result.nativeRef && Object.entries(c.nativeRef).some(([k, v]) =>
+			result.nativeRef![k as keyof NativeRef] !== undefined && result.nativeRef![k as keyof NativeRef] !== v)) throw new Error('native reference conflict');
+		if (old?.status === 'unknown') {
+			if (!result.reconciled || !['completed', 'failed', 'noop'].includes(result.status)) return copy(old);
+			if (!result.nativeRef && !result.effect) throw new Error('reconciliation evidence required');
+		}
+		if (result.nativeRef) c.nativeRef = { ...c.nativeRef, ...result.nativeRef };
+		c.receipt = { ...result, generation: String(c.generation), ...(c.nativeRef ? { nativeRef: c.nativeRef } : {}) };
+		if (result.status !== 'accepted') c.state = 'settled';
+		this.replace(r); return copy(c.receipt);
+	}
+	assertGeneration(uid: string, room: string, generation: number): ConversationRecord {
+		const r = this.get(uid, room);
+		if (this.closed || !r || r.generation !== generation) throw new Error('STALE_GENERATION');
+		if (r.state === 'disabled') throw new Error('conversation disabled');
+		return r;
+	}
+	saveControlNativeState(uid: string, room: string, generation: number, provider: Provider, state: Record<string, unknown>): void {
+		this.assertProvider(provider, uid);
+		const r = this.assertGeneration(uid, room, generation); this.assertCodexNativeWrite(r, provider, state); this.assertCcNativeWrite(provider, state);
+		r.nativeState[provider] = copy(state); this.replace(r);
+	}
+	selectModel(uid: string, room: string, generation: number, model: { providerID: string; modelID: string }): void {
+		if (!validId(model.providerID) || !validId(model.modelID)) throw new Error('invalid model');
+		const r = this.assertGeneration(uid, room, generation); r.selectedModel = copy(model); this.replace(r);
+	}
+	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>): ConversationRecord {
+		this.assertProvider(provider, uid);
+		const old = this.assertGeneration(uid, room, generation);
+		if (!validId(id) || !Number.isSafeInteger(generation + 1)) throw new Error('invalid native reset');
+		if (provider === 'opencode') this.assertOpencodeDirectoryOwner(old.conversationId, state.directory as string);
+		const r: ConversationRecord = { ...old, generation: generation + 1, contextKey: randomBytes(32).toString('hex'),
+			state: 'ready', detachedGenerations: [...(old.detachedGenerations ?? []), generation],
+			nativeState: { [provider]: copy(state) }, nativeAliases: [{ provider, id }],
+			replyBindings: (old.replyBindings ?? []).filter((b) => b.thinkingId && b.authorizationEpoch &&
+				(old.pendingRuns ?? []).some((run) => run.runId === b.runId)).map((b) => ({ ...b,
+					nativeAliases: b.generation === generation ? copy(old.nativeAliases) : b.nativeAliases })) };
+		this.commit(this.snapshot.records.map((item) => item.conversationId === r.conversationId ? r : item), {
+			revokedKeys: [...(this.snapshot.revokedKeys ?? []), old.contextKey],
+			revokedAliases: [...(this.snapshot.revokedAliases ?? []), ...old.nativeAliases],
+		});
+		return copy(r);
+	}
+	/** Old aliases never resolve generally; only an exact leased reply token may settle its own target. */
+	resolveReplyContext(token: string, candidates: readonly ContextCandidate[]): ConversationRecord | undefined {
+		const b = this.resolveReplyBinding(token);
+		if (!b || !candidates.length) return undefined;
+		const r = this.snapshot.records.find((item) => item.conversationId === b.conversationId);
+		if (!r || !this.visible(r)) return undefined;
+		if (b.generation === r.generation) return this.resolveCandidates(candidates);
+		if (!candidates.every((c) => 'provider' in c && b.nativeAliases?.some((a) =>
+			a.provider === c.provider && a.id === c.nativeId && (c.runtimeScope === undefined || a.runtimeScope === c.runtimeScope)))) return undefined;
+		return { ...copy(r), generation: b.generation };
+	}
+
 	getResetReceipt(bearer: string, requestId: string): ResetReceipt | undefined {
 		const digest = this.receiptDigest(bearer, requestId);
 		const entry = this.snapshot.resetReceipts?.find((r) => r.digest === digest);
@@ -309,12 +416,13 @@ export class ConversationStore {
 		return createHash('sha256').update(JSON.stringify([bearer, requestId])).digest('hex');
 	}
 
-	beginRun(identityId: string, roomId: string, runId: string): BoundConversationRun {
+	beginRun(identityId: string, roomId: string, runId: string, options?: { authorizationEpoch?: string; nativeTurn?: NativeRef }): BoundConversationRun {
 		if (!validId(runId)) throw new Error('invalid runId');
 		const record = this.getOrCreate(identityId, roomId);
-		if (record.state !== 'ready' || record.pendingRuns?.length) throw new Error('conversation paused or occupied');
+		if (record.state !== 'ready' || (!options?.nativeTurn && executionRuns(record).length)) throw new Error('conversation paused or occupied');
 		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
-		record.pendingRuns = [{ runId, generation: record.generation, startedAt: new Date().toISOString() }];
+		record.pendingRuns = [...(record.pendingRuns ?? []), { runId, generation: record.generation, startedAt: new Date().toISOString(),
+			...(options?.nativeTurn ? { recovery: { version: 1, value: { provider: record.adapterInstanceId, ...options.nativeTurn } } } : {}) }];
 		// #404: mint the opaque reply binding and persist it in the SAME commit as the run slot —
 		// the token becomes visible only after this commit succeeds (disk failure → no usable target).
 		record.replyBindings = this.prunedBindings(record, record.generation);
@@ -324,7 +432,9 @@ export class ConversationStore {
 		const binding: ReplyBinding = { token: randomBytes(32).toString('hex'), runId,
 			conversationId: record.conversationId, serverNamespace: this.options.serverNamespace,
 			generation: record.generation, createdAt: now.toISOString(),
-			expiresAt: new Date(now.getTime() + REPLY_BINDING_TTL_MS).toISOString() };
+			expiresAt: new Date(now.getTime() + REPLY_BINDING_TTL_MS).toISOString(),
+			...(options?.authorizationEpoch ? { authorizationEpoch: options.authorizationEpoch } : {}),
+			nativeAliases: copy(record.nativeAliases) };
 		if ((record.replyBindings ?? []).some((b) => b.token === binding.token || b.runId === runId))
 			throw new Error('duplicate reply binding');
 		record.replyBindings.push(binding);
@@ -392,13 +502,15 @@ export class ConversationStore {
 		if (!record || this.closed) throw new Error('run no longer pending');
 		const updated = copy(record);
 		updated.pendingRuns = updated.pendingRuns!.filter((run) => run.runId !== runId);
-		updated.state = updated.pendingRuns.length ? 'stop_unconfirmed'
+		updated.state = executionRuns(updated).length && updated.state !== 'ready' ? 'stop_unconfirmed'
 			: ccCwdPending(updated) || codexThreadPending(updated) || ccResumeBroken(updated) ? 'suspended' : 'ready';
 		this.replace(updated);
 	}
 	private updateRunState(runId: string, state: 'suspended' | 'stop_unconfirmed'): void {
 		const record = this.snapshot.records.find((r) => r.pendingRuns?.some((run) => run.runId === runId));
 		if (!record || this.closed) throw new Error('run no longer pending');
+		const run = record.pendingRuns!.find((r) => r.runId === runId)!;
+		if (record.detachedGenerations?.includes(run.generation)) return;
 		this.replace({ ...copy(record), state });
 	}
 
@@ -437,7 +549,8 @@ export class ConversationStore {
 		for (const record of this.snapshot.records) {
 			const binding = (record.replyBindings ?? []).find((b) => b.token === token);
 			if (!binding) continue;
-			if (binding.conversationId !== record.conversationId || binding.generation !== record.generation ||
+			if (binding.conversationId !== record.conversationId || (binding.generation !== record.generation &&
+					!(record.detachedGenerations?.includes(binding.generation) && binding.authorizationEpoch && binding.nativeAliases?.length)) ||
 				binding.serverNamespace !== this.options.serverNamespace || binding.thinkingId === undefined ||
 				!binding.thinkingId || Number.isNaN(Date.parse(binding.expiresAt)) ||
 				Date.parse(binding.expiresAt) <= now) return undefined;
@@ -450,7 +563,7 @@ export class ConversationStore {
 	private prunedBindings(record: ConversationRecord, generation: number): ReplyBinding[] {
 		const now = Date.now();
 		return (record.replyBindings ?? []).filter((b) =>
-			b.generation === generation && !Number.isNaN(Date.parse(b.expiresAt)) && Date.parse(b.expiresAt) > now);
+			(b.generation === generation || record.detachedGenerations?.includes(b.generation)) && !Number.isNaN(Date.parse(b.expiresAt)) && Date.parse(b.expiresAt) > now);
 	}
 	private assertRecovery(value: RecoveryData): void {
 		if (!value || !Number.isSafeInteger(value.version) || value.version < 1) throw new Error('invalid recovery');
@@ -467,7 +580,7 @@ export class ConversationStore {
 		this.assertProvider(provider, identityId);
 		if (!validId(id) || (runtimeScope !== undefined && !validId(runtimeScope))) throw new Error('invalid native alias');
 		const prior = this.get(identityId, roomId);
-		if (prior && (prior.state !== 'ready' || prior.pendingRuns?.some((run) => run.generation !== prior.generation)))
+		if (prior && (prior.state !== 'ready' || executionRuns(prior).some((run) => run.generation !== prior.generation)))
 			throw new Error('conversation paused');
 		if (prior && this.options.activeProviders?.has(identityId) && prior.adapterInstanceId !== this.options.activeProviders.get(identityId))
 			throw new Error('activated provider changed for existing conversation');
@@ -752,7 +865,11 @@ export class ConversationStore {
 				if (run.recovery !== undefined) this.assertRecovery(run.recovery);
 				runs.add(run.runId);
 			}
-			if (r.state === 'ready' && r.pendingRuns?.some((run) => run.generation !== r.generation)) throw new Error('old run cannot be ready');
+			if (r.state === 'ready' && executionRuns(r).some((run) => run.generation !== r.generation)) throw new Error('old run cannot be ready');
+			if (r.detachedGenerations && (!Array.isArray(r.detachedGenerations) || r.detachedGenerations.some((g) => !Number.isSafeInteger(g) || g < 1 || g >= r.generation))) throw new Error('invalid detached generation');
+			if (r.selectedModel && (!validId(r.selectedModel.providerID) || !validId(r.selectedModel.modelID))) throw new Error('invalid selected model');
+			if (r.controls && (!Array.isArray(r.controls) || r.controls.length > 10000 || new Set(r.controls.map((c) => c.requestId)).size !== r.controls.length ||
+				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state)))) throw new Error('invalid control journal');
 			if (r.replyBindings !== undefined && !Array.isArray(r.replyBindings)) throw new Error('invalid reply bindings');
 			for (const b of r.replyBindings ?? []) {
 				if (!b || typeof b.token !== 'string' || !/^[0-9a-f]{64}$/.test(b.token) ||

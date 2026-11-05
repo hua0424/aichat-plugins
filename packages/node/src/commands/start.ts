@@ -237,6 +237,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		resolve: (sessionKey) => bound(conversations?.resolveLegacy(sessionKey)),
 		resolveCandidate: (candidate: ContextCandidate) => bound(conversations?.resolveCandidate(candidate as
 			Parameters<ConversationStore['resolveCandidate']>[0])),
+		resolveReplyContext: (token, candidates) => bound(conversations?.resolveReplyContext(token, candidates)),
 		// #404: V3 run-binding verification against the same core store (fail closed when unwired).
 		resolveReplyBinding: (token) => {
 			const binding = conversations?.resolveReplyBinding(token);

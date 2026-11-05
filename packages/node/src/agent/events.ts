@@ -55,6 +55,10 @@ export interface PreparedRun {
 	 * native submission. CC/Codex drivers inject it verbatim into the per-run execution env.
 	 */
 	replyToken?: string;
+	replyThinkingId?: string;
+	selectedModel?: { providerID: string; modelID: string };
+	getSelectedModel?(): { providerID: string; modelID: string } | undefined;
+	onNativeBound?(ref: NativeRef): void;
 	/** Legacy transcript file key only; not an authorization source. */
 	transcriptKey?: string;
 	systemPrompt: string;
@@ -86,28 +90,64 @@ export interface AgentCapability {
 	defaultVisibility: 'public' | 'hidden';
 	scope: 'workspace' | 'conversation' | 'instance';
 	parameters: Array<{ name: string; type: string; required: boolean }>;
+	source?: 'skill' | 'command' | 'mcp' | 'model' | 'session';
 }
 export interface AgentCapabilityCatalog {
 	version: string;
 	framework: string;
 	runtimeVersion: string;
 	capabilities: AgentCapability[];
+	models?: { items: { providerId: string; modelId: string; label: string; connected: boolean }[]; total: number; offset: number; nextOffset?: number };
 }
 export interface AgentCapabilityContext {
 	/** Prepared by core from trusted room context, never supplied directly by the UI. */
 	workspace?: string;
 	signal: AbortSignal;
+	capabilityId?: string;
+	parameters?: Record<string, unknown>;
 }
 export interface AgentCapabilityInvocation extends AgentCapabilityContext {
 	capabilityId: string;
 	parameters?: Record<string, unknown>;
 	catalogVersion: string;
+	execution?: CapabilityExecution;
+	/** Core journal only. Presence selects read-only reconciliation; never a submission fallback. */
+	recovery?: { generation: number; nativeRef?: NativeRef; receipt: AgentCapabilityResult; value?: { version: number; value: unknown } };
 }
+export interface NativeRef { sessionId: string; inputId?: string; messageId?: string; parentId?: string; turnId?: string }
+export type CapabilityEffect =
+	| { kind: 'reset'; sessionId: string; generation: string }
+	| { kind: 'compact'; controlId: string; summaryId?: string; summary: boolean }
+	| { kind: 'model'; providerId: string; modelId: string; effective: 'next_request' };
 export interface AgentCapabilityResult {
-	status: 'completed' | 'failed' | 'unsupported' | 'unknown';
+	status: 'accepted' | 'completed' | 'failed' | 'noop' | 'unsupported' | 'unknown';
 	text?: string;
 	nativeResult?: unknown;
 	error?: string;
+	phase?: 'accepted' | 'outcome';
+	generation?: string;
+	nativeRef?: NativeRef;
+	effect?: CapabilityEffect;
+	reconciled?: boolean;
+}
+export interface NativeTurnEvent {
+	eventId: string; conversationId: string; generation: number; nativeRef: NativeRef;
+	requestIds: string[]; relation: 'new' | 'attached'; phase: 'bound' | 'completed' | 'failed' | 'cancelled';
+	event?: AgentEvent;
+}
+export interface CapabilityExecution {
+	requestId: string; conversation: BoundConversation; systemPrompt: string; contextKey: string;
+	promptOwner: string; authorizationEpoch: string;
+	selectedModel?: { providerID: string; modelID: string };
+	getSelectedModel?(): { providerID: string; modelID: string } | undefined;
+	saveRecovery(value: { version: number; value: unknown }): Promise<void>;
+	/** Persist native locator BEFORE the native mutation. */
+	submitted(ref?: NativeRef): Promise<void>;
+	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
+	replaceSession(id: string, state: { version: number; value: unknown }): Promise<number>;
+	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
+	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
+	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }>;
 }
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
