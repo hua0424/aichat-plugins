@@ -8,10 +8,11 @@ import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
 import { MessageDebouncer } from '../util/debounce.js';
+import { AgentCommandHandler } from './agent-command.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
 import type { HulaApiClient } from '../api/hula-api.js';
-import { buildAgentInjection } from './media-inject.js';
+import { buildAgentInjection, isFeedbackMessage } from './media-inject.js';
 import { buildAgentEnvelope } from './envelope.js';
 import { buildSystemPrompt, type AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
@@ -268,6 +269,7 @@ const DSH_PERSONA_CHANGED_NOTICE =
 export class MessageHandler {
 	private ws: HulaWSClient;
 	private driver: RunDriver;
+	private readonly agentCommands: AgentCommandHandler;
 	// REQ-029 (#29): selfUid is an opaque string end-to-end.
 	private selfUid: string;
 
@@ -350,6 +352,7 @@ export class MessageHandler {
 	) {
 		this.ws = ws;
 		this.driver = driver;
+		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase);
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
 		this.groupConfigCache = new GroupConfigCache();
@@ -590,6 +593,11 @@ export class MessageHandler {
 
 	handle(msg: WSResponse): void {
 		switch (msg.type) {
+			case 'agentCommand':
+				if (this.apiClient) void this.agentCommands.handle(msg.data).then(async (result) => {
+					if (result) await this.apiClient!.reportAgentCommandResult(result);
+				}).catch(() => console.warn('[handler] agent command result callback unconfirmed'));
+				break;
 			case 'receiveMessage':
 				// REQ-146: media messages now resolve a short-lived signed URL (async) before injection,
 				// so handleReceiveMessage is async. ACK/dedup run in its synchronous prefix (before any await),
@@ -657,6 +665,8 @@ export class MessageHandler {
 
 		// 3. 忽略自己发的消息
 		if (String(data.fromUser.uid) === String(this.selfUid)) return;
+		// Visible system/command feedback never enters media signing, accumulation or the agent queue.
+		if (isFeedbackMessage(data.message)) return;
 		// REQ-007 #73: 文本(1)直接用；图片(3)/文件(4)注入 file-attachment；其余类型跳过。
 		// REQ-146 (#146): server 已停发 7 天下载地址——图片(3)/文件(4)落地时先 async 换取一个短效签名地址
 		// （signDownload），把它作为 resolvedFileUrl 注入本轮 agent 输入；文本(1)不触发任何网络调用（同步路径不变）。
@@ -680,13 +690,6 @@ export class MessageHandler {
 		const roomId = String(data.message.roomId);
 		const fromUid = String(data.fromUser.uid);
 		const isFromAi = data.fromUser.userType === 4; // 4 = AICLAW
-
-		// 4. 【M3】跳过 autoReply 消息
-		const extra = (data.message as Record<string, unknown>).extra as Record<string, unknown> | undefined;
-		if (extra?.autoReply === true) {
-			console.log(`[handler] Skipping autoReply message msgId=${msgId}`);
-			return;
-		}
 
 		// 5. 【M3】AI 互触发开关检查
 		if (isFromAi) {

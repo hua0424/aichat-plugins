@@ -1,6 +1,7 @@
 import { mkdir, realpath } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import type { OpencodeClient } from '@opencode-ai/sdk';
-import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver, AgentCapability, AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult } from '../events.js';
 import { mapOpencodeEvent } from './events.js';
 import { AncestorChain } from './ancestor-chain.js';
 import { defaultRunBindDir, removeRunBindFile, writeRunBindFile } from './run-bind.js';
@@ -43,6 +44,67 @@ export class OpencodeDriver implements RunDriver {
 			throw new RangeError('Invalid OpenCode cancel timeout');
 	}
 	async connect(): Promise<void> { await this.deps.server.ensureStarted(); }
+	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		return (await this.discoverSnapshot(input)).catalog;
+	}
+	private async discoverSnapshot(input: AgentCapabilityContext) {
+		if (!input.workspace) throw new Error('workspace_required');
+		input.signal.throwIfAborted();
+		// Same trusted workspace preparation as chat, without creating a native session or run.
+		await mkdir(input.workspace, { recursive: true });
+		input.signal.throwIfAborted();
+		await this.deps.server.ensureStarted();
+		const client = this.deps.server.getDiscoveryClient();
+		const options = { signal: input.signal, throwOnError: true } as const;
+		const [health, skills, commands, providers] = await Promise.all([
+			client.global.health(options),
+			client.app.skills({ directory: input.workspace }, options),
+			client.command.list({ directory: input.workspace }, options),
+			client.provider.list({ directory: input.workspace }, options),
+		]);
+		if (!health.data?.version || !Array.isArray(skills.data) || !Array.isArray(commands.data) || !Array.isArray(providers.data?.all))
+			throw new Error('native_discovery_invalid');
+		const metadata = (kind: 'skill' | 'command', name: string, description?: string, hints: string[] = []): AgentCapability => ({
+			id: `${kind}:${name}`, kind, name,
+			description: [description, hints.length ? 'Native argument hints only; requiredness unavailable; execution not connected.' : undefined].filter(Boolean).join(' '),
+			supported: true, executable: false, reason: 'execution_not_connected',
+			defaultVisibility: kind === 'skill' || ['reset', 'compact', 'model'].includes(name) ? 'public' : 'hidden',
+			scope: 'workspace', parameters: hints.map((hint) => ({ name: hint, type: 'string', required: false })),
+		});
+		const capabilities: AgentCapability[] = [
+			{ id: 'model.list', kind: 'model', name: 'Models', description: 'List native models available in this workspace.', supported: true, executable: true,
+				defaultVisibility: 'public', scope: 'workspace', parameters: [] },
+			...skills.data.map((skill) => metadata('skill', skill.name, skill.description)),
+			...commands.data.map((command) => metadata('command', command.name, command.description, command.hints)),
+		];
+		capabilities.sort((a, b) => a.kind === b.kind ? a.id.localeCompare(b.id) :
+			['model', 'skill', 'command'].indexOf(a.kind) - ['model', 'skill', 'command'].indexOf(b.kind));
+		const catalog: AgentCapabilityCatalog = { framework: this.type, runtimeVersion: health.data.version, capabilities,
+			version: createHash('sha256').update(JSON.stringify([this.deps.server.url, input.workspace, health.data.version, capabilities])).digest('hex') };
+		return { catalog, providers: providers.data };
+	}
+	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		if (input.capabilityId !== 'model.list') return { status: 'unsupported', error: 'execution_not_connected' };
+		if (input.parameters && Object.keys(input.parameters).length) return { status: 'failed', error: 'invalid_parameters' };
+		const { catalog, providers: data } = await this.discoverSnapshot(input);
+		if (catalog.version !== input.catalogVersion) return { status: 'failed', error: 'catalog_stale' };
+		if (!data || !Array.isArray(data.connected)) throw new Error('native_model_list_invalid');
+		const models = data.all.flatMap((provider) => Object.values(provider.models).map((model) => ({
+			id: `${provider.id}/${model.id}`, providerId: provider.id, modelId: model.id, name: model.name,
+			connected: data.connected.includes(provider.id), default: data.default[provider.id] === model.id,
+		}))).sort((a, b) => Number(b.connected) - Number(a.connected) || a.id.localeCompare(b.id));
+		const lines = ['Available models:'];
+		let length = lines[0].length;
+		for (const model of models) {
+			const line = `${model.id} — ${model.name} (${model.connected ? 'connected' : 'not connected'})`;
+			if (length + line.length > 1800) {
+				lines.push(`Showing ${lines.length - 1} of ${models.length} models (${models.filter((item) => item.connected).length} connected).`);
+				break;
+			}
+			lines.push(line); length += line.length + 1;
+		}
+		return { status: 'completed', text: models.length ? lines.join('\n') : 'No models available.', nativeResult: { models } };
+	}
 	async disconnect(): Promise<void> {
 		await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
 		// Never restart or stop the backend shared by other identities.

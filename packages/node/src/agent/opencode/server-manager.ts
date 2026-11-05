@@ -1,4 +1,5 @@
 import { createOpencodeServer, createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
+import { createOpencodeClient as createDiscoveryClient, type OpencodeClient as DiscoveryClient } from '@opencode-ai/sdk/v2';
 
 /** A started opencode server handle (the subset we depend on). */
 export interface OpencodeServerHandle {
@@ -127,6 +128,12 @@ export class OpencodeServerManager {
 			throw new Error('opencode server not started; call ensureStarted() first');
 		}
 		return this.client;
+	}
+
+	/** Same native instance/auth, richer SDK discovery surface; leave the existing run transport alone. */
+	getDiscoveryClient(): DiscoveryClient {
+		const auth = opencodeBasicAuthHeader(process.env.OPENCODE_SERVER_PASSWORD);
+		return createDiscoveryClient({ baseUrl: this.url, ...(auth ? { headers: { Authorization: auth } } : {}) });
 	}
 
 	/** The started server's base URL. Throws if not started. */

@@ -1,5 +1,10 @@
 import type { ReceivedMessage, MediaMessageBody, TextMessageBody } from '../stream/protocol.js';
 
+/** Feedback is visible IM history, never ordinary agent input (live or replayed). */
+export function isFeedbackMessage(message: ReceivedMessage['message']): boolean {
+	return message.extra?.autoReply === true || typeof message.extra?.commandFeedback === 'string';
+}
+
 /**
  * REQ-007 #73: 把一条 receiveMessage 的 message 归一化为「喂给 openclaw agent 的纯文本」。
  *
@@ -22,6 +27,7 @@ export function buildAgentInjection(
 	message: ReceivedMessage['message'],
 	resolvedFileUrl?: string,
 ): string | null {
+	if (isFeedbackMessage(message)) return null;
 	const { type, body } = message;
 
 	if (type === 1) {

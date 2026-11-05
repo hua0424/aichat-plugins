@@ -3,6 +3,7 @@
  * 仅用于 autoReply 发送和 CLI 命令，不替代 aichat-claw 的 Tool 路径
  */
 import type { HostInfo } from '../host-info.js';
+import type { AgentCommandResponse } from '../stream/protocol.js';
 import type { AgentPromptTemplates } from '../agent/prompt-templates.js';
 import { errMsg } from '../util/err.js';
 
@@ -26,6 +27,11 @@ export class HulaApiClient {
 	constructor(baseUrl: string, token: string) {
 		this.baseUrl = baseUrl.replace(/\/+$/, '');
 		this.token = token;
+	}
+
+	/** Result callback is authenticated with this identity's existing agent token. */
+	async reportAgentCommandResult(result: AgentCommandResponse): Promise<void> {
+		await this.post('/api/im/aiclaw/commands/result', result, AbortSignal.timeout(7000));
 	}
 
 	/** Probe the actual T15 endpoint: old servers ignoring unknown JSON fields are NOT receipt-capable. */
