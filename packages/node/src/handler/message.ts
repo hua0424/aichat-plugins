@@ -395,7 +395,20 @@ export class MessageHandler {
 			throw new Error('trusted execution context required');
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
-		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch])).digest('hex');
+		const expectedGeneration = request.context.expectedGeneration;
+		if (expectedGeneration !== undefined) {
+			const generation = Number(expectedGeneration);
+			if (!/^\d+$/.test(expectedGeneration) || !Number.isSafeInteger(generation)) {
+				return { receipt: { status: 'failed', error: 'authorization_changed' } };
+			}
+			try {
+				store.assertGeneration(this.selfUid, room, generation);
+			} catch {
+				// 审批冻结后原生会话已 reset：旧代次永远不能再执行。
+				return { receipt: { status: 'failed', error: 'authorization_changed' } };
+			}
+		}
+		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
 		if (request.reconcileOnly) {
 			// Evidence queries never create journal state: absent/mismatched entries stay unknown.
 			const existing = store.getControl(this.selfUid, room, request.requestId);
