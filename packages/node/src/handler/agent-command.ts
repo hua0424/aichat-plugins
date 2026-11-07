@@ -23,6 +23,7 @@ export class AgentCommandHandler {
    (ctx.roomType !== 1 && ctx.roomType !== 2) ||
     (raw.reconcileOnly !== undefined && typeof raw.reconcileOnly !== 'boolean') ||
    ['counterpartUid', 'workspaceDir', 'account', 'authorizationEpoch'].some((key) => ctx[key] !== undefined && typeof ctx[key] !== 'string') ||
+   (ctx.expectedGeneration !== undefined && (typeof ctx.expectedGeneration !== 'string' || !/^\d+$/.test(ctx.expectedGeneration))) ||
    (ctx.isOwner !== undefined && typeof ctx.isOwner !== 'boolean') ||
    (ctx.roomType === 2 && (typeof ctx.isOwner !== 'boolean' || !id(ctx.counterpartUid))) ||
    (raw.operation === 'invoke' && (!id(raw.capabilityId) || !id(raw.catalogVersion))) ||
@@ -31,7 +32,7 @@ export class AgentCommandHandler {
   try { request.parameters = capabilityParameters(request.operation, request.capabilityId, raw.parameters); }
   catch { return fail('invalid_request'); }
   const fingerprint = JSON.stringify([request.roomId, request.operation, request.capabilityId, request.catalogVersion,
-   request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch]);
+   request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch, ctx.expectedGeneration]);
   // An internal evidence query must bypass an in-flight invocation promise/cache.
    if (request.reconcileOnly) return this.execute(request);
    const prior = this.requests.get(request.requestId);

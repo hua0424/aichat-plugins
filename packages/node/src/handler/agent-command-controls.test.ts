@@ -59,4 +59,17 @@ describe('command native execution seam', () => {
   expect(executeCapability).not.toHaveBeenCalled();
   expect(await handler.handle({ ...request, requestId: 'bad', parameters: { arguments: null } })).toMatchObject({ error: 'invalid_request' });
  });
+ it('accepts only a decimal expectedGeneration and hands the frozen generation to preparation', async () => {
+  const prepare = vi.fn(async () => ({ receipt: { status: 'failed' as const, error: 'authorization_changed' } }));
+  const handler = new AgentCommandHandler({} as unknown as AgentDriver, 'u', '/work', { prepare });
+  expect(await handler.handle({ ...request, context: { ...request.context, expectedGeneration: 'x' } }))
+   .toMatchObject({ error: 'invalid_request' });
+  expect(prepare).not.toHaveBeenCalled();
+  const frozen = { ...request, requestId: 'frozen', context: { ...request.context, expectedGeneration: '7' } };
+  expect(await handler.handle(frozen)).toMatchObject({ status: 'failed', error: 'authorization_changed' });
+  expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({ expectedGeneration: '7' }) }), expect.any(String));
+  // 同一 requestId 换代次必须视为冲突，而不是复用旧指纹。
+  expect(await handler.handle({ ...frozen, context: { ...frozen.context, expectedGeneration: '8' } }))
+   .toMatchObject({ error: 'request_id_conflict' });
+ });
 });
