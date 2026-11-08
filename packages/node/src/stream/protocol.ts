@@ -8,6 +8,8 @@ export interface AgentCommandRequest {
 	operation: 'discover' | 'invoke';
 	/** Server-internal evidence query; never submit when the local journal is absent. */
 	reconcileOnly?: boolean;
+	/** Server-internal approval fence probe; replies with the local native generation only, never executes. */
+	generationProbe?: boolean;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;
 	catalogVersion?: string;
