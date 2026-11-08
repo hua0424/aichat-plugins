@@ -308,7 +308,7 @@ describe('native OpenCode AgentRun', () => {
 		f.cleanup();
 	});
 
-	it('#405 ancestor conflict fails the turn instead of guessing current/latest', async () => {
+	it('#405 foreign final HTTP response is never bound as this run; unknown only after stream loss', async () => {
 		const f = fixture();
 		const pending = collect(f.driver.createRun(f.input).events);
 		await vi.waitFor(() => expect(f.prompt).toHaveBeenCalled());
@@ -316,10 +316,14 @@ describe('native OpenCode AgentRun', () => {
 		f.emit({ type: 'message.updated', properties: { info: { id: 'A1', sessionID: 's1', role: 'assistant', parentID: f.inputID } } });
 		await tick();
 		f.complete(undefined, 'U_FOREIGN');
+		await tick();
+		// A foreign final assistant must not complete this run, and an in-progress own
+		// assistant is not terminal: the run keeps observing instead of guessing.
+		f.cleanup();
 		expect(await pending).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN') }]);
+		expect(f.saveRecovery).not.toHaveBeenCalledWith({ version: 1, value: expect.objectContaining({ ancestorProof: 'verified' }) });
 		// Conflict withdraws the file binding too: nothing further may send as this run.
 		expect(await readRunBindFile(f.runBindDir, 's1')).toBeUndefined();
-		f.cleanup();
 	});
 
 	it('#503 absent user SSE is recoverable through preassigned inputID and exact assistant parent', async () => {
