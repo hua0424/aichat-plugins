@@ -174,7 +174,10 @@ export class NativeInputRun implements AgentRun {
       for (const part of row.parts) observe({ type: 'message.part.updated', properties: { part } });
      }
      for (const row of own) observe({ type: 'message.updated', properties: { info: row.info } });
-    if (!terminal) fail('NATIVE_OUTCOME_UNKNOWN: no matching native completion');
+    // aichatoverview#505: a history snapshot without own completion is NOT terminal. The
+    // command HTTP response can win the race while the own assistant is still running; its
+    // completion (and later parts) may still arrive on SSE. Keep observing until completion,
+    // stream loss, or the observation timeout below decides unknown.
    }).catch(() => { if (!terminal) fail('NATIVE_OUTCOME_UNKNOWN: native request outcome unavailable'); });
    timer = setTimeout(() => fail('NATIVE_OUTCOME_UNKNOWN: native observation timeout'), 5 * 60_000); timer.unref?.();
    while (!ended || queue.length) {
