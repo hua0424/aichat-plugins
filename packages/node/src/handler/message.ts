@@ -434,8 +434,14 @@ export class MessageHandler {
 			const entry = prepared.entry;
 			const receipt = entry.receipt ?? store.recordControl(this.selfUid, room, request.requestId,
 				{ status: 'unknown', phase: 'outcome', error: 'native_request_failed', generation: String(entry.generation), nativeRef: entry.nativeRef });
-			if (!['accepted', 'unknown'].includes(receipt.status) || !this.driver.executeCapability) {
-				this.settleRecoveredControl(request, receipt, entry.generation); return { receipt };
+			// #505: a reconcileOnly query of this request's own terminal journal is durable native
+			// evidence. Replay it as reconciled so the server can repair a record that raced to
+			// unknown; never manufacture completed without evidence and never re-execute here.
+			const replay = request.reconcileOnly && ['completed', 'failed', 'noop'].includes(receipt.status)
+				&& (receipt.status !== 'completed' || receipt.nativeRef || receipt.effect)
+				? { ...receipt, reconciled: true } : receipt;
+			if (!['accepted', 'unknown'].includes(replay.status) || !this.driver.executeCapability) {
+				this.settleRecoveredControl(request, replay, entry.generation); return { receipt: replay };
 			}
 			// Journal identity was checked above. This branch has no execution/mutation handles.
 			const recovered = await this.driver.executeCapability({ workspace, signal: AbortSignal.timeout(10_000), capabilityId: request.capabilityId!,
