@@ -124,7 +124,7 @@ export interface AgentCapabilityResult {
 	text?: string;
 	nativeResult?: unknown;
 	error?: string;
-	phase?: 'accepted' | 'outcome';
+	phase?: 'accepted' | 'outcome' | 'generation';
 	generation?: string;
 	nativeRef?: NativeRef;
 	effect?: CapabilityEffect;

@@ -73,3 +73,25 @@ describe('command native execution seam', () => {
    .toMatchObject({ error: 'request_id_conflict' });
  });
 });
+
+describe('approval generation probe', () => {
+ it('answers the probe without preparing, executing or entering the command cache', async () => {
+  const prepare = vi.fn(async () => ({ receipt: { status: 'failed' as const, error: 'authorization_changed' } }));
+  const executeCapability = vi.fn();
+  const handler = new AgentCommandHandler({ executeCapability } as unknown as AgentDriver, 'u', '/work', { prepare, generation: () => 3 });
+  expect(await handler.handle({ ...request, requestId: 'probe', operation: 'generation', generationProbe: true }))
+   .toEqual({ requestId: 'probe', roomId: 'room', status: 'completed', phase: 'generation', generation: '3' });
+  expect(prepare).not.toHaveBeenCalled();
+  expect(executeCapability).not.toHaveBeenCalled();
+  // 侦测响应不进命令缓存：同一 requestId 的正式下发仍走 prepare 并冻结代次。
+  expect(await handler.handle({ ...request, requestId: 'probe', context: { ...request.context, expectedGeneration: '3' } }))
+   .toMatchObject({ status: 'failed', error: 'authorization_changed' });
+  expect(prepare).toHaveBeenCalledOnce();
+  // 旧插件会把 operation=generation 当非法请求拒绝，因此侦测信封绝不会被当成真实 invoke 执行。
+  expect(await handler.handle({ ...request, requestId: 'probe2', generationProbe: true }))
+   .toMatchObject({ error: 'invalid_request' });
+  const bare = new AgentCommandHandler({} as unknown as AgentDriver, 'u', '/work', { prepare });
+  expect(await bare.handle({ ...request, requestId: 'probe3', operation: 'generation', generationProbe: true }))
+   .toMatchObject({ error: 'execution_not_supported' });
+ });
+});

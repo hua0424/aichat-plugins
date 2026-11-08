@@ -357,7 +357,10 @@ export class MessageHandler {
 	) {
 		this.ws = ws;
 		this.driver = driver;
-		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, { prepare: (request, workspace) => this.prepareCommand(request, workspace) });
+		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, {
+			prepare: (request, workspace) => this.prepareCommand(request, workspace),
+			generation: (request) => this.snapshotGeneration(request),
+		});
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
 		this.groupConfigCache = new GroupConfigCache();
@@ -389,6 +392,11 @@ export class MessageHandler {
 		return JSON.stringify([conversationId, generation, ref.sessionId, ref.turnId ?? ref.inputId ?? ref.messageId]);
 	}
 
+	/** Trusted native generation at probe time; an absent local record is reported as 0 (initial), never guessed from server state. */
+	private snapshotGeneration(request: AgentCommandRequest): number {
+		return this.getConversations().get(this.selfUid, request.roomId)?.generation ?? 0;
+	}
+
 	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
 		if (!workspace || !request.context.authorizationEpoch) {
 			if (request.reconcileOnly) return { receipt: { status: 'unknown', error: 'native_request_failed' } };
@@ -402,7 +410,13 @@ export class MessageHandler {
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };
 			}
 			try {
-				store.assertGeneration(this.selfUid, room, generation);
+				if (generation === 0) {
+					// 服务端可信快照：0 = 批准时本机尚无会话记录。等待期内若已 reset/换代，记录会存在且代次≠1。
+					const record = store.get(this.selfUid, room);
+					if (record) store.assertGeneration(this.selfUid, room, 1);
+				} else {
+					store.assertGeneration(this.selfUid, room, generation);
+				}
 			} catch {
 				// 审批冻结后原生会话已 reset：旧代次永远不能再执行。
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };

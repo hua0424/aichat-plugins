@@ -6,6 +6,8 @@ import type { AgentCommandRequest, AgentCommandResponse } from '../stream/protoc
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 const id = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v);
 export interface CommandPreparation {
+	/** Trusted local native generation snapshot for the approval fence probe; 0 means the conversation has no native record yet. */
+	generation?(request: AgentCommandRequest): number;
  prepare(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
 }
 /** Independent native command lane; never acquires the ordinary chat queue/slot. */
@@ -19,6 +21,14 @@ export class AgentCommandHandler {
   const fail = (error: string): AgentCommandResponse => ({ ...correlation, status: 'failed', error });
   if (raw.aiclawUid !== this.selfUid) return fail('identity_mismatch');
   const ctx = raw.context;
+  // 审批围栏侦测是服务端内部信封：operation=generation 使旧插件按非法请求拒绝，绝不会被当成真实 invoke 执行。
+  if (raw.generationProbe === true) {
+   if (raw.operation !== 'generation' || !object(ctx) || (ctx.roomType !== 1 && ctx.roomType !== 2)) return fail('invalid_request');
+   if (!this.preparation?.generation) return fail('execution_not_supported');
+   try {
+    return { ...correlation, status: 'completed', phase: 'generation', generation: String(this.preparation.generation(raw as unknown as AgentCommandRequest)) };
+   } catch { return fail('authorization_changed'); }
+  }
   if ((raw.operation !== 'discover' && raw.operation !== 'invoke') || !object(ctx) ||
    (ctx.roomType !== 1 && ctx.roomType !== 2) ||
     (raw.reconcileOnly !== undefined && typeof raw.reconcileOnly !== 'boolean') ||
