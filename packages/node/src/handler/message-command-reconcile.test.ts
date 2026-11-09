@@ -143,4 +143,53 @@ describe('command reconcile evidence', () => {
 		expect(executeCapability).not.toHaveBeenCalled();
 		expect(store.get('u', '20')).toBeUndefined();
 	});
+
+	it('replays a trusted terminal journal after a pure reset without touching the new generation', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'c1diag-reset-')); dirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });
+		store.getOrCreate('u', '20');
+		const execute = vi.fn(complete);
+		const { handler, posted } = setup(store, execute, home);
+		const data = request('R', { context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch', expectedGeneration: '1' } });
+		handler.handle({ type: 'agentCommand', data });
+		await waitForReports(posted, 2);
+		const server: ServerRecord = { status: 'unknown' };
+		applyServer(server, posted[0]);
+		applyServer(server, posted.find((value) => value.status === 'completed')!);
+		expect(server.status).toBe('unknown');
+
+		store.reset('u', '20');
+		const reset = store.get('u', '20')!;
+		expect(reset.generation).toBe(2);
+		const nativeState = JSON.stringify(reset.nativeState);
+
+		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await vi.waitFor(() => { if (!posted.some((value) => value.reconciled === true)) throw new Error('waiting for replayed terminal evidence'); });
+		const replay = posted.find((value) => value.reconciled === true)!;
+		expect(replay).toMatchObject({ status: 'completed', generation: '1', reconciled: true });
+		applyServer(server, replay);
+		expect(server).toEqual({ status: 'completed', reconciled: true });
+		expect(execute).toHaveBeenCalledOnce();
+		const after = store.get('u', '20')!;
+		expect(after.generation).toBe(2);
+		expect(JSON.stringify(after.nativeState)).toBe(nativeState);
+	});
+
+	it('keeps the execution fence for a pending old-generation journal', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'c1diag-pending-')); dirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });
+		store.getOrCreate('u', '20');
+		const execute = vi.fn(() => new Promise<never>(() => {}));
+		const { handler, posted } = setup(store, execute, home);
+		const data = request('P', { context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch', expectedGeneration: '1' } });
+		void handler.handle({ type: 'agentCommand', data });
+		await vi.waitFor(() => { if (!store.getControl('u', '20', 'P')) throw new Error('waiting for journal'); });
+
+		store.reset('u', '20');
+		void handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await vi.waitFor(() => { if (!posted.some((value) => value.status === 'failed' && value.error === 'authorization_changed')) throw new Error('waiting for execution-fence rejection'); });
+		expect(posted.some((value) => value.reconciled === true)).toBe(false);
+		expect(execute).toHaveBeenCalledOnce();
+		expect(store.get('u', '20')!.generation).toBe(2);
+	});
 });
