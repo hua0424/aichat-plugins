@@ -404,7 +404,18 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
-		if (expectedGeneration !== undefined) {
+		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
+		// A reconcileOnly query that hits this request's own terminal journal is read-only evidence,
+		// not a new execution: a pure session reset may advance the native generation legitimately.
+		// Identity/epoch/fingerprint still have to match, a disabled record still fails closed, and
+		// pending/executing journals stay behind the old-generation execution fence below.
+		const existing = request.reconcileOnly ? store.getControl(this.selfUid, room, request.requestId) : undefined;
+		if (request.reconcileOnly && (!existing || existing.fingerprint !== fingerprint || existing.authorizationEpoch !== epoch))
+			return { receipt: { status: 'unknown', error: 'native_request_failed' } };
+		const terminalReplay = Boolean(existing?.receipt && ['completed', 'failed', 'noop'].includes(existing.receipt.status)
+			&& (existing.receipt.status !== 'completed' || existing.receipt.nativeRef || existing.receipt.effect))
+			&& store.get(this.selfUid, room)?.state !== 'disabled';
+		if (expectedGeneration !== undefined && !terminalReplay) {
 			const generation = Number(expectedGeneration);
 			if (!/^\d+$/.test(expectedGeneration) || !Number.isSafeInteger(generation)) {
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };
@@ -421,13 +432,6 @@ export class MessageHandler {
 				// 审批冻结后原生会话已 reset：旧代次永远不能再执行。
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };
 			}
-		}
-		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
-		if (request.reconcileOnly) {
-			// Evidence queries never create journal state: absent/mismatched entries stay unknown.
-			const existing = store.getControl(this.selfUid, room, request.requestId);
-			if (!existing || existing.fingerprint !== fingerprint || existing.authorizationEpoch !== epoch)
-				return { receipt: { status: 'unknown', error: 'native_request_failed' } };
 		}
 		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
 		if (!prepared.fresh) {
