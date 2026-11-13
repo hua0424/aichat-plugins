@@ -10,7 +10,11 @@ interface Session {
 	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope; modelProvider?: string;
 	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>;
 }
-type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId'>;
+type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId' | 'selectedModel'>;
+function frozenModel(input: Pick<PreparedRun, 'selectedModel' | 'getSelectedModel'>) {
+	const model = input.getSelectedModel?.() ?? input.selectedModel;
+	return model ? { ...model } : undefined;
+}
 function sessionState(session: Session, workspace: string) {
 	return { version: 1, value: {
 		...(session.scope.frozenPrompt !== undefined ? { originalPrompt: session.scope.systemPrompt, legacyConfirmationRequired: false } : {}),
@@ -84,7 +88,7 @@ export class CodexNativeDriver implements AgentDriver {
 		const nativeRef = typeof previous === 'string' ? { sessionId: previous } : undefined;
 		// Explicit reset uses the currently prepared persona, never silently resumes an unverified old thread.
 		const fresh: SessionInput = { runId: execution.requestId, workspace: input.workspace, systemPrompt: execution.systemPrompt,
-			conversation: { ...execution.conversation, nativeState: undefined }, saveRecovery: execution.saveRecovery };
+			conversation: { ...execution.conversation, nativeState: undefined }, saveRecovery: execution.saveRecovery, selectedModel: frozenModel(execution) };
 		const scope = await prepareCodexScope(fresh);
 		execution.conversation.assertCurrent(); input.signal.throwIfAborted();
 		await execution.submitted(nativeRef);
@@ -121,7 +125,7 @@ export class CodexNativeDriver implements AgentDriver {
 		let session: Session | undefined;
 		try {
 			session = await this.session({ runId: `${execution.requestId}:session`, workspace: input.workspace,
-				systemPrompt: execution.systemPrompt, conversation: execution.conversation, saveRecovery: execution.saveRecovery });
+				systemPrompt: execution.systemPrompt, conversation: execution.conversation, saveRecovery: execution.saveRecovery, selectedModel: frozenModel(execution) });
 			if (session.modelProvider !== model.providerId) return { status: 'failed', generation, error: 'native_provider_mismatch' };
 			const nativeRef = { sessionId: session.threadId };
 			await execution.saveRecovery({ version: 1, value: { provider: 'codex', kind: 'model', nativeRef,
@@ -173,7 +177,7 @@ export class CodexNativeDriver implements AgentDriver {
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.workspace || !input.replyToken || !input.conversation || !input.signal)
 			throw new TypeError('Codex native run requires prepared core input');
-		return new CodexNativeRun(input, () => this.session(input), (session, settled) => this.release(session, settled));
+		return new CodexNativeRun(input, () => this.session({ ...input, selectedModel: frozenModel(input) }), (session, settled) => this.release(session, settled));
 	}
 	private async session(input: SessionInput): Promise<Session> {
 		const scope = await prepareCodexScope(input);
@@ -211,17 +215,28 @@ export class CodexNativeDriver implements AgentDriver {
 		try {
 			await channel.start();
 			input.conversation.assertCurrent();
+			if (input.selectedModel) {
+				const config = object(object(await channel.request('config/read', { cwd: input.workspace, includeLayers: false }))?.config);
+				if (config?.model_provider !== input.selectedModel.providerID) throw new Error('CODEX_NATIVE_SELECTED_MODEL_PROVIDER_UNVERIFIED');
+				if (scope.threadId) {
+					const existing = object(object(await channel.request('thread/read', { threadId: scope.threadId, includeTurns: false }))?.thread);
+					if (existing?.id !== scope.threadId || existing.modelProvider !== input.selectedModel.providerID || existing.cwd !== input.workspace)
+						throw new Error('CODEX_NATIVE_SELECTED_MODEL_PROVIDER_UNVERIFIED');
+				}
+			}
+			input.conversation.assertCurrent();
 			await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, threadId: scope.threadId ?? null,
 				workspace: input.workspace, stopProbe: 'unknown-after-restart' } });
 			input.conversation.assertCurrent();
 			const raw = await channel.request(scope.threadId ? 'thread/resume' : 'thread/start', {
 				...(scope.threadId ? { threadId: scope.threadId } : {}), cwd: input.workspace,
 				developerInstructions: scope.systemPrompt, approvalPolicy: 'never', sandbox: 'danger-full-access',
-				...(this.deps.model ? { model: this.deps.model } : {}),
+				...((input.selectedModel?.modelID ?? this.deps.model) ? { model: input.selectedModel?.modelID ?? this.deps.model } : {}),
 			}, input.runId);
 			const response = object(raw), thread = object(response?.thread);
 			if (typeof thread?.id !== 'string' || !thread.id || thread.cliVersion !== '0.142.3' ||
-				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId))
+				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId) ||
+				(input.selectedModel && response?.modelProvider !== input.selectedModel.providerID))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
 			return { channel, grants, threadId: thread.id, scope, references: 0, retired: false,
 				modelProvider: typeof response?.modelProvider === 'string' ? response.modelProvider : undefined };

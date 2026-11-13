@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import type { AgentCapability, AgentCapabilityCatalog } from '../events.js';
 import type { CodexAppServer } from './app-server.js';
@@ -11,6 +11,7 @@ const id = (value: unknown): value is string => typeof value === 'string' && val
 
 /** Codex-only discovery: native inventory is complete before the public menu is paged. */
 export async function codexCatalog(channel: CodexAppServer, workspace: string, signal: AbortSignal) {
+	await mkdir(workspace, { recursive: true });
 	const cwd = await realpath(workspace);
 	signal.throwIfAborted();
 	const config = object(object(await channel.request('config/read', { cwd, includeLayers: false }))?.config);
@@ -33,7 +34,8 @@ export async function codexCatalog(channel: CodexAppServer, workspace: string, s
 	do {
 		signal.throwIfAborted();
 		const page = object(await channel.request('model/list', { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) }));
-		if (!Array.isArray(page?.data) || (page.nextCursor !== null && !id(page.nextCursor))) throw new Error('CODEX_NATIVE_DISCOVERY_UNVERIFIED');
+		if (!Array.isArray(page?.data) || (page.nextCursor !== null && (typeof page.nextCursor !== 'string' || !page.nextCursor.length)))
+			throw new Error('CODEX_NATIVE_DISCOVERY_UNVERIFIED');
 		for (const raw of page.data) {
 			const model = object(raw);
 			if (!model || !id(model.id) || !id(model.model) || !id(model.displayName) || typeof model.hidden !== 'boolean' || seen.has(model.model))
