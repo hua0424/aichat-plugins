@@ -546,7 +546,7 @@ export class MessageHandler {
 			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
 			const control = store.getControl(this.selfUid, request.roomId, request.requestId);
 			const proof = control?.recovery?.value as { provider?: string; runId?: string; nativeRef?: NativeRef;
-				submission?: { method?: string; requestId?: string; threadId?: string }; inputProof?: { itemId?: string; turnId?: string } } | undefined;
+				submission?: { method?: string; requestId?: string; threadId?: string; expectedTurnId?: string }; inputProof?: { itemId?: string; turnId?: string } } | undefined;
 			const ref = turn.nativeRef;
 			if (record.adapterInstanceId !== 'codex' || record.conversationId !== turn.conversationId || record.identityId !== this.selfUid ||
 				(owner && (record.state !== 'ready' || this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== request.authorizationEpoch)) ||
@@ -554,7 +554,8 @@ export class MessageHandler {
 				control.generation !== turn.generation || control.state !== 'submitted' || turn.phase !== 'bound' ||
 				turn.requestIds.length !== 1 || turn.requestIds[0] !== request.requestId || !ref.turnId || !ref.inputId || ref.parentId || ref.messageId ||
 				record.nativeState.codex?.threadId !== ref.sessionId || proof?.provider !== 'codex' || proof.runId !== request.requestId ||
-				proof.submission?.method !== 'turn/start' || proof.submission.requestId !== `${request.requestId}:turn` || proof.submission.threadId !== ref.sessionId ||
+				!['turn/start', 'turn/steer'].includes(proof.submission?.method ?? '') || proof.submission?.requestId !== `${request.requestId}:turn` || proof.submission.threadId !== ref.sessionId ||
+				(proof.submission.method === 'turn/steer' && (proof.submission.expectedTurnId !== ref.turnId || this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== request.authorizationEpoch)) ||
 				(proofReady && (proof.nativeRef?.sessionId !== ref.sessionId || proof.nativeRef.turnId !== ref.turnId || proof.nativeRef.inputId !== ref.inputId ||
 				proof.inputProof?.itemId !== ref.inputId || proof.inputProof.turnId !== ref.turnId)))
 				throw new Error('native Codex input proof unconfirmed');
@@ -591,6 +592,8 @@ export class MessageHandler {
 			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
 			if (codex) {
 				validateCodex();
+				if ((store.getControl(this.selfUid, request.roomId, request.requestId)?.recovery?.value as { submission?: { method?: string } } | undefined)?.submission?.method !== 'turn/start')
+					throw new Error('native Codex steer requires its original START lease');
 				const origin = (store.getControl(this.selfUid, request.roomId, request.requestId)?.recovery?.value as
 					{ origin?: { submissionId?: string; startedTurnId?: string } } | undefined)?.origin;
 				if (origin?.submissionId !== turn.nativeRef.turnId || origin?.startedTurnId !== turn.nativeRef.turnId)

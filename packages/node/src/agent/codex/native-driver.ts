@@ -8,7 +8,7 @@ import { codexCatalog } from './native-catalog.js';
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
 interface Session {
 	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; workspace: string; scope: Scope; modelProvider?: string;
-	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>;
+	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>; activeTurnId?: string;
 }
 type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId' | 'selectedModel'>;
 function frozenModel(input: Pick<PreparedRun, 'selectedModel' | 'getSelectedModel'>) {
@@ -286,6 +286,7 @@ function object(value: unknown): Record<string, unknown> | undefined {
 class CodexNativeRun implements AgentRun {
 	private consumed = false;
 	private submitted = false;
+	private submissionRejected = false;
 	private cancelled = false;
 	private terminal = false;
 	private interruptRequested = false;
@@ -339,17 +340,22 @@ class CodexNativeRun implements AgentRun {
 			if (!this.command && !input.replyThinkingId) throw new Error('Codex native run requires the exact START-ready reply grant');
 			input.signal.addEventListener('abort', onAbort, { once: true });
 			const session = this.session = await this.getSession();
+			// An observed turn is only an RPC locator; core still proves the original START lease.
+			const expectedTurnId = this.command ? session.activeTurnId : undefined;
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			unsubscribe = session.channel.onNotification((method, params) => {
 				const frame = object(params);
 				if (frame?.threadId !== session.threadId || this.channelFailure) return;
+				if (method === 'turn/completed' && object(frame.turn)?.id === session.activeTurnId) session.activeTurnId = undefined;
 				const item = object(frame.item);
 				if (this.submitted && ['item/started', 'item/completed'].includes(method) && item?.type === 'userMessage' && item.clientId === input.runId) {
 					if (typeof item.id !== 'string' || !item.id || typeof frame.turnId !== 'string' || !frame.turnId ||
+						(expectedTurnId && frame.turnId !== expectedTurnId) ||
 						(this.nativeInput && (this.nativeInput.itemId !== item.id || this.nativeInput.turnId !== frame.turnId)))
 						this.channelFailure = 'NATIVE_OUTCOME_UNKNOWN: registered native input association ambiguous; no new grant';
 					else if (!this.nativeInput) {
 						this.nativeInput = { itemId: item.id, turnId: frame.turnId };
+						session.activeTurnId = frame.turnId;
 						// Register the known ordinary owner synchronously, before either RPC ACK or recovery IO.
 						// This is not a grant: START, durable recovery and the original lease still gate grant below.
 						if (!this.command) {
@@ -370,7 +376,8 @@ class CodexNativeRun implements AgentRun {
 			});
 			offClose = session.channel.onClose(() => { this.channelFailure = 'CODEX_RESULT_UNKNOWN: native channel lost; do not resubmit'; this.wake?.(); });
 			input.conversation.assertCurrent();
-			const submission = { method: 'turn/start', requestId: `${input.runId}:turn`, threadId: session.threadId };
+			const submission = { method: expectedTurnId ? 'turn/steer' : 'turn/start', requestId: `${input.runId}:turn`, threadId: session.threadId,
+				...(expectedTurnId ? { expectedTurnId } : {}) };
 			await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, threadId: session.threadId,
 				workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
 			input.conversation.assertCurrent();
@@ -380,9 +387,16 @@ class CodexNativeRun implements AgentRun {
 				input.conversation.assertCurrent(); input.signal.throwIfAborted();
 			}
 			this.submitted = true;
-			const raw = await session.channel.request('turn/start', { threadId: session.threadId, clientUserMessageId: input.runId,
-				input: this.command?.items ?? [{ type: 'text', text: input.message, text_elements: [] }] }, submission.requestId);
-			const turn = object(object(raw)?.turn);
+			let raw: unknown;
+			try {
+				raw = await session.channel.request(submission.method, { threadId: session.threadId, clientUserMessageId: input.runId,
+					...(expectedTurnId ? { expectedTurnId } : {}), input: this.command?.items ?? [{ type: 'text', text: input.message, text_elements: [] }] }, submission.requestId);
+			} catch (error) {
+				this.submissionRejected = !!expectedTurnId && error instanceof Error && error.message === 'CODEX_NATIVE_REQUEST_FAILED';
+				throw error;
+			}
+			const turn = expectedTurnId ? { id: object(raw)?.turnId } : object(object(raw)?.turn);
+			if (expectedTurnId && turn?.id !== expectedTurnId) throw new Error('CODEX_NATIVE_STEER_TURN_UNVERIFIED');
 			if (typeof turn?.id !== 'string' || !turn.id) throw new Error('CODEX_NATIVE_TURN_UNVERIFIED');
 			// 0.142.3 ACKs a submission ID, which may steer an existing turn. Only the user item proves its turn.
 			const proofDeadline = setTimeout(() => {
@@ -398,8 +412,8 @@ class CodexNativeRun implements AgentRun {
 				...(this.command ? { inputId: this.nativeInput!.itemId } : {}) };
 			try {
 				await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, nativeRef: this.ref,
-					...(this.command ? { inputProof: this.nativeInput, origin: { submissionId: turn.id,
-						startedTurnId: this.inbox.some(frame => frame.method === 'turn/started' && object(object(frame.params)?.turn)?.id === this.ref!.turnId) ? this.ref!.turnId : null } } : {}), workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
+					...(this.command ? { inputProof: this.nativeInput, ...(!expectedTurnId ? { origin: { submissionId: turn.id,
+						startedTurnId: this.inbox.some(frame => frame.method === 'turn/started' && object(object(frame.params)?.turn)?.id === this.ref!.turnId) ? this.ref!.turnId : null } } : {}) } : {}), workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
 			} catch {
 				this.settlementUnconfirmed = true;
 				throw new Error('NATIVE_OUTCOME_UNKNOWN: native reply locator could not be committed; no new grant');
@@ -468,7 +482,7 @@ class CodexNativeRun implements AgentRun {
 			}
 		} catch (error) {
 			let message = error instanceof Error ? error.message : 'CODEX_NATIVE_RUN_FAILED';
-			if (this.submitted && !this.terminal) {
+			if (this.submitted && !this.terminal && !this.submissionRejected) {
 				this.settlementUnconfirmed = true;
 				if (!message.startsWith('NATIVE_OUTCOME_UNKNOWN:')) message = `NATIVE_OUTCOME_UNKNOWN: ${message}`;
 			}
@@ -480,7 +494,7 @@ class CodexNativeRun implements AgentRun {
 				try { await this.session.grants.revoke(this.ref); }
 				catch { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; if (!this.cancelled) this.session.channel.close(); }
 			}
-			if (this.session) await this.releaseSession(this.session, this.terminal || !this.submitted);
+			if (this.session) await this.releaseSession(this.session, this.terminal || !this.submitted || this.submissionRejected);
 		}
 	}
 	async cancel(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {

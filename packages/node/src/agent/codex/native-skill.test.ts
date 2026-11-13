@@ -25,14 +25,17 @@ async function fixture(mode = '') {
  if(r.method==='model/list')result={data:[],nextCursor:null};
  if(r.method==='thread/start'){const n=Number(fs.existsSync(process.env.THREADS)?fs.readFileSync(process.env.THREADS,'utf8'):0)+1;fs.writeFileSync(process.env.THREADS,String(n));result={thread:{id:'thread-'+n,cwd:p.cwd,cliVersion:'0.142.3'}};if(process.env.MODE==='attach-thread-init'&&n===1)deferAck=true;}
  if(r.method==='thread/resume')result={thread:{id:p.threadId,cwd:p.cwd,cliVersion:'0.142.3'}};
- if(r.method==='turn/start'){const n=++seq,id=process.env.MODE==='attach-prewarmed'&&n===1?'seed-turn':process.env.MODE.startsWith('attach')?'turn-1':'turn-'+n;deferAck=process.env.MODE==='attach-late-ack'&&n===1;const fresh=!process.env.MODE.startsWith('attach')||n===1||(process.env.MODE==='attach-prewarmed'&&n===2);result={turn:{id:fresh&&process.env.MODE!=='orphan'?id:'submission-'+n,status:'inProgress',items:[]}};if(fresh&&process.env.MODE!=='no-start')send({method:'turn/started',params:{threadId:p.threadId,turn:{id,status:'inProgress',items:[]}}});
+ if(r.method==='turn/steer'&&['attach-steer-rejected','attach-steer-ended'].includes(process.env.MODE)){if(process.env.MODE==='attach-steer-ended')send({method:'turn/completed',params:{threadId:p.threadId,turn:{id:p.expectedTurnId,status:'completed',items:[]}}});send({id:r.id,error:{code:-32600,message:'expected active turn mismatch'}});return;}
+  if(r.method==='turn/start'||r.method==='turn/steer'){const n=++seq,id=r.method==='turn/steer'?p.expectedTurnId:process.env.MODE==='attach-prewarmed'&&n===1?'seed-turn':process.env.MODE.startsWith('attach')?'turn-1':'turn-'+n;deferAck=process.env.MODE==='attach-late-ack'&&n===1;const fresh=r.method==='turn/start'&&(!process.env.MODE.startsWith('attach')||n===1||(process.env.MODE==='attach-prewarmed'&&n===2));result=r.method==='turn/steer'?{turnId:id}:{turn:{id:fresh&&process.env.MODE!=='orphan'?id:'submission-'+n,status:'inProgress',items:[]}};if(fresh&&process.env.MODE!=='no-start')send({method:'turn/started',params:{threadId:p.threadId,turn:{id,status:'inProgress',items:[]}}});
  const proof={method:'item/started',params:{threadId:p.threadId,turnId:id,item:{id:'input-'+n,type:'userMessage',clientId:p.clientUserMessageId,content:p.input}}};
- if(process.env.MODE==='foreign-client')proof.params.item.clientId='unregistered';
- if(process.env.MODE==='foreign-thread')proof.params.threadId='other-thread';
+ if(process.env.MODE==='foreign-client'||(r.method==='turn/steer'&&process.env.MODE==='attach-steer-client'))proof.params.item.clientId='unregistered';
+  if(r.method==='turn/steer'&&process.env.MODE==='attach-steer-turn')proof.params.turnId='other-turn';
+  if(r.method==='turn/steer'&&process.env.MODE==='attach-steer-ack')result.turnId='other-turn';
+ if(process.env.MODE==='foreign-thread'||(r.method==='turn/steer'&&process.env.MODE==='attach-steer-thread'))proof.params.threadId='other-thread';
  if(process.env.MODE==='missing')setTimeout(()=>process.exit(0),50);
- else if(['gate','attach-gate'].includes(process.env.MODE)){const gate=setInterval(()=>{if(fs.existsSync(process.env.PROOF)){clearInterval(gate);send(proof);}},5);}
+ else if(['gate','attach-gate'].includes(process.env.MODE)||(r.method==='turn/steer'&&process.env.MODE==='attach-steer-gate')){const gate=setInterval(()=>{if(fs.existsSync(process.env.PROOF)){clearInterval(gate);send(proof);}},5);}
  else {send(proof);if(process.env.MODE==='conflict')send({...proof,params:{...proof.params,turnId:'other-turn'}});if(process.env.MODE==='duplicate')send({...proof,method:'item/completed'});}
- if(['foreign-client','foreign-thread','conflict'].includes(process.env.MODE))setTimeout(()=>process.exit(0),100);
+ if(['foreign-client','foreign-thread','conflict'].includes(process.env.MODE)||(r.method==='turn/steer'&&['attach-steer-client','attach-steer-thread','attach-steer-loss'].includes(process.env.MODE)))setTimeout(()=>process.exit(0),100);
  const poll=setInterval(()=>{if(fs.readdirSync(process.env.GRANTS).some(x=>x.endsWith('.env'))&&((process.env.MODE==='attach-prewarmed'&&n===1)||!(process.env.MODE.startsWith('attach')||process.env.MODE==='separate')||fs.existsSync(process.env.MODE==='attach-old-terminal'&&p.threadId==='thread-2'?process.env.DONE+'-new':process.env.DONE))){clearInterval(poll);if(process.env.MODE==='attach-loss'||(process.env.MODE==='attach-old-loss'&&p.threadId==='thread-1')){process.exit(0);return;}send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'a',delta:'native answer'}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:process.env.MODE==='native-failed'?'failed':process.env.MODE==='native-interrupted'?'interrupted':'completed',items:[]}}});}},5);}
  if(r.id){if(deferAck){const gate=setInterval(()=>{if(fs.existsSync(process.env.ACK)){clearInterval(gate);send({id:r.id,result});}},5);}else send({id:r.id,result});}});`);
  const store = new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['u']), activeProviders: new Map([['u', 'codex']]) });
@@ -61,14 +64,78 @@ async function fixture(mode = '') {
  return { home, path, store, driver, grants, frames, send, receipts, request, result, lines, grantPath, catalog, context,
   async setEpoch(epoch: string) { currentEpoch = epoch; await handler.prewarmGroupConfigs(); },
   rejectStart(index = 0) { const frame = frames.filter(x => x.type === 20)[index]; handler.handle({ type: 'thinkingEnd', data: { ...frame.data, fromUid: 'u', thinkingId: 'thinking-' + frame.data.clientRunId, status: 'error', error: 'authorization_revoked' } }); },
- ordinary(id = 'ordinary') { handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 'owner', name: 'Owner', userType: 1 }, message: { id, roomId: 'room', type: 1, roomType: 2, aiclaw: { isOwner: true }, body: { content: 'hello' } } } }); }, setAck(value: boolean) { ack = value; }, ackStart(index = -1) { const data = frames.filter(f => f.type === 20).at(index)!.data; handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: 'thinking-' + data.clientRunId } }); } };
+ ordinary(id = 'ordinary', content = 'hello') { handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 'owner', name: 'Owner', userType: 1 }, message: { id, roomId: 'room', type: 1, roomType: 2, aiclaw: { isOwner: true }, body: { content } } } }); }, setAck(value: boolean) { ack = value; }, ackStart(index = -1) { const data = frames.filter(f => f.type === 20).at(index)!.data; handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: 'thinking-' + data.clientRunId } }); } };
 }
+it.each(['ordinary', 'skill'])('steers busy %s input with the exact native turn and literal text without another grant', async kind => {
+ const f = await fixture('attach'), mint = vi.spyOn(f.store, 'beginRun');
+ f.ordinary('owner'); await f.grantPath();
+ const grant = vi.spyOn(f.grants[0], 'grant'), revoke = vi.spyOn(f.grants[0], 'revoke');
+ if (kind === 'ordinary') f.ordinary('borrower', '$x\nsecond line');
+ else f.request('borrower', 'invoke', f.catalog.version, { arguments: '$x\nsecond line' });
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1));
+ const wire = await f.lines(), steer = wire.find(r => r.method === 'turn/steer');
+ expect(steer.params).toEqual({ threadId: 'thread-1', expectedTurnId: 'turn-1', clientUserMessageId: expect.any(String),
+  input: kind === 'ordinary' ? [{ type: 'text', text: expect.stringContaining('$x\nsecond line'), text_elements: [] }]
+   : [{ type: 'skill', name: 'probe', path: f.path }, { type: 'text', text: '$x\nsecond line', text_elements: [] }] });
+ await waitFor(() => expect(f.store.getControl('u', 'room', steer.params.clientUserMessageId)?.receipt?.status).toBe('accepted'));
+ expect(mint).toHaveBeenCalledTimes(1); expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
+ expect(grant).not.toHaveBeenCalled(); expect(revoke).not.toHaveBeenCalled();
+ expect(wire.filter(r => r.method === 'turn/start')).toHaveLength(1); expect(wire.filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+});
+it.each(['attach-steer-rejected', 'attach-steer-ended'])('reports native %s without fallback or borrowed cleanup', async mode => {
+ const f = await fixture(mode), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary(); await f.grantPath();
+ const grant = vi.spyOn(f.grants[0], 'grant'); f.request('rejected', 'invoke', f.catalog.version);
+ expect(await f.result('rejected')).toMatchObject({ status: 'failed', error: 'CODEX_NATIVE_REQUEST_FAILED' });
+ const wire = await f.lines(); expect(wire.filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect(wire.filter(r => r.method === 'turn/steer')).toHaveLength(1); expect(wire.filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ expect(mint).toHaveBeenCalledTimes(1); expect(grant).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
+ if (mode === 'attach-steer-ended') await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+});
+it.each(['attach-steer-turn', 'attach-steer-client', 'attach-steer-thread', 'attach-steer-ack', 'attach-steer-loss'])('keeps %s unknown without another owner or fallback', async mode => {
+ const f = await fixture(mode), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary(); await f.grantPath();
+ const grant = vi.spyOn(f.grants[0], 'grant'); f.request('unconfirmed', 'invoke', f.catalog.version);
+ expect(await f.result('unconfirmed')).toMatchObject({ status: 'unknown' });
+ expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1); expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1);
+ expect(mint).toHaveBeenCalledTimes(1); expect(grant).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it('never promotes a steer ACK into new-turn origin when the original START lease was never established', async () => {
+ const f = await fixture('orphan'), mint = vi.spyOn(f.store, 'beginRun');
+ f.request('orphan', 'invoke', f.catalog.version); expect((await f.result('orphan')).status).toBe('unknown');
+ f.request('not-new', 'invoke', f.catalog.version); expect((await f.result('not-new')).status).toBe('unknown');
+ expect((await f.lines()).find(r => r.method === 'turn/steer').params.expectedTurnId).toBe('turn-1');
+ expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
+ expect((await readdir(f.grants[0].directory)).filter(p => p.endsWith('.env'))).toHaveLength(0);
+});
+it.each(['epoch', 'reset'])('rejects a late steer proof after %s without changing the successor', async fault => {
+ const f = await fixture('attach-steer-gate'), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary(); await f.grantPath();
+ const generation = f.store.get('u', 'room')!.generation;
+ const grant = vi.spyOn(f.grants[0], 'grant'); f.request('late-steer', 'invoke', f.catalog.version);
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1));
+ if (fault === 'epoch') await f.setEpoch('next');
+ else { f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset'); expect((await f.result('reset')).status).toBe('completed'); }
+ await writeFile(join(f.home, 'proof'), '1'); expect((await f.result('late-steer')).status).toBe('unknown');
+ expect(mint).toHaveBeenCalledTimes(1); expect(grant).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ if (fault === 'reset') expect(f.store.get('u', 'room')).toMatchObject({ generation: generation + 1, state: 'ready', nativeState: { codex: { threadId: 'thread-2' } } });
+});
+it('does not renew the original ordinary budget when a busy steer arrives two minutes later', async () => {
+ const f = await fixture('attach'), create = f.driver.createNativeInput.bind(f.driver), signals: AbortSignal[] = [];
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signals.push(input.signal); return create(input); });
+ vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] }); f.ordinary('owner'); await f.grantPath();
+ await vi.advanceTimersByTimeAsync(120_000); f.ordinary('steer');
+ await waitFor(async () => { const rpc = (await f.lines()).find(r => r.method === 'turn/steer'); expect(rpc).toBeDefined();
+  expect(f.store.getControl('u', 'room', rpc.params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
+ await vi.advanceTimersByTimeAsync(180_001); expect(signals.map(s => s.aborted)).toEqual([true, false]);
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(1));
+});
 it('times out only the original ordinary resource owner after the existing five-minute budget', async () => {
  const f = await fixture('attach'), create = f.driver.createNativeInput.bind(f.driver), signals: AbortSignal[] = [];
  vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signals.push(input.signal); return create(input); });
  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
  f.ordinary('owner'); await f.grantPath(); f.ordinary('borrower');
- await waitFor(async () => { const inputs = (await f.lines()).filter(r => r.method === 'turn/start'); expect(inputs).toHaveLength(2);
+ await waitFor(async () => { const inputs = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method)); expect(inputs).toHaveLength(2);
   expect(f.store.getControl('u', 'room', inputs[1].params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
  await vi.advanceTimersByTimeAsync(300_001);
  expect(signals.map(signal => signal.aborted)).toEqual([true, false]);
@@ -99,7 +166,7 @@ it('gives neither a capability owner nor its ordinary borrower an ordinary watch
  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] }); const timers = vi.fn(globalThis.setTimeout);
   vi.stubGlobal('setTimeout', timers);
  f.request('cap-owner', 'invoke', f.catalog.version); await f.grantPath(); f.ordinary('borrower');
- await waitFor(async () => { const input = (await f.lines()).filter(r => r.method === 'turn/start')[1]; expect(input).toBeDefined();
+ await waitFor(async () => { const input = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))[1]; expect(input).toBeDefined();
   expect(f.store.getControl('u', 'room', input.params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
  expect(timers.mock.calls.filter(call => call[1] === 300_000)).toHaveLength(0);
  await vi.advanceTimersByTimeAsync(300_001); expect(signal.aborted).toBe(false);
@@ -137,7 +204,7 @@ it('shares the exact first native initialization between two new-room ordinary i
  f.ordinary('first'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1));
  f.ordinary('second'); await waitFor(() => expect(staleSecondScope).toBe(true));
  await writeFile(join(f.home, 'ack'), '1');
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2));
  expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1);
  expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
  await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
@@ -158,7 +225,7 @@ it.each(['workspace', 'prompt'])('refuses a concurrent first-room input with a d
  f.ordinary('second'); await waitFor(() => expect(staleSecondScope).toBe(true)); await writeFile(join(f.home, 'ack'), '1');
  await f.grantPath(); await waitFor(() => expect(f.store.get('u', 'room')!.controls?.some(control =>
   control.receipt?.status === 'failed' && control.receipt.error?.includes('CODEX_NATIVE_SCOPE_CHANGED'))).toBe(true));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1);
  await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
@@ -177,8 +244,8 @@ it('does not borrow a reset successor for ordinary inputs awaiting their first i
  f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset');
  await waitFor(() => expect(f.store.get('u', 'room')!.generation).toBe(generation + 1));
  await writeFile(join(f.home, 'ack'), '1'); expect((await f.result('reset')).status).toBe('completed');
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(0);
- f.ordinary('fresh'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(0);
+ f.ordinary('fresh'); await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  expect((await f.lines()).find(r => r.method === 'turn/start').params.threadId).toBe('thread-2');
  await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
  expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(2);
@@ -187,7 +254,7 @@ it('does not borrow a reset successor for ordinary inputs awaiting their first i
 it('admits ordinary input before proof without minting a reply token or START', async () => {
  const f = await fixture('gate'), mint = vi.spyOn(f.store, 'beginRun');
  f.ordinary();
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
  expect(f.store.get('u', 'room')!.replyBindings ?? []).toHaveLength(0);
  await writeFile(join(f.home, 'proof'), '1');
@@ -196,7 +263,7 @@ it('admits ordinary input before proof without minting a reply token or START', 
 });
 it('does not authorize a frozen ordinary proof after its current epoch changes', async () => {
  const f = await fixture('gate'), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary();
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  await f.setEpoch('next-epoch'); await writeFile(join(f.home, 'proof'), '1');
  await waitFor(async () => { const request = (await f.lines()).find(r => r.method === 'turn/start');
   expect(f.store.getControl('u', 'room', request.params.clientUserMessageId)?.receipt?.status).toBe('unknown'); });
@@ -210,23 +277,23 @@ it.each(['orphan', 'no-start', 'missing', 'foreign-client', 'foreign-thread', 'c
   expect(f.store.getControl('u', 'room', request.params.clientUserMessageId)?.receipt?.status).toBe('unknown'); });
  expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
  expect((await readdir(f.grants[0].directory)).filter(x => x.endsWith('.env'))).toHaveLength(0);
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0); expect(mark).not.toHaveBeenCalled();
 });
 it('marks only the actual ordinary owner stop-unconfirmed after grant then channel loss', async () => {
  const f = await fixture('attach-loss'), mark = vi.spyOn(f.store, 'markStopUnconfirmed'); f.ordinary('owner');
  await f.grantPath(); f.ordinary('borrower');
- await waitFor(async () => { const turns = (await f.lines()).filter(r => r.method === 'turn/start'); expect(turns).toHaveLength(2);
+ await waitFor(async () => { const turns = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method)); expect(turns).toHaveLength(2);
   expect(f.store.getControl('u', 'room', turns[1].params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
  const lifecycle = f.store.get('u', 'room')!.pendingRuns![0].runId;
  await writeFile(join(f.home, 'done'), '1');
- await waitFor(async () => { for (const r of (await f.lines()).filter(r => r.method === 'turn/start'))
+ await waitFor(async () => { for (const r of (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method)))
   expect(f.store.getControl('u', 'room', r.params.clientUserMessageId)?.receipt?.status).toBe('unknown'); });
  expect(f.store.get('u', 'room')!.state).toBe('stop_unconfirmed');
  expect(mark.mock.calls).toEqual([[lifecycle]]); expect(f.store.get('u', 'room')!.pendingRuns).toHaveLength(1);
  expect(f.frames.filter(x => x.type === 22)).toHaveLength(0);
  f.ordinary('blocked'); await new Promise(resolve => setTimeout(resolve, 30));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
 it('never replays a completed ordinary input after disposal fails', async () => {
@@ -243,7 +310,7 @@ it('never replays a completed ordinary input after disposal fails', async () => 
  expect(f.store.getControl('u', 'room', first.params.clientUserMessageId)?.receipt?.status).toBe('completed');
  await waitFor(() => expect(f.frames.filter(x => x.type === 22).length).toBeGreaterThanOrEqual(2));
  await new Promise(resolve => setTimeout(resolve, 60));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2);
  expect(f.store.getControl('u', 'room', first.params.clientUserMessageId)?.receipt?.status).toBe('completed');
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
@@ -253,11 +320,11 @@ it('records an unsubmitted native construction fault without inventing an owner 
  f.ordinary('unsubmitted'); await waitFor(() => expect(prepared).toHaveBeenCalledTimes(1));
  const id = prepared.mock.calls[0][2];
  await waitFor(() => expect(f.store.getControl('u', 'room', id)?.receipt?.status).toBe('unknown'));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(0);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(0);
  expect(f.store.get('u', 'room')!.pendingRuns ?? []).toHaveLength(0); expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
  f.ordinary('fresh'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
  await new Promise(resolve => setTimeout(resolve, 60));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  expect(mark).not.toHaveBeenCalled(); expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
 it('executes only the trusted catalog skill as typed input after actual native proof and exact START', async () => {
@@ -276,7 +343,7 @@ it('deduplicates repeated actual input notifications and never replays a complet
  expect(await f.result('once')).toMatchObject({ status: 'completed' });
  f.request('once', 'invoke', f.catalog.version);
  await waitFor(() => expect(f.receipts.filter(r => r.requestId === 'once' && r.status === 'completed')).toHaveLength(2));
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  expect(f.frames.filter(x => x.type === 20)).toHaveLength(1); expect(f.frames.filter(x => x.type === 22)).toHaveLength(1);
 });
 it.each([false, true])('waits for the exact new START receipt and refuses an expired lease with expiry=%s', async expired => {
@@ -305,7 +372,7 @@ it('attaches a busy/racing input only to the original frozen START lease with ze
  expect(await f.result('first')).toMatchObject({ status: 'completed', nativeRef: { turnId: 'turn-1' } });
  expect(await f.result('second')).toMatchObject({ status: 'completed', nativeRef: { turnId: 'turn-1' } });
  expect(f.frames.filter(x => x.type === 22)).toHaveLength(1);
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
 it.each([
@@ -333,15 +400,15 @@ it.each([
  }
  const send = (kind: string, id: string) => kind === 'ordinary' ? f.ordinary(id) : f.request(id, 'invoke', f.catalog.version);
  send(firstKind, 'first');
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  if (mode === 'attach-recovery-pause') await waitFor(() => expect(paused).toBe(true));
  if (mode === 'attach') await f.grantPath();
  else { expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(0); }
  const grant = vi.spyOn(f.grants[0], 'grant'), revoke = vi.spyOn(f.grants[0], 'revoke');
  send(secondKind, 'second');
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2));
  resume(); await writeFile(join(f.home, 'ack'), '1');
- await waitFor(async () => { const requests = (await f.lines()).filter(r => r.method === 'turn/start');
+ await waitFor(async () => { const requests = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method));
   expect(requests.map(r => f.store.getControl('u', 'room', r.params.clientUserMessageId)?.receipt?.status)).toEqual(['accepted', 'accepted']); });
  const env = await f.grantPath(), token = await readFile(env, 'utf8');
  expect(mint).toHaveBeenCalledTimes(1); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1);
@@ -354,7 +421,7 @@ it.each([
 it('cancels only the real ordinary owner resource, never its borrowed observer', async () => {
  const f = await fixture('attach'), create = vi.spyOn(f.driver, 'createNativeInput'); f.ordinary(); await f.grantPath();
  const original = vi.spyOn(create.mock.results[0].value, 'cancel'); f.ordinary('attached');
- await waitFor(async () => { const requests = (await f.lines()).filter(r => r.method === 'turn/start'); expect(requests).toHaveLength(2);
+ await waitFor(async () => { const requests = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method)); expect(requests).toHaveLength(2);
   expect(f.store.getControl('u', 'room', requests[1].params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
  const borrowed = vi.spyOn(create.mock.results[1].value, 'cancel'); f.rejectStart();
  await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(1));
@@ -390,15 +457,17 @@ it('does not give an ordinary attachment a new token after its original lease ex
  f.ordinary(); const env = await f.grantPath(), token = await readFile(env, 'utf8');
  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 9 * 24 * 60 * 60 * 1000);
  const grant = vi.spyOn(f.grants[0], 'grant'), revoke = vi.spyOn(f.grants[0], 'revoke'); f.ordinary('late');
- await waitFor(async () => { const requests = (await f.lines()).filter(r => r.method === 'turn/start'); expect(requests).toHaveLength(2);
+ await waitFor(async () => { const requests = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method)); expect(requests).toHaveLength(2);
   expect(f.store.getControl('u', 'room', requests[1].params.clientUserMessageId)?.receipt?.status).toBe('unknown'); });
  expect(mint).toHaveBeenCalledTimes(1); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1);
  expect(grant).not.toHaveBeenCalled(); expect(revoke).not.toHaveBeenCalled(); expect(await readFile(env, 'utf8')).toBe(token);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
-it('allows a proved different turn on the same thread instead of treating pending ordinary work as busy authority', async () => {
+it('starts a proved different turn on the same thread after the native terminal clears the busy locator', async () => {
  const f = await fixture('separate'), mint = vi.spyOn(f.store, 'beginRun');
- f.ordinary(); await f.grantPath(); f.request('different-turn', 'invoke', f.catalog.version);
+ f.ordinary(); await f.grantPath(); await writeFile(join(f.home, 'done'), '1');
+  await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+  f.request('different-turn', 'invoke', f.catalog.version);
  await waitFor(() => expect(f.receipts.find(r => r.requestId === 'different-turn' && r.status === 'accepted')).toBeDefined());
  expect(mint).toHaveBeenCalledTimes(2); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(2);
  await writeFile(join(f.home, 'done'), '1'); expect(await f.result('different-turn')).toMatchObject({ status: 'completed', nativeRef: { turnId: 'turn-2' } });
@@ -415,12 +484,12 @@ it('does not reuse an ended original turn as authority for a fresh request', asy
 });
 it('keeps a preSTART ordinary old-generation proof unknown while a new thread gets its own START', async () => {
  const f = await fixture('attach-gate'), mint = vi.spyOn(f.store, 'beginRun');
- f.ordinary(); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ f.ordinary(); await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  const old = f.store.get('u', 'room')!; expect(old.replyBindings ?? []).toHaveLength(0);
  f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset'); expect((await f.result('reset')).status).toBe('completed');
  expect(f.store.get('u', 'room')!.generation).toBe(old.generation + 1);
  f.request('fresh', 'invoke', f.catalog.version);
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2));
  await writeFile(join(f.home, 'proof'), '1');
  await waitFor(() => expect(f.receipts.find(r => r.requestId === 'fresh' && r.status === 'accepted'), JSON.stringify(f.receipts)).toBeDefined());
  expect(mint).toHaveBeenCalledTimes(1); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1);
@@ -433,7 +502,7 @@ it('never registers a failed ordinary START as native authority for the followin
  const f = await fixture('start-fail'); f.ordinary();
  await waitFor(() => expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1));
  expect(f.store.get('u', 'room')!.replyBindings![0].thinkingId).toBeUndefined();
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  f.request('after-failed-start', 'invoke', f.catalog.version); expect((await f.result('after-failed-start')).status).toBe('unknown');
  expect((await readdir(f.grants[0].directory)).filter(p => p.endsWith('.env'))).toHaveLength(0);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
@@ -443,10 +512,10 @@ it('keeps the capability original lease while an ordinary attachment arrives bef
  f.request('cap-first', 'invoke', f.catalog.version);
  await waitFor(() => expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1));
  const grant = vi.spyOn(f.grants[0], 'grant'), revoke = vi.spyOn(f.grants[0], 'revoke'); f.ordinary();
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(2));
  expect(mint).toHaveBeenCalledTimes(1); expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1); expect(grant).not.toHaveBeenCalled();
  f.ackStart(); await f.grantPath();
- await waitFor(async () => { const requests = (await f.lines()).filter(r => r.method === 'turn/start');
+ await waitFor(async () => { const requests = (await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method));
   expect(f.store.getControl('u', 'room', requests[1].params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
  expect(grant).toHaveBeenCalledTimes(1); expect(revoke).not.toHaveBeenCalled();
  await writeFile(join(f.home, 'done'), '1'); expect((await f.result('cap-first')).status).toBe('completed');
@@ -458,7 +527,7 @@ it.each(['missing', 'start-fail', 'foreign-client', 'foreign-thread', 'conflict'
  expect(await f.result('failed')).toMatchObject({ status: 'unknown' });
  expect((await readdir(f.grants[0].directory)).filter(x => x.endsWith('.env'))).toEqual([]);
  expect(f.receipts.filter(r => r.requestId === 'failed' && r.status === 'accepted')).toHaveLength(0);
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
 });
 it.each(['expired', 'epoch'])('refuses %s attachment before map reuse without touching the original native task', async fault => {
@@ -478,7 +547,7 @@ it.each(['expired', 'epoch'])('refuses %s attachment before map reuse without to
 });
 it('does not start thinking from an ACK or broaden a preSTART old-generation input after reset CAS', async () => {
  const f = await fixture('gate'); f.request('late', 'invoke', f.catalog.version);
- await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ await waitFor(async () => expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(1));
  expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
  f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset');
  expect(await f.result('reset')).toMatchObject({ status: 'completed' });
@@ -500,5 +569,5 @@ it('rejects UI path injection and stale catalogs before any native turn submissi
  f.request('stale', 'invoke', 'stale-catalog');
  expect(await f.result('path')).toMatchObject({ status: 'failed', error: 'invalid_request' });
  expect(await f.result('stale')).toMatchObject({ status: 'failed', error: 'catalog_stale' });
- expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(0); expect(f.frames).toEqual([]);
+ expect((await f.lines()).filter(r => ['turn/start', 'turn/steer'].includes(r.method))).toHaveLength(0); expect(f.frames).toEqual([]);
 });
