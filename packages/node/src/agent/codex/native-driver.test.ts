@@ -130,6 +130,64 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
 		f.channels[0].close(); await original;
 	});
+	it('does not own an existing turn while its attached grant is deferred and cancellation wins', async () => {
+		const f = await fixture({ ATTACH: '1', PARK: '1' });
+		const original = collect(f.driver.createRun(f.input).events);
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		await vi.waitFor(async () => expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token'));
+		let entered!: () => void, release!: () => void;
+		const waiting = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const grant = f.grants.grant.bind(f.grants);
+		vi.spyOn(f.grants, 'grant').mockImplementation(async (ref, token) => { entered(); await gate; await grant(ref, token); });
+		const revoke = vi.spyOn(f.grants, 'revoke');
+		const attached = f.driver.createRun({ ...f.input, runId: 'request-2', replyToken: 'must-not-replace' });
+		const result = collect(attached.events);
+		await waiting;
+		expect(await attached.cancel('core-timeout')).toMatchObject({ status: 'unconfirmed' });
+		release();
+		expect(await result).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN:') }]);
+		await attached.dispose();
+		expect(revoke).not.toHaveBeenCalled();
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token');
+		await expect(readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+		f.channels[0].close(); await original;
+	});
+	it.each(['persist', 'lease'])('has no cleanup ownership when pregrant %s validation fails on an attached turn', async (fault) => {
+		const f = await fixture({ ATTACH: '1', PARK: '1' });
+		const original = collect(f.driver.createRun(f.input).events);
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		await vi.waitFor(async () => expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token'));
+		const revoke = vi.spyOn(f.grants, 'revoke');
+		const attached = f.driver.createRun({ ...f.input, runId: 'request-2', replyToken: 'must-not-replace',
+			saveRecovery: async (recovery) => { if (fault === 'persist' && (recovery.value as { nativeRef?: unknown }).nativeRef) throw new Error('disk full'); },
+			assertReplySettlement: () => { if (fault === 'lease') throw new Error('lease expired'); } });
+		expect(await collect(attached.events)).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN:') }]);
+		await attached.dispose();
+		expect(revoke).not.toHaveBeenCalled();
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token');
+		await expect(readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+		f.channels[0].close(); await original;
+	});
+	it('cleans its own grant if cancellation wins while a successful grant is pending', async () => {
+		const f = await fixture({ PARK: '1' });
+		let entered!: () => void, release!: () => void;
+		const waiting = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const grant = f.grants.grant.bind(f.grants);
+		vi.spyOn(f.grants, 'grant').mockImplementation(async (ref, token) => { entered(); await gate; await grant(ref, token); });
+		const run = f.driver.createRun(f.input), result = collect(run.events);
+		await waiting;
+		expect(await run.cancel('core-timeout')).toMatchObject({ status: 'unconfirmed' });
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+		release();
+		expect(await result).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt').map((r) => r.params)).toEqual([{ threadId: 'native-thread', turnId: 'turn-1' }]);
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		expect(await readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).toBe('');
+	});
 	it('cannot admit a native run before exact START-ready reply target exists', async () => {
 		const f = await fixture();
 		const run = f.driver.createRun({ ...f.input, replyThinkingId: undefined });
@@ -165,7 +223,10 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		const f = await fixture({ PARK: '1' });
 		const run = f.driver.createRun(f.input);
 		let cancellation: ReturnType<typeof run.cancel> | undefined;
-		f.input.onNativeBound = (ref) => { f.onNativeBound(ref); cancellation = run.cancel('user stop'); };
+		const grant = f.grants.grant.bind(f.grants);
+		vi.spyOn(f.grants, 'grant').mockImplementation(async (ref, token) => {
+			await grant(ref, token); setImmediate(() => { cancellation = run.cancel('user stop'); });
+		});
 		expect(await collect(run.events)).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
 		expect(await cancellation).toMatchObject({ status: 'unconfirmed' });
 		expect(await run.cancel('repeat')).toMatchObject({ status: 'unconfirmed' });
@@ -174,14 +235,17 @@ describe('Codex persistent native ordinary-message vertical', () => {
 			.toEqual([{ threadId: 'native-thread', turnId: 'turn-1' }]);
 		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
 		expect(await readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).toBe('');
-		await expect(readFile(join(f.grants.directory, `${id}.env`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token');
 	});
 	it('revocation IO failure cannot short-circuit interrupt, wake or the unconfirmed stop result', async () => {
 		const f = await fixture({ PARK: '1' });
 		const run = f.driver.createRun(f.input);
 		vi.spyOn(f.grants, 'revoke').mockRejectedValue(new Error('injected disk full'));
 		let cancellation: ReturnType<typeof run.cancel> | undefined;
-		f.input.onNativeBound = () => { cancellation = run.cancel('user stop'); };
+		const grant = f.grants.grant.bind(f.grants);
+		vi.spyOn(f.grants, 'grant').mockImplementation(async (ref, token) => {
+			await grant(ref, token); setImmediate(() => { cancellation = run.cancel('user stop'); });
+		});
 		expect(await collect(run.events)).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
 		expect(await cancellation).toMatchObject({ status: 'unconfirmed', reason: expect.stringContaining('CODEX_GRANT_REVOKE_FAILED') });
 		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(1);
@@ -204,7 +268,10 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		const f = await fixture({ PARK: '1' });
 		const abort = new AbortController(); f.input.signal = abort.signal;
 		vi.spyOn(f.grants, 'revoke').mockRejectedValue(new Error('injected disk full'));
-		f.input.onNativeBound = () => { abort.abort(); };
+		const grant = f.grants.grant.bind(f.grants);
+		vi.spyOn(f.grants, 'grant').mockImplementation(async (ref, token) => {
+			await grant(ref, token); setImmediate(() => { abort.abort(); });
+		});
 		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
 		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(1);
 	});
@@ -213,7 +280,7 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		f.input.onNativeBound = () => { f.setCurrent(false); };
 		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: stale generation' }]);
 		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
-		expect(await readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).toBe('');
+		await expect(readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 		await expect(readFile(join(f.grants.directory, `${id}.env`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 	});
 	it('event overflow is unknown, not a dropped native terminal or invented success', async () => {

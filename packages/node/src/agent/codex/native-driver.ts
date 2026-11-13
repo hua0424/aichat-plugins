@@ -254,6 +254,7 @@ class CodexNativeRun implements AgentRun {
 	private cancelled = false;
 	private terminal = false;
 	private interruptRequested = false;
+	private ownsGrant = false;
 	private settlementUnconfirmed = false;
 	private channelFailure?: string;
 	private session?: Session;
@@ -334,16 +335,16 @@ class CodexNativeRun implements AgentRun {
 			input.onNativeBound?.(this.ref);
 			assertSettlement();
 			if (!this.cancelled) {
-				try { await session.grants.grant(this.ref, input.replyToken!); }
+				try { await session.grants.grant(this.ref, input.replyToken!); this.ownsGrant = true; }
 				catch (error) {
 					if (error instanceof Error && error.message === 'CODEX_TURN_GRANT_CONFLICT') {
-						// This input does not own the original turn's immutable grant or cancellation.
-						this.ref = undefined;
 						throw new Error('NATIVE_OUTCOME_UNKNOWN: existing turn requires its original core lease; no new grant');
 					}
 					throw error;
 				}
 			}
+			// Cancellation may have arrived while grant IO was pending; now clean only our acquired grant.
+			if (this.cancelled && this.ownsGrant) await this.cancel('cancelled during grant');
 			const seen = new Set<string>();
 			while (!this.terminal) {
 				if (this.cancelled) { yield { type: 'cancelled', reason: 'Codex native stop unconfirmed' }; return; }
@@ -358,7 +359,7 @@ class CodexNativeRun implements AgentRun {
 					const complete = object(params.turn);
 					if (!complete || complete.id !== this.ref.turnId) continue;
 					this.terminal = true;
-					await session.grants.revoke(this.ref);
+					if (this.ownsGrant) await session.grants.revoke(this.ref);
 					if (complete.status === 'completed') yield { type: 'done', durationMs: Date.now() - started };
 					else if (complete.status === 'interrupted') yield { type: 'cancelled', reason: 'Native turn interrupted; background process stop unconfirmed' };
 					else yield { type: 'error', message: 'CODEX_NATIVE_TURN_FAILED' };
@@ -384,7 +385,7 @@ class CodexNativeRun implements AgentRun {
 			yield { type: 'error', message };
 		} finally {
 			unsubscribe?.(); offClose?.(); input.signal.removeEventListener('abort', onAbort);
-			if (this.ref && this.session) {
+			if (this.ownsGrant && this.ref && this.session) {
 				try { await this.session.grants.revoke(this.ref); }
 				catch { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; if (!this.cancelled) this.session.channel.close(); }
 			}
@@ -395,7 +396,7 @@ class CodexNativeRun implements AgentRun {
 		this.cancelled = true;
 		let revokeFailed = false;
 		try {
-			if (this.ref && this.session) {
+			if (this.ownsGrant && this.ref && this.session) {
 				try { await this.session.grants.revoke(this.ref); } catch { revokeFailed = true; }
 				if (!this.terminal && !this.interruptRequested) {
 					this.interruptRequested = true;
