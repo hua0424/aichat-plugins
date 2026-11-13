@@ -1,13 +1,13 @@
-import { createHash } from 'node:crypto';
 import type { AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult, AgentDriver, AgentEvent, AgentRun, NativeRef, PreparedRun } from '../events.js';
 import { capabilityParameters } from '../capability-parameters.js';
 import { CodexAppServer } from './app-server.js';
 import { prepareCodexScope } from './codex-driver.js';
 import { CodexTurnGrants, codexHookConfig } from './turn-grants.js';
+import { codexCatalog } from './native-catalog.js';
 
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
 interface Session {
-	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope;
+	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope; modelProvider?: string;
 	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>;
 }
 type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId'>;
@@ -43,29 +43,40 @@ export class CodexNativeDriver implements AgentDriver {
 		createChannel?: (args: string[], env: NodeJS.ProcessEnv) => CodexAppServer;
 		createGrants?: () => Promise<CodexTurnGrants> }) {}
 	async connect(): Promise<void> {}
-	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+	private async snapshot(input: AgentCapabilityContext) {
 		if (!input.workspace) throw new Error('workspace_required');
 		input.signal.throwIfAborted();
 		this.discovery ??= this.deps.createChannel?.([], codexNativeEnv(this.deps.env)) ??
 			new CodexAppServer({ command: this.deps.command, env: codexNativeEnv(this.deps.env) });
 		await this.discovery.start();
-		input.signal.throwIfAborted();
-		// This staged adapter advertises only the proven control, never a synthetic compact success.
-		return { version: createHash('sha256').update(JSON.stringify(['codex-native-reset-v1', '0.142.3', input.workspace])).digest('hex'),
-			framework: 'codex', runtimeVersion: '0.142.3', capabilities: [
-				{ id: 'session.reset', kind: 'command', name: 'New Codex thread', supported: true, executable: true,
-					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' },
-				{ id: 'session.compact', kind: 'command', name: 'Compact Codex context', supported: false, executable: false,
-					reason: 'native_request_and_summary_attribution_unproven', defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' },
-			] };
+		return codexCatalog(this.discovery, input.workspace, input.signal);
+	}
+	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		const params = capabilityParameters('discover', input.capabilityId, input.parameters);
+		const { catalog, models } = await this.snapshot(input);
+		if (input.capabilityId === 'model.set') {
+			const query = String(params.query).toLowerCase(), offset = params.offset as number;
+			const all = models.filter((m) => `${m.providerId} ${m.modelId} ${m.label}`.toLowerCase().includes(query));
+			catalog.models = { items: all.slice(offset, offset + 100), total: all.length, offset,
+				...(offset + 100 < all.length ? { nextOffset: offset + 100 } : {}) };
+		}
+		return catalog;
 	}
 	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
 		if (input.recovery) return input.recovery.receipt; // Read-only replay; unknown never starts another thread.
-		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
+		let params: Record<string, string | number>;
+		try { params = capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
-		if (input.capabilityId !== 'session.reset') return { status: 'unsupported', error: 'execution_not_connected' };
-		const catalog = await this.discoverCapabilities(input);
+		if (!['session.reset', 'model.list', 'model.set'].includes(input.capabilityId)) return { status: 'unsupported', error: 'execution_not_connected' };
+		const { catalog, models } = await this.snapshot(input);
 		if (catalog.version !== input.catalogVersion) return { status: 'failed', error: 'catalog_stale' };
+		if (!catalog.capabilities.find((c) => c.id === input.capabilityId)?.executable) return { status: 'unsupported', error: 'native_provider_unverified' };
+		if (input.capabilityId === 'model.list') return { status: 'completed', text: `${models.length} native models available in the model picker.`, nativeResult: { models } };
+		if (input.capabilityId === 'model.set') {
+			const model = models.find((m) => m.providerId === params.providerId && m.modelId === params.modelId);
+			if (!model) return { status: 'failed', error: 'invalid_parameters' };
+			return this.setModel(input, model);
+		}
 		const execution = input.execution;
 		if (!execution || !input.workspace) return { status: 'unsupported', error: 'execution_not_connected' };
 		const generation = String(execution.conversation.generation);
@@ -100,6 +111,39 @@ export class CodexNativeDriver implements AgentDriver {
 				text: 'Native reset outcome unconfirmed. Retain the recorded thread evidence; do not automatically retry.' };
 		}
 	}
+	private async setModel(input: AgentCapabilityInvocation, model: { providerId: string; modelId: string }): Promise<AgentCapabilityResult> {
+		const execution = input.execution;
+		if (!execution || !input.workspace) return { status: 'unsupported', error: 'execution_not_connected' };
+		execution.conversation.assertCurrent(); input.signal.throwIfAborted();
+		const generation = String(execution.conversation.generation);
+		const previous = object(execution.conversation.nativeState?.value)?.threadId;
+		await execution.submitted(typeof previous === 'string' ? { sessionId: previous } : undefined);
+		let session: Session | undefined;
+		try {
+			session = await this.session({ runId: `${execution.requestId}:session`, workspace: input.workspace,
+				systemPrompt: execution.systemPrompt, conversation: execution.conversation, saveRecovery: execution.saveRecovery });
+			if (session.modelProvider !== model.providerId) return { status: 'failed', generation, error: 'native_provider_mismatch' };
+			const nativeRef = { sessionId: session.threadId };
+			await execution.saveRecovery({ version: 1, value: { provider: 'codex', kind: 'model', nativeRef,
+				requestId: execution.requestId, modelId: model.modelId, modelProvider: model.providerId } });
+			execution.conversation.assertCurrent(); input.signal.throwIfAborted();
+			await session.channel.request('thread/settings/update', { threadId: session.threadId, model: model.modelId }, execution.requestId);
+			execution.conversation.assertCurrent(); input.signal.throwIfAborted();
+			await execution.selectModel({ providerID: model.providerId, modelID: model.modelId });
+			return { status: 'accepted', phase: 'outcome', generation, nativeRef,
+				effect: { kind: 'model', providerId: model.providerId, modelId: model.modelId, effective: 'next_request' },
+				text: 'Native model setting accepted for subsequent turns. Response effectiveness has not been observed.' };
+		} catch {
+			return { status: 'unknown', generation, ...(session ? { nativeRef: { sessionId: session.threadId } } : {}),
+				error: 'native_model_outcome_unconfirmed', text: 'Native model outcome unconfirmed. Do not automatically retry.' };
+		} finally {
+			if (session) {
+				try { await this.release(session, true); }
+				catch { return { status: 'unknown', generation, nativeRef: { sessionId: session.threadId },
+					error: 'CODEX_MODEL_CLEANUP_UNCONFIRMED', text: 'Native model request submitted; retired channel cleanup unconfirmed. Do not automatically retry.' }; }
+			}
+		}
+	}
 	async disconnect(): Promise<void> {
 		this.discovery?.close();
 		await Promise.all([...this.sessions.values()].map(async (pending) => {
@@ -131,7 +175,7 @@ export class CodexNativeDriver implements AgentDriver {
 			throw new TypeError('Codex native run requires prepared core input');
 		return new CodexNativeRun(input, () => this.session(input), (session, settled) => this.release(session, settled));
 	}
-	private async session(input: PreparedRun): Promise<Session> {
+	private async session(input: SessionInput): Promise<Session> {
 		const scope = await prepareCodexScope(input);
 		input.conversation.assertCurrent();
 		const key = JSON.stringify([input.conversation.id, input.conversation.generation]);
@@ -179,7 +223,8 @@ export class CodexNativeDriver implements AgentDriver {
 			if (typeof thread?.id !== 'string' || !thread.id || thread.cliVersion !== '0.142.3' ||
 				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
-			return { channel, grants, threadId: thread.id, scope, references: 0, retired: false };
+			return { channel, grants, threadId: thread.id, scope, references: 0, retired: false,
+				modelProvider: typeof response?.modelProvider === 'string' ? response.modelProvider : undefined };
 		} catch (error) { try { await grants.dispose(); } finally { channel.close(); } throw error; }
 	}
 }
