@@ -464,7 +464,7 @@ export class MessageHandler {
 	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string }, generation: number, systemPrompt: string,
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
-		const record = store.assertGeneration(this.selfUid, room, generation);
+		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (owner && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
@@ -475,7 +475,10 @@ export class MessageHandler {
 			selectedModel: record.selectedModel,
 			getSelectedModel: () => store.assertGeneration(this.selfUid, room, generation).selectedModel,
 			conversation: { id: record.conversationId, generation, assertCurrent,
-				nativeState: record.nativeState[this.driver.type] ? { version: 1, value: record.nativeState[this.driver.type] } : undefined,
+				get nativeState() {
+					const state = (provider === 'codex' ? store.assertGeneration(record.identityId, room, generation) : record).nativeState[provider];
+					return state ? { version: 1 as const, value: state } : undefined;
+				},
 				saveNativeState: async (state) => { assertCurrent(); store.saveControlNativeState(this.selfUid, room, generation, this.driver.type, state.value as Record<string, unknown>); },
 				registerNativeAlias: async (alias) => { assertCurrent(); store.registerNative(this.driver.type, alias.id, this.selfUid, room, undefined, alias.scope); },
 				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
@@ -485,6 +488,9 @@ export class MessageHandler {
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {
 				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>, expectedModel);
+				for (const session of this.nativeThinking.values()) if (session.roomId === room && session.run?.generation === generation && session.timeoutId) {
+					clearTimeout(session.timeoutId); session.timeoutId = undefined;
+				}
 				const key = bindingKey(this.selfUid, room), old = this.thinkingSessions.get(key);
 				if (old?.run?.generation === generation) {
 					this.thinkingSessions.delete(key); old.sessionKey = `${key}:retired:${generation}`; this.thinkingSessions.set(old.sessionKey, old);
@@ -498,8 +504,10 @@ export class MessageHandler {
 				if (owner && receipt.status === 'unknown' && receipt.nativeRef && store.get(this.selfUid, room)?.generation === generation) {
 					const key = this.nativeKey(record.conversationId, generation, receipt.nativeRef), session = this.nativeThinking.get(key);
 					if (session?.run?.agent === owner.agent() && session.run.generation === generation && !this.nativeTerminal.has(key) &&
-						store.get(this.selfUid, room)?.pendingRuns?.some(run => run.runId === session.run!.id && run.generation === generation))
+						store.get(this.selfUid, room)?.pendingRuns?.some(run => run.runId === session.run!.id && run.generation === generation)) {
+						if (session.timeoutId) { clearTimeout(session.timeoutId); session.timeoutId = undefined; }
 						store.markStopUnconfirmed(session.run.id);
+					}
 				}
 				// Ordinary inputs have no command-result transport; both use the same durable control.
 				report?.(receipt);
@@ -605,13 +613,19 @@ export class MessageHandler {
 				startTime: Date.now(), accumulatedContent: '', finalized: false, events: [], authorizationEpoch: request.authorizationEpoch,
 				run: { id: runId, generation: turn.generation, agent, abort: owner?.abort ?? new AbortController() } };
 			this.nativeThinking.set(key, session); this.thinkingSessions.set(session.sessionKey, session);
+			if (owner) session.timeoutId = setTimeout(() => {
+				if (session.finalized || this.nativeThinking.get(key) !== session || store.get(this.selfUid, session.roomId)?.generation !== turn.generation) return;
+				session.finalized = true;
+				this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: 'error', error: 'thinking_session_timeout', content: session.accumulatedContent });
+				this.teardownSession(session, session.roomId, true);
+			}, Math.max(1, this.THINKING_SESSION_TIMEOUT_MS - (Date.now() - session.startTime)));
 			const retry = setInterval(() => { if (this.ws.isConnected) this.sendThinkingStart(session); }, 2_000); retry.unref?.();
 			const deadline = setTimeout(() => { this.forgetThinkingStart(runId); }, this.startReceiptTimeout()); deadline.unref?.();
 			this.pendingThinkingStarts.set(runId, { session, retry, deadline });
 			const receipt = this.waitStartReceipt(runId); this.sendThinkingStart(session);
 			const outcome = await receipt;
 			if (outcome.status !== 'admitted') {
-				this.forgetThinkingStart(runId); store.markStopUnconfirmed(runId);
+				this.forgetThinkingStart(runId); if (session.timeoutId) clearTimeout(session.timeoutId); store.markStopUnconfirmed(runId);
 				throw new Error('native START receipt unconfirmed');
 			}
 			if (codex) validateLease({ token: bound.replyToken, runId, thinkingId: outcome.thinkingId });
@@ -625,9 +639,13 @@ export class MessageHandler {
 		if (!session || this.nativeTerminal.has(key)) return;
 		if (turn.event) { session.events.push(turn.event); if (turn.event.type === 'thinking') session.accumulatedContent += turn.event.text; }
 		if (turn.phase === 'bound') return;
-		this.nativeTerminal.set(key, null); session.finalized = true;
-		this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: turn.phase === 'completed' ? 'complete' : 'error',
-			...(turn.phase !== 'completed' ? { error: 'native_request_failed' } : {}), content: session.accumulatedContent });
+		this.nativeTerminal.set(key, null);
+		if (session.timeoutId) { clearTimeout(session.timeoutId); session.timeoutId = undefined; }
+		if (!session.finalized) {
+			session.finalized = true;
+			this.sendThinkingEnd(session, { durationMs: Date.now() - session.startTime, status: turn.phase === 'completed' ? 'complete' : 'error',
+				...(turn.phase !== 'completed' ? { error: 'native_request_failed' } : {}), content: session.accumulatedContent });
+		}
 		this.releaseRun(session);
 	}
 

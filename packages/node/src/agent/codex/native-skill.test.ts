@@ -13,7 +13,7 @@ import type { AgentCommandResponse } from '../../stream/protocol.js';
 // Fake-child process startup/JSONL under a full Windows suite is not Vitest's 1s observation default.
 const waitFor = <T>(callback: () => T | Promise<T>) => vi.waitFor(callback, { timeout: 3000 });
 const cleanup: Array<() => Promise<void>> = [];
-afterEach(async () => { vi.restoreAllMocks(); for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); for (const dispose of cleanup.splice(0).reverse()) await dispose(); });
 async function fixture(mode = '') {
  const home = await mkdtemp(join(tmpdir(), 'codex-skill-')), wire = join(home, 'wire'), script = join(home, 'child.cjs'), path = join(home, 'trusted-skill.md');
  await writeFile(path, 'deterministic fake skill');
@@ -23,7 +23,7 @@ async function fixture(mode = '') {
  if(r.method==='config/read')result={config:{model_provider:'openai'}};
  if(r.method==='skills/list')result={data:[{cwd:p.cwds[0],skills:[{name:'probe',scope:'user',path:process.env.SKILL,enabled:true,description:'native'}],errors:[]}]};
  if(r.method==='model/list')result={data:[],nextCursor:null};
- if(r.method==='thread/start'){const n=Number(fs.existsSync(process.env.THREADS)?fs.readFileSync(process.env.THREADS,'utf8'):0)+1;fs.writeFileSync(process.env.THREADS,String(n));result={thread:{id:'thread-'+n,cwd:p.cwd,cliVersion:'0.142.3'}};}
+ if(r.method==='thread/start'){const n=Number(fs.existsSync(process.env.THREADS)?fs.readFileSync(process.env.THREADS,'utf8'):0)+1;fs.writeFileSync(process.env.THREADS,String(n));result={thread:{id:'thread-'+n,cwd:p.cwd,cliVersion:'0.142.3'}};if(process.env.MODE==='attach-thread-init'&&n===1)deferAck=true;}
  if(r.method==='thread/resume')result={thread:{id:p.threadId,cwd:p.cwd,cliVersion:'0.142.3'}};
  if(r.method==='turn/start'){const n=++seq,id=process.env.MODE==='attach-prewarmed'&&n===1?'seed-turn':process.env.MODE.startsWith('attach')?'turn-1':'turn-'+n;deferAck=process.env.MODE==='attach-late-ack'&&n===1;const fresh=!process.env.MODE.startsWith('attach')||n===1||(process.env.MODE==='attach-prewarmed'&&n===2);result={turn:{id:fresh&&process.env.MODE!=='orphan'?id:'submission-'+n,status:'inProgress',items:[]}};if(fresh&&process.env.MODE!=='no-start')send({method:'turn/started',params:{threadId:p.threadId,turn:{id,status:'inProgress',items:[]}}});
  const proof={method:'item/started',params:{threadId:p.threadId,turnId:id,item:{id:'input-'+n,type:'userMessage',clientId:p.clientUserMessageId,content:p.input}}};
@@ -33,7 +33,7 @@ async function fixture(mode = '') {
  else if(['gate','attach-gate'].includes(process.env.MODE)){const gate=setInterval(()=>{if(fs.existsSync(process.env.PROOF)){clearInterval(gate);send(proof);}},5);}
  else {send(proof);if(process.env.MODE==='conflict')send({...proof,params:{...proof.params,turnId:'other-turn'}});if(process.env.MODE==='duplicate')send({...proof,method:'item/completed'});}
  if(['foreign-client','foreign-thread','conflict'].includes(process.env.MODE))setTimeout(()=>process.exit(0),100);
- const poll=setInterval(()=>{if(fs.readdirSync(process.env.GRANTS).some(x=>x.endsWith('.env'))&&((process.env.MODE==='attach-prewarmed'&&n===1)||!(process.env.MODE.startsWith('attach')||process.env.MODE==='separate')||fs.existsSync(process.env.DONE))){clearInterval(poll);if(process.env.MODE==='attach-loss'||(process.env.MODE==='attach-old-loss'&&p.threadId==='thread-1')){process.exit(0);return;}send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'a',delta:'native answer'}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:process.env.MODE==='native-failed'?'failed':process.env.MODE==='native-interrupted'?'interrupted':'completed',items:[]}}});}},5);}
+ const poll=setInterval(()=>{if(fs.readdirSync(process.env.GRANTS).some(x=>x.endsWith('.env'))&&((process.env.MODE==='attach-prewarmed'&&n===1)||!(process.env.MODE.startsWith('attach')||process.env.MODE==='separate')||fs.existsSync(process.env.MODE==='attach-old-terminal'&&p.threadId==='thread-2'?process.env.DONE+'-new':process.env.DONE))){clearInterval(poll);if(process.env.MODE==='attach-loss'||(process.env.MODE==='attach-old-loss'&&p.threadId==='thread-1')){process.exit(0);return;}send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'a',delta:'native answer'}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:process.env.MODE==='native-failed'?'failed':process.env.MODE==='native-interrupted'?'interrupted':'completed',items:[]}}});}},5);}
  if(r.id){if(deferAck){const gate=setInterval(()=>{if(fs.existsSync(process.env.ACK)){clearInterval(gate);send({id:r.id,result});}},5);}else send({id:r.id,result});}});`);
  const store = new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['u']), activeProviders: new Map([['u', 'codex']]) });
  const grants: CodexTurnGrants[] = [];
@@ -63,6 +63,127 @@ async function fixture(mode = '') {
   rejectStart(index = 0) { const frame = frames.filter(x => x.type === 20)[index]; handler.handle({ type: 'thinkingEnd', data: { ...frame.data, fromUid: 'u', thinkingId: 'thinking-' + frame.data.clientRunId, status: 'error', error: 'authorization_revoked' } }); },
  ordinary(id = 'ordinary') { handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 'owner', name: 'Owner', userType: 1 }, message: { id, roomId: 'room', type: 1, roomType: 2, aiclaw: { isOwner: true }, body: { content: 'hello' } } } }); }, setAck(value: boolean) { ack = value; }, ackStart(index = -1) { const data = frames.filter(f => f.type === 20).at(index)!.data; handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: 'thinking-' + data.clientRunId } }); } };
 }
+it('times out only the original ordinary resource owner after the existing five-minute budget', async () => {
+ const f = await fixture('attach'), create = f.driver.createNativeInput.bind(f.driver), signals: AbortSignal[] = [];
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signals.push(input.signal); return create(input); });
+ vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+ f.ordinary('owner'); await f.grantPath(); f.ordinary('borrower');
+ await waitFor(async () => { const inputs = (await f.lines()).filter(r => r.method === 'turn/start'); expect(inputs).toHaveLength(2);
+  expect(f.store.getControl('u', 'room', inputs[1].params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
+ await vi.advanceTimersByTimeAsync(300_001);
+ expect(signals.map(signal => signal.aborted)).toEqual([true, false]);
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(1));
+ expect(f.frames.filter(x => x.type === 22)).toHaveLength(1);
+ expect(f.frames.find(x => x.type === 22)?.data.error).toBe('thinking_session_timeout');
+ expect(f.store.get('u', 'room')!.state).toBe('stop_unconfirmed');
+ await writeFile(join(f.home, 'done'), '1');
+ await waitFor(() => expect(f.store.pendingRuns('u', 'room')).toHaveLength(0));
+ expect(f.frames.filter(x => x.type === 22)).toHaveLength(1);
+});
+it('clears a normally settled ordinary owner budget before it can abort a completed task', async () => {
+ const f = await fixture(), create = f.driver.createNativeInput.bind(f.driver); let signal!: AbortSignal;
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signal = input.signal; return create(input); });
+ vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+ const timers = vi.fn(globalThis.setTimeout), cleared = vi.fn(globalThis.clearTimeout);
+  vi.stubGlobal('setTimeout', timers); vi.stubGlobal('clearTimeout', cleared);
+ f.ordinary(); await waitFor(() => expect(f.store.pendingRuns('u', 'room')).toHaveLength(0));
+ await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ const budget = timers.mock.results[timers.mock.calls.findIndex(call => call[1] === 300_000)]?.value;
+ expect(budget).toBeDefined(); expect(cleared.mock.calls.some(call => call[0] === budget)).toBe(true);
+ await vi.advanceTimersByTimeAsync(300_001); expect(signal.aborted).toBe(false);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it('gives neither a capability owner nor its ordinary borrower an ordinary watchdog', async () => {
+ const f = await fixture('attach'), create = f.driver.createNativeInput.bind(f.driver); let signal!: AbortSignal;
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signal = input.signal; return create(input); });
+ vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] }); const timers = vi.fn(globalThis.setTimeout);
+  vi.stubGlobal('setTimeout', timers);
+ f.request('cap-owner', 'invoke', f.catalog.version); await f.grantPath(); f.ordinary('borrower');
+ await waitFor(async () => { const input = (await f.lines()).filter(r => r.method === 'turn/start')[1]; expect(input).toBeDefined();
+  expect(f.store.getControl('u', 'room', input.params.clientUserMessageId)?.receipt?.status).toBe('accepted'); });
+ expect(timers.mock.calls.filter(call => call[1] === 300_000)).toHaveLength(0);
+ await vi.advanceTimersByTimeAsync(300_001); expect(signal.aborted).toBe(false);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ await writeFile(join(f.home, 'done'), '1'); expect((await f.result('cap-owner')).status).toBe('completed');
+ expect(f.frames.filter(x => x.type === 22)).toHaveLength(1);
+});
+it('clears the reset owner budget while its late terminal cannot clear the new owner budget', async () => {
+ const f = await fixture('attach-old-terminal'), create = f.driver.createNativeInput.bind(f.driver), signals: AbortSignal[] = [];
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => { signals.push(input.signal); return create(input); });
+ vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+ const timers = vi.fn(globalThis.setTimeout), cleared = vi.fn(globalThis.clearTimeout);
+  vi.stubGlobal('setTimeout', timers); vi.stubGlobal('clearTimeout', cleared);
+ f.ordinary('old'); await f.grantPath();
+ const oldBudget = timers.mock.results[timers.mock.calls.findIndex(call => call[1] === 300_000)]?.value;
+ await vi.advanceTimersByTimeAsync(120_000);
+ f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset'); expect((await f.result('reset')).status).toBe('completed');
+ expect(oldBudget).toBeDefined(); expect(cleared.mock.calls.some(call => call[0] === oldBudget)).toBe(true);
+ f.ordinary('new'); await waitFor(async () => expect((await readdir(f.grants[1].directory)).filter(x => x.endsWith('.env'))).toHaveLength(1));
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ await vi.advanceTimersByTimeAsync(180_001); expect(signals.map(s => s.aborted)).toEqual([false, false]);
+ await vi.advanceTimersByTimeAsync(120_001); expect(signals.map(s => s.aborted)).toEqual([false, true]);
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(1));
+ expect((await f.lines()).find(r => r.method === 'turn/interrupt').params.threadId).toBe('thread-2');
+ expect(f.frames.filter(x => x.type === 22)).toHaveLength(2);
+});
+it('shares the exact first native initialization between two new-room ordinary inputs', async () => {
+ const f = await fixture('attach-thread-init'), create = f.driver.createNativeInput.bind(f.driver); let inputs = 0, staleSecondScope = false;
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => {
+  const second = ++inputs === 2;
+  return create({ ...input, execution: { ...input.execution, conversation: { ...input.execution.conversation,
+   get nativeState() { const state = input.execution.conversation.nativeState; if (second && !state) staleSecondScope = true; return state; }
+  } } });
+ });
+ f.ordinary('first'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1));
+ f.ordinary('second'); await waitFor(() => expect(staleSecondScope).toBe(true));
+ await writeFile(join(f.home, 'ack'), '1');
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(2));
+ expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1);
+ expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it.each(['workspace', 'prompt'])('refuses a concurrent first-room input with a different %s instead of borrowing initialization', async fault => {
+ const f = await fixture('attach-thread-init'), create = f.driver.createNativeInput.bind(f.driver); let inputs = 0, staleSecondScope = false;
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => {
+  const second = ++inputs === 2;
+  return create({ ...input, ...(second && fault === 'workspace' ? { workspace: join(f.home, 'other-cwd') } : {}), execution: { ...input.execution,
+   ...(second && fault === 'prompt' ? { systemPrompt: 'different frozen developer instructions' } : {}),
+   conversation: { ...input.execution.conversation, get nativeState() {
+    const state = input.execution.conversation.nativeState; if (second && !state) staleSecondScope = true; return state;
+   } }
+  } });
+ });
+ f.ordinary('first'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1));
+ f.ordinary('second'); await waitFor(() => expect(staleSecondScope).toBe(true)); await writeFile(join(f.home, 'ack'), '1');
+ await f.grantPath(); await waitFor(() => expect(f.store.get('u', 'room')!.controls?.some(control =>
+  control.receipt?.status === 'failed' && control.receipt.error?.includes('CODEX_NATIVE_SCOPE_CHANGED'))).toBe(true));
+ expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1);
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it('does not borrow a reset successor for ordinary inputs awaiting their first initialization', async () => {
+ const f = await fixture('attach-thread-init'), create = f.driver.createNativeInput.bind(f.driver); let inputs = 0, staleSecondScope = false;
+ vi.spyOn(f.driver, 'createNativeInput').mockImplementation(input => {
+  const second = ++inputs === 2;
+  return create({ ...input, execution: { ...input.execution, conversation: { ...input.execution.conversation,
+   get nativeState() { const state = input.execution.conversation.nativeState; if (second && !state) staleSecondScope = true; return state; }
+  } } });
+ });
+ f.ordinary('first'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(1));
+ const generation = f.store.get('u', 'room')!.generation;
+ f.ordinary('second'); await waitFor(() => expect(staleSecondScope).toBe(true));
+ f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset');
+ await waitFor(() => expect(f.store.get('u', 'room')!.generation).toBe(generation + 1));
+ await writeFile(join(f.home, 'ack'), '1'); expect((await f.result('reset')).status).toBe('completed');
+ expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(0);
+ f.ordinary('fresh'); await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1));
+ expect((await f.lines()).find(r => r.method === 'turn/start').params.threadId).toBe('thread-2');
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ expect((await f.lines()).filter(r => r.method === 'thread/start')).toHaveLength(2);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
 it('admits ordinary input before proof without minting a reply token or START', async () => {
  const f = await fixture('gate'), mint = vi.spyOn(f.store, 'beginRun');
  f.ordinary();

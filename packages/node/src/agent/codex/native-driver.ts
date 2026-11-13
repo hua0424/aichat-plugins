@@ -7,7 +7,7 @@ import { codexCatalog } from './native-catalog.js';
 
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
 interface Session {
-	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope; modelProvider?: string;
+	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; workspace: string; scope: Scope; modelProvider?: string;
 	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>;
 }
 type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId' | 'selectedModel'>;
@@ -216,7 +216,13 @@ export class CodexNativeDriver implements AgentDriver {
 		if (existing) {
 			const session = await existing;
 			input.conversation.assertCurrent();
-			if (session.retired || session.scope.digest !== scope.digest || session.threadId !== scope.threadId)
+			// A sibling may capture no thread before this exact initialization registers it in core.
+			const registered = object(input.conversation.nativeState?.value);
+			const joinedInitialization = scope.threadId === undefined && session.scope.threadId === undefined &&
+				this.sessions.get(key) === existing && session.cacheKey === key && registered?.threadId === session.threadId &&
+				registered.promptHash === scope.digest && registered.workspace === input.workspace;
+			if (session.retired || session.workspace !== input.workspace || session.scope.digest !== scope.digest ||
+				(session.threadId !== scope.threadId && !joinedInitialization))
 				throw new Error('CODEX_NATIVE_SCOPE_CHANGED: explicit reset required');
 			session.references++;
 			return session;
@@ -267,7 +273,7 @@ export class CodexNativeDriver implements AgentDriver {
 				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId) ||
 				(input.selectedModel && response?.modelProvider !== input.selectedModel.providerID))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
-			return { channel, grants, threadId: thread.id, scope, references: 0, retired: false,
+			return { channel, grants, threadId: thread.id, workspace: input.workspace!, scope, references: 0, retired: false,
 				modelProvider: typeof response?.modelProvider === 'string' ? response.modelProvider : undefined };
 		} catch (error) { try { await grants.dispose(); } finally { channel.close(); } throw error; }
 	}
@@ -413,6 +419,7 @@ class CodexNativeRun implements AgentRun {
 				await e.emit({ type: 'receipt', receipt: { status: 'accepted', phase: 'accepted', generation: String(input.conversation.generation), nativeRef: this.ref } });
 				input.conversation.assertCurrent();
 			} else assertSettlement();
+			if (this.channelFailure) throw new Error(this.channelFailure);
 			if (!this.cancelled && !this.attached) {
 				try { await session.grants.grant(this.ref, replyToken!); this.ownsGrant = true; }
 				catch (error) {

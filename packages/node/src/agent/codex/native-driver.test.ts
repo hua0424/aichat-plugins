@@ -15,7 +15,7 @@ vi.mock('node:fs/promises', async (original) => {
 		if (String(args[0]).endsWith('.revoked') && publicationFault.revoke) await publicationFault.revoke();
 		return fs.writeFile(...args);
 	}, unlink: async (...args: Parameters<typeof fs.unlink>) => {
-		if (String(args[0]).endsWith('.pending') && publicationFault.unlink) return publicationFault.unlink();
+		if (String(args[0]).endsWith('.pending') && publicationFault.unlink) await publicationFault.unlink();
 		return fs.unlink(...args);
 	} };
 });
@@ -39,6 +39,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(process.env.PROOF!=='missing')send(proof);
  if(process.env.PROOF==='duplicate')send({...proof,method:'item/completed'});
  if(process.env.PROOF==='conflict')send({...proof,params:{...proof.params,turnId:'another-turn'}});
+ if(process.env.PROOF==='conflict-gated'){const gate=setInterval(()=>{if(fs.existsSync(process.env.PROOF_GATE)){clearInterval(gate);send({...proof,params:{...proof.params,turnId:'another-turn'}});}},5);}
  if(process.env.FLOOD==='1'){for(let n=0;n<4100;n++)send({method:'item/agentMessage/delta',params:{threadId,turnId:id,itemId:'a',delta:'x'}});send({id:r.id,result:{turn:{id,status:'inProgress',items:[]}}});return;}
  if(process.env.PARK==='1')return;
  setTimeout(()=>{
@@ -60,7 +61,7 @@ async function fixture(extra: NodeJS.ProcessEnv = {}) {
 	await writeFile(file, script);
 	const grants = await CodexTurnGrants.create();
 	const channels: CodexAppServer[] = [];
-	const driver = new CodexNativeDriver({ command: 'unused', env: { ...process.env, WIRE: wire, ...extra }, createGrants: async () => grants,
+	const driver = new CodexNativeDriver({ command: 'unused', env: { ...process.env, WIRE: wire, PROOF_GATE: join(directory, 'proof-gate'), ...extra }, createGrants: async () => grants,
 		createChannel: (args, env) => { const channel = new CodexAppServer({ command: process.execPath, prefix: [file], args, env, timeoutMs: 2000 }); channels.push(channel); return channel; } });
 	let state: unknown;
 	let current = true;
@@ -79,6 +80,40 @@ async function fixture(extra: NodeJS.ProcessEnv = {}) {
 async function collect(events: AsyncIterable<AgentEvent>) { const result: AgentEvent[] = []; for await (const event of events) result.push(event); return result; }
 
 describe('Codex persistent native ordinary-message vertical', () => {
+	it.each(['recovery', 'publication'])('keeps contradictory proof unknown across the %s await without borrowing cleanup ownership', async (window) => {
+		const f = await fixture({ PROOF: 'conflict-gated', PARK: '1' });
+		const unrelated = { sessionId: 'native-thread', turnId: 'other-owner' };
+		await f.grants.grant(unrelated, 'unrelated-token');
+		const grant = vi.spyOn(f.grants, 'grant'), revoke = vi.spyOn(f.grants, 'revoke');
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; }), paused = new Promise<void>((resolve) => { entered = resolve; });
+		if (window === 'recovery') f.input.saveRecovery = async (recovery) => {
+			if (typeof recovery.value === 'object' && recovery.value !== null && 'nativeRef' in recovery.value) { entered(); await gate; }
+		};
+		else publicationFault.unlink = async () => { entered(); await gate; };
+		const run = f.driver.createRun(f.input), result = collect(run.events);
+		await paused;
+		const conflict = vi.fn();
+		const unsubscribe = f.channels[0].onNotification((method, params) => {
+			if (method === 'item/started' && typeof params === 'object' && params !== null && 'turnId' in params && params.turnId === 'another-turn') conflict();
+		});
+		await writeFile(join(f.input.workspace!, 'proof-gate'), 'go');
+		await vi.waitFor(() => expect(conflict).toHaveBeenCalledOnce(), { timeout: 3000 });
+		release();
+		expect(await result).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN: registered native input association ambiguous') }]);
+		unsubscribe(); await run.dispose();
+		expect(grant).toHaveBeenCalledTimes(window === 'recovery' ? 0 : 1);
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		if (window === 'recovery') {
+			expect(await readdir(f.grants.directory)).not.toContain(`${id}.env`);
+			expect(revoke).not.toHaveBeenCalled();
+		} else expect(await readdir(f.grants.directory)).toContain(`${id}.revoked`);
+		const original = createHash('sha256').update(JSON.stringify(['native-thread', 'other-owner'])).digest('hex');
+		expect(await readFile(join(f.grants.directory, `${original}.env`), 'utf8')).toContain("'unrelated-token'");
+		expect(await readdir(f.grants.directory)).not.toContain(`${original}.revoked`);
+		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(1);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(0);
+	});
 	it.each([false, true])('rolls back its actual publication on pending unlink failure with cancel-first=%s', async (cancelFirst) => {
 		const f = await fixture({ PARK: '1' }), run = f.driver.createRun(f.input);
 		let release!: () => void, entered!: () => void;
