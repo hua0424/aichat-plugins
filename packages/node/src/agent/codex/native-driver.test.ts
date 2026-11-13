@@ -8,6 +8,18 @@ import { CodexAppServer } from './app-server.js';
 import { CodexTurnGrants } from './turn-grants.js';
 import type { AgentEvent, PreparedRun } from '../events.js';
 
+const publicationFault = vi.hoisted(() => ({ unlink: undefined as undefined | (() => Promise<void>), revoke: undefined as undefined | (() => Promise<void>) }));
+vi.mock('node:fs/promises', async (original) => {
+	const fs = await original<typeof import('node:fs/promises')>();
+	return { ...fs, writeFile: async (...args: Parameters<typeof fs.writeFile>) => {
+		if (String(args[0]).endsWith('.revoked') && publicationFault.revoke) await publicationFault.revoke();
+		return fs.writeFile(...args);
+	}, unlink: async (...args: Parameters<typeof fs.unlink>) => {
+		if (String(args[0]).endsWith('.pending') && publicationFault.unlink) return publicationFault.unlink();
+		return fs.unlink(...args);
+	} };
+});
+
 const script = `
 const fs=require('node:fs');
 if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.exit(0)}
@@ -41,7 +53,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
 });
 `;
 const disposers: Array<() => Promise<void>> = [];
-afterEach(async () => { vi.restoreAllMocks(); for (const dispose of disposers.splice(0).reverse()) await dispose(); });
+afterEach(async () => { publicationFault.unlink = undefined; publicationFault.revoke = undefined; vi.restoreAllMocks(); for (const dispose of disposers.splice(0).reverse()) await dispose(); });
 async function fixture(extra: NodeJS.ProcessEnv = {}) {
 	const directory = await mkdtemp(join(tmpdir(), 'aichat-native-507-'));
 	const file = join(directory, 'native.cjs'), wire = join(directory, 'wire.jsonl');
@@ -67,6 +79,54 @@ async function fixture(extra: NodeJS.ProcessEnv = {}) {
 async function collect(events: AsyncIterable<AgentEvent>) { const result: AgentEvent[] = []; for await (const event of events) result.push(event); return result; }
 
 describe('Codex persistent native ordinary-message vertical', () => {
+	it.each([false, true])('rolls back its actual publication on pending unlink failure with cancel-first=%s', async (cancelFirst) => {
+		const f = await fixture({ PARK: '1' }), run = f.driver.createRun(f.input);
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; }), published = new Promise<void>((resolve) => { entered = resolve; });
+		publicationFault.unlink = async () => { entered(); await gate; throw Object.assign(new Error('pending unlink EACCES'), { code: 'EACCES' }); };
+		const result = collect(run.events);
+		await published;
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain("'secret-token'");
+		if (cancelFirst) expect(await run.cancel('during publication cleanup')).toMatchObject({ status: 'unconfirmed' });
+		release();
+		expect(await result).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: pending unlink EACCES' }]);
+		await run.dispose();
+		expect(await readdir(f.grants.directory)).toContain(`${id}.revoked`);
+		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(1);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(0);
+	});
+	it.each([false, true])('retains actual publication ownership when rollback also fails with cancel-first=%s', async (cancelFirst) => {
+		const f = await fixture({ PARK: '1' }), run = f.driver.createRun(f.input);
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; }), published = new Promise<void>((resolve) => { entered = resolve; });
+		publicationFault.unlink = async () => { entered(); await gate; throw Object.assign(new Error('pending unlink EACCES'), { code: 'EACCES' }); };
+		let attempts = 0;
+		publicationFault.revoke = async () => { if (++attempts === 1) throw Object.assign(new Error('rollback EACCES'), { code: 'EACCES' }); };
+		const result = collect(run.events);
+		await published;
+		if (cancelFirst) await run.cancel('during publication cleanup');
+		release();
+		expect(await result).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: CODEX_GRANT_ROLLBACK_UNCONFIRMED' }]);
+		await run.dispose();
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		expect(await readdir(f.grants.directory)).toContain(`${id}.revoked`);
+		expect(attempts).toBeGreaterThanOrEqual(2);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(cancelFirst ? 1 : 0);
+	});
+	it('never rolls back an EEXIST original grant when only the conflicting temporary unlink fails', async () => {
+		const f = await fixture({ PARK: '1', ATTACH: '1' }), grant = vi.spyOn(f.grants, 'grant');
+		const original = f.driver.createRun(f.input); void collect(original.events);
+		await vi.waitFor(() => expect(grant).toHaveBeenCalledOnce()); await grant.mock.results[0].value;
+		publicationFault.unlink = async () => { throw Object.assign(new Error('pending unlink EACCES'), { code: 'EACCES' }); };
+		const attached = f.driver.createRun({ ...f.input, runId: 'attached', replyToken: 'not-the-original' });
+		expect(await collect(attached.events)).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: pending unlink EACCES' }]);
+		await attached.dispose();
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain("'secret-token'");
+		expect(await readdir(f.grants.directory)).not.toContain(`${id}.revoked`);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(0);
+	});
 	it('keeps one native process/thread, exact turn IDs, immutable per-turn grants, and root event dedup', async () => {
 		const f = await fixture();
 		const first = await collect(f.driver.createRun(f.input).events);

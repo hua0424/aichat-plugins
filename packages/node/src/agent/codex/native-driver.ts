@@ -2,7 +2,7 @@ import type { AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInv
 import { capabilityParameters } from '../capability-parameters.js';
 import { CodexAppServer } from './app-server.js';
 import { prepareCodexScope } from './codex-driver.js';
-import { CodexTurnGrants, codexHookConfig } from './turn-grants.js';
+import { CodexGrantPublicationError, CodexTurnGrants, codexHookConfig } from './turn-grants.js';
 import { codexCatalog } from './native-catalog.js';
 
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
@@ -337,6 +337,10 @@ class CodexNativeRun implements AgentRun {
 			if (!this.cancelled) {
 				try { await session.grants.grant(this.ref, input.replyToken!); this.ownsGrant = true; }
 				catch (error) {
+					if (error instanceof CodexGrantPublicationError) {
+						this.ownsGrant = true;
+						if (this.cancelled) await this.cancel('cancelled during publication rollback');
+					}
 					if (error instanceof Error && error.message === 'CODEX_TURN_GRANT_CONFLICT') {
 						throw new Error('NATIVE_OUTCOME_UNKNOWN: existing turn requires its original core lease; no new grant');
 					}

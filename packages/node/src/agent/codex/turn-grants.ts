@@ -14,6 +14,11 @@ const key = (ref: NativeRef) => {
 // Loaded bytes, not a second require(path), are evaluated after hashing: no check/use race.
 export const GRANT_BOOTSTRAP = `try{const f=require('node:fs'),c=f.readFileSync(process.argv[1]);if(require('node:crypto').createHash('sha256').update(c).digest('hex')!==process.argv[2])throw 0;new Function('require','process',c.toString('utf8'))(require,process)}catch{process.stderr.write('CODEX_HOOK_INTEGRITY_FAILED\\n');process.exit(2)}`;
 
+/** The caller still owns its published grant when both cleanup and exact rollback fail. */
+export class CodexGrantPublicationError extends Error {
+	constructor() { super('CODEX_GRANT_ROLLBACK_UNCONFIRMED'); }
+}
+
 /** Private to this app-server lifetime. No shared current-turn pointer and no workspace writes. */
 export class CodexTurnGrants {
 	readonly helper: string;
@@ -62,13 +67,26 @@ process.stdin.on('end',async()=>{try{
 		const file = join(this.directory, `${id}.env`), temporary = join(this.directory, `${randomUUID()}.pending`);
 		const value = `export AICHAT_RUN_BIND=${quote(token)}\n`;
 		await writeFile(temporary, value, { flag: 'wx', mode: 0o400 });
+		let published = false;
 		try {
 			// link is an atomic publish-without-replacement; readers never see half-written bytes.
 			await link(temporary, file);
+			published = true;
+			this.granted.add(id);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || await readFile(file, 'utf8') !== value)
 				throw new Error('CODEX_TURN_GRANT_CONFLICT');
-		} finally { await unlink(temporary); }
+		} finally {
+			try { await unlink(temporary); }
+			catch (error) {
+				// A rejected grant must not silently leave this call's publication live. Never revoke EEXIST's owner.
+				if (published) {
+					try { await this.tombstone(id); }
+					catch { throw new CodexGrantPublicationError(); }
+				}
+				throw error;
+			}
+		}
 		this.granted.add(id);
 	}
 	async revoke(ref: NativeRef): Promise<void> { await this.tombstone(key(ref)); }
