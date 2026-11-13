@@ -258,6 +258,7 @@ class CodexNativeRun implements AgentRun {
 	private channelFailure?: string;
 	private session?: Session;
 	private ref?: NativeRef;
+	private nativeInput?: { itemId: string; turnId: string };
 	private wake?: () => void;
 	private readonly inbox: Array<{ method: string; params: unknown }> = [];
 	constructor(private readonly input: PreparedRun, private readonly getSession: () => Promise<Session>,
@@ -280,7 +281,15 @@ class CodexNativeRun implements AgentRun {
 			const session = this.session = await this.getSession();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			unsubscribe = session.channel.onNotification((method, params) => {
-				if (object(params)?.threadId !== session.threadId || this.channelFailure) return;
+				const frame = object(params);
+				if (frame?.threadId !== session.threadId || this.channelFailure) return;
+				const item = object(frame.item);
+				if (this.submitted && ['item/started', 'item/completed'].includes(method) && item?.type === 'userMessage' && item.clientId === input.runId) {
+					if (typeof item.id !== 'string' || !item.id || typeof frame.turnId !== 'string' || !frame.turnId ||
+						(this.nativeInput && (this.nativeInput.itemId !== item.id || this.nativeInput.turnId !== frame.turnId)))
+						this.channelFailure = 'NATIVE_OUTCOME_UNKNOWN: registered native input association ambiguous; no new grant';
+					else this.nativeInput = { itemId: item.id, turnId: frame.turnId };
+				}
 				// ponytail: bound per-run buffering; overflow is unknown, never a silently dropped terminal.
 				if (this.inbox.length >= 4096) this.channelFailure = 'CODEX_RESULT_UNKNOWN: native event buffer exceeded';
 				else this.inbox.push({ method, params });
@@ -298,7 +307,17 @@ class CodexNativeRun implements AgentRun {
 				input: [{ type: 'text', text: input.message, text_elements: [] }] }, submission.requestId);
 			const turn = object(object(raw)?.turn);
 			if (typeof turn?.id !== 'string' || !turn.id) throw new Error('CODEX_NATIVE_TURN_UNVERIFIED');
-			this.ref = { sessionId: session.threadId, turnId: turn.id };
+			// 0.142.3 ACKs a submission ID, which may steer an existing turn. Only the user item proves its turn.
+			const proofDeadline = setTimeout(() => {
+				this.channelFailure = 'NATIVE_OUTCOME_UNKNOWN: registered native input notification missing; do not resubmit'; this.wake?.();
+			}, 15_000);
+			try {
+				while (!this.nativeInput && !this.channelFailure && !this.cancelled)
+					await new Promise<void>((resolve) => { this.wake = resolve; });
+			} finally { clearTimeout(proofDeadline); this.wake = undefined; }
+			if (this.channelFailure) throw new Error(this.channelFailure);
+			if (this.cancelled) { yield { type: 'cancelled', reason: 'Codex native stop unconfirmed' }; return; }
+			this.ref = { sessionId: session.threadId, turnId: this.nativeInput!.turnId };
 			try {
 				await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, nativeRef: this.ref,
 					workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
@@ -314,7 +333,17 @@ class CodexNativeRun implements AgentRun {
 			assertSettlement();
 			input.onNativeBound?.(this.ref);
 			assertSettlement();
-			if (!this.cancelled) await session.grants.grant(this.ref, input.replyToken!);
+			if (!this.cancelled) {
+				try { await session.grants.grant(this.ref, input.replyToken!); }
+				catch (error) {
+					if (error instanceof Error && error.message === 'CODEX_TURN_GRANT_CONFLICT') {
+						// This input does not own the original turn's immutable grant or cancellation.
+						this.ref = undefined;
+						throw new Error('NATIVE_OUTCOME_UNKNOWN: existing turn requires its original core lease; no new grant');
+					}
+					throw error;
+				}
+			}
 			const seen = new Set<string>();
 			while (!this.terminal) {
 				if (this.cancelled) { yield { type: 'cancelled', reason: 'Codex native stop unconfirmed' }; return; }
@@ -347,7 +376,12 @@ class CodexNativeRun implements AgentRun {
 				}
 			}
 		} catch (error) {
-			yield { type: 'error', message: error instanceof Error ? error.message : 'CODEX_NATIVE_RUN_FAILED' };
+			let message = error instanceof Error ? error.message : 'CODEX_NATIVE_RUN_FAILED';
+			if (this.submitted && !this.terminal) {
+				this.settlementUnconfirmed = true;
+				if (!message.startsWith('NATIVE_OUTCOME_UNKNOWN:')) message = `NATIVE_OUTCOME_UNKNOWN: ${message}`;
+			}
+			yield { type: 'error', message };
 		} finally {
 			unsubscribe?.(); offClose?.(); input.signal.removeEventListener('abort', onAbort);
 			if (this.ref && this.session) {

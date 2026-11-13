@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -19,10 +19,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
  if(r.method==='thread/start'||r.method==='thread/resume')return send({id:r.id,result:{thread:{id:r.params.threadId||'native-thread',cwd:r.params.cwd,cliVersion:process.env.BAD_CLI||'0.142.3'}}});
  if(r.method==='turn/interrupt')return send({id:r.id,result:{}});
  if(r.method!=='turn/start')return;
- const id='turn-'+(++number),threadId='native-thread';
+ ++number;const id='turn-'+(process.env.ATTACH==='1'?1:number),threadId='native-thread';
  send({method:'turn/completed',params:{threadId,turn:{id:'unrelated',status:'completed',items:[]}}});
- if(process.env.FLOOD!=='1')send({id:r.id,result:{turn:{id,status:'inProgress',items:[]}}});
+ if(process.env.FLOOD!=='1')send({id:r.id,result:{turn:{id:process.env.DIFFERENT_ACK==='1'?'submission-only':id,status:'inProgress',items:[]}}});
  send({method:'turn/started',params:{threadId,turn:{id,status:'inProgress',items:[]}}});
+ const proof={method:'item/started',params:{threadId:process.env.PROOF==='foreign-thread'?'other-thread':threadId,turnId:id,item:{id:'input-'+number,type:'userMessage',clientId:process.env.PROOF==='foreign-client'?'other-input':r.params.clientUserMessageId,content:r.params.input}}};
+ if(process.env.PROOF!=='missing')send(proof);
+ if(process.env.PROOF==='duplicate')send({...proof,method:'item/completed'});
+ if(process.env.PROOF==='conflict')send({...proof,params:{...proof.params,turnId:'another-turn'}});
  if(process.env.FLOOD==='1'){for(let n=0;n<4100;n++)send({method:'item/agentMessage/delta',params:{threadId,turnId:id,itemId:'a',delta:'x'}});send({id:r.id,result:{turn:{id,status:'inProgress',items:[]}}});return;}
  if(process.env.PARK==='1')return;
  setTimeout(()=>{
@@ -32,6 +36,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   send({method:'item/agentMessage/delta',params:{threadId,turnId:id,itemId:'a',delta:'visible'}});
   send({method:'item/completed',params:{threadId,turnId:id,item:{id:'exec-1',type:'commandExecution'}}});
   send({method:'turn/completed',params:{threadId,turn:{id,status:'completed',items:[]}}});
+   if(process.env.DIFFERENT_ACK==='1'||process.env.PROOF)setTimeout(()=>process.exit(0),100);
  },30);
 });
 `;
@@ -82,6 +87,48 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		]);
 		expect(JSON.stringify(wire)).not.toContain('secret-token');
 		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).not.toContain('next-token');
+	});
+	it('binds the registered userMessage notification, never the turn/start submission ID', async () => {
+		const f = await fixture({ DIFFERENT_ACK: '1' });
+		const events = await collect(f.driver.createRun(f.input).events);
+		expect(events.at(-1)?.type).toBe('done');
+		expect(f.onNativeBound.mock.calls.map(([ref]) => ref)).toEqual([{ sessionId: 'native-thread', turnId: 'turn-1' }]);
+		const submission = createHash('sha256').update(JSON.stringify(['native-thread', 'submission-only'])).digest('hex');
+		await expect(readFile(join(f.grants.directory, `${submission}.env`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(1);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+	});
+	it.each(['missing', 'foreign-client', 'foreign-thread', 'conflict'])('keeps %s input proof unknown, without a grant, resend or implicit interrupt', async (proof) => {
+		const f = await fixture({ PROOF: proof });
+		const run = f.driver.createRun(f.input);
+		expect(await collect(run.events)).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN:') }]);
+		await run.dispose();
+		expect(f.onNativeBound).not.toHaveBeenCalled();
+		expect((await readdir(f.grants.directory)).filter((name) => name.endsWith('.env'))).toEqual([]);
+		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(1);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+	});
+	it('accepts duplicate started/completed evidence for the same native item exactly once', async () => {
+		const f = await fixture({ PROOF: 'duplicate' });
+		expect((await collect(f.driver.createRun(f.input).events)).at(-1)?.type).toBe('done');
+		expect(f.onNativeBound).toHaveBeenCalledTimes(1);
+	});
+	it('never replaces or revokes an existing turn grant when safe core attachment is not connected', async () => {
+		const f = await fixture({ ATTACH: '1', PARK: '1' });
+		let ready!: () => void; const bound = new Promise<void>((resolve) => { ready = resolve; });
+		f.input.onNativeBound = () => { ready(); };
+		const original = collect(f.driver.createRun(f.input).events);
+		await bound;
+		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
+		await vi.waitFor(async () => expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token'));
+		const attached = f.driver.createRun({ ...f.input, runId: 'request-2', replyToken: 'must-not-replace' });
+		expect(await collect(attached.events)).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN:') }]);
+		await attached.dispose();
+		expect(await readFile(join(f.grants.directory, `${id}.env`), 'utf8')).toContain('secret-token');
+		await expect(readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(2);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);
+		f.channels[0].close(); await original;
 	});
 	it('cannot admit a native run before exact START-ready reply target exists', async () => {
 		const f = await fixture();
@@ -164,14 +211,14 @@ describe('Codex persistent native ordinary-message vertical', () => {
 	it('late native identity from an old generation cannot receive a new usable grant', async () => {
 		const f = await fixture();
 		f.input.onNativeBound = () => { f.setCurrent(false); };
-		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'stale generation' }]);
+		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: stale generation' }]);
 		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
 		expect(await readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).toBe('');
 		await expect(readFile(join(f.grants.directory, `${id}.env`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 	});
 	it('event overflow is unknown, not a dropped native terminal or invented success', async () => {
 		const f = await fixture({ FLOOD: '1' });
-		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'CODEX_RESULT_UNKNOWN: native event buffer exceeded' }]);
+		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'NATIVE_OUTCOME_UNKNOWN: CODEX_RESULT_UNKNOWN: native event buffer exceeded' }]);
 	});
 	it('pre-submission cancellation starts neither app-server nor a native turn', async () => {
 		const f = await fixture();

@@ -27,11 +27,12 @@ if(x.method==='config/read')result={config:{model_provider:'openai'},origins:{},
 if(x.method==='skills/list')result={data:[{cwd:p.cwds[0],skills:[],errors:[]}]};
 if(x.method==='model/list')result={data:[],nextCursor:null};
 if(x.method==='thread/start'||x.method==='thread/resume')result={thread:{id:process.env.REUSE||p.threadId||'thread-'+process.env.CHANNEL,cliVersion:'0.142.3',cwd:p.cwd},modelProvider:'openai'};
-if(x.method==='turn/start'){const id='turn-'+(++seq);result={turn:{id,status:'inProgress',items:[]}};
+if(x.method==='turn/start'){const id='turn-'+(++seq);result={turn:{id,status:'inProgress',items:[]}};const proof=()=>send({method:'item/started',params:{threadId:p.threadId,turnId:id,item:{id:'input-'+seq,type:'userMessage',clientId:p.clientUserMessageId,content:p.input}}});
+if(process.env.DELAY_ACK!=='1')proof();
 const timer=setInterval(()=>{if(!fs.existsSync(process.env.HOME_DIR+'/'+p.threadId+'-'+id+'.done'))return;clearInterval(timer);
 send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'answer',delta:p.threadId}});
 send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:'completed',items:[]}}});},5);
-if(process.env.DELAY_ACK==='1'){const timer=setInterval(()=>{if(!fs.existsSync(process.env.HOME_DIR+'/'+p.threadId+'-'+id+'.ack'))return;clearInterval(timer);send({id:x.id,result});},5);return;}}
+if(process.env.DELAY_ACK==='1'){const timer=setInterval(()=>{if(!fs.existsSync(process.env.HOME_DIR+'/'+p.threadId+'-'+id+'.ack'))return;clearInterval(timer);send({id:x.id,result});proof();},5);return;}}
 if(x.id)send({id:x.id,result});});`);
 	const options = { home, serverNamespace: 'server', activeUids: new Set(['owner']), activeProviders: new Map([['owner', 'codex']]) };
 	const store = new ConversationStore(options);
