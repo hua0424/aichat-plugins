@@ -41,6 +41,39 @@ export class CodexDriver implements RunDriver {
 	}
 }
 
+export async function prepareCodexScope(input: Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace'>) {
+	const previous = input.conversation.nativeState?.value;
+	const frozenPrompt = previous && typeof previous === 'object' && 'originalPrompt' in previous ? previous.originalPrompt : undefined;
+	const systemPrompt = typeof frozenPrompt === 'string' ? frozenPrompt : input.systemPrompt;
+	const digest = createHash('sha256').update(systemPrompt).digest('hex');
+	if (previous !== undefined && (!previous || typeof previous !== 'object' ||
+		!('threadId' in previous) || typeof previous.threadId !== 'string' || !previous.threadId ||
+		('workspace' in previous && previous.workspace !== input.workspace) ||
+		('promptHash' in previous && previous.promptHash !== digest) ||
+		('originalPrompt' in previous && (typeof previous.originalPrompt !== 'string' ||
+			(!('legacyConfirmationRequired' in previous) || previous.legacyConfirmationRequired !== false)))))
+		throw new Error('Codex native thread invalid or original cwd/prompt mismatch; explicit reset required (history retained)');
+	if (previous && typeof previous === 'object' && (!('workspace' in previous) || !('promptHash' in previous)))
+		throw new Error('CODEX_LEGACY_THREAD_UNVERIFIED: original cwd/persona unknown; owner must verify provenance before resume or explicitly reset');
+	if (frozenPrompt !== undefined && input.systemPrompt !== systemPrompt)
+		console.warn('[codex] updated persona deferred for confirmed legacy thread until explicit reset');
+	const threadId = previous && typeof previous === 'object' && 'threadId' in previous ? previous.threadId as string : undefined;
+	if (!input.workspace) throw new Error('Codex trusted workspace required');
+	await mkdir(input.workspace, { recursive: true });
+	const physical = await realpath(input.workspace);
+	for (let dir = physical; ; dir = dirname(dir)) {
+		let agents = '';
+		try { agents = await readFile(join(dir, 'AGENTS.md'), 'utf8'); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+		const begins = agents.split(AICHAT_SYSTEM_BEGIN).length - 1;
+		const ends = agents.split(AICHAT_SYSTEM_END).length - 1;
+		if ((begins || ends) && (dir !== physical || begins !== 1 || ends !== 1 || !agents.includes(renderSystemBlock(systemPrompt))))
+			throw new Error('PROMPT_SCOPE_CONFLICT: managed AGENTS.md in workspace or ancestor is unverified');
+		if (dir === dirname(dir)) break;
+	}
+	return { threadId, systemPrompt, digest, frozenPrompt };
+}
+
 class CodexRun implements AgentRun {
 	private readonly controller = new AbortController();
 	private consuming = false;
@@ -66,44 +99,12 @@ class CodexRun implements AgentRun {
 		// Validated non-empty by createRun; rechecked here for the async boundary.
 		const replyToken = input.replyToken;
 		if (!replyToken) throw new Error('Invalid Codex prepared run');
-		const previous = input.conversation.nativeState?.value;
-		const frozenPrompt = previous && typeof previous === 'object' && 'originalPrompt' in previous
-			? previous.originalPrompt : undefined;
-		const systemPrompt = typeof frozenPrompt === 'string' ? frozenPrompt : input.systemPrompt;
-		const digest = createHash('sha256').update(systemPrompt).digest('hex');
 		const toolStarted = new Set<string>();
 		const toolEnded = new Set<string>();
 		try {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			input.signal.addEventListener('abort', this.onAbort, { once: true });
-			if (previous !== undefined && (!previous || typeof previous !== 'object' ||
-				!('threadId' in previous) || typeof previous.threadId !== 'string' || !previous.threadId ||
-				('workspace' in previous && previous.workspace !== input.workspace) ||
-				('promptHash' in previous && previous.promptHash !== digest) ||
-				('originalPrompt' in previous && (typeof previous.originalPrompt !== 'string' ||
-					(!('legacyConfirmationRequired' in previous) || previous.legacyConfirmationRequired !== false)))))
-				throw new Error('Codex native thread invalid or original cwd/prompt mismatch; explicit reset required (history retained)');
-			if (previous && typeof previous === 'object' &&
-				(!('workspace' in previous) || !('promptHash' in previous)))
-				throw new Error('CODEX_LEGACY_THREAD_UNVERIFIED: original cwd/persona unknown; owner must verify provenance before resume or explicitly reset');
-			if (frozenPrompt !== undefined && input.systemPrompt !== systemPrompt)
-				console.warn('[codex] updated persona deferred for confirmed legacy thread until explicit reset');
-			const threadId = previous && typeof previous === 'object' && 'threadId' in previous ? previous.threadId as string : undefined;
-			await mkdir(input.workspace!, { recursive: true });
-			// Codex also loads AGENTS.md from ancestor directories, not just the working directory.
-			// The owner may reconcile only an explicitly approved block; never edit any of these files here.
-			const physical = await realpath(input.workspace!);
-			for (let dir = physical; ; dir = dirname(dir)) {
-				let agents = '';
-				try { agents = await readFile(join(dir, 'AGENTS.md'), 'utf8'); }
-				catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-				const begins = agents.split(AICHAT_SYSTEM_BEGIN).length - 1;
-				const ends = agents.split(AICHAT_SYSTEM_END).length - 1;
-				if ((begins || ends) && (dir !== physical || begins !== 1 || ends !== 1 ||
-					!agents.includes(renderSystemBlock(systemPrompt))))
-					throw new Error('PROMPT_SCOPE_CONFLICT: managed AGENTS.md in workspace or ancestor is unverified');
-				if (dir === dirname(dir)) break;
-			}
+			const { threadId, systemPrompt, digest, frozenPrompt } = await prepareCodexScope(input);
 			input.conversation.assertCurrent();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			const opts: ThreadOptions = { sandboxMode: 'danger-full-access', approvalPolicy: 'never',
