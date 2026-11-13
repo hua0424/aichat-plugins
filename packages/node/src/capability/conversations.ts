@@ -382,9 +382,12 @@ export class ConversationStore {
 		if (!validId(model.providerID) || !validId(model.modelID)) throw new Error('invalid model');
 		const r = this.assertGeneration(uid, room, generation); r.selectedModel = copy(model); this.replace(r);
 	}
-	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>): ConversationRecord {
+	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>, expectedModel?: ConversationRecord['selectedModel'] | null): ConversationRecord {
 		this.assertProvider(provider, uid);
 		const old = this.assertGeneration(uid, room, generation);
+		if (expectedModel !== undefined && ((expectedModel !== null && (!validId(expectedModel.providerID) || !validId(expectedModel.modelID))) ||
+			(old.selectedModel?.providerID ?? null) !== (expectedModel?.providerID ?? null) ||
+			(old.selectedModel?.modelID ?? null) !== (expectedModel?.modelID ?? null))) throw new Error('MODEL_SELECTION_CONFLICT');
 		if (!validId(id) || !Number.isSafeInteger(generation + 1)) throw new Error('invalid native reset');
 		if (provider === 'opencode') this.assertOpencodeDirectoryOwner(old.conversationId, state.directory as string);
 		const r: ConversationRecord = { ...old, generation: generation + 1, contextKey: randomBytes(32).toString('hex'),

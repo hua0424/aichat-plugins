@@ -99,7 +99,7 @@ export class CodexNativeDriver implements AgentDriver {
 			await execution.saveRecovery({ version: 1, value: { provider: 'codex', createdThreadId: created.threadId,
 				workspace: input.workspace, previousThreadId: previous ?? null } });
 			execution.conversation.assertCurrent();
-			const next = await execution.replaceSession(created.threadId, sessionState(created, input.workspace));
+			const next = await execution.replaceSession(created.threadId, sessionState(created, input.workspace), fresh.selectedModel ?? null);
 			created.cacheKey = JSON.stringify([execution.conversation.id, next]);
 			this.sessions.set(created.cacheKey, Promise.resolve(created));
 			// CAS has selected the new thread; cleanup failure must never close that new generation.

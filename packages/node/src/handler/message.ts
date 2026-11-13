@@ -471,8 +471,8 @@ export class MessageHandler {
 			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, request.requestId, value),
 			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref); },
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
-			replaceSession: async (id, state) => {
-				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>);
+			replaceSession: async (id, state, expectedModel) => {
+				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>, expectedModel);
 				const key = bindingKey(this.selfUid, room), old = this.thinkingSessions.get(key);
 				if (old?.run?.generation === generation) {
 					this.thinkingSessions.delete(key); old.sessionKey = `${key}:retired:${generation}`; this.thinkingSessions.set(old.sessionKey, old);

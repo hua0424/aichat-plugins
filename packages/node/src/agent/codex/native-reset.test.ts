@@ -86,7 +86,7 @@ if(x.id)send({id:x.id,result});});`);
 			async saveRecovery(value) { store.saveControlRecovery('owner', 'room', requestId, value); },
 			async submitted(ref) { store.submitControl('owner', 'room', requestId, ref); },
 			async selectModel() { throw new Error('reset must not set model'); },
-			async replaceSession(id, state) { return store.replaceNativeSession('owner', 'room', current.generation, 'codex', id, state.value as Record<string, unknown>).generation; },
+			async replaceSession(id, state, expectedModel) { return store.replaceNativeSession('owner', 'room', current.generation, 'codex', id, state.value as Record<string, unknown>, expectedModel).generation; },
 			async emit() { throw new Error('reset must not create a thinking turn'); }, async bindTurn() { throw new Error('reset must not mint a run grant'); } };
 		return { capabilityId: 'session.reset', catalogVersion: catalog.version, workspace: home, signal, execution };
 	};

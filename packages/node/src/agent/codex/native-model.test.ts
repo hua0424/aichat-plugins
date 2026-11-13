@@ -20,7 +20,7 @@ async function fixture(mode = '') {
 	await writeFile(inventory, JSON.stringify([{ name: 'local-skill', scope: 'user', path: skillPath, description: 'Native skill', enabled: true }]));
 	await writeFile(script, `const fs=require('node:fs');if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.exit(0)}
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');let model='model-000',seq=0;const threads=fs.existsSync(process.env.NATIVE_STATE)?JSON.parse(fs.readFileSync(process.env.NATIVE_STATE,'utf8')):{};
-const save=()=>fs.writeFileSync(process.env.NATIVE_STATE,JSON.stringify(threads)),thread=id=>({id,cliVersion:'0.142.3',cwd:threads[id].cwd,modelProvider:threads[id].modelProvider});
+const save=id=>{const current=fs.existsSync(process.env.NATIVE_STATE)?JSON.parse(fs.readFileSync(process.env.NATIVE_STATE,'utf8')):{};current[id]=threads[id];fs.writeFileSync(process.env.NATIVE_STATE,JSON.stringify(current));},thread=id=>({id,cliVersion:'0.142.3',cwd:threads[id].cwd,modelProvider:threads[id].modelProvider});
 const all=Array.from({length:205},(_,i)=>({id:'entry-'+i,model:'model-'+String(i).padStart(3,'0'),displayName:'Model '+i,description:'Native model',hidden:i===204,
 upgrade:null,upgradeInfo:null,availabilityNux:null,supportedReasoningEfforts:[],defaultReasoningEffort:'medium',inputModalities:['text'],supportsPersonality:false,additionalSpeedTiers:[],serviceTiers:[],defaultServiceTier:null,isDefault:i===0}));
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const x=JSON.parse(line),p=x.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={};
@@ -28,16 +28,16 @@ if(x.method==='initialize')result={userAgent:'aichat/0.142.3'};
 if(x.method==='config/read')result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};
 if(x.method==='skills/list')result={data:[{cwd:process.env.MODE==='wrong-cwd'?'/untrusted':p.cwds[0],skills:JSON.parse(fs.readFileSync(process.env.INVENTORY,'utf8')),errors:process.env.MODE==='scan-error'?[{path:'/private',message:'scan failed'}]:[]}]};
 if(x.method==='model/list'){const opaque='opaque:'+ 'x'.repeat(300),at=p.cursor===opaque?100:p.cursor?Number(p.cursor):0;result={data:all.slice(at,at+100),nextCursor:at+100<all.length?String(at+100):null};if(process.env.MODE==='cursor-loop')result.nextCursor='100';if(process.env.MODE==='long-cursor'&&at===0)result.nextCursor=opaque;}
-if(x.method==='thread/start'||x.method==='thread/resume'){const id=p.threadId||'thread-'+process.env.CHANNEL;model=p.model||(threads[id]&&threads[id].model)||'model-000';threads[id]={model,cwd:p.cwd,modelProvider:(threads[id]&&threads[id].modelProvider)||(process.env.MODE==='provider-mismatch'?'other':'openai')};save();result={thread:thread(id),model,modelProvider:threads[id].modelProvider};}
+if(x.method==='thread/start'||x.method==='thread/resume'){const id=p.threadId||'thread-'+process.env.CHANNEL;model=p.model||(threads[id]&&threads[id].model)||'model-000';threads[id]={model,cwd:p.cwd,modelProvider:(threads[id]&&threads[id].modelProvider)||(process.env.MODE==='provider-mismatch'?'other':'openai')};save(id);result={thread:thread(id),model,modelProvider:threads[id].modelProvider};}
 if(x.method==='thread/read')result={thread:thread(p.threadId)};
-if(x.method==='thread/settings/update'){if(process.env.MODE==='drop-settings')return;if(process.env.MODE==='error-settings'){send({id:x.id,error:{code:-32000,message:'native rejected'}});return;}model=p.model;threads[p.threadId].model=model;save();send({method:'thread/settings/updated',params:{threadId:p.threadId,threadSettings:{cwd:process.env.HOME_DIR,approvalPolicy:'never',sandboxPolicy:{type:'dangerFullAccess'},model,modelProvider:'openai'}}});}
-if(x.method==='turn/start'){const id='turn-'+(++seq);result={turn:{id,status:'inProgress',items:[]}};setTimeout(()=>{send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'answer',delta:model}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:'completed',items:[]}}});},10);}
-if(x.id)send({id:x.id,result});});`);
+if(x.method==='thread/settings/update'){if(process.env.MODE==='drop-settings')return;if(process.env.MODE==='error-settings'){send({id:x.id,error:{code:-32000,message:'native rejected'}});return;}model=p.model;threads[p.threadId].model=model;save(p.threadId);send({method:'thread/settings/updated',params:{threadId:p.threadId,threadSettings:{cwd:process.env.HOME_DIR,approvalPolicy:'never',sandboxPolicy:{type:'dangerFullAccess'},model,modelProvider:'openai'}}});}
+if(x.method==='turn/start'){const id='turn-'+(++seq),runModel=model;result={turn:{id,status:'inProgress',items:[]}};const complete=()=>{send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'answer',delta:runModel}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:'completed',items:[]}}});};if(process.env.MODE==='race'&&p.clientUserMessageId==='ordinary-turn-1'){const timer=setInterval(()=>{if(fs.existsSync(process.env.HOME_DIR+'/old.done')){clearInterval(timer);complete();}},5);}else setTimeout(complete,10);}
+if(x.id){const gate=process.env.MODE==='race'&&x.id==='race-reset'&&x.method==='thread/start'?'reset.release':process.env.MODE==='race'&&x.id==='race-model'&&x.method==='thread/settings/update'?'model.release':undefined;if(gate){const timer=setInterval(()=>{if(fs.existsSync(process.env.HOME_DIR+'/'+gate)){clearInterval(timer);send({id:x.id,result});}},5);}else send({id:x.id,result});}});`);
 	const store = new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['owner']), activeProviders: new Map([['owner', 'codex']]) });
 	const grants: CodexTurnGrants[] = [], channels: CodexAppServer[] = [];
 	const createDriver = () => new CodexNativeDriver({ command: 'unused', env: process.env, model: 'model-000',
 		createGrants: async () => { const grant = await CodexTurnGrants.create(); grants.push(grant); return grant; },
-		createChannel: (args) => { const channel = new CodexAppServer({ command: process.execPath, prefix: [script], args, timeoutMs: 3000,
+		createChannel: (args) => { const channel = new CodexAppServer({ command: process.execPath, prefix: [script], args, timeoutMs: mode === 'race' ? 10_000 : 3000,
 			env: { ...process.env, WIRE: wire, INVENTORY: inventory, NATIVE_STATE: nativeState, HOME_DIR: workspace, MODE: mode, CHANNEL: String(channels.length + 1) } });
 			channels.push(channel); return channel; } });
 	let driver = createDriver();
@@ -65,18 +65,25 @@ if(x.id)send({id:x.id,result});});`);
 			async replaceSession() { throw new Error('model control must not reset'); }, async emit() { throw new Error('model control must not create turn'); }, async bindTurn() { throw new Error('model control must not create grant'); } };
 		return { capabilityId: 'model.set', parameters, catalogVersion: catalog.version, workspace, signal, execution };
 	};
+	const reset = async (requestId: string) => {
+		const request = { ...await invoke(requestId, {}), capabilityId: 'session.reset' }, generation = request.execution!.conversation.generation;
+		request.execution!.replaceSession = async (id, state, expectedModel?: { providerID: string; modelID: string } | null) =>
+			store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>, expectedModel).generation;
+		return request;
+	};
 	const lines = async () => (await readFile(wire, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+	let chatSequence = 0;
 	const chat = async () => {
-		const runId = 'ordinary-turn', bound = store.beginRun('owner', 'room', runId, { authorizationEpoch: 'epoch' });
-		store.confirmReplyBindingThinking(runId, 'thinking-exact');
+		const runId = `ordinary-turn-${++chatSequence}`, thinkingId = `thinking-${runId}`, bound = store.beginRun('owner', 'room', runId, { authorizationEpoch: 'epoch' });
+		store.confirmReplyBindingThinking(runId, thinkingId);
 		const run = driver.createRun({ runId, message: 'next response', workspace, systemPrompt: 'frozen persona', conversation: conversation(),
-			replyToken: bound.replyToken, replyThinkingId: 'thinking-exact', selectedModel: record().selectedModel, getSelectedModel: () => record().selectedModel,
+			replyToken: bound.replyToken, replyThinkingId: thinkingId, selectedModel: record().selectedModel, getSelectedModel: () => record().selectedModel,
 			saveRecovery: async (value) => bound.saveRecovery(value),
 			assertReplySettlement: (ref) => bound.assertReplySettlement(ref), signal, capabilities: { invoke: async () => undefined } });
 		const events = []; for await (const event of run.events) events.push(event);
 		await run.dispose(); store.finishRun(runId); return events;
 	};
-	return { home, workspace, skillPath, inventory, nativeState, get driver() { return driver; }, restart, store, signal, discover, invoke, lines, chat, grants, channels };
+	return { home, workspace, skillPath, inventory, nativeState, get driver() { return driver; }, restart, store, signal, discover, invoke, reset, lines, chat, grants, channels };
 }
 
 describe('Codex native catalog and model control', () => {
@@ -92,7 +99,7 @@ describe('Codex native catalog and model control', () => {
 		expect((await stat(f.workspace)).isDirectory()).toBe(true);
 		const reset = { ...await f.invoke('first-room-reset', {}), capabilityId: 'session.reset' };
 		const generation = reset.execution!.conversation.generation;
-		reset.execution!.replaceSession = async (id, state) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>).generation;
+		reset.execution!.replaceSession = async (id, state, expectedModel) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>, expectedModel).generation;
 		await rm(f.workspace, { recursive: true });
 		expect(await f.driver.executeCapability(reset)).toMatchObject({ status: 'completed', effect: { kind: 'reset' } });
 		expect((await stat(f.workspace)).isDirectory()).toBe(true);
@@ -151,7 +158,7 @@ describe('Codex native catalog and model control', () => {
 	it('preserves the selected model through reset and the next native request instead of the configured default', async () => {
 		const f = await fixture(); expect((await f.driver.executeCapability(await f.invoke('select-before-reset'))).status).toBe('accepted');
 		const reset = { ...await f.invoke('reset-with-model', {}), capabilityId: 'session.reset' }, generation = reset.execution!.conversation.generation;
-		reset.execution!.replaceSession = async (id, state) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>).generation;
+		reset.execution!.replaceSession = async (id, state, expectedModel) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>, expectedModel).generation;
 		expect((await f.driver.executeCapability(reset)).status).toBe('completed');
 		expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-204' });
 		expect(f.store.getOrCreate('owner', 'room', 'codex').selectedModel).toEqual({ providerID: 'openai', modelID: 'model-204' });
@@ -178,6 +185,56 @@ describe('Codex native catalog and model control', () => {
 		expect(await f.chat()).toContainEqual({ type: 'error', message: expect.stringContaining('CODEX_NATIVE_SELECTED_MODEL_PROVIDER_UNVERIFIED') });
 		expect((await f.lines()).filter((x) => x.method === 'thread/resume' || x.method === 'turn/start')).toEqual([]);
 	});
+	it('fences reset CAS when another model selection commits first, preserving created evidence and the old native lifetime', async () => {
+		const f = await fixture('race'); await f.driver.executeCapability(await f.invoke('seed-A', { providerId: 'openai', modelId: 'model-000' }));
+		const oldThread = f.store.getOrCreate('owner', 'room', 'codex').nativeState.codex.threadId;
+		const old = f.chat(); cleanup.push(async () => { await writeFile(join(f.home, 'old.done'), ''); await old; });
+		await vi.waitFor(async () => expect((await f.lines()).some((x) => x.method === 'turn/start')).toBe(true), { timeout: 10_000 });
+		const request = await f.reset('race-reset'), pending = f.driver.executeCapability(request);
+		cleanup.push(async () => { await writeFile(join(f.home, 'reset.release'), ''); await pending; });
+		await vi.waitFor(async () => expect((await f.lines()).some((x) => x.id === 'race-reset')).toBe(true), { timeout: 10_000 });
+		expect((await f.driver.executeCapability(await f.invoke('select-B-first'))).status).toBe('accepted');
+		await writeFile(join(f.home, 'reset.release'), ''); const result = await pending;
+		expect(result.status).toBe('unknown');
+		const record = f.store.getOrCreate('owner', 'room', 'codex');
+		expect(record.generation).toBe(1); expect(record.selectedModel?.modelID).toBe('model-204'); expect(record.nativeState.codex.threadId).toBe(oldThread);
+		const recovery = record.controls!.find((c) => c.requestId === 'race-reset')!.recovery!.value as { createdThreadId: string };
+		expect(recovery.createdThreadId).not.toBe(oldThread);
+		expect(JSON.parse(await readFile(f.nativeState, 'utf8'))[recovery.createdThreadId].model).toBe('model-000');
+		await expect(f.channels[1].request('thread/read', { threadId: oldThread, includeTurns: false })).resolves.toMatchObject({ thread: { id: oldThread } });
+		const count = (await f.lines()).length;
+		expect(await f.driver.executeCapability({ ...request, execution: undefined, recovery: { generation: 1, receipt: result } })).toEqual(result);
+		expect(await f.lines()).toHaveLength(count);
+		await writeFile(join(f.home, 'old.done'), ''); await old;
+		expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-204' });
+		expect((await f.lines()).filter((x) => x.method === 'turn/interrupt')).toEqual([]);
+	});
+	it('keeps the CAS-selected new channel when reset wins before the old model commit, retaining active old work until its terminal', async () => {
+		const f = await fixture('race'); await f.driver.executeCapability(await f.invoke('seed-A', { providerId: 'openai', modelId: 'model-000' }));
+		const oldThread = f.store.getOrCreate('owner', 'room', 'codex').nativeState.codex.threadId;
+		const old = f.chat(); cleanup.push(async () => { await writeFile(join(f.home, 'old.done'), ''); await old; });
+		await vi.waitFor(async () => expect((await f.lines()).some((x) => x.method === 'turn/start')).toBe(true), { timeout: 10_000 });
+		const resetPending = f.driver.executeCapability(await f.reset('race-reset'));
+		cleanup.push(async () => { await writeFile(join(f.home, 'reset.release'), ''); await resetPending; });
+		await vi.waitFor(async () => expect((await f.lines()).some((x) => x.id === 'race-reset')).toBe(true), { timeout: 10_000 });
+		const modelRequest = await f.invoke('race-model'), modelPending = f.driver.executeCapability(modelRequest);
+		cleanup.push(async () => { await writeFile(join(f.home, 'model.release'), ''); await modelPending; });
+		await vi.waitFor(async () => expect((await f.lines()).some((x) => x.id === 'race-model')).toBe(true), { timeout: 10_000 });
+		await writeFile(join(f.home, 'reset.release'), ''); expect((await resetPending).status).toBe('completed');
+		await writeFile(join(f.home, 'model.release'), ''); const modelResult = await modelPending; expect(modelResult.status).toBe('unknown');
+		const count = (await f.lines()).length;
+		expect(await f.driver.executeCapability({ ...modelRequest, execution: undefined, recovery: { generation: 1, receipt: modelResult } })).toEqual(modelResult);
+		expect(await f.lines()).toHaveLength(count);
+		const record = f.store.getOrCreate('owner', 'room', 'codex'), newThread = record.nativeState.codex.threadId;
+		expect(record.generation).toBe(2); expect(record.selectedModel?.modelID).toBe('model-000'); expect(newThread).not.toBe(oldThread);
+		await expect(f.channels[1].request('thread/read', { threadId: oldThread, includeTurns: false })).resolves.toMatchObject({ thread: { id: oldThread } });
+		await expect(f.channels[2].request('thread/read', { threadId: newThread, includeTurns: false })).resolves.toMatchObject({ thread: { id: newThread } });
+		await writeFile(join(f.home, 'old.done'), ''); await old;
+		await expect(f.channels[1].request('thread/read', { threadId: oldThread, includeTurns: false })).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+		await expect(f.channels[2].request('thread/read', { threadId: newThread, includeTurns: false })).resolves.toMatchObject({ thread: { id: newThread } });
+		expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-000' });
+		expect((await f.lines()).filter((x) => x.method === 'turn/interrupt')).toEqual([]);
+	});
 	it('rejects a changed native catalog before creating a model-control thread', async () => {
 		const f = await fixture(), request = await f.invoke('stale');
 		const data = JSON.parse(await readFile(f.inventory, 'utf8')); data[0].path = join(f.home, 'changed-path'); await writeFile(f.inventory, JSON.stringify(data));
@@ -198,7 +255,7 @@ describe('Codex native catalog and model control', () => {
 		request.execution!.selectModel = async () => {
 			const reset = { ...await f.invoke('reset-during-control', {}), capabilityId: 'session.reset' };
 			const generation = reset.execution!.conversation.generation;
-			reset.execution!.replaceSession = async (id, state) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>).generation;
+			reset.execution!.replaceSession = async (id, state, expectedModel) => f.store.replaceNativeSession('owner', 'room', generation, 'codex', id, state.value as Record<string, unknown>, expectedModel).generation;
 			resetResult = await f.driver.executeCapability(reset);
 			vi.spyOn(f.grants[0], 'dispose').mockRejectedValueOnce(new Error('test retired cleanup IO failure'));
 		};

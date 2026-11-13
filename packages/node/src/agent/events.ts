@@ -146,7 +146,8 @@ export interface CapabilityExecution {
 	/** Persist native locator BEFORE the native mutation. */
 	submitted(ref?: NativeRef): Promise<void>;
 	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
-	replaceSession(id: string, state: { version: number; value: unknown }): Promise<number>;
+	/** Optional model snapshot is checked atomically with generation; null means explicitly unselected. */
+	replaceSession(id: string, state: { version: number; value: unknown }, expectedModel?: { providerID: string; modelID: string } | null): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
 	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
 	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }>;
