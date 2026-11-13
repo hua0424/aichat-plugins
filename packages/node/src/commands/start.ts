@@ -229,10 +229,9 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	const bound = (record: ReturnType<ConversationStore['resolveCandidate']>) => {
 		if (!record) return undefined;
 		const agent = supervisor.agents.find((a) => a.uid === record.identityId && a.status !== 'offline');
-		const state = record.nativeState.codex;
 		return agent ? { aiclawUid: agent.uid, roomId: record.roomId, apiClient: agent.api,
 			conversationId: record.conversationId, generation: record.generation,
-			replyBindingRequired: agent.driver.type === 'codex' && state?.nativeControls === true } : undefined;
+			replyBindingRequired: record.replyBindingRequired } : undefined;
 	};
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,

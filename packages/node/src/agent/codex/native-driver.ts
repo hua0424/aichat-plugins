@@ -33,7 +33,7 @@ export class CodexNativeDriver implements AgentDriver {
 	async disconnect(): Promise<void> {
 		await Promise.all([...this.sessions.values()].map(async (pending) => {
 			const session = await pending.catch(() => undefined);
-			if (session) { await session.grants.revokeAll(); session.channel.close(); }
+			if (session) { try { await session.grants.revokeAll(); } finally { session.channel.close(); } }
 		}));
 	}
 	createRun(input: PreparedRun): AgentRun {
@@ -83,7 +83,7 @@ export class CodexNativeDriver implements AgentDriver {
 				threadId: thread.id, promptHash: scope.digest, workspace: input.workspace, nativeControls: true,
 			} });
 			return { channel, grants, threadId: thread.id, scope };
-		} catch (error) { await grants.revokeAll(); channel.close(); throw error; }
+		} catch (error) { try { await grants.revokeAll(); } finally { channel.close(); } throw error; }
 	}
 }
 
@@ -112,7 +112,7 @@ class CodexNativeRun implements AgentRun {
 	}
 	private async *execute(): AsyncGenerator<AgentEvent> {
 		const input = this.input, started = Date.now();
-		const onAbort = () => { void this.cancel('aborted'); };
+		const onAbort = () => { void this.cancel('aborted').catch(() => { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; this.wake?.(); }); };
 		let unsubscribe: (() => void) | undefined, offClose: (() => void) | undefined;
 		try {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
@@ -179,20 +179,28 @@ class CodexNativeRun implements AgentRun {
 			yield { type: 'error', message: error instanceof Error ? error.message : 'CODEX_NATIVE_RUN_FAILED' };
 		} finally {
 			unsubscribe?.(); offClose?.(); input.signal.removeEventListener('abort', onAbort);
-			if (this.ref && this.session) await this.session.grants.revoke(this.ref);
+			if (this.ref && this.session) {
+				try { await this.session.grants.revoke(this.ref); }
+				catch { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; if (!this.cancelled) this.session.channel.close(); }
+			}
 		}
 	}
 	async cancel(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {
 		this.cancelled = true;
-		if (this.ref && this.session) {
-			await this.session.grants.revoke(this.ref);
-			if (!this.terminal && !this.interruptRequested) {
-				this.interruptRequested = true;
-				await this.session.channel.request('turn/interrupt', { threadId: this.ref.sessionId, turnId: this.ref.turnId }).catch(() => {});
+		let revokeFailed = false;
+		try {
+			if (this.ref && this.session) {
+				try { await this.session.grants.revoke(this.ref); } catch { revokeFailed = true; }
+				if (!this.terminal && !this.interruptRequested) {
+					this.interruptRequested = true;
+					await this.session.channel.request('turn/interrupt', { threadId: this.ref.sessionId, turnId: this.ref.turnId }).catch(() => {});
+				}
 			}
+		} finally {
+			if (revokeFailed) { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; this.session?.channel.close(); }
+			this.wake?.();
 		}
-		this.wake?.();
-		return this.submitted ? { status: 'unconfirmed', reason: `${reason}: native background process tree stop not verified` } : { status: 'stopped' };
+		return this.submitted ? { status: 'unconfirmed', reason: `${reason}: ${revokeFailed ? 'CODEX_GRANT_REVOKE_FAILED; ' : ''}native background process tree stop not verified` } : { status: 'stopped' };
 	}
 	async dispose(): Promise<void> { if (!this.terminal) await this.cancel('dispose'); }
 }

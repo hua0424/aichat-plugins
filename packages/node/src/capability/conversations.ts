@@ -43,6 +43,8 @@ export interface ConversationRecord {
 	ccResumeFailure?: { sessionId: string; generation: number };
 	controls?: ControlEntry[];
 	selectedModel?: { providerID: string; modelID: string };
+	/** Once a Codex persistent shell is admitted, no generation may downgrade replies to V1/V2. */
+	replyBindingRequired?: true;
 	/** Only explicit native fresh-session reset detaches old execution, never legacy reset. */
 	detachedGenerations?: number[];
 }
@@ -179,6 +181,9 @@ export class ConversationStore {
 			const missing = newlyActive.records.filter((r) => !this.byIdentity.has(identityKey(r.serverNamespace, r.identityId, r.roomId)));
 			if (missing.length) this.commit([...this.snapshot.records, ...missing]);
 		}
+		// Upgrade the staged native flag before exposing any current or old-generation alias.
+		if (this.snapshot.records.some((r) => r.nativeState.codex?.nativeControls === true && !r.replyBindingRequired))
+			this.commit(this.snapshot.records.map((r) => r.nativeState.codex?.nativeControls === true ? { ...r, replyBindingRequired: true } : r));
 		// Persist the legacy CC cwd gate even for snapshots created before this safety check.
 		// A process restart is not evidence that a native run stopped.
 		if (this.snapshot.records.some((r) => (executionRuns(r).length && r.state !== 'stop_unconfirmed') ||
@@ -386,6 +391,7 @@ export class ConversationStore {
 			replyBindings: (old.replyBindings ?? []).filter((b) => b.thinkingId && b.authorizationEpoch &&
 				(old.pendingRuns ?? []).some((run) => run.runId === b.runId)).map((b) => ({ ...b,
 					nativeAliases: b.generation === generation ? copy(old.nativeAliases) : b.nativeAliases })) };
+		this.assertCodexNativeWrite(r, provider, state);
 		this.commit(this.snapshot.records.map((item) => item.conversationId === r.conversationId ? r : item), {
 			revokedKeys: [...(this.snapshot.revokedKeys ?? []), old.contextKey],
 			revokedAliases: [...(this.snapshot.revokedAliases ?? []), ...old.nativeAliases],
@@ -633,6 +639,7 @@ export class ConversationStore {
 				state.legacyConfirmationRequired !== false) throw new Error('Codex confirmed thread cannot change native provenance');
 		} else if ('originalPrompt' in state || 'legacyConfirmationRequired' in state)
 			throw new Error('Codex original prompt requires offline owner confirmation');
+		if (state.nativeControls === true) record.replyBindingRequired = true;
 	}
 
 	/** #343: agent-facing CC native writes cannot persist a resumable session without its original cwd,
@@ -840,6 +847,7 @@ export class ConversationStore {
 				!Number.isSafeInteger(r.generation) || r.generation < 1 || !['ready', 'suspended', 'stop_unconfirmed', 'disabled'].includes(r.state) ||
 				!Array.isArray(r.nativeAliases) || !r.nativeState || typeof r.nativeState !== 'object' || Array.isArray(r.nativeState) ||
 				(r.pendingRuns !== undefined && !Array.isArray(r.pendingRuns))) throw new Error('invalid conversation record');
+			if (r.replyBindingRequired !== undefined && r.replyBindingRequired !== true) throw new Error('invalid reply binding requirement');
 			if (r.codexThreadConfirmation !== undefined && (!r.codexThreadConfirmation ||
 				!validId(r.codexThreadConfirmation.threadId) || !validId(r.codexThreadConfirmation.workspace) ||
 				!isAbsolute(r.codexThreadConfirmation.workspace) ||

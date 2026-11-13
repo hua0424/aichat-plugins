@@ -36,14 +36,15 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
 });
 `;
 const disposers: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const dispose of disposers.splice(0).reverse()) await dispose(); });
+afterEach(async () => { vi.restoreAllMocks(); for (const dispose of disposers.splice(0).reverse()) await dispose(); });
 async function fixture(extra: NodeJS.ProcessEnv = {}) {
 	const directory = await mkdtemp(join(tmpdir(), 'aichat-native-507-'));
 	const file = join(directory, 'native.cjs'), wire = join(directory, 'wire.jsonl');
 	await writeFile(file, script);
 	const grants = await CodexTurnGrants.create();
+	const channels: CodexAppServer[] = [];
 	const driver = new CodexNativeDriver({ command: 'unused', env: { ...process.env, WIRE: wire, ...extra }, createGrants: async () => grants,
-		createChannel: (args, env) => new CodexAppServer({ command: process.execPath, prefix: [file], args, env, timeoutMs: 2000 }) });
+		createChannel: (args, env) => { const channel = new CodexAppServer({ command: process.execPath, prefix: [file], args, env, timeoutMs: 2000 }); channels.push(channel); return channel; } });
 	let state: unknown;
 	let current = true;
 	const onNativeBound = vi.fn();
@@ -55,7 +56,7 @@ async function fixture(extra: NodeJS.ProcessEnv = {}) {
 			async saveNativeState(value) { state = value.value; }, async registerNative(_id, value) { state = value.value; }, async registerNativeAlias() {} } };
 	disposers.push(async () => { await driver.disconnect(); await rm(grants.directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 		await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }); });
-	return { driver, grants, input, onNativeBound, setCurrent(value: boolean) { current = value; }, get state() { return state; },
+	return { driver, grants, channels, input, onNativeBound, setCurrent(value: boolean) { current = value; }, get state() { return state; },
 		wire: async () => (await readFile(wire, 'utf8')).trim().split('\n').map((line) => JSON.parse(line)) };
 }
 async function collect(events: AsyncIterable<AgentEvent>) { const result: AgentEvent[] = []; for await (const event of events) result.push(event); return result; }
@@ -127,6 +128,38 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		const id = createHash('sha256').update(JSON.stringify(['native-thread', 'turn-1'])).digest('hex');
 		expect(await readFile(join(f.grants.directory, `${id}.revoked`), 'utf8')).toBe('');
 		await expect(readFile(join(f.grants.directory, `${id}.env`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+	});
+	it('revocation IO failure cannot short-circuit interrupt, wake or the unconfirmed stop result', async () => {
+		const f = await fixture({ PARK: '1' });
+		const run = f.driver.createRun(f.input);
+		vi.spyOn(f.grants, 'revoke').mockRejectedValue(new Error('injected disk full'));
+		let cancellation: ReturnType<typeof run.cancel> | undefined;
+		f.input.onNativeBound = () => { cancellation = run.cancel('user stop'); };
+		expect(await collect(run.events)).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
+		expect(await cancellation).toMatchObject({ status: 'unconfirmed', reason: expect.stringContaining('CODEX_GRANT_REVOKE_FAILED') });
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(1);
+		await expect(f.channels[0].request('thread/read', { threadId: 'native-thread' })).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+	});
+	it('disconnect closes its real channel even if lifetime revocation IO fails, while surfacing that failure', async () => {
+		const f = await fixture();
+		await collect(f.driver.createRun(f.input).events);
+		vi.spyOn(f.grants, 'revokeAll').mockRejectedValue(new Error('injected read-only filesystem'));
+		await expect(f.driver.disconnect()).rejects.toThrow('injected read-only filesystem');
+		await expect(f.channels[0].request('thread/read', { threadId: 'native-thread' })).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+	});
+	it('admission failure closes its real channel even when its revocation cleanup also fails', async () => {
+		const f = await fixture({ BAD_CLI: '0.142.4' });
+		vi.spyOn(f.grants, 'revokeAll').mockRejectedValue(new Error('injected read-only filesystem'));
+		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'error', message: 'injected read-only filesystem' }]);
+		await expect(f.channels[0].request('thread/read', { threadId: 'native-thread' })).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+	});
+	it('abort-triggered cancellation consumes failures and still interrupts when grant IO fails', async () => {
+		const f = await fixture({ PARK: '1' });
+		const abort = new AbortController(); f.input.signal = abort.signal;
+		vi.spyOn(f.grants, 'revoke').mockRejectedValue(new Error('injected disk full'));
+		f.input.onNativeBound = () => { abort.abort(); };
+		expect(await collect(f.driver.createRun(f.input).events)).toEqual([{ type: 'cancelled', reason: 'Codex native stop unconfirmed' }]);
+		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toHaveLength(1);
 	});
 	it('late native identity from an old generation cannot receive a new usable grant', async () => {
 		const f = await fixture();
