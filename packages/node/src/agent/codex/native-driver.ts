@@ -6,7 +6,10 @@ import { prepareCodexScope } from './codex-driver.js';
 import { CodexTurnGrants, codexHookConfig } from './turn-grants.js';
 
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
-interface Session { channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope }
+interface Session {
+	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope;
+	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>;
+}
 type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId'>;
 function sessionState(session: Session, workspace: string) {
 	return { version: 1, value: {
@@ -82,12 +85,17 @@ export class CodexNativeDriver implements AgentDriver {
 				workspace: input.workspace, previousThreadId: previous ?? null } });
 			execution.conversation.assertCurrent();
 			const next = await execution.replaceSession(created.threadId, sessionState(created, input.workspace));
-			this.sessions.set(JSON.stringify([execution.conversation.id, next]), Promise.resolve(created));
+			created.cacheKey = JSON.stringify([execution.conversation.id, next]);
+			this.sessions.set(created.cacheKey, Promise.resolve(created));
+			// CAS has selected the new thread; cleanup failure must never close that new generation.
+			try { await this.retire(JSON.stringify([execution.conversation.id, execution.conversation.generation])); }
+			catch { return { status: 'unknown', generation, nativeRef, error: 'CODEX_RETIRED_CLEANUP_UNCONFIRMED',
+				text: 'New thread selected; previous native channel cleanup unconfirmed. Do not automatically retry reset.' }; }
 			return { status: 'completed', generation, nativeRef, effect: { kind: 'reset', sessionId: created.threadId, generation: String(next) },
 				text: 'New native Codex thread selected. Previous work and history are retained; no stop is claimed.' };
 		} catch {
 			let revokeFailed = false;
-			if (created) { try { await created.grants.revokeAll(); } catch { revokeFailed = true; } finally { created.channel.close(); } }
+			if (created) { try { await this.closeSession(created); } catch { revokeFailed = true; } }
 			return { status: 'unknown', generation, nativeRef, error: revokeFailed ? 'CODEX_GRANT_REVOKE_FAILED' : 'native_request_failed',
 				text: 'Native reset outcome unconfirmed. Retain the recorded thread evidence; do not automatically retry.' };
 		}
@@ -96,13 +104,32 @@ export class CodexNativeDriver implements AgentDriver {
 		this.discovery?.close();
 		await Promise.all([...this.sessions.values()].map(async (pending) => {
 			const session = await pending.catch(() => undefined);
-			if (session) { try { await session.grants.revokeAll(); } finally { session.channel.close(); } }
+			if (session) await this.closeSession(session);
 		}));
+	}
+	private async closeSession(session: Session): Promise<void> {
+		const cleanup = session.cleanup ??= (async () => {
+			try { await session.grants.dispose(); } finally { session.channel.close(); }
+			if (session.cacheKey) this.sessions.delete(session.cacheKey);
+		})();
+		try { await cleanup; } finally { session.cleanup = undefined; }
+	}
+	private async retire(key: string): Promise<void> {
+		const session = await this.sessions.get(key)?.catch(() => undefined);
+		if (!session) { this.sessions.delete(key); return; }
+		session.retired = true;
+		if (!session.references) await this.closeSession(session);
+	}
+	private async release(session: Session, settled: boolean): Promise<void> {
+		// Unknown submitted work still owns its native lifetime; reset is not stop evidence.
+		if (!settled) return;
+		session.references--;
+		if (session.retired && !session.references) await this.closeSession(session);
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.workspace || !input.replyToken || !input.conversation || !input.signal)
 			throw new TypeError('Codex native run requires prepared core input');
-		return new CodexNativeRun(input, () => this.session(input));
+		return new CodexNativeRun(input, () => this.session(input), (session, settled) => this.release(session, settled));
 	}
 	private async session(input: PreparedRun): Promise<Session> {
 		const scope = await prepareCodexScope(input);
@@ -111,20 +138,26 @@ export class CodexNativeDriver implements AgentDriver {
 		const existing = this.sessions.get(key);
 		if (existing) {
 			const session = await existing;
-			if (session.scope.digest !== scope.digest || session.threadId !== scope.threadId)
+			input.conversation.assertCurrent();
+			if (session.retired || session.scope.digest !== scope.digest || session.threadId !== scope.threadId)
 				throw new Error('CODEX_NATIVE_SCOPE_CHANGED: explicit reset required');
+			session.references++;
 			return session;
 		}
 		const pending = this.open(input, scope).then(async (session) => {
 			try {
 				if (!input.conversation.registerNative) throw new Error('Codex atomic native registration unavailable');
 				await input.conversation.registerNative(session.threadId, sessionState(session, input.workspace!));
+				session.cacheKey = key;
 				return session;
-			} catch (error) { try { await session.grants.revokeAll(); } finally { session.channel.close(); } throw error; }
+			} catch (error) { await this.closeSession(session); throw error; }
 		});
 		// Keep failed admission too: an unknown native start/resume must not be blindly retried.
 		this.sessions.set(key, pending);
-		return pending;
+		const session = await pending;
+		input.conversation.assertCurrent();
+		session.references++;
+		return session;
 	}
 	private async open(input: SessionInput, scope: Scope): Promise<Session> {
 		const grants = await (this.deps.createGrants?.() ?? CodexTurnGrants.create());
@@ -146,8 +179,8 @@ export class CodexNativeDriver implements AgentDriver {
 			if (typeof thread?.id !== 'string' || !thread.id || thread.cliVersion !== '0.142.3' ||
 				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
-			return { channel, grants, threadId: thread.id, scope };
-		} catch (error) { try { await grants.revokeAll(); } finally { channel.close(); } throw error; }
+			return { channel, grants, threadId: thread.id, scope, references: 0, retired: false };
+		} catch (error) { try { await grants.dispose(); } finally { channel.close(); } throw error; }
 	}
 }
 
@@ -161,12 +194,14 @@ class CodexNativeRun implements AgentRun {
 	private cancelled = false;
 	private terminal = false;
 	private interruptRequested = false;
+	private settlementUnconfirmed = false;
 	private channelFailure?: string;
 	private session?: Session;
 	private ref?: NativeRef;
 	private wake?: () => void;
 	private readonly inbox: Array<{ method: string; params: unknown }> = [];
-	constructor(private readonly input: PreparedRun, private readonly getSession: () => Promise<Session>) {}
+	constructor(private readonly input: PreparedRun, private readonly getSession: () => Promise<Session>,
+		private readonly releaseSession: (session: Session, settled: boolean) => Promise<void>) {}
 	get events(): AsyncIterable<AgentEvent> {
 		return { [Symbol.asyncIterator]: () => {
 			if (this.consumed) throw new Error('Codex native run can be consumed only once');
@@ -193,20 +228,32 @@ class CodexNativeRun implements AgentRun {
 			});
 			offClose = session.channel.onClose(() => { this.channelFailure = 'CODEX_RESULT_UNKNOWN: native channel lost; do not resubmit'; this.wake?.(); });
 			input.conversation.assertCurrent();
+			const submission = { method: 'turn/start', requestId: `${input.runId}:turn`, threadId: session.threadId };
 			await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, threadId: session.threadId,
-				workspace: input.workspace, stopProbe: 'unknown-after-restart' } });
+				workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
 			input.conversation.assertCurrent();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			this.submitted = true;
 			const raw = await session.channel.request('turn/start', { threadId: session.threadId, clientUserMessageId: input.runId,
-				input: [{ type: 'text', text: input.message, text_elements: [] }] });
+				input: [{ type: 'text', text: input.message, text_elements: [] }] }, submission.requestId);
 			const turn = object(object(raw)?.turn);
 			if (typeof turn?.id !== 'string' || !turn.id) throw new Error('CODEX_NATIVE_TURN_UNVERIFIED');
 			this.ref = { sessionId: session.threadId, turnId: turn.id };
-			await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, nativeRef: this.ref,
-				workspace: input.workspace, stopProbe: 'unknown-after-restart' } });
+			try {
+				await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, nativeRef: this.ref,
+					workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
+			} catch {
+				this.settlementUnconfirmed = true;
+				throw new Error('NATIVE_OUTCOME_UNKNOWN: native reply locator could not be committed; no new grant');
+			}
+			const assertSettlement = () => {
+				if (!input.assertReplySettlement) { input.conversation.assertCurrent(); return; }
+				try { input.assertReplySettlement(this.ref!); }
+				catch { this.settlementUnconfirmed = true; throw new Error('NATIVE_OUTCOME_UNKNOWN: original native reply lease unconfirmed; no new grant'); }
+			};
+			assertSettlement();
 			input.onNativeBound?.(this.ref);
-			input.conversation.assertCurrent();
+			assertSettlement();
 			if (!this.cancelled) await session.grants.grant(this.ref, input.replyToken!);
 			const seen = new Set<string>();
 			while (!this.terminal) {
@@ -247,6 +294,7 @@ class CodexNativeRun implements AgentRun {
 				try { await this.session.grants.revoke(this.ref); }
 				catch { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; if (!this.cancelled) this.session.channel.close(); }
 			}
+			if (this.session) await this.releaseSession(this.session, this.terminal || !this.submitted);
 		}
 	}
 	async cancel(reason: string): Promise<Awaited<ReturnType<AgentRun['cancel']>>> {
@@ -266,5 +314,5 @@ class CodexNativeRun implements AgentRun {
 		}
 		return this.submitted ? { status: 'unconfirmed', reason: `${reason}: ${revokeFailed ? 'CODEX_GRANT_REVOKE_FAILED; ' : ''}native background process tree stop not verified` } : { status: 'stopped' };
 	}
-	async dispose(): Promise<void> { if (!this.terminal) await this.cancel('dispose'); }
+	async dispose(): Promise<void> { if (!this.terminal && !this.settlementUnconfirmed) await this.cancel('dispose'); }
 }

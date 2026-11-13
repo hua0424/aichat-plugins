@@ -59,6 +59,8 @@ export interface PreparedRun {
 	selectedModel?: { providerID: string; modelID: string };
 	getSelectedModel?(): { providerID: string; modelID: string } | undefined;
 	onNativeBound?(ref: NativeRef): void;
+	/** Core verifies an already-submitted native turn's original START-ready reply lease, including detached generations. */
+	assertReplySettlement?(ref: NativeRef): void;
 	/** Legacy transcript file key only; not an authorization source. */
 	transcriptKey?: string;
 	systemPrompt: string;

@@ -86,6 +86,8 @@ export interface BoundConversationRun {
 	readonly nativeState: ConversationRecord['nativeState'];
 	/** Synchronous, side-effect-free gate checked immediately before native submission. */
 	assertCurrent(): void;
+	/** Exact already-submitted Codex turn only; never authorizes new input or state writes. */
+	assertReplySettlement(ref: NativeRef): void;
 	saveNativeState(provider: Provider, state: Record<string, unknown>): void;
 	registerNativeAlias(provider: Provider, id: string, runtimeScope?: string): void;
 	registerNative(provider: Provider, id: string, state?: Record<string, unknown>, runtimeScope?: string): void;
@@ -457,6 +459,20 @@ export class ConversationStore {
 			conversationId, generation, contextKey: record.contextKey, nativeState: copy(record.nativeState),
 			replyToken: binding.token,
 			assertCurrent: () => { current(); },
+			assertReplySettlement: (ref) => {
+				const target = this.resolveReplyBinding(binding.token);
+				const context = this.resolveReplyContext(binding.token, [{ provider: 'codex', nativeId: ref.sessionId }]);
+				const pending = context?.pendingRuns?.find((run) => run.runId === runId && run.generation === generation);
+				const value = pending?.recovery?.value as { provider?: string; runId?: string; nativeRef?: NativeRef;
+					submission?: { method?: string; requestId?: string; threadId?: string } } | undefined;
+				if (this.closed || !validId(ref.turnId) || !context || context.adapterInstanceId !== 'codex' || context.state === 'disabled' ||
+					context.conversationId !== conversationId || context.generation !== generation || !target || target.runId !== runId ||
+					target.authorizationEpoch !== options?.authorizationEpoch ||
+					value?.provider !== 'codex' || value.runId !== runId || value.nativeRef?.sessionId !== ref.sessionId || value.nativeRef.turnId !== ref.turnId ||
+					value.submission?.method !== 'turn/start' || value.submission.requestId !== `${runId}:turn` || value.submission.threadId !== ref.sessionId)
+					throw new Error('NATIVE_REPLY_SETTLEMENT_UNCONFIRMED');
+				if (this.byIdentity.get(identityKey(this.options.serverNamespace, identityId, roomId))?.generation === generation) current();
+			},
 			saveNativeState: (provider, state) => {
 				current(); this.assertProvider(provider, identityId);
 				if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid native state');

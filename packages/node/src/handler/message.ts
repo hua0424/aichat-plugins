@@ -1121,6 +1121,7 @@ export class MessageHandler {
 					get replyThinkingId() { return session.thinkingId || undefined; },
 					selectedModel: store.get(this.selfUid, roomId)?.selectedModel,
 					getSelectedModel: () => store.assertGeneration(this.selfUid, roomId, bound.generation).selectedModel,
+					assertReplySettlement: (ref) => bound.assertReplySettlement(ref),
 					onNativeBound: (ref) => {
 						const key = this.nativeKey(bound.conversationId, bound.generation, ref);
 						if (!session.thinkingId) throw new Error('START not ready');

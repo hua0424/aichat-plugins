@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, link, mkdtemp, readFile, unlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { NativeRef } from '../events.js';
@@ -20,6 +20,7 @@ export class CodexTurnGrants {
 	readonly helperHash: string;
 	private readonly granted = new Set<string>();
 	private closed = false;
+	private disposed = false;
 	private constructor(readonly directory: string, helper: string, helperHash: string) { this.helper = helper; this.helperHash = helperHash; }
 	static async create(): Promise<CodexTurnGrants> {
 		const directory = await mkdtemp(join(tmpdir(), 'aichat-codex-turn-'));
@@ -80,6 +81,16 @@ process.stdin.on('end',async()=>{try{
 		try { await writeFile(join(this.directory, '.closed'), '', { flag: 'wx', mode: 0o400 }); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
 		await Promise.all([...this.granted].map((id) => this.tombstone(id)));
+	}
+	/** Only this instance's mkdtemp directory; no workspace/native history is removed. */
+	async dispose(): Promise<void> {
+		if (this.disposed) return;
+		this.closed = true;
+		try { await this.revokeAll(); }
+		finally {
+			await rm(this.directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+			this.disposed = true;
+		}
 	}
 }
 
