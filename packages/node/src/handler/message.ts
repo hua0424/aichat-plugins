@@ -456,10 +456,22 @@ export class MessageHandler {
 			return { receipt: persisted };
 		}
 		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
-		const assertCurrent = () => { store.assertGeneration(this.selfUid, room, generation); };
 		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
-		const execution: CapabilityExecution = {
-			requestId: request.requestId, systemPrompt, contextKey: record.contextKey, promptOwner: this.selfUid, authorizationEpoch: epoch,
+		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch }, generation, systemPrompt,
+			(receipt) => { void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
+				.catch(() => console.error('[command] control receipt publication failed; retained for explicit query')); }) };
+	}
+	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string }, generation: number, systemPrompt: string,
+		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
+		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
+		const record = store.assertGeneration(this.selfUid, room, generation);
+		const assertCurrent = () => {
+			const current = store.assertGeneration(this.selfUid, room, generation);
+			if (owner && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
+				throw new Error('native ordinary authorization changed');
+		};
+		return {
+			requestId, systemPrompt, contextKey: record.contextKey, promptOwner: this.selfUid, authorizationEpoch: epoch,
 			selectedModel: record.selectedModel,
 			getSelectedModel: () => store.assertGeneration(this.selfUid, room, generation).selectedModel,
 			conversation: { id: record.conversationId, generation, assertCurrent,
@@ -468,8 +480,8 @@ export class MessageHandler {
 				registerNativeAlias: async (alias) => { assertCurrent(); store.registerNative(this.driver.type, alias.id, this.selfUid, room, undefined, alias.scope); },
 				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
 			},
-			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, request.requestId, value),
-			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref); },
+			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, requestId, value),
+			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref); },
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {
 				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>, expectedModel);
@@ -479,16 +491,20 @@ export class MessageHandler {
 				}
 				return next.generation;
 			},
-			bindTurn: (turn) => this.bindCommandTurn(request, turn),
+			bindTurn: (turn, ready) => this.bindCommandTurn(scope, turn, ready, owner),
 			emit: async (event) => {
 				if (event.type === 'turn') { this.settleCommandTurn(event.turn); return; }
-				const receipt = store.recordControl(this.selfUid, room, request.requestId, event.receipt);
-				// Reporting must not block native SSE, START-ready or shell hooks; server CAS orders receipts.
-				void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
-					.catch(() => console.error('[command] control receipt publication failed; retained for explicit query'));
+				const receipt = store.recordControl(this.selfUid, room, requestId, event.receipt);
+				if (owner && receipt.status === 'unknown' && receipt.nativeRef && store.get(this.selfUid, room)?.generation === generation) {
+					const key = this.nativeKey(record.conversationId, generation, receipt.nativeRef), session = this.nativeThinking.get(key);
+					if (session?.run?.agent === owner.agent() && session.run.generation === generation && !this.nativeTerminal.has(key) &&
+						store.get(this.selfUid, room)?.pendingRuns?.some(run => run.runId === session.run!.id && run.generation === generation))
+						store.markStopUnconfirmed(session.run.id);
+				}
+				// Ordinary inputs have no command-result transport; both use the same durable control.
+				report?.(receipt);
 			},
 		};
-		return { execution };
 	}
 
 	private settleRecoveredControl(request: AgentCommandRequest, receipt: AgentCapabilityResult, generation: number): void {
@@ -515,26 +531,28 @@ export class MessageHandler {
 			requestIds: [request.requestId], relation: 'attached', phase: receipt.status === 'completed' ? 'completed' : 'failed' });
 	}
 
-	private bindCommandTurn(request: AgentCommandRequest, turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }> {
+	private bindCommandTurn(request: { roomId: string; requestId: string; authorizationEpoch: string }, turn: NativeTurnEvent, ready?: Promise<void>,
+		owner?: { agent: () => AgentRun; abort: AbortController }): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }> {
 		const store = this.getConversations(), codex = this.driver.type === 'codex';
-		const validateCodex = () => {
+		const validateCodex = (proofReady = true) => {
 			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
 			const control = store.getControl(this.selfUid, request.roomId, request.requestId);
 			const proof = control?.recovery?.value as { provider?: string; runId?: string; nativeRef?: NativeRef;
 				submission?: { method?: string; requestId?: string; threadId?: string }; inputProof?: { itemId?: string; turnId?: string } } | undefined;
 			const ref = turn.nativeRef;
 			if (record.adapterInstanceId !== 'codex' || record.conversationId !== turn.conversationId || record.identityId !== this.selfUid ||
-				!request.context.authorizationEpoch || control?.authorizationEpoch !== request.context.authorizationEpoch ||
+				(owner && (record.state !== 'ready' || this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== request.authorizationEpoch)) ||
+				!request.authorizationEpoch || control?.authorizationEpoch !== request.authorizationEpoch ||
 				control.generation !== turn.generation || control.state !== 'submitted' || turn.phase !== 'bound' ||
 				turn.requestIds.length !== 1 || turn.requestIds[0] !== request.requestId || !ref.turnId || !ref.inputId || ref.parentId || ref.messageId ||
 				record.nativeState.codex?.threadId !== ref.sessionId || proof?.provider !== 'codex' || proof.runId !== request.requestId ||
 				proof.submission?.method !== 'turn/start' || proof.submission.requestId !== `${request.requestId}:turn` || proof.submission.threadId !== ref.sessionId ||
-				proof.nativeRef?.sessionId !== ref.sessionId || proof.nativeRef.turnId !== ref.turnId || proof.nativeRef.inputId !== ref.inputId ||
-				proof.inputProof?.itemId !== ref.inputId || proof.inputProof.turnId !== ref.turnId)
+				(proofReady && (proof.nativeRef?.sessionId !== ref.sessionId || proof.nativeRef.turnId !== ref.turnId || proof.nativeRef.inputId !== ref.inputId ||
+				proof.inputProof?.itemId !== ref.inputId || proof.inputProof.turnId !== ref.turnId)))
 				throw new Error('native Codex input proof unconfirmed');
 			return record;
 		};
-		if (codex) { try { validateCodex(); } catch (error) { return Promise.reject(error); } }
+		if (codex) { try { validateCodex(!ready); } catch (error) { return Promise.reject(error); } }
 		const key = this.nativeKey(turn.conversationId, turn.generation, turn.nativeRef);
 		if (this.nativeTerminal.has(key)) {
 			if (codex) return Promise.reject(new Error('native Codex turn already terminal'));
@@ -548,21 +566,27 @@ export class MessageHandler {
 			const original = record.pendingRuns?.find((r) => r.runId === binding.runId && r.generation === turn.generation);
 			const recovery = original?.recovery?.value as { provider?: string; nativeRef?: NativeRef; submission?: { method?: string; threadId?: string } } | undefined;
 			if (!lease || lease.runId !== binding.runId || lease.thinkingId !== binding.thinkingId || lease.generation !== turn.generation ||
-				lease.conversationId !== record.conversationId || lease.authorizationEpoch !== request.context.authorizationEpoch ||
+				lease.conversationId !== record.conversationId || lease.authorizationEpoch !== request.authorizationEpoch ||
 				context?.identityId !== this.selfUid || context.roomId !== request.roomId || context.conversationId !== record.conversationId ||
 				context.generation !== turn.generation || recovery?.provider !== 'codex' || recovery.submission?.method !== 'turn/start' ||
 				recovery.submission.threadId !== turn.nativeRef.sessionId || recovery.nativeRef?.sessionId !== turn.nativeRef.sessionId || recovery.nativeRef.turnId !== turn.nativeRef.turnId)
 				throw new Error('original native Codex START lease unconfirmed');
 		};
 		const existing = this.nativeBindings.get(key);
-		if (existing) return !codex ? existing : existing.then((binding) => {
+		if (existing) return !codex ? existing : Promise.all([existing, ready]).then(([binding]) => {
+			if (this.nativeTerminal.has(key)) throw new Error('native Codex turn already terminal');
 			validateLease(binding);
 			return { ...binding, relation: 'attached' as const };
 		});
 		const pending = (async () => {
+			if (ready) await ready;
 			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
 			if (codex) {
 				validateCodex();
+				const origin = (store.getControl(this.selfUid, request.roomId, request.requestId)?.recovery?.value as
+					{ origin?: { submissionId?: string; startedTurnId?: string } } | undefined)?.origin;
+				if (origin?.submissionId !== turn.nativeRef.turnId || origin?.startedTurnId !== turn.nativeRef.turnId)
+					throw new Error('native Codex new-turn origin unconfirmed');
 				if (record.pendingRuns?.some(run => {
 					const original = run.recovery?.value as { provider?: string; nativeRef?: NativeRef } | undefined;
 					return original?.provider === 'codex' && original.nativeRef?.sessionId === turn.nativeRef.sessionId && original.nativeRef.turnId === turn.nativeRef.turnId;
@@ -570,16 +594,16 @@ export class MessageHandler {
 			}
 			else if (record.conversationId !== turn.conversationId || !turn.nativeRef.messageId || !turn.nativeRef.inputId || turn.nativeRef.parentId !== turn.nativeRef.inputId) throw new Error('native turn association unconfirmed');
 			const runId = randomUUID();
-			const bound = store.beginRun(this.selfUid, request.roomId, runId, { authorizationEpoch: request.context.authorizationEpoch, nativeTurn: turn.nativeRef });
+			const bound = store.beginRun(this.selfUid, request.roomId, runId, { authorizationEpoch: request.authorizationEpoch, nativeTurn: turn.nativeRef });
 			if (codex) {
 				await bound.saveRecovery(store.getControl(this.selfUid, request.roomId, request.requestId)!.recovery!);
 				validateCodex();
 			}
-			// This lifecycle is created AFTER native proof; it does not submit another AgentRun.
-			const agent: AgentRun = { events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => ({ status: 'unsupported' }), dispose: async () => {} };
+			// This lifecycle is created AFTER native proof; ordinary input retains its real resource owner.
+			const agent: AgentRun = owner?.agent() ?? { events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => ({ status: 'unsupported' }), dispose: async () => {} };
 			const session: ThinkingSession = { sessionKey: `native:${key}`, thinkingId: '', roomId: request.roomId, triggerMsgId: '',
-				startTime: Date.now(), accumulatedContent: '', finalized: false, events: [], authorizationEpoch: request.context.authorizationEpoch,
-				run: { id: runId, generation: turn.generation, agent, abort: new AbortController() } };
+				startTime: Date.now(), accumulatedContent: '', finalized: false, events: [], authorizationEpoch: request.authorizationEpoch,
+				run: { id: runId, generation: turn.generation, agent, abort: owner?.abort ?? new AbortController() } };
 			this.nativeThinking.set(key, session); this.thinkingSessions.set(session.sessionKey, session);
 			const retry = setInterval(() => { if (this.ws.isConnected) this.sendThinkingStart(session); }, 2_000); retry.unref?.();
 			const deadline = setTimeout(() => { this.forgetThinkingStart(runId); }, this.startReceiptTimeout()); deadline.unref?.();
@@ -772,7 +796,7 @@ export class MessageHandler {
 	private runReady(roomId: string): boolean {
 		if (!this.getConversations) return true;
 		const record = this.getConversations().get(this.selfUid, roomId);
-		return !record || (record.state === 'ready' && !record.pendingRuns?.some((run) => !record.detachedGenerations?.includes(run.generation)));
+		return !record || (record.state === 'ready' && (Boolean(this.driver.createNativeInput) || !record.pendingRuns?.some((run) => !record.detachedGenerations?.includes(run.generation))));
 	}
 
 	/**
@@ -994,7 +1018,7 @@ export class MessageHandler {
 
 		// 6. thinking 活跃 **或** 处于退避窗口时入队——退避窗口内不另起触发、不丢消息，
 		//    待 rescheduled 触发的思考结束后随 flushPendingMessages 处理。
-		if (this.thinkingSessions.has(sessionKey) || channel.antiLoopDelaying || !this.runReady(roomId)) {
+		if ((!this.driver.createNativeInput && this.thinkingSessions.has(sessionKey)) || channel.antiLoopDelaying || !this.runReady(roomId)) {
 			channel.pendingMessages.push(content);
 			this.syncSuspensionNotice(roomId, channel); // #343: 暂停排队必须对用户可见
 			console.log(`[handler] Message queued (thinking active or anti-loop delaying) room=${roomId}, pending: ${channel.pendingMessages.length}`);
@@ -1006,6 +1030,24 @@ export class MessageHandler {
 		channel.debouncer.push(content);
 	}
 
+	private async nativeOrdinaryInput(requestId: string, roomId: string, generation: number, authorizationEpoch: string,
+		message: string, systemPrompt: string, workspace: string, abort: AbortController): Promise<void> {
+		let agent!: AgentRun;
+		const execution = this.controlExecution({ requestId, roomId, authorizationEpoch }, generation, systemPrompt, undefined,
+			{ agent: () => agent, abort });
+		try {
+			agent = this.driver.createNativeInput!({ message, workspace, signal: abort.signal, execution });
+			for await (const _event of agent.events) { /* Native events settle through the shared control execution. */ }
+		} catch (error) {
+			console.error(`[handler] native ordinary input failed: ${errMsg(error)}`);
+			const receipt = this.getConversations().getControl(this.selfUid, roomId, requestId)?.receipt;
+			if (!receipt || !['completed', 'failed'].includes(receipt.status))
+				await execution.emit({ type: 'receipt', receipt: { status: 'unknown', generation: String(generation), nativeRef: receipt?.nativeRef, error: 'native ordinary outcome unconfirmed; do not resubmit' } });
+		} finally {
+			try { await agent?.dispose(); }
+			catch (error) { console.error(`[handler] native ordinary cleanup failed: ${errMsg(error)}`); }
+		}
+	}
 	/**
 	 * REQ-004 Agent Loop 触发汇聚点。
 	 * 所有触发路径（直达 debounce / pendingMessages flush / 退避 reschedule）都经此进入，
@@ -1077,7 +1119,7 @@ export class MessageHandler {
 		// 并发防护：必须先于「消费/清空积累缓冲」——只有真正进入交付路径时才消费缓冲，否则早返回会丢弃
 		// 已清空但从未发送的群聊上下文（P1-a）。REQ-011 S2：cc 现为 node-driven，
 		// 与 openclaw/opencode/codex 共用此标准守卫与 drop 语义（其消息内容不会因此丢失）。
-		if (this.thinkingSessions.has(sessionKey) || !this.runReady(roomId)) {
+		if ((!this.driver.createNativeInput && this.thinkingSessions.has(sessionKey)) || !this.runReady(roomId)) {
 			console.warn(`[handler] Thinking session already active or paused for ${sessionKey}`);
 			channel.pendingMessages.push(message);
 			this.syncSuspensionNotice(roomId, channel); // #343
@@ -1140,8 +1182,13 @@ export class MessageHandler {
 			try {
 				const store = this.getConversations();
 				const id = randomUUID();
-				const bound = store.beginRun(this.selfUid, roomId, id, { authorizationEpoch });
-				begunId = id;
+				const workspace = this.workspaceBase ? deriveWorkspaceDir(this.workspaceBase, this.selfUid, workspaceContext) : undefined;
+				if (this.driver.createNativeInput && (!authorizationEpoch || !workspace)) throw new Error('native ordinary admission unavailable');
+				const native = this.driver.createNativeInput ? store.prepareControl(this.selfUid, roomId, id,
+					createHash('sha256').update(JSON.stringify(['ordinary', agentEnvelope, workspace, store.get(this.selfUid, roomId)?.generation ?? 1])).digest('hex'), authorizationEpoch!).entry : undefined;
+				if (native && store.assertGeneration(this.selfUid, roomId, native.generation).state !== 'ready') throw new Error('native ordinary admission unavailable');
+				const bound = native ? undefined : store.beginRun(this.selfUid, roomId, id, { authorizationEpoch });
+				begunId = bound ? id : undefined;
 				// Render server templates once at the core boundary; adapters only inject the prepared prompt.
 				let nameTimer: ReturnType<typeof setTimeout> | undefined;
 				let selfName: string | undefined;
@@ -1157,6 +1204,13 @@ export class MessageHandler {
 				const systemPrompt = this.templates
 					? buildSystemPrompt(this.templates, { displayName: selfName, uid: this.selfUid, persona: this.persona }) : '';
 				const abort = new AbortController();
+				if (native) {
+					// Once in the native lane, even recovery/receipt IO failure must never re-enter legacy preparation/replay.
+					await this.nativeOrdinaryInput(id, roomId, native.generation, authorizationEpoch!, agentEnvelope, systemPrompt, workspace!, abort)
+						.catch(error => console.error(`[handler] native ordinary settlement failed; do not resubmit: ${errMsg(error)}`));
+					return;
+				}
+				if (!bound) throw new Error('ordinary run admission unavailable');
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
 					contextKey: bound.contextKey, promptOwner: this.selfUid,

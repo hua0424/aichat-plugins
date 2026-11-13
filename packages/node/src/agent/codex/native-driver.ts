@@ -1,4 +1,4 @@
-import type { AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult, AgentDriver, AgentEvent, AgentRun, CapabilityExecution, NativeRef, NativeTurnEvent, PreparedRun } from '../events.js';
+import type { AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult, AgentDriver, AgentEvent, AgentRun, CapabilityExecution, NativeRef, PreparedRun } from '../events.js';
 import { capabilityParameters } from '../capability-parameters.js';
 import { CodexAppServer } from './app-server.js';
 import { prepareCodexScope } from './codex-driver.js';
@@ -120,6 +120,13 @@ export class CodexNativeDriver implements AgentDriver {
 				text: 'Native reset outcome unconfirmed. Retain the recorded thread evidence; do not automatically retry.' };
 		}
 	}
+	createNativeInput(input: { message: string; workspace: string; signal: AbortSignal; execution: CapabilityExecution }): AgentRun {
+		const e = input.execution;
+		const prepared = { runId: e.requestId, message: input.message, workspace: input.workspace, systemPrompt: e.systemPrompt,
+			conversation: e.conversation, saveRecovery: e.saveRecovery, signal: input.signal };
+		return new CodexNativeRun(prepared, () => this.session({ ...prepared, selectedModel: frozenModel(e) }),
+			(session, settled) => this.release(session, settled), { execution: e, items: [{ type: 'text', text: input.message, text_elements: [] }], receiptOutcomes: true });
+	}
 	private async skill(input: AgentCapabilityInvocation, items: Record<string, unknown>[]): Promise<AgentCapabilityResult> {
 		const execution = input.execution;
 		if (!execution || !input.workspace) return { status: 'unsupported', error: 'execution_not_connected' };
@@ -131,10 +138,6 @@ export class CodexNativeDriver implements AgentDriver {
 		let result: AgentCapabilityResult = { status: 'unknown', error: 'native_skill_outcome_unconfirmed' };
 		for await (const event of run.events) {
 			const nativeRef = run.nativeRef;
-			if (nativeRef && (run.confirmedTerminal || (event.type !== 'error' && event.type !== 'cancelled'))) await execution.emit({ type: 'turn', turn: {
-				eventId: `${execution.requestId}:${event.type}`, conversationId: execution.conversation.id, generation: execution.conversation.generation,
-				nativeRef, requestIds: [execution.requestId], relation: run.attached ? 'attached' : 'new', phase: event.type === 'done' ? 'completed' : event.type === 'error' ? 'failed' : event.type === 'cancelled' ? 'cancelled' : 'bound',
-				...(!run.attached ? { event } : {}) } });
 			if (event.type === 'done') result = { status: 'completed', nativeRef };
 			if (event.type === 'error') result = { status: event.message.startsWith('NATIVE_OUTCOME_UNKNOWN:') ? 'unknown' : 'failed', nativeRef, error: event.message };
 			if (event.type === 'cancelled') result = { status: 'unknown', nativeRef, error: 'native_skill_stop_unconfirmed' };
@@ -290,21 +293,41 @@ class CodexNativeRun implements AgentRun {
 	private readonly inbox: Array<{ method: string; params: unknown }> = [];
 	attached = false;
 	get nativeRef(): NativeRef | undefined { return this.ref; }
-	get confirmedTerminal(): boolean { return this.terminal; }
 	constructor(private readonly input: Pick<PreparedRun, 'runId' | 'message' | 'workspace' | 'systemPrompt' | 'conversation' | 'saveRecovery' | 'signal' | 'replyToken' | 'replyThinkingId' | 'onNativeBound' | 'assertReplySettlement'>,
 		private readonly getSession: () => Promise<Session>, private readonly releaseSession: (session: Session, settled: boolean) => Promise<void>,
-		private readonly command?: { execution: CapabilityExecution; items: Record<string, unknown>[] }) {}
+		private readonly command?: { execution: CapabilityExecution; items: Record<string, unknown>[]; receiptOutcomes?: boolean }) {}
 	get events(): AsyncIterable<AgentEvent> {
 		return { [Symbol.asyncIterator]: () => {
 			if (this.consumed) throw new Error('Codex native run can be consumed only once');
 			this.consumed = true;
-			return this.execute();
+			return this.observe();
 		} };
+	}
+	private async *observe(): AsyncGenerator<AgentEvent> {
+		for await (const event of this.execute()) {
+			if (this.command) {
+				const e = this.command.execution, nativeRef = this.ref;
+				if (nativeRef && (this.terminal || (event.type !== 'error' && event.type !== 'cancelled'))) await e.emit({ type: 'turn', turn: {
+					eventId: `${e.requestId}:${event.type}`, conversationId: e.conversation.id, generation: e.conversation.generation,
+					nativeRef, requestIds: [e.requestId], relation: this.attached ? 'attached' : 'new',
+					phase: event.type === 'done' ? 'completed' : event.type === 'error' ? 'failed' : event.type === 'cancelled' ? 'cancelled' : 'bound',
+					...(!this.attached ? { event } : {}) } });
+				if (this.command.receiptOutcomes && ['done', 'error', 'cancelled'].includes(event.type)) await e.emit({ type: 'receipt', receipt: {
+					status: event.type === 'done' ? 'completed' : event.type === 'error' && !event.message.startsWith('NATIVE_OUTCOME_UNKNOWN:') ? 'failed' : 'unknown',
+					generation: String(e.conversation.generation), nativeRef,
+					...(event.type === 'error' ? { error: event.message } : {}) } });
+			}
+			yield event;
+		}
 	}
 	private async *execute(): AsyncGenerator<AgentEvent> {
 		const input = this.input, started = Date.now();
 		const onAbort = () => { void this.cancel('aborted').catch(() => { this.channelFailure = 'CODEX_GRANT_REVOKE_FAILED'; this.wake?.(); }); };
 		let unsubscribe: (() => void) | undefined, offClose: (() => void) | undefined;
+		let admit!: () => void, rejectAdmission!: (reason: Error) => void;
+		const ready = new Promise<void>((resolve, reject) => { admit = resolve; rejectAdmission = reject; });
+		void ready.catch(() => {});
+		let binding: ReturnType<CapabilityExecution['bindTurn']> | undefined;
 		try {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			if (!this.command && !input.replyThinkingId) throw new Error('Codex native run requires the exact START-ready reply grant');
@@ -326,6 +349,11 @@ class CodexNativeRun implements AgentRun {
 						if (!this.command) {
 							try { input.onNativeBound?.({ sessionId: session.threadId, turnId: frame.turnId }); }
 							catch { this.channelFailure = 'NATIVE_OUTCOME_UNKNOWN: original native owner could not be registered; no new grant'; }
+						} else {
+							this.ref = { sessionId: session.threadId, turnId: frame.turnId, inputId: item.id };
+							binding = this.command.execution.bindTurn({ eventId: `${input.runId}:bound`, conversationId: input.conversation.id,
+								generation: input.conversation.generation, nativeRef: this.ref, requestIds: [input.runId], relation: 'new', phase: 'bound' }, ready);
+							void binding.catch(() => {});
 						}
 					}
 				}
@@ -364,7 +392,8 @@ class CodexNativeRun implements AgentRun {
 				...(this.command ? { inputId: this.nativeInput!.itemId } : {}) };
 			try {
 				await input.saveRecovery({ version: 1, value: { provider: 'codex', runId: input.runId, nativeRef: this.ref,
-					...(this.command ? { inputProof: this.nativeInput } : {}), workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
+					...(this.command ? { inputProof: this.nativeInput, origin: { submissionId: turn.id,
+						startedTurnId: this.inbox.some(frame => frame.method === 'turn/started' && object(object(frame.params)?.turn)?.id === this.ref!.turnId) ? this.ref!.turnId : null } } : {}), workspace: input.workspace, submission, stopProbe: 'unknown-after-restart' } });
 			} catch {
 				this.settlementUnconfirmed = true;
 				throw new Error('NATIVE_OUTCOME_UNKNOWN: native reply locator could not be committed; no new grant');
@@ -377,11 +406,10 @@ class CodexNativeRun implements AgentRun {
 			let replyToken = input.replyToken;
 			if (this.command) {
 				const e = this.command.execution;
-				const turn: NativeTurnEvent = { eventId: `${input.runId}:bound`, conversationId: input.conversation.id, generation: input.conversation.generation,
-					nativeRef: this.ref, requestIds: [input.runId], relation: 'new', phase: 'bound' };
-				const binding = await e.bindTurn(turn);
-				if (!binding.relation) throw new Error('native Codex core lease relation unconfirmed');
-				this.attached = binding.relation === 'attached'; replyToken = binding.token;
+				admit();
+				const lease = await binding;
+				if (!lease?.relation) throw new Error('native Codex core lease relation unconfirmed');
+				this.attached = lease.relation === 'attached'; replyToken = lease.token;
 				await e.emit({ type: 'receipt', receipt: { status: 'accepted', phase: 'accepted', generation: String(input.conversation.generation), nativeRef: this.ref } });
 				input.conversation.assertCurrent();
 			} else assertSettlement();
@@ -439,6 +467,7 @@ class CodexNativeRun implements AgentRun {
 			}
 			yield { type: 'error', message };
 		} finally {
+			rejectAdmission(new Error('native input admission unconfirmed'));
 			unsubscribe?.(); offClose?.(); input.signal.removeEventListener('abort', onAbort);
 			if (this.ownsGrant && this.ref && this.session) {
 				try { await this.session.grants.revoke(this.ref); }

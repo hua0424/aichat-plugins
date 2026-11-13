@@ -149,8 +149,8 @@ export interface CapabilityExecution {
 	/** Optional model snapshot is checked atomically with generation; null means explicitly unselected. */
 	replaceSession(id: string, state: { version: number; value: unknown }, expectedModel?: { providerID: string; modelID: string } | null): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
-	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
-	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
+	/** A pending ready reserves correlation only; the returned lease still requires durable proof and exact START. */
+	bindTurn(turn: NativeTurnEvent, ready?: Promise<void>): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
 }
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
@@ -165,6 +165,8 @@ export interface AgentDriver {
 	/** Absence means unsupported; never infer support from the framework name. */
 	discoverCapabilities?(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog>;
 	executeCapability?(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult>;
+	/** Optional proof-first ordinary input; absence preserves the prepared START-before-native path. */
+	createNativeInput?(input: { message: string; workspace: string; signal: AbortSignal; execution: CapabilityExecution }): AgentRun;
 	createRun(input: PreparedRun): AgentRun;
 	disconnect(): Promise<void>;
 	/** Preserve provider-specific thinking presentation without an identity-routing branch. */
