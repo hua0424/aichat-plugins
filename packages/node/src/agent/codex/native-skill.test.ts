@@ -17,7 +17,7 @@ afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealT
 async function fixture(mode = '') {
  const home = await mkdtemp(join(tmpdir(), 'codex-skill-')), wire = join(home, 'wire'), script = join(home, 'child.cjs'), path = join(home, 'trusted-skill.md');
  await writeFile(path, 'deterministic fake skill');
- await writeFile(script, `const fs=require('node:fs');if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.exit(0)}const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');let seq=0;
+ await writeFile(script, `const fs=require('node:fs');if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.exit(0)}const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');let seq=0;const ended=new Set();setInterval(()=>{if(process.env.NOTIFY&&fs.existsSync(process.env.NOTIFY)){const frame=JSON.parse(fs.readFileSync(process.env.NOTIFY,'utf8'));fs.unlinkSync(process.env.NOTIFY);if(frame.method==='turn/completed')ended.add(frame.params.threadId+'/'+frame.params.turn.id);send(frame);}},5);
  require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line),p=r.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={},deferAck=false;
  if(r.method==='initialize')result={userAgent:'aichat/0.142.3'};
  if(r.method==='config/read')result={config:{model_provider:'openai'}};
@@ -25,8 +25,9 @@ async function fixture(mode = '') {
  if(r.method==='model/list')result={data:[],nextCursor:null};
  if(r.method==='thread/start'){const n=Number(fs.existsSync(process.env.THREADS)?fs.readFileSync(process.env.THREADS,'utf8'):0)+1;fs.writeFileSync(process.env.THREADS,String(n));result={thread:{id:'thread-'+n,cwd:p.cwd,cliVersion:'0.142.3'}};if(process.env.MODE==='attach-thread-init'&&n===1)deferAck=true;}
  if(r.method==='thread/resume')result={thread:{id:p.threadId,cwd:p.cwd,cliVersion:'0.142.3'}};
- if(r.method==='turn/steer'&&['attach-steer-rejected','attach-steer-ended'].includes(process.env.MODE)){if(process.env.MODE==='attach-steer-ended')send({method:'turn/completed',params:{threadId:p.threadId,turn:{id:p.expectedTurnId,status:'completed',items:[]}}});send({id:r.id,error:{code:-32600,message:'expected active turn mismatch'}});return;}
-  if(r.method==='turn/start'||r.method==='turn/steer'){const n=++seq,id=r.method==='turn/steer'?p.expectedTurnId:process.env.MODE==='attach-prewarmed'&&n===1?'seed-turn':process.env.MODE.startsWith('attach')?'turn-1':'turn-'+n;deferAck=process.env.MODE==='attach-late-ack'&&n===1;const fresh=r.method==='turn/start'&&(!process.env.MODE.startsWith('attach')||n===1||(process.env.MODE==='attach-prewarmed'&&n===2));result=r.method==='turn/steer'?{turnId:id}:{turn:{id:fresh&&process.env.MODE!=='orphan'?id:'submission-'+n,status:'inProgress',items:[]}};if(fresh&&process.env.MODE!=='no-start')send({method:'turn/started',params:{threadId:p.threadId,turn:{id,status:'inProgress',items:[]}}});
+ if(r.method==='turn/steer'&&process.env.MODE==='attach-steer-contradicted-reject'){send({method:'item/started',params:{threadId:p.threadId,turnId:'other-turn',item:{id:'contradicted-input',type:'userMessage',clientId:p.clientUserMessageId,content:p.input}}});send({id:r.id,error:{code:-32600,message:'expected active turn mismatch'}});return;}
+  if(r.method==='turn/steer'&&(ended.has(p.threadId+'/'+p.expectedTurnId)||['attach-steer-rejected','attach-steer-ended'].includes(process.env.MODE))){if(process.env.MODE==='attach-steer-ended')send({method:'turn/completed',params:{threadId:p.threadId,turn:{id:p.expectedTurnId,status:'completed',items:[]}}});send({id:r.id,error:{code:-32600,message:'expected active turn mismatch'}});return;}
+  if(r.method==='turn/start'||r.method==='turn/steer'){const n=++seq,id=r.method==='turn/steer'?p.expectedTurnId:process.env.MODE==='attach-prewarmed'&&n===1?'seed-turn':process.env.MODE.startsWith('attach')?'turn-1':'turn-'+n;deferAck=process.env.MODE==='attach-late-ack'&&n===1;const fresh=r.method==='turn/start'&&(!process.env.MODE.startsWith('attach')||n===1||(process.env.MODE==='attach-prewarmed'&&n===2));result=r.method==='turn/steer'?{turnId:id}:{turn:{id:fresh&&process.env.MODE!=='orphan'&&!(process.env.MODE==='orphan-terminal'&&n===1&&p.threadId==='thread-1')?id:'submission-'+n,status:'inProgress',items:[]}};if(fresh&&process.env.MODE!=='no-start')send({method:'turn/started',params:{threadId:p.threadId,turn:{id,status:'inProgress',items:[]}}});
  const proof={method:'item/started',params:{threadId:p.threadId,turnId:id,item:{id:'input-'+n,type:'userMessage',clientId:p.clientUserMessageId,content:p.input}}};
  if(process.env.MODE==='foreign-client'||(r.method==='turn/steer'&&process.env.MODE==='attach-steer-client'))proof.params.item.clientId='unregistered';
   if(r.method==='turn/steer'&&process.env.MODE==='attach-steer-turn')proof.params.turnId='other-turn';
@@ -36,14 +37,19 @@ async function fixture(mode = '') {
  else if(['gate','attach-gate'].includes(process.env.MODE)||(r.method==='turn/steer'&&process.env.MODE==='attach-steer-gate')){const gate=setInterval(()=>{if(fs.existsSync(process.env.PROOF)){clearInterval(gate);send(proof);}},5);}
  else {send(proof);if(process.env.MODE==='conflict')send({...proof,params:{...proof.params,turnId:'other-turn'}});if(process.env.MODE==='duplicate')send({...proof,method:'item/completed'});}
  if(['foreign-client','foreign-thread','conflict'].includes(process.env.MODE)||(r.method==='turn/steer'&&['attach-steer-client','attach-steer-thread','attach-steer-loss'].includes(process.env.MODE)))setTimeout(()=>process.exit(0),100);
- const poll=setInterval(()=>{if(fs.readdirSync(process.env.GRANTS).some(x=>x.endsWith('.env'))&&((process.env.MODE==='attach-prewarmed'&&n===1)||!(process.env.MODE.startsWith('attach')||process.env.MODE==='separate')||fs.existsSync(process.env.MODE==='attach-old-terminal'&&p.threadId==='thread-2'?process.env.DONE+'-new':process.env.DONE))){clearInterval(poll);if(process.env.MODE==='attach-loss'||(process.env.MODE==='attach-old-loss'&&p.threadId==='thread-1')){process.exit(0);return;}send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'a',delta:'native answer'}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:process.env.MODE==='native-failed'?'failed':process.env.MODE==='native-interrupted'?'interrupted':'completed',items:[]}}});}},5);}
+ const poll=setInterval(()=>{if(!(process.env.MODE==='orphan-terminal'&&n===1&&p.threadId==='thread-1')&&fs.readdirSync(process.env.GRANTS).some(x=>x.endsWith('.env'))&&((process.env.MODE==='attach-prewarmed'&&n===1)||!(process.env.MODE.startsWith('attach')||process.env.MODE==='separate')||fs.existsSync(process.env.MODE==='attach-old-terminal'&&p.threadId==='thread-2'?process.env.DONE+'-new':process.env.DONE))){clearInterval(poll);if(process.env.MODE==='attach-loss'||(process.env.MODE==='attach-old-loss'&&p.threadId==='thread-1')){process.exit(0);return;}send({method:'item/agentMessage/delta',params:{threadId:p.threadId,turnId:id,itemId:'a',delta:'native answer'}});send({method:'turn/completed',params:{threadId:p.threadId,turn:{id,status:process.env.MODE==='native-failed'?'failed':process.env.MODE==='native-interrupted'?'interrupted':'completed',items:[]}}});}},5);}
  if(r.id){if(deferAck){const gate=setInterval(()=>{if(fs.existsSync(process.env.ACK)){clearInterval(gate);send({id:r.id,result});}},5);}else send({id:r.id,result});}});`);
  const store = new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['u']), activeProviders: new Map([['u', 'codex']]) });
- const grants: CodexTurnGrants[] = [];
+ const grants: CodexTurnGrants[] = [], channels: CodexAppServer[] = [];
+ const subscriptions: Array<{ channel: number; active: boolean }> = [];
  const driver = new CodexNativeDriver({ command: 'unused', env: process.env,
   createGrants: async () => { const g = await CodexTurnGrants.create(); grants.push(g); return g; },
-  createChannel: (args) => new CodexAppServer({ command: process.execPath, prefix: [script], args, timeoutMs: 3000,
-   env: { ...process.env, WIRE: wire, SKILL: path, MODE: mode, GRANTS: grants.at(-1)?.directory, DONE: join(home, 'done'), PROOF: join(home, 'proof'), ACK: join(home, 'ack'), THREADS: join(home, 'threads') } }) });
+  createChannel: (args) => { const channel = new CodexAppServer({ command: process.execPath, prefix: [script], args, timeoutMs: 3000,
+   env: { ...process.env, WIRE: wire, SKILL: path, MODE: mode, GRANTS: grants.at(-1)?.directory, DONE: join(home, 'done'), PROOF: join(home, 'proof'), ACK: join(home, 'ack'), THREADS: join(home, 'threads'), NOTIFY: join(home, 'notify-' + channels.length) } });
+   if (mode === 'orphan-terminal') { const index = channels.length, subscribe = channel.onNotification.bind(channel);
+    vi.spyOn(channel, 'onNotification').mockImplementation(listener => { const entry = { channel: index, active: true }; subscriptions.push(entry);
+     const off = subscribe(listener); return () => { entry.active = false; off(); }; }); }
+   channels.push(channel); return channel; } });
  let handler!: MessageHandler, ack = true, currentEpoch = 'epoch';
  const frames: Array<{ type: number; data: Record<string, unknown> }> = [], receipts: AgentCommandResponse[] = [];
  const send = vi.fn((type: number, data: Record<string, unknown>) => { frames.push({ type, data }); if (type === 20 && mode === 'start-fail') throw new Error('START transport failed'); if (type === 20 && ack) queueMicrotask(() => handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: 'thinking-' + data.clientRunId } })); });
@@ -61,7 +67,11 @@ async function fixture(mode = '') {
  const result = async (requestId: string) => { await waitFor(() => expect(receipts.find(r => r.requestId === requestId && r.status !== 'accepted'), JSON.stringify(receipts)).toBeDefined()); return receipts.find(r => r.requestId === requestId && r.status !== 'accepted')!; };
  const lines = async () => (await readFile(wire, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
  const grantPath = () => waitFor(async () => { const env = (await readdir(grants[0].directory)).find(p => p.endsWith('.env')); expect(env).toBeDefined(); return join(grants[0].directory, env!); });
- return { home, path, store, driver, grants, frames, send, receipts, request, result, lines, grantPath, catalog, context,
+ return { home, path, store, driver, grants, channels, subscriptions, frames, send, receipts, request, result, lines, grantPath, catalog, context,
+  async notify(index: number, method: string, params: { threadId: string; turn: { id: string; status: string; items: unknown[] } }) {
+   let seen = false; const off = channels[index].onNotification((name, value) => { if (name === method && JSON.stringify(value) === JSON.stringify(params)) seen = true; });
+   try { await writeFile(join(home, 'notify-' + index), JSON.stringify({ method, params })); await waitFor(() => expect(seen).toBe(true)); } finally { off(); }
+  },
   async setEpoch(epoch: string) { currentEpoch = epoch; await handler.prewarmGroupConfigs(); },
   rejectStart(index = 0) { const frame = frames.filter(x => x.type === 20)[index]; handler.handle({ type: 'thinkingEnd', data: { ...frame.data, fromUid: 'u', thinkingId: 'thinking-' + frame.data.clientRunId, status: 'error', error: 'authorization_revoked' } }); },
  ordinary(id = 'ordinary', content = 'hello') { handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: 'owner', name: 'Owner', userType: 1 }, message: { id, roomId: 'room', type: 1, roomType: 2, aiclaw: { isOwner: true }, body: { content } } } }); }, setAck(value: boolean) { ack = value; }, ackStart(index = -1) { const data = frames.filter(f => f.type === 20).at(index)!.data; handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: 'thinking-' + data.clientRunId } }); } };
@@ -83,6 +93,20 @@ it.each(['ordinary', 'skill'])('steers busy %s input with the exact native turn 
  expect(wire.filter(r => r.method === 'turn/start')).toHaveLength(1); expect(wire.filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
  await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
 });
+it.each(['ordinary', 'skill'])('keeps a contradicted %s steer unknown even when its RPC is rejected', async kind => {
+ const f = await fixture('attach-steer-contradicted-reject'), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary('owner'); await f.grantPath();
+ const grant = vi.spyOn(f.grants[0], 'grant'), revoke = vi.spyOn(f.grants[0], 'revoke');
+ if (kind === 'ordinary') f.ordinary('contradicted'); else f.request('contradicted', 'invoke', f.catalog.version);
+ let receipt: ReturnType<ConversationStore['getControl']>;
+ await waitFor(async () => { const rpc = (await f.lines()).find(r => r.method === 'turn/steer'); expect(rpc).toBeDefined();
+  receipt = f.store.getControl('u', 'room', rpc.params.clientUserMessageId); expect(receipt?.receipt).toBeDefined(); });
+ expect(receipt!.receipt).toMatchObject({ status: 'unknown', error: expect.stringContaining('registered native input association ambiguous') });
+ expect(mint).toHaveBeenCalledTimes(1); expect(grant).not.toHaveBeenCalled(); expect(revoke).not.toHaveBeenCalled();
+ expect(f.frames.filter(x => x.type === 20)).toHaveLength(1); expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1); expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ await writeFile(join(f.home, 'done'), '1'); await waitFor(() => expect(f.frames.filter(x => x.type === 22)).toHaveLength(1));
+ expect(receipt!.receipt?.status).toBe('unknown');
+});
 it.each(['attach-steer-rejected', 'attach-steer-ended'])('reports native %s without fallback or borrowed cleanup', async mode => {
  const f = await fixture(mode), mint = vi.spyOn(f.store, 'beginRun'); f.ordinary(); await f.grantPath();
  const grant = vi.spyOn(f.grants[0], 'grant'); f.request('rejected', 'invoke', f.catalog.version);
@@ -99,6 +123,60 @@ it.each(['attach-steer-turn', 'attach-steer-client', 'attach-steer-thread', 'att
  expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1); expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1);
  expect(mint).toHaveBeenCalledTimes(1); expect(grant).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(1);
  expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it('observes an exact terminal after root origin denial so subsequent idle inputs start without fallback', async () => {
+ const f = await fixture('orphan-terminal'), mint = vi.spyOn(f.store, 'beginRun');
+ f.request('orphan', 'invoke', f.catalog.version); expect((await f.result('orphan')).status).toBe('unknown');
+ expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20)).toHaveLength(0);
+ await f.notify(1, 'turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } });
+ f.request('next', 'invoke', f.catalog.version); expect((await f.result('next')).status).toBe('completed');
+ f.request('again', 'invoke', f.catalog.version); expect((await f.result('again')).status).toBe('completed');
+ const wire = await f.lines(); expect(wire.filter(r => r.method === 'turn/start')).toHaveLength(3);
+ expect(wire.filter(r => r.method === 'turn/steer')).toHaveLength(0); expect(wire.filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ expect(mint).toHaveBeenCalledTimes(2); expect(f.frames.filter(x => x.type === 20)).toHaveLength(2); expect(f.frames.filter(x => x.type === 22)).toHaveLength(2);
+ expect((await f.result('orphan')).status).toBe('unknown');
+});
+it.each(['thread', 'turn'])('keeps an unknown active locator after a foreign %s terminal', async foreign => {
+ const f = await fixture('orphan-terminal'), mint = vi.spyOn(f.store, 'beginRun');
+ f.request('orphan', 'invoke', f.catalog.version); expect((await f.result('orphan')).status).toBe('unknown');
+ expect(f.subscriptions.filter(x => x.channel === 1 && x.active)).toHaveLength(1);
+ await f.notify(1, 'turn/completed', { threadId: foreign === 'thread' ? 'other-thread' : 'thread-1', turn: { id: foreign === 'turn' ? 'other-turn' : 'turn-1', status: 'completed', items: [] } });
+ f.request('still-active', 'invoke', f.catalog.version); expect((await f.result('still-active')).status).toBe('unknown');
+ expect((await f.lines()).filter(r => r.method === 'turn/start')).toHaveLength(1);
+ expect((await f.lines()).find(r => r.method === 'turn/steer').params.expectedTurnId).toBe('turn-1');
+ expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20 || x.type === 22)).toHaveLength(0);
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+});
+it('retires only the old locator observer while an old-channel terminal cannot clear the successor', async () => {
+ const f = await fixture('orphan-terminal'), mint = vi.spyOn(f.store, 'beginRun');
+ f.request('orphan', 'invoke', f.catalog.version); expect((await f.result('orphan')).status).toBe('unknown');
+ expect(f.subscriptions.filter(x => x.channel === 1 && x.active)).toHaveLength(1);
+ const generation = f.store.get('u', 'room')!.generation;
+ f.request('reset', 'invoke', f.catalog.version, {}, 'session.reset'); expect((await f.result('reset')).status).toBe('completed');
+ expect(f.subscriptions.filter(x => x.channel === 1 && x.active)).toHaveLength(0);
+ f.setAck(false); f.request('new-owner', 'invoke', f.catalog.version);
+ await waitFor(() => expect(f.frames.filter(x => x.type === 20)).toHaveLength(1));
+ await f.notify(1, 'turn/completed', { threadId: 'thread-2', turn: { id: 'turn-1', status: 'completed', items: [] } });
+ f.request('new-borrower', 'invoke', f.catalog.version);
+ await waitFor(async () => expect((await f.lines()).filter(r => r.method === 'turn/steer')).toHaveLength(1));
+ expect((await f.lines()).find(r => r.method === 'turn/steer').params).toMatchObject({ threadId: 'thread-2', expectedTurnId: 'turn-1' });
+ expect(mint).toHaveBeenCalledTimes(1); f.ackStart();
+ expect((await f.result('new-owner')).status).toBe('completed'); expect((await f.result('new-borrower')).status).toBe('completed');
+ expect(f.store.get('u', 'room')).toMatchObject({ generation: generation + 1, state: 'ready' });
+ expect(f.frames.filter(x => x.type === 22)).toHaveLength(1); expect((await f.result('orphan')).status).toBe('unknown');
+ expect((await f.lines()).filter(r => r.method === 'turn/interrupt')).toHaveLength(0);
+ await f.driver.disconnect(); expect(f.subscriptions.filter(x => x.active)).toHaveLength(0);
+});
+it('unsubscribes on channel close without treating the close as native turn completion', async () => {
+ const f = await fixture('orphan-terminal'), mint = vi.spyOn(f.store, 'beginRun');
+ f.request('orphan', 'invoke', f.catalog.version); expect((await f.result('orphan')).status).toBe('unknown');
+ expect(f.subscriptions.filter(x => x.channel === 1 && x.active)).toHaveLength(1);
+ f.channels[1].close(); expect(f.subscriptions.filter(x => x.channel === 1 && x.active)).toHaveLength(0);
+ const request = vi.spyOn(f.channels[1], 'request'); f.request('closed', 'invoke', f.catalog.version);
+ expect((await f.result('closed')).status).toBe('unknown');
+ expect(request).toHaveBeenCalledWith('turn/steer', expect.objectContaining({ expectedTurnId: 'turn-1' }), expect.any(String));
+ expect(request.mock.calls.some(call => call[0] === 'turn/start')).toBe(false);
+ expect(mint).not.toHaveBeenCalled(); expect(f.frames.filter(x => x.type === 20 || x.type === 22)).toHaveLength(0);
 });
 it('never promotes a steer ACK into new-turn origin when the original START lease was never established', async () => {
  const f = await fixture('orphan'), mint = vi.spyOn(f.store, 'beginRun');

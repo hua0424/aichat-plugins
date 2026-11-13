@@ -8,7 +8,7 @@ import { codexCatalog } from './native-catalog.js';
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
 interface Session {
 	channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; workspace: string; scope: Scope; modelProvider?: string;
-	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>; activeTurnId?: string;
+	references: number; retired: boolean; cacheKey?: string; cleanup?: Promise<void>; activeTurnId?: string; stopObserving?: () => void;
 }
 type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId' | 'selectedModel'>;
 function frozenModel(input: Pick<PreparedRun, 'selectedModel' | 'getSelectedModel'>) {
@@ -185,6 +185,7 @@ export class CodexNativeDriver implements AgentDriver {
 		}));
 	}
 	private async closeSession(session: Session): Promise<void> {
+		session.stopObserving?.();
 		const cleanup = session.cleanup ??= (async () => {
 			try { await session.grants.dispose(); } finally { session.channel.close(); }
 			if (session.cacheKey) this.sessions.delete(session.cacheKey);
@@ -195,6 +196,7 @@ export class CodexNativeDriver implements AgentDriver {
 		const session = await this.sessions.get(key)?.catch(() => undefined);
 		if (!session) { this.sessions.delete(key); return; }
 		session.retired = true;
+		session.stopObserving?.();
 		if (!session.references) await this.closeSession(session);
 	}
 	private async release(session: Session, settled: boolean): Promise<void> {
@@ -273,8 +275,17 @@ export class CodexNativeDriver implements AgentDriver {
 				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId) ||
 				(input.selectedModel && response?.modelProvider !== input.selectedModel.providerID))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
-			return { channel, grants, threadId: thread.id, workspace: input.workspace!, scope, references: 0, retired: false,
+			const session: Session = { channel, grants, threadId: thread.id, workspace: input.workspace!, scope, references: 0, retired: false,
 				modelProvider: typeof response?.modelProvider === 'string' ? response.modelProvider : undefined };
+			// A request may leave unknown before its turn finishes; keep locator-only observation with the session.
+			const offTerminal = channel.onNotification((method, params) => {
+				const frame = object(params);
+				if (method === 'turn/completed' && frame?.threadId === session.threadId && object(frame.turn)?.id === session.activeTurnId)
+					session.activeTurnId = undefined;
+			});
+			const offClose = channel.onClose(() => session.stopObserving?.());
+			session.stopObserving = () => { offTerminal(); offClose(); session.stopObserving = undefined; };
+			return session;
 		} catch (error) { try { await grants.dispose(); } finally { channel.close(); } throw error; }
 	}
 }
@@ -346,7 +357,6 @@ class CodexNativeRun implements AgentRun {
 			unsubscribe = session.channel.onNotification((method, params) => {
 				const frame = object(params);
 				if (frame?.threadId !== session.threadId || this.channelFailure) return;
-				if (method === 'turn/completed' && object(frame.turn)?.id === session.activeTurnId) session.activeTurnId = undefined;
 				const item = object(frame.item);
 				if (this.submitted && ['item/started', 'item/completed'].includes(method) && item?.type === 'userMessage' && item.clientId === input.runId) {
 					if (typeof item.id !== 'string' || !item.id || typeof frame.turnId !== 'string' || !frame.turnId ||
@@ -392,6 +402,7 @@ class CodexNativeRun implements AgentRun {
 				raw = await session.channel.request(submission.method, { threadId: session.threadId, clientUserMessageId: input.runId,
 					...(expectedTurnId ? { expectedTurnId } : {}), input: this.command?.items ?? [{ type: 'text', text: input.message, text_elements: [] }] }, submission.requestId);
 			} catch (error) {
+				if (this.channelFailure) throw new Error(this.channelFailure);
 				this.submissionRejected = !!expectedTurnId && error instanceof Error && error.message === 'CODEX_NATIVE_REQUEST_FAILED';
 				throw error;
 			}
