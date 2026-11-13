@@ -78,8 +78,13 @@ describe('Codex 0.142.3 continuous app-server channel', () => {
 	it('reports missing RPC result as unknown and never resends the request', async () => {
 		const { channel, wire } = await create({}, 2000);
 		await channel.start();
-		await expect(channel.request('no-response', { threadId: 't' })).rejects.toThrow('CODEX_RESULT_UNKNOWN');
-		expect((await wire()).filter((frame) => frame.method === 'no-response')).toHaveLength(1);
+		const pending = channel.request('no-response', { threadId: 't' }, 'journal-reset-1');
+		await expect(channel.request('no-response', { threadId: 't' }, 'journal-reset-1')).rejects.toThrow('CODEX_REQUEST_ID_CONFLICT');
+		await expect(pending).rejects.toThrow('CODEX_RESULT_UNKNOWN');
+		await expect(channel.request('no-response', { threadId: 't' }, 'journal-reset-1')).rejects.toThrow('CODEX_REQUEST_ID_CONFLICT');
+		expect((await wire()).filter((frame) => frame.method === 'no-response')).toEqual([
+			{ id: 'journal-reset-1', method: 'no-response', params: { threadId: 't' } },
+		]);
 		expect(await channel.request('pid', {})).toHaveProperty('pid');
 	});
 	it('fails closed on malformed protocol and rejects pending requests', async () => {

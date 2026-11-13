@@ -8,6 +8,8 @@ export class CodexAppServer {
 	private readonly pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
 	private readonly listeners = new Set<(method: string, params: unknown) => void>();
 	private readonly closeListeners = new Set<() => void>();
+	/** Explicit journal IDs remain tombstones after timeout; a late native reply must never match a replay. */
+	private readonly coreRequestIds = new Set<string>();
 	private startPromise?: Promise<void>;
 	private closed = false;
 	constructor(private readonly options: {
@@ -79,9 +81,11 @@ export class CodexAppServer {
 		});
 	}
 
-	request(method: string, params: unknown): Promise<unknown> {
+	request(method: string, params: unknown, coreRequestId?: string): Promise<unknown> {
 		if (this.closed || !this.child) return Promise.reject(new Error('CODEX_CHANNEL_CLOSED'));
-		const id = randomUUID();
+		const id = coreRequestId ?? randomUUID();
+		if (!id || this.pending.has(id) || this.coreRequestIds.has(id)) return Promise.reject(new Error('CODEX_REQUEST_ID_CONFLICT'));
+		if (coreRequestId !== undefined) this.coreRequestIds.add(id);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.pending.delete(id);

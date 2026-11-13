@@ -1,10 +1,19 @@
-import type { AgentDriver, AgentEvent, AgentRun, NativeRef, PreparedRun } from '../events.js';
+import { createHash } from 'node:crypto';
+import type { AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult, AgentDriver, AgentEvent, AgentRun, NativeRef, PreparedRun } from '../events.js';
+import { capabilityParameters } from '../capability-parameters.js';
 import { CodexAppServer } from './app-server.js';
 import { prepareCodexScope } from './codex-driver.js';
 import { CodexTurnGrants, codexHookConfig } from './turn-grants.js';
 
 type Scope = Awaited<ReturnType<typeof prepareCodexScope>>;
 interface Session { channel: CodexAppServer; grants: CodexTurnGrants; threadId: string; scope: Scope }
+type SessionInput = Pick<PreparedRun, 'conversation' | 'systemPrompt' | 'workspace' | 'saveRecovery' | 'runId'>;
+function sessionState(session: Session, workspace: string) {
+	return { version: 1, value: {
+		...(session.scope.frozenPrompt !== undefined ? { originalPrompt: session.scope.systemPrompt, legacyConfirmationRequired: false } : {}),
+		threadId: session.threadId, promptHash: session.scope.digest, workspace, nativeControls: true,
+	} };
+}
 
 /** Clear sibling/previous run aliases before spawning a persistent native process. */
 export function codexNativeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -26,11 +35,65 @@ export class CodexNativeDriver implements AgentDriver {
 	readonly type = 'codex';
 	readonly features = { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' } as const;
 	private readonly sessions = new Map<string, Promise<Session>>();
+	private discovery?: CodexAppServer;
 	constructor(private readonly deps: { command: string; env: NodeJS.ProcessEnv; model?: string;
 		createChannel?: (args: string[], env: NodeJS.ProcessEnv) => CodexAppServer;
 		createGrants?: () => Promise<CodexTurnGrants> }) {}
 	async connect(): Promise<void> {}
+	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		if (!input.workspace) throw new Error('workspace_required');
+		input.signal.throwIfAborted();
+		this.discovery ??= this.deps.createChannel?.([], codexNativeEnv(this.deps.env)) ??
+			new CodexAppServer({ command: this.deps.command, env: codexNativeEnv(this.deps.env) });
+		await this.discovery.start();
+		input.signal.throwIfAborted();
+		// This staged adapter advertises only the proven control, never a synthetic compact success.
+		return { version: createHash('sha256').update(JSON.stringify(['codex-native-reset-v1', '0.142.3', input.workspace])).digest('hex'),
+			framework: 'codex', runtimeVersion: '0.142.3', capabilities: [
+				{ id: 'session.reset', kind: 'command', name: 'New Codex thread', supported: true, executable: true,
+					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' },
+				{ id: 'session.compact', kind: 'command', name: 'Compact Codex context', supported: false, executable: false,
+					reason: 'native_request_and_summary_attribution_unproven', defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' },
+			] };
+	}
+	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		if (input.recovery) return input.recovery.receipt; // Read-only replay; unknown never starts another thread.
+		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
+		catch { return { status: 'failed', error: 'invalid_parameters' }; }
+		if (input.capabilityId !== 'session.reset') return { status: 'unsupported', error: 'execution_not_connected' };
+		const catalog = await this.discoverCapabilities(input);
+		if (catalog.version !== input.catalogVersion) return { status: 'failed', error: 'catalog_stale' };
+		const execution = input.execution;
+		if (!execution || !input.workspace) return { status: 'unsupported', error: 'execution_not_connected' };
+		const generation = String(execution.conversation.generation);
+		const previous = object(execution.conversation.nativeState?.value)?.threadId;
+		const nativeRef = typeof previous === 'string' ? { sessionId: previous } : undefined;
+		// Explicit reset uses the currently prepared persona, never silently resumes an unverified old thread.
+		const fresh: SessionInput = { runId: execution.requestId, workspace: input.workspace, systemPrompt: execution.systemPrompt,
+			conversation: { ...execution.conversation, nativeState: undefined }, saveRecovery: execution.saveRecovery };
+		const scope = await prepareCodexScope(fresh);
+		execution.conversation.assertCurrent(); input.signal.throwIfAborted();
+		await execution.submitted(nativeRef);
+		let created: Session | undefined;
+		try {
+			created = await this.open(fresh, scope);
+			if (created.threadId === previous) throw new Error('CODEX_NATIVE_RESET_REUSED_THREAD');
+			await execution.saveRecovery({ version: 1, value: { provider: 'codex', createdThreadId: created.threadId,
+				workspace: input.workspace, previousThreadId: previous ?? null } });
+			execution.conversation.assertCurrent();
+			const next = await execution.replaceSession(created.threadId, sessionState(created, input.workspace));
+			this.sessions.set(JSON.stringify([execution.conversation.id, next]), Promise.resolve(created));
+			return { status: 'completed', generation, nativeRef, effect: { kind: 'reset', sessionId: created.threadId, generation: String(next) },
+				text: 'New native Codex thread selected. Previous work and history are retained; no stop is claimed.' };
+		} catch {
+			let revokeFailed = false;
+			if (created) { try { await created.grants.revokeAll(); } catch { revokeFailed = true; } finally { created.channel.close(); } }
+			return { status: 'unknown', generation, nativeRef, error: revokeFailed ? 'CODEX_GRANT_REVOKE_FAILED' : 'native_request_failed',
+				text: 'Native reset outcome unconfirmed. Retain the recorded thread evidence; do not automatically retry.' };
+		}
+	}
 	async disconnect(): Promise<void> {
+		this.discovery?.close();
 		await Promise.all([...this.sessions.values()].map(async (pending) => {
 			const session = await pending.catch(() => undefined);
 			if (session) { try { await session.grants.revokeAll(); } finally { session.channel.close(); } }
@@ -52,12 +115,18 @@ export class CodexNativeDriver implements AgentDriver {
 				throw new Error('CODEX_NATIVE_SCOPE_CHANGED: explicit reset required');
 			return session;
 		}
-		const pending = this.open(input, scope);
+		const pending = this.open(input, scope).then(async (session) => {
+			try {
+				if (!input.conversation.registerNative) throw new Error('Codex atomic native registration unavailable');
+				await input.conversation.registerNative(session.threadId, sessionState(session, input.workspace!));
+				return session;
+			} catch (error) { try { await session.grants.revokeAll(); } finally { session.channel.close(); } throw error; }
+		});
 		// Keep failed admission too: an unknown native start/resume must not be blindly retried.
 		this.sessions.set(key, pending);
 		return pending;
 	}
-	private async open(input: PreparedRun, scope: Scope): Promise<Session> {
+	private async open(input: SessionInput, scope: Scope): Promise<Session> {
 		const grants = await (this.deps.createGrants?.() ?? CodexTurnGrants.create());
 		const args = codexHookFlags(codexHookConfig(grants.command()));
 		const env = codexNativeEnv(this.deps.env);
@@ -72,16 +141,11 @@ export class CodexNativeDriver implements AgentDriver {
 				...(scope.threadId ? { threadId: scope.threadId } : {}), cwd: input.workspace,
 				developerInstructions: scope.systemPrompt, approvalPolicy: 'never', sandbox: 'danger-full-access',
 				...(this.deps.model ? { model: this.deps.model } : {}),
-			});
+			}, input.runId);
 			const response = object(raw), thread = object(response?.thread);
 			if (typeof thread?.id !== 'string' || !thread.id || thread.cliVersion !== '0.142.3' ||
 				thread.cwd !== input.workspace || (scope.threadId && thread.id !== scope.threadId))
 				throw new Error('CODEX_NATIVE_THREAD_UNVERIFIED');
-			if (!input.conversation.registerNative) throw new Error('Codex atomic native registration unavailable');
-			await input.conversation.registerNative(thread.id, { version: 1, value: {
-				...(scope.frozenPrompt !== undefined ? { originalPrompt: scope.systemPrompt, legacyConfirmationRequired: false } : {}),
-				threadId: thread.id, promptHash: scope.digest, workspace: input.workspace, nativeControls: true,
-			} });
 			return { channel, grants, threadId: thread.id, scope };
 		} catch (error) { try { await grants.revokeAll(); } finally { channel.close(); } throw error; }
 	}

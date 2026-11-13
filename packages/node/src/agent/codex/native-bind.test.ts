@@ -4,7 +4,7 @@ import { CapabilityRegistry, sendMessageCapability } from '../../capability/regi
 import type { HulaApiClient } from '../../api/hula-api.js';
 import { handleSendMessage } from '../../commands/send-message.js';
 import { postCapability } from '../../capability/client.js';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ConversationStore, type ConversationRecord } from '../../capability/conversations.js';
@@ -29,6 +29,28 @@ function env(marker: boolean, token?: string) {
 }
 
 describe('persistent Codex reply binding fail-closed boundary', () => {
+	it('upgrades a nativeControls-only snapshot before exposure and deleteNative cannot remove that sticky fence', async () => {
+		const home = await mkdtemp(join(tmpdir(), 'aichat-codex-fence-upgrade-'));
+		const options = { home, serverNamespace: 'server', activeUids: new Set(['owner']), activeProviders: new Map([['owner', 'codex']]) };
+		let store = new ConversationStore(options);
+		try {
+			store.registerNative('codex', 'old-snapshot', 'owner', 'trusted-room', { threadId: 'old-snapshot', workspace: home,
+				promptHash: 'a'.repeat(64), nativeControls: true });
+			store.close();
+			const file = join(home, 'conversations.json');
+			const snapshot = JSON.parse(await readFile(file, 'utf8'));
+			delete snapshot.records[0].replyBindingRequired;
+			await writeFile(file, JSON.stringify(snapshot));
+			store = new ConversationStore(options);
+			expect(store.get('owner', 'trusted-room')?.replyBindingRequired).toBe(true);
+			expect(JSON.parse(await readFile(file, 'utf8')).records[0].replyBindingRequired).toBe(true);
+			store.deleteNative('codex', 'owner', 'trusted-room');
+			expect(store.get('owner', 'trusted-room')?.nativeState).toEqual({});
+			expect(store.get('owner', 'trusted-room')?.replyBindingRequired).toBe(true);
+			store.close(); store = new ConversationStore(options);
+			expect(store.get('owner', 'trusted-room')?.replyBindingRequired).toBe(true);
+		} finally { store.close(); await rm(home, { recursive: true, force: true }); }
+	});
 	it('persists the strict fence across native reset, old leased aliases, legacy reset and restart', async () => {
 		const home = await mkdtemp(join(tmpdir(), 'aichat-codex-fence-'));
 		const options = { home, serverNamespace: 'server', activeUids: new Set(['owner']), activeProviders: new Map([['owner', 'codex']]) };
