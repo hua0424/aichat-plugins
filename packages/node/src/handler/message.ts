@@ -515,21 +515,66 @@ export class MessageHandler {
 			requestIds: [request.requestId], relation: 'attached', phase: receipt.status === 'completed' ? 'completed' : 'failed' });
 	}
 
-	private bindCommandTurn(request: AgentCommandRequest, turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }> {
+	private bindCommandTurn(request: AgentCommandRequest, turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }> {
+		const store = this.getConversations(), codex = this.driver.type === 'codex';
+		const validateCodex = () => {
+			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
+			const control = store.getControl(this.selfUid, request.roomId, request.requestId);
+			const proof = control?.recovery?.value as { provider?: string; runId?: string; nativeRef?: NativeRef;
+				submission?: { method?: string; requestId?: string; threadId?: string }; inputProof?: { itemId?: string; turnId?: string } } | undefined;
+			const ref = turn.nativeRef;
+			if (record.adapterInstanceId !== 'codex' || record.conversationId !== turn.conversationId || record.identityId !== this.selfUid ||
+				!request.context.authorizationEpoch || control?.authorizationEpoch !== request.context.authorizationEpoch ||
+				control.generation !== turn.generation || control.state !== 'submitted' || turn.phase !== 'bound' ||
+				turn.requestIds.length !== 1 || turn.requestIds[0] !== request.requestId || !ref.turnId || !ref.inputId || ref.parentId || ref.messageId ||
+				record.nativeState.codex?.threadId !== ref.sessionId || proof?.provider !== 'codex' || proof.runId !== request.requestId ||
+				proof.submission?.method !== 'turn/start' || proof.submission.requestId !== `${request.requestId}:turn` || proof.submission.threadId !== ref.sessionId ||
+				proof.nativeRef?.sessionId !== ref.sessionId || proof.nativeRef.turnId !== ref.turnId || proof.nativeRef.inputId !== ref.inputId ||
+				proof.inputProof?.itemId !== ref.inputId || proof.inputProof.turnId !== ref.turnId)
+				throw new Error('native Codex input proof unconfirmed');
+			return record;
+		};
+		if (codex) { try { validateCodex(); } catch (error) { return Promise.reject(error); } }
 		const key = this.nativeKey(turn.conversationId, turn.generation, turn.nativeRef);
 		if (this.nativeTerminal.has(key)) {
+			if (codex) return Promise.reject(new Error('native Codex turn already terminal'));
 			const completed = this.nativeTerminal.get(key);
 			return completed && this.getConversations().resolveReplyBinding(completed.token)
 				? Promise.resolve(completed) : Promise.reject(new Error('completed native binding unavailable'));
 		}
+		const validateLease = (binding: { token: string; runId: string; thinkingId: string }) => {
+			const record = validateCodex(), lease = store.resolveReplyBinding(binding.token);
+			const context = store.resolveReplyContext(binding.token, [{ provider: 'codex', nativeId: turn.nativeRef.sessionId }]);
+			const original = record.pendingRuns?.find((r) => r.runId === binding.runId && r.generation === turn.generation);
+			const recovery = original?.recovery?.value as { provider?: string; nativeRef?: NativeRef; submission?: { method?: string; threadId?: string } } | undefined;
+			if (!lease || lease.runId !== binding.runId || lease.thinkingId !== binding.thinkingId || lease.generation !== turn.generation ||
+				lease.conversationId !== record.conversationId || lease.authorizationEpoch !== request.context.authorizationEpoch ||
+				context?.identityId !== this.selfUid || context.roomId !== request.roomId || context.conversationId !== record.conversationId ||
+				context.generation !== turn.generation || recovery?.provider !== 'codex' || recovery.submission?.method !== 'turn/start' ||
+				recovery.submission.threadId !== turn.nativeRef.sessionId || recovery.nativeRef?.sessionId !== turn.nativeRef.sessionId || recovery.nativeRef.turnId !== turn.nativeRef.turnId)
+				throw new Error('original native Codex START lease unconfirmed');
+		};
 		const existing = this.nativeBindings.get(key);
-		if (existing) return existing;
+		if (existing) return !codex ? existing : existing.then((binding) => {
+			validateLease(binding);
+			return { ...binding, relation: 'attached' as const };
+		});
 		const pending = (async () => {
-			const store = this.getConversations();
 			const record = store.assertGeneration(this.selfUid, request.roomId, turn.generation);
-			if (record.conversationId !== turn.conversationId || !turn.nativeRef.messageId || !turn.nativeRef.inputId || turn.nativeRef.parentId !== turn.nativeRef.inputId) throw new Error('native turn association unconfirmed');
+			if (codex) {
+				validateCodex();
+				if (record.pendingRuns?.some(run => {
+					const original = run.recovery?.value as { provider?: string; nativeRef?: NativeRef } | undefined;
+					return original?.provider === 'codex' && original.nativeRef?.sessionId === turn.nativeRef.sessionId && original.nativeRef.turnId === turn.nativeRef.turnId;
+				})) throw new Error('original native Codex owner exists but its START lease is unconfirmed');
+			}
+			else if (record.conversationId !== turn.conversationId || !turn.nativeRef.messageId || !turn.nativeRef.inputId || turn.nativeRef.parentId !== turn.nativeRef.inputId) throw new Error('native turn association unconfirmed');
 			const runId = randomUUID();
 			const bound = store.beginRun(this.selfUid, request.roomId, runId, { authorizationEpoch: request.context.authorizationEpoch, nativeTurn: turn.nativeRef });
+			if (codex) {
+				await bound.saveRecovery(store.getControl(this.selfUid, request.roomId, request.requestId)!.recovery!);
+				validateCodex();
+			}
 			// This lifecycle is created AFTER native proof; it does not submit another AgentRun.
 			const agent: AgentRun = { events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => ({ status: 'unsupported' }), dispose: async () => {} };
 			const session: ThinkingSession = { sessionKey: `native:${key}`, thinkingId: '', roomId: request.roomId, triggerMsgId: '',
@@ -545,7 +590,8 @@ export class MessageHandler {
 				this.forgetThinkingStart(runId); store.markStopUnconfirmed(runId);
 				throw new Error('native START receipt unconfirmed');
 			}
-			return { token: bound.replyToken, runId, thinkingId: outcome.thinkingId };
+			if (codex) validateLease({ token: bound.replyToken, runId, thinkingId: outcome.thinkingId });
+			return { token: bound.replyToken, runId, thinkingId: outcome.thinkingId, ...(codex ? { relation: 'new' as const } : {}) };
 		})();
 		this.nativeBindings.set(key, pending);
 		return pending;
@@ -1125,6 +1171,18 @@ export class MessageHandler {
 					onNativeBound: (ref) => {
 						const key = this.nativeKey(bound.conversationId, bound.generation, ref);
 						if (!session.thinkingId) throw new Error('START not ready');
+						if (this.driver.type === 'codex') {
+							const recovery = store.get(this.selfUid, roomId)?.pendingRuns?.find(run => run.runId === id)?.recovery;
+							const value = recovery?.value as { provider?: string; runId?: string; submission?: { method?: string; requestId?: string; threadId?: string } } | undefined;
+							if (!ref.turnId || recovery?.version !== 1 || value?.provider !== 'codex' || value.runId !== id ||
+								value.submission?.method !== 'turn/start' || value.submission.requestId !== `${id}:turn` || value.submission.threadId !== ref.sessionId)
+								throw new Error('original native submission unconfirmed');
+							// Existing pending run + frozen START lease, not a second admission/journal. No await before map visibility.
+							bound.saveRecovery({ ...recovery, value: { ...value, nativeRef: ref } });
+							bound.assertReplySettlement(ref);
+							if (this.nativeBindings.has(key) && this.nativeThinking.get(key)?.run?.id !== id)
+								throw new Error('native Codex turn already has a different original START lease');
+						}
 						this.nativeBindings.set(key, Promise.resolve({ token: bound.replyToken, runId: id, thinkingId: session.thinkingId }));
 						this.nativeThinking.set(key, session);
 					},

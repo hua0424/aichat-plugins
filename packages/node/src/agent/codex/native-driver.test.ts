@@ -163,7 +163,8 @@ describe('Codex persistent native ordinary-message vertical', () => {
 		const run = f.driver.createRun(f.input);
 		expect(await collect(run.events)).toEqual([{ type: 'error', message: expect.stringContaining('NATIVE_OUTCOME_UNKNOWN:') }]);
 		await run.dispose();
-		expect(f.onNativeBound).not.toHaveBeenCalled();
+		// The first genuine proof registers the ordinary owner synchronously; later conflict still issues zero grants.
+		expect(f.onNativeBound).toHaveBeenCalledTimes(proof === 'conflict' ? 1 : 0);
 		expect((await readdir(f.grants.directory)).filter((name) => name.endsWith('.env'))).toEqual([]);
 		expect((await f.wire()).filter((r) => r.method === 'turn/start')).toHaveLength(1);
 		expect((await f.wire()).filter((r) => r.method === 'turn/interrupt')).toEqual([]);

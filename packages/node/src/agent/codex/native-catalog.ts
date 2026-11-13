@@ -70,11 +70,11 @@ export async function codexCatalog(channel: CodexAppServer, workspace: string, s
 		names.add(skill.name);
 		const ambiguous = counts.get(skill.name)! > 1;
 		capabilities.push({ id: `skill:${skill.name}`, kind: 'skill', name: skill.name, description: skill.description,
-			supported: skill.enabled && !ambiguous, executable: false,
-			reason: ambiguous ? 'native_skill_namespace_ambiguous' : !skill.enabled ? 'native_skill_disabled' : 'execution_not_connected',
+			supported: skill.enabled && !ambiguous, executable: skill.enabled && !ambiguous,
+			...(ambiguous ? { reason: 'native_skill_namespace_ambiguous' } : !skill.enabled ? { reason: 'native_skill_disabled' } : {}),
 			defaultVisibility: 'public', scope: 'workspace', source: 'skill', parameters: [{ name: 'arguments', type: 'string', required: false }] });
 	}
 	const catalog: AgentCapabilityCatalog = { framework: 'codex', runtimeVersion: '0.142.3', capabilities,
 		version: createHash('sha256').update(JSON.stringify(['codex-native-catalog-v1', '0.142.3', cwd, provider ?? null, inventory, nativeModels])).digest('hex') };
-	return { catalog, models, provider };
+	return { catalog, models, provider, skills: inventory };
 }

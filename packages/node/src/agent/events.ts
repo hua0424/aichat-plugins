@@ -150,7 +150,7 @@ export interface CapabilityExecution {
 	replaceSession(id: string, state: { version: number; value: unknown }, expectedModel?: { providerID: string; modelID: string } | null): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
 	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
-	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }>;
+	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
 }
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */

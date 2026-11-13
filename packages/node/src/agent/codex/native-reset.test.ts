@@ -156,7 +156,8 @@ describe('native Codex reset uses a fresh thread and generation CAS', () => {
 		const ref = await old.native;
 		expect(ref).toEqual({ sessionId: oldThread, turnId: 'turn-1' });
 		expect(() => old.bound.assertCurrent()).toThrow('STALE_GENERATION');
-		expect(() => old.bound.assertReplySettlement(ref)).not.toThrow();
+		// onNativeBound now announces real proof before ACK/recovery IO; grant settlement remains gated on durable recovery.
+		await vi.waitFor(() => expect(() => old.bound.assertReplySettlement(ref)).not.toThrow());
 		expect(() => old.bound.assertReplySettlement({ ...ref, turnId: 'not-this-turn' })).toThrow('NATIVE_REPLY_SETTLEMENT_UNCONFIRMED');
 		expect(() => old.bound.assertReplySettlement({ ...ref, sessionId: String(fresh.nativeState.codex.threadId) })).toThrow();
 		expect(f.store.resolveReplyBinding(old.bound.replyToken)).toMatchObject({ runId: 'old', generation: old.bound.generation, thinkingId: 'thinking-old', authorizationEpoch: 'epoch' });

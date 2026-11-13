@@ -115,7 +115,7 @@ describe('Codex native catalog and model control', () => {
 		const query = await f.discover({ query: 'model-204' }); expect(query.models!.items.map((m) => m.modelId)).toEqual(['model-204']); expect(query.version).toBe(first.version);
 		const pages = (await f.lines()).filter((x) => x.method === 'model/list');
 		expect(pages.slice(0, 3).map((x) => x.params)).toEqual([{ limit: 100, includeHidden: true }, { limit: 100, includeHidden: true, cursor: '100' }, { limit: 100, includeHidden: true, cursor: '200' }]);
-		expect(JSON.stringify(first)).not.toContain(f.skillPath); expect(first.capabilities.find((c) => c.id === 'skill:local-skill')).toMatchObject({ supported: true, executable: false, reason: 'execution_not_connected' });
+		expect(JSON.stringify(first)).not.toContain(f.skillPath); expect(first.capabilities.find((c) => c.id === 'skill:local-skill')).toMatchObject({ supported: true, executable: true });
 	});
 	it('round-trips an opaque native cursor longer than public model identifiers without truncating inventory', async () => {
 		const f = await fixture('long-cursor'), catalog = await f.discover();
@@ -131,7 +131,7 @@ describe('Codex native catalog and model control', () => {
 		data.pop(); data[0].enabled = false; await writeFile(f.inventory, JSON.stringify(data));
 		expect((await f.discover()).capabilities.find((c) => c.id === 'skill:local-skill')).toMatchObject({ supported: false, executable: false, reason: 'native_skill_disabled' });
 	});
-	it('rejects untrusted UI cwd/path before native discovery and leaves skills unconnected', async () => {
+	it('rejects untrusted UI cwd/path before native discovery or model mutation', async () => {
 		const f = await fixture(); await expect(f.discover({ path: f.skillPath })).rejects.toThrow('invalid_parameters'); expect(await f.lines()).toEqual([]);
 		const request = await f.invoke('bad-path', { providerId: 'openai', modelId: 'model-204', cwd: f.home });
 		expect(await f.driver.executeCapability(request)).toMatchObject({ status: 'failed', error: 'invalid_parameters' }); expect((await f.lines()).some((x) => x.method === 'thread/start')).toBe(false);
