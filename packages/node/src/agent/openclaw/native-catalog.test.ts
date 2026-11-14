@@ -277,6 +277,20 @@ describe('catalog native boundaries', () => {
   expect((await f.discover('old-generation')).catalog!.discovery?.coverage).toBe('unavailable');
   expect(f.socket.sent.filter(r => r.method === 'commands.list')).toHaveLength(0);
  });
+ it('preserves valid-owner discovery while denying stale request epoch and generation', async () => {
+  const f = await fixture(); const record = f.store.get('1', '2')!;
+  expect(record.generation).toBeGreaterThan(0);
+  const context = { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch', expectedGeneration: String(record.generation) };
+  expect((await f.discover('current-owner', { context })).catalog!.discovery?.coverage).toBe('complete');
+  const nativeQueries = f.socket.sent.filter(frame => frame.method === 'commands.list').length;
+  for (const [requestId, patch] of [['stale-request-epoch', { authorizationEpoch: 'old-epoch' }], ['stale-request-generation', { expectedGeneration: String(record.generation - 1) }]] as const) {
+   const denied = await f.discover(requestId, { context: { ...context, ...patch } });
+   expect(denied.catalog!.discovery?.coverage).toBe('unavailable');
+   expect(denied.catalog!.capabilities).toEqual([]);
+  }
+  expect(f.socket.sent.filter(frame => frame.method === 'commands.list')).toHaveLength(nativeQueries);
+  expect(f.frames.filter(frame => frame.type === 20)).toHaveLength(1);
+ });
  it('rejects original-run metadata after the current identity epoch changes', async () => {
   const f = await fixture(); await f.setEpoch('epoch-2');
   expect((await f.discover('old-run-new-epoch')).catalog!.discovery?.coverage).toBe('unavailable');

@@ -1,21 +1,46 @@
 import { describe, expect, it, vi } from 'vitest';
 import { MessageHandler } from './message.js';
 import type { RunDriver } from '../agent/events.js';
+import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
 
-function fixture() {
+function fixture(adapter?: RunDriver) {
 	const catalog = { version: 'catalog-v1', framework: 'test', runtimeVersion: 'native-v1', capabilities: [] };
 	const driver = { type: 'test', discoverCapabilities: vi.fn(async () => catalog), executeCapability: vi.fn(async () => ({ status: 'completed', text: 'models' })), createRun: vi.fn() };
 	const api = { reportAgentCommandResult: vi.fn(async () => {}), signDownload: vi.fn() };
 	const ws = { send: vi.fn() };
-	const handler = new MessageHandler(ws as unknown as HulaWSClient, driver as unknown as RunDriver, '42', api as unknown as HulaApiClient,
-		{ waitMs: 1, maxWaitMs: 1 }, () => {}, () => { throw new Error('No chat state should be touched'); }, '/work');
-	return { handler, driver, api, ws, catalog };
+	const getConversations = vi.fn(() => { throw new Error('No chat state should be touched'); });
+	const handler = new MessageHandler(ws as unknown as HulaWSClient, adapter ?? driver as unknown as RunDriver, '42', api as unknown as HulaApiClient,
+		{ waitMs: 1, maxWaitMs: 1 }, () => {}, getConversations, '/work');
+	return { handler, driver, api, ws, catalog, getConversations };
 }
 const request = { requestId: 'request-1', roomId: 'room-1', aiclawUid: '42', operation: 'discover', context: { roomType: 2, counterpartUid: '9007199254740993', isOwner: false } };
 
 describe('structured command conversation boundary', () => {
+	it('does not read optional conversation state for discovery without an authorization epoch', async () => {
+		const { handler, driver, api, catalog, getConversations } = fixture();
+		handler.handle({ type: 'agentCommand', data: request });
+		await vi.waitFor(() => expect(api.reportAgentCommandResult).toHaveBeenCalledOnce());
+		expect(getConversations).not.toHaveBeenCalled();
+		expect(driver.discoverCapabilities).toHaveBeenCalledOnce();
+		expect(api.reportAgentCommandResult).toHaveBeenCalledWith({ requestId: request.requestId, roomId: request.roomId, status: 'completed', catalog });
+	});
+	it('keeps a throwing optional lookup unavailable without inventing an OpenClaw owner', async () => {
+		const createSocket = vi.fn(() => { throw new Error('No native transport should be opened'); });
+		const native = new OpenclawDriver('ws://unused.invalid', '', createSocket);
+		const discover = vi.spyOn(native, 'discoverCapabilities');
+		const { handler, api, getConversations } = fixture(native);
+		handler.handle({ type: 'agentCommand', data: { ...request, context: { ...request.context, authorizationEpoch: 'epoch' } } });
+		await vi.waitFor(() => expect(api.reportAgentCommandResult).toHaveBeenCalledOnce());
+		expect(getConversations).toHaveBeenCalledOnce();
+		expect(discover).toHaveBeenCalledWith(expect.objectContaining({ conversation: undefined }));
+		expect(api.reportAgentCommandResult).toHaveBeenCalledWith({ requestId: request.requestId, roomId: request.roomId, status: 'completed', catalog: expect.objectContaining({
+			framework: 'openclaw', capabilities: [], discovery: { source: 'native', coverage: 'unavailable', reason: 'context_unavailable' },
+		}) });
+		expect(createSocket).not.toHaveBeenCalled();
+		handler.destroy();
+	});
 	it('rejects conflicts, forged identity and unsupported drivers without native submission', async () => {
 		const { handler, driver, api } = fixture();
 		handler.handle({ type: 'agentCommand', data: request });

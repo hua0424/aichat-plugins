@@ -399,16 +399,21 @@ export class MessageHandler {
 	}
 
 	private discoveryConversation(request: AgentCommandRequest) {
-		const store = this.getConversations(), record = store.get(this.selfUid, request.roomId), epoch = request.context.authorizationEpoch;
-		if (!record || !epoch || record.adapterInstanceId !== this.driver.type) return undefined;
-		const assertCurrent = () => {
-			const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
-			if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-				this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch ||
-				(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
-				throw new Error('discovery context changed');
-		};
-		try { assertCurrent(); return { id: record.conversationId, generation: record.generation, assertCurrent }; } catch { return undefined; }
+		const epoch = request.context.authorizationEpoch;
+		if (!epoch) return undefined;
+		try {
+			const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
+			if (!record || record.adapterInstanceId !== this.driver.type) return undefined;
+			const assertCurrent = () => {
+				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
+				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
+					this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch ||
+					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
+					throw new Error('discovery context changed');
+			};
+			assertCurrent();
+			return { id: record.conversationId, generation: record.generation, assertCurrent };
+		} catch { return undefined; }
 	}
 
 	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
