@@ -3,6 +3,8 @@
  * 仅声明 aichat-claw 实际使用的类型，避免依赖完整 openclaw 源码
  */
 
+export type PluginJsonValue = null | boolean | number | string | PluginJsonValue[] | { [key: string]: PluginJsonValue };
+
 export interface PluginLogger {
 	info(msg: string, ...args: unknown[]): void;
 	warn(msg: string, ...args: unknown[]): void;
@@ -13,6 +15,12 @@ export interface PluginLogger {
 export interface OpenClawPluginApi {
 	logger: PluginLogger;
 	registerChannel(opts: { plugin: ChannelPlugin }): void;
+	runContext?: {
+		getRunContext(params: { runId: string; namespace: string }): PluginJsonValue | undefined;
+		setRunContext(patch: { runId: string; namespace: string; value: PluginJsonValue }): boolean;
+	};
+	registerGatewayMethod?(method: string, handler: (opts: { params: Record<string, unknown>; respond: (ok: boolean, value?: unknown) => void }) => void, opts: { scope: 'operator.read' }): void;
+	agent?: { events: { registerAgentEventSubscription(subscription: { id: string; streams: string[]; handle: (event: { runId: string; stream: string; data: Record<string, unknown> }) => void }): void } };
 	/**
 	 * 注册 openclaw plugin hook（REQ-010 S6 Phase-2 实测可用）。
 	 * `resolve_exec_env` 的真实 handler 签名为 `(event, ctx)`（ctx 是第 2 个参数），
@@ -32,6 +40,7 @@ export interface OpenClawPluginApi {
 		handler: BeforeToolCallHandler,
 		opts?: { priority?: number },
 	): void;
+	on(event: 'before_prompt_build', handler: (event: unknown, ctx?: BeforePromptBuildCtx) => Promise<void>, opts?: { priority?: number }): void;
 }
 
 /**
@@ -63,6 +72,11 @@ export interface BeforeToolCallEvent {
 	params?: unknown;
 	runId?: unknown;
 	toolCallId?: unknown;
+}
+
+export interface BeforePromptBuildCtx extends Record<string, unknown> {
+	runId?: unknown; agentId?: unknown; sessionKey?: unknown; sessionId?: unknown; workspaceDir?: unknown;
+	modelProviderId?: unknown; modelId?: unknown;
 }
 
 export interface BeforeToolCallCtx {

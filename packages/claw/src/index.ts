@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from './types.js';
 import { hulaChannel } from './channel/index.js';
 import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
 import { handleBeforeToolCall } from './run-exec-bridge.js';
+import { registerGatewayContext } from './gateway-context.js';
 
 /**
  * aichat-claw Plugin 入口（aichatoverview#161 — ADR-0004 收尾；#406 追加 exec 可信桥）
@@ -29,6 +30,7 @@ export default function register(api: OpenClawPluginApi) {
 	// resolveAgentSessionKey() 读它 → 发 `openclaw:<token>` 给 node CapabilityEndpoint 精确反查。
 	// 非良构 sessionKey 返回 {}（不注入）——绝不 throw、绝不注入畸形值。
 	if (typeof api.on === 'function') {
+		registerGatewayContext(api);
 		api.on(
 			'resolve_exec_env',
 			(event, ctx) => {

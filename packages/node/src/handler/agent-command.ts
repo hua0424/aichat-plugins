@@ -1,4 +1,4 @@
-import type { AgentDriver, AgentCapabilityResult, CapabilityExecution } from '../agent/events.js';
+import type { AgentDriver, AgentCapabilityResult, CapabilityExecution, AgentCapabilityContext } from '../agent/events.js';
 import { capabilityParameters, isMutation } from '../agent/capability-parameters.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import type { AgentCommandRequest, AgentCommandResponse } from '../stream/protocol.js';
@@ -6,6 +6,7 @@ import type { AgentCommandRequest, AgentCommandResponse } from '../stream/protoc
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 const id = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v);
 export interface CommandPreparation {
+ conversation?(request: AgentCommandRequest): AgentCapabilityContext['conversation'];
 	/** Trusted local native generation snapshot for the approval fence probe; 0 means the conversation has no native record yet. */
 	generation?(request: AgentCommandRequest): number;
  prepare(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
@@ -88,7 +89,7 @@ export class AgentCommandHandler {
    const execute = async (): Promise<AgentCommandResponse> => {
     if (request.operation === 'discover') {
      if (!this.driver.discoverCapabilities) return { ...correlation, status: 'unsupported', error: 'discovery_not_supported' };
-     return { ...correlation, status: 'completed', catalog: await this.driver.discoverCapabilities({ ...context,
+     return { ...correlation, status: 'completed', catalog: await this.driver.discoverCapabilities({ ...context, conversation: this.preparation?.conversation?.(request),
       ...(request.capabilityId ? { capabilityId: request.capabilityId, parameters: request.parameters } : {}) }) };
     }
     if (!this.driver.executeCapability) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
