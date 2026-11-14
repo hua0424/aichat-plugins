@@ -43,6 +43,8 @@ export interface ConversationRecord {
 	ccResumeFailure?: { sessionId: string; generation: number };
 	controls?: ControlEntry[];
 	selectedModel?: { providerID: string; modelID: string };
+	/** Once a Codex persistent shell is admitted, no generation may downgrade replies to V1/V2. */
+	replyBindingRequired?: true;
 	/** Only explicit native fresh-session reset detaches old execution, never legacy reset. */
 	detachedGenerations?: number[];
 }
@@ -84,6 +86,8 @@ export interface BoundConversationRun {
 	readonly nativeState: ConversationRecord['nativeState'];
 	/** Synchronous, side-effect-free gate checked immediately before native submission. */
 	assertCurrent(): void;
+	/** Exact already-submitted Codex turn only; never authorizes new input or state writes. */
+	assertReplySettlement(ref: NativeRef): void;
 	saveNativeState(provider: Provider, state: Record<string, unknown>): void;
 	registerNativeAlias(provider: Provider, id: string, runtimeScope?: string): void;
 	registerNative(provider: Provider, id: string, state?: Record<string, unknown>, runtimeScope?: string): void;
@@ -179,6 +183,9 @@ export class ConversationStore {
 			const missing = newlyActive.records.filter((r) => !this.byIdentity.has(identityKey(r.serverNamespace, r.identityId, r.roomId)));
 			if (missing.length) this.commit([...this.snapshot.records, ...missing]);
 		}
+		// Upgrade the staged native flag before exposing any current or old-generation alias.
+		if (this.snapshot.records.some((r) => r.nativeState.codex?.nativeControls === true && !r.replyBindingRequired))
+			this.commit(this.snapshot.records.map((r) => r.nativeState.codex?.nativeControls === true ? { ...r, replyBindingRequired: true } : r));
 		// Persist the legacy CC cwd gate even for snapshots created before this safety check.
 		// A process restart is not evidence that a native run stopped.
 		if (this.snapshot.records.some((r) => (executionRuns(r).length && r.state !== 'stop_unconfirmed') ||
@@ -375,9 +382,12 @@ export class ConversationStore {
 		if (!validId(model.providerID) || !validId(model.modelID)) throw new Error('invalid model');
 		const r = this.assertGeneration(uid, room, generation); r.selectedModel = copy(model); this.replace(r);
 	}
-	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>): ConversationRecord {
+	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>, expectedModel?: ConversationRecord['selectedModel'] | null): ConversationRecord {
 		this.assertProvider(provider, uid);
 		const old = this.assertGeneration(uid, room, generation);
+		if (expectedModel !== undefined && ((expectedModel !== null && (!validId(expectedModel.providerID) || !validId(expectedModel.modelID))) ||
+			(old.selectedModel?.providerID ?? null) !== (expectedModel?.providerID ?? null) ||
+			(old.selectedModel?.modelID ?? null) !== (expectedModel?.modelID ?? null))) throw new Error('MODEL_SELECTION_CONFLICT');
 		if (!validId(id) || !Number.isSafeInteger(generation + 1)) throw new Error('invalid native reset');
 		if (provider === 'opencode') this.assertOpencodeDirectoryOwner(old.conversationId, state.directory as string);
 		const r: ConversationRecord = { ...old, generation: generation + 1, contextKey: randomBytes(32).toString('hex'),
@@ -386,6 +396,7 @@ export class ConversationStore {
 			replyBindings: (old.replyBindings ?? []).filter((b) => b.thinkingId && b.authorizationEpoch &&
 				(old.pendingRuns ?? []).some((run) => run.runId === b.runId)).map((b) => ({ ...b,
 					nativeAliases: b.generation === generation ? copy(old.nativeAliases) : b.nativeAliases })) };
+		this.assertCodexNativeWrite(r, provider, state);
 		this.commit(this.snapshot.records.map((item) => item.conversationId === r.conversationId ? r : item), {
 			revokedKeys: [...(this.snapshot.revokedKeys ?? []), old.contextKey],
 			revokedAliases: [...(this.snapshot.revokedAliases ?? []), ...old.nativeAliases],
@@ -451,6 +462,20 @@ export class ConversationStore {
 			conversationId, generation, contextKey: record.contextKey, nativeState: copy(record.nativeState),
 			replyToken: binding.token,
 			assertCurrent: () => { current(); },
+			assertReplySettlement: (ref) => {
+				const target = this.resolveReplyBinding(binding.token);
+				const context = this.resolveReplyContext(binding.token, [{ provider: 'codex', nativeId: ref.sessionId }]);
+				const pending = context?.pendingRuns?.find((run) => run.runId === runId && run.generation === generation);
+				const value = pending?.recovery?.value as { provider?: string; runId?: string; nativeRef?: NativeRef;
+					submission?: { method?: string; requestId?: string; threadId?: string } } | undefined;
+				if (this.closed || !validId(ref.turnId) || !context || context.adapterInstanceId !== 'codex' || context.state === 'disabled' ||
+					context.conversationId !== conversationId || context.generation !== generation || !target || target.runId !== runId ||
+					target.authorizationEpoch !== options?.authorizationEpoch ||
+					value?.provider !== 'codex' || value.runId !== runId || value.nativeRef?.sessionId !== ref.sessionId || value.nativeRef.turnId !== ref.turnId ||
+					value.submission?.method !== 'turn/start' || value.submission.requestId !== `${runId}:turn` || value.submission.threadId !== ref.sessionId)
+					throw new Error('NATIVE_REPLY_SETTLEMENT_UNCONFIRMED');
+				if (this.byIdentity.get(identityKey(this.options.serverNamespace, identityId, roomId))?.generation === generation) current();
+			},
 			saveNativeState: (provider, state) => {
 				current(); this.assertProvider(provider, identityId);
 				if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('invalid native state');
@@ -633,6 +658,7 @@ export class ConversationStore {
 				state.legacyConfirmationRequired !== false) throw new Error('Codex confirmed thread cannot change native provenance');
 		} else if ('originalPrompt' in state || 'legacyConfirmationRequired' in state)
 			throw new Error('Codex original prompt requires offline owner confirmation');
+		if (state.nativeControls === true) record.replyBindingRequired = true;
 	}
 
 	/** #343: agent-facing CC native writes cannot persist a resumable session without its original cwd,
@@ -840,6 +866,7 @@ export class ConversationStore {
 				!Number.isSafeInteger(r.generation) || r.generation < 1 || !['ready', 'suspended', 'stop_unconfirmed', 'disabled'].includes(r.state) ||
 				!Array.isArray(r.nativeAliases) || !r.nativeState || typeof r.nativeState !== 'object' || Array.isArray(r.nativeState) ||
 				(r.pendingRuns !== undefined && !Array.isArray(r.pendingRuns))) throw new Error('invalid conversation record');
+			if (r.replyBindingRequired !== undefined && r.replyBindingRequired !== true) throw new Error('invalid reply binding requirement');
 			if (r.codexThreadConfirmation !== undefined && (!r.codexThreadConfirmation ||
 				!validId(r.codexThreadConfirmation.threadId) || !validId(r.codexThreadConfirmation.workspace) ||
 				!isAbsolute(r.codexThreadConfirmation.workspace) ||

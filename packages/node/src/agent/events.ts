@@ -59,6 +59,8 @@ export interface PreparedRun {
 	selectedModel?: { providerID: string; modelID: string };
 	getSelectedModel?(): { providerID: string; modelID: string } | undefined;
 	onNativeBound?(ref: NativeRef): void;
+	/** Core verifies an already-submitted native turn's original START-ready reply lease, including detached generations. */
+	assertReplySettlement?(ref: NativeRef): void;
 	/** Legacy transcript file key only; not an authorization source. */
 	transcriptKey?: string;
 	systemPrompt: string;
@@ -144,10 +146,11 @@ export interface CapabilityExecution {
 	/** Persist native locator BEFORE the native mutation. */
 	submitted(ref?: NativeRef): Promise<void>;
 	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
-	replaceSession(id: string, state: { version: number; value: unknown }): Promise<number>;
+	/** Optional model snapshot is checked atomically with generation; null means explicitly unselected. */
+	replaceSession(id: string, state: { version: number; value: unknown }, expectedModel?: { providerID: string; modelID: string } | null): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
-	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
-	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }>;
+	/** A pending ready reserves correlation only; the returned lease still requires durable proof and exact START. */
+	bindTurn(turn: NativeTurnEvent, ready?: Promise<void>): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
 }
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
@@ -162,6 +165,8 @@ export interface AgentDriver {
 	/** Absence means unsupported; never infer support from the framework name. */
 	discoverCapabilities?(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog>;
 	executeCapability?(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult>;
+	/** Optional proof-first ordinary input; absence preserves the prepared START-before-native path. */
+	createNativeInput?(input: { message: string; workspace: string; signal: AbortSignal; execution: CapabilityExecution }): AgentRun;
 	createRun(input: PreparedRun): AgentRun;
 	disconnect(): Promise<void>;
 	/** Preserve provider-specific thinking presentation without an identity-routing branch. */

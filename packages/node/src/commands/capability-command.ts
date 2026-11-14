@@ -55,6 +55,8 @@ export async function runCapabilityCommand(
 	// #404: a frozen per-run binding upgrades this call to the V3 envelope; the token itself is
 	// never logged. An overlong value is rejected client-side rather than sent.
 	const runBinding = resolveRunBind();
+	if (command === 'send-message' && process.env.AICHAT_CODEX_NATIVE === '1' && runBinding === undefined)
+		return fail('RUN_BINDING_REQUIRED', 'exact Codex native turn grant unavailable; do not send unassociated reply', json, false);
 	if (runBinding !== undefined && runBinding.length > 256)
 		return fail('INVALID_ARGUMENT', 'send-message: invalid run binding', json, false);
 	let res: Awaited<ReturnType<typeof postCapability>>;

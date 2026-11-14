@@ -11,7 +11,7 @@ import { HulaApiRejectedError, type HulaApiClient } from '../api/hula-api.js';
 import { parseSessionKey } from './session-key.js';
 
 /** The resolve() result: the bound identity+room + the per-identity api client (REQ-029: opaque strings). */
-type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient };
+type Resolved = { aiclawUid: string; roomId: string; apiClient: HulaApiClient; replyBindingRequired?: boolean };
 export type ContextCandidate = { key: string } | { provider: string; nativeId: string; runtimeScope?: string };
 export type ResolvedCandidate = Resolved & { conversationId: string; generation: number };
 /** #404: core-verified single-round reply target; endpoint compares it against the resolved binding. */
@@ -180,6 +180,10 @@ export class CapabilityEndpoint {
 			console.log(`[capability] ${sanitizeLogField(parsed.command, 64)} ${logKey} → (unresolved) err=unknown session`);
 			return { status: 404, json: { ok: false, code: parsed.sessionKey ? 'CONTEXT_REVOKED' : 'UNKNOWN_CONTEXT', error: 'unknown session', retryable: false } };
 		}
+		// Persistent Codex shells cannot fall back to an unassociated V1/V2 send if the
+		// hook fails open or its environment marker is removed. This flag is core-owned.
+		if (parsed.command === 'send-message' && resolved.replyBindingRequired && parsed.runBinding === undefined)
+			return { status: 403, json: { ok: false, code: 'RUN_BINDING_REQUIRED', error: 'exact native turn reply binding required', retryable: false } };
 		// #404: a run-bound (V3) send must present a live core-verified binding for the SAME
 		// conversation+generation the contexts resolved to. Anything else — unknown, forged,
 		// expired, stale-generation, unfixed, cross-namespace, or inconsistent with the resolved

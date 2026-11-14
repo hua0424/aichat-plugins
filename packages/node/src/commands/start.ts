@@ -230,7 +230,8 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		if (!record) return undefined;
 		const agent = supervisor.agents.find((a) => a.uid === record.identityId && a.status !== 'offline');
 		return agent ? { aiclawUid: agent.uid, roomId: record.roomId, apiClient: agent.api,
-			conversationId: record.conversationId, generation: record.generation } : undefined;
+			conversationId: record.conversationId, generation: record.generation,
+			replyBindingRequired: record.replyBindingRequired } : undefined;
 	};
 	const endpoint = new CapabilityEndpoint({
 		registry: registry$,
