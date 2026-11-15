@@ -79,7 +79,7 @@ export async function writeOpenclawRunBindFile(dir: string, runId: string, paylo
 	const file = fileFor(dir, runId);
 	if (!file) throw new Error('refusing to publish run binding for an invalid native run id');
 	if (!validPayload(payload)) throw new Error('refusing to publish an invalid run binding payload');
-	await mkdir(resolve(dir), { recursive: true });
+	await mkdir(resolve(dir), { recursive: true, mode: 0o700 });
 	// Atomic publish like the core snapshot store: 0600 temp + rename, never a partial read.
 	// Both writer (node) and reader (gateway) run as the same uid, so 0600 stays readable.
 	const tmp = join(resolve(dir), `.${Date.now()}.${randomBytes(8).toString('hex')}.tmp`);

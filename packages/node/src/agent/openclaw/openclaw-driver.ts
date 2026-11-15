@@ -1,12 +1,12 @@
 import WebSocket from 'ws';
-import { randomUUID, createPrivateKey, sign, createPublicKey } from 'node:crypto';
+import { randomUUID, createPrivateKey, sign, createPublicKey, createHash } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver, AgentCapabilityCatalog, AgentCapabilityContext } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
 import {
-	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile,
+	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile, readOpenclawRunBindFile,
 } from './run-bind.js';
 import { errMsg } from '../../util/err.js';
 
@@ -83,6 +83,8 @@ export function parseHelloOk(payload: unknown): {
 	connId?: string;
 	version?: string;
 	tickIntervalMs?: number;
+	authRole?: string;
+	authScopes?: string[];
 } {
 	if (!payload || typeof payload !== 'object') return { ok: false };
 	const helloOk = payload as Record<string, unknown>;
@@ -94,6 +96,8 @@ export function parseHelloOk(payload: unknown): {
 		connId?: string;
 		version?: string;
 		tickIntervalMs?: number;
+		authRole?: string;
+		authScopes?: string[];
 	} = { ok: true };
 
 	if (Number.isInteger(helloOk.protocol)) {
@@ -108,6 +112,9 @@ export function parseHelloOk(payload: unknown): {
 		result.connId = server.connId;
 	}
 
+	const auth = helloOk.auth as Record<string, unknown> | undefined;
+	if (typeof auth?.role === 'string') result.authRole = auth.role;
+	if (Array.isArray(auth?.scopes) && auth.scopes.every(scope => typeof scope === 'string')) result.authScopes = [...auth.scopes];
 	const policy = helloOk.policy as Record<string, unknown> | undefined;
 	const tick = policy?.tickIntervalMs;
 	if (Number.isFinite(tick) && (tick as number) > 0) {
@@ -301,7 +308,9 @@ export class OpenclawDriver implements RunDriver {
 	 * names the native run — never before (the gateway assigns the id, so pre-submit
 	 * publish would be a guess), never keyed by room/session "current".
 	 */
-	private pendingRunBinds = new Map<string, { token: string; runId: string; conversationId: string; generation: number }>();
+	private pendingRunBinds = new Map<string, { token: string; runId: string; conversationId: string; generation: number; input?: PreparedRun; transport?: WebSocket; observerStamp?: string; sessionKey?: string; nativeRunId?: string }>();
+	private gatewayVersion?: string;
+	private observerConnection?: { ws: WebSocket; stamp?: string };
 	/** #406: native runId → owning core runId, for runId-guarded withdrawal at cleanup. */
 	private runBindOwners = new Map<string, string>();
 	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
@@ -334,6 +343,118 @@ export class OpenclawDriver implements RunDriver {
 		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw', 'workspace');
 	}
 
+	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		let reason: NonNullable<AgentCapabilityCatalog['discovery']>['reason'] = 'context_unavailable';
+		const catalog = (capabilities: AgentCapabilityCatalog['capabilities'] = [], version = 'unavailable', coverage: 'complete' | 'partial' | 'unavailable' = 'unavailable'): AgentCapabilityCatalog => ({
+			version, framework: 'openclaw', runtimeVersion: this.gatewayVersion ?? 'unknown', capabilities,
+			discovery: { source: 'native', coverage, ...(coverage === 'complete' ? {} : { reason }) },
+		});
+		const object = (v: unknown): Record<string, unknown> | undefined => v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : undefined;
+		try {
+			if (!input.conversation) return catalog();
+			input.conversation.assertCurrent();
+			const matches = [...this.pendingRunBinds.entries()].filter(([, bind]) => bind.conversationId === input.conversation!.id && bind.generation === input.conversation!.generation && bind.input && bind.nativeRunId);
+			if (matches.length !== 1) return catalog();
+			const [requestId, bind] = matches[0], original = bind.input!, nativeRunId = bind.nativeRunId!, dir = this.runBindDir ?? defaultOpenclawRunBindDir();
+			const assertOwner = () => {
+				reason = 'context_unavailable'; input.conversation!.assertCurrent(); original.conversation.assertCurrent();
+				if (input.signal.aborted || !this.connected || !bind.transport || this.ws !== bind.transport || !bind.observerStamp || this.observerConnection?.ws !== bind.transport || this.observerConnection.stamp !== bind.observerStamp || !original.replyThinkingId || this.pendingRunBinds.get(requestId) !== bind || this.requestToRunId.get(requestId) !== nativeRunId || this.runBindOwners.get(nativeRunId) !== bind.runId) throw new Error('inactive original context');
+			};
+			const check = async () => {
+				assertOwner();
+				const live = await readOpenclawRunBindFile(dir, nativeRunId);
+				assertOwner();
+				if (!live || live.token !== bind.token || live.runId !== bind.runId || live.conversationId !== bind.conversationId || live.generation !== bind.generation || this.pendingRunBinds.get(requestId) !== bind) throw new Error('original binding unavailable');
+				return live;
+			};
+			const readObservation = async () => {
+				const live = await check(); reason = 'native_unavailable';
+				const owner = { nativeRunId, runId: live.runId, conversationId: live.conversationId, generation: live.generation, createdAt: live.createdAt };
+				const reply = object(await this.readDiscovery('aichat.gatewayContext', { kind: 'context', stamp: bind.observerStamp, nativeRunId, owner }, input.signal, bind.transport));
+				assertOwner();
+				const value = object(reply?.observation);
+				reason = 'context_unavailable';
+				if (reply?.available !== true || !value || value.schema !== 1 || value.state !== 'ready' || value.stamp !== bind.observerStamp || value.nativeRunId !== nativeRunId || JSON.stringify(value.owner) !== JSON.stringify(owner) ||
+					!['agentId', 'sessionKey', 'sessionId', 'workspaceDir'].every(key => typeof value[key] === 'string' && !!value[key] && String(value[key]).length <= 4096 && !/[\x00-\x1f\x7f]/.test(String(value[key])))) throw new Error('native observation unavailable');
+				await check();
+				return value as Record<'agentId' | 'sessionKey' | 'sessionId' | 'workspaceDir', string> & Record<string, unknown>;
+			};
+			reason = 'native_unavailable';
+			if (this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') return catalog();
+			const metadata = await readObservation();
+			const rpc = async (method: string, params: Record<string, unknown>) => {
+				await check(); reason = 'native_unavailable';
+				const result = await this.readDiscovery(method, params, input.signal, bind.transport);
+				assertOwner();
+				if (JSON.stringify(await readObservation()) !== JSON.stringify(metadata)) throw new Error('native observation changed');
+				assertOwner();
+				return object(result);
+			};
+			const canonical = async () => {
+				const resolved = await rpc('sessions.resolve', { key: bind.sessionKey });
+				reason = 'context_mismatch'; if (resolved?.ok !== true || resolved.key !== metadata.sessionKey) return false;
+				const identity = await rpc('agent.identity.get', { agentId: metadata.agentId, sessionKey: metadata.sessionKey });
+				reason = 'context_mismatch'; if (identity?.agentId !== metadata.agentId) return false;
+				const described = await rpc('sessions.describe', { key: metadata.sessionKey, includeLastMessage: false, includeDerivedTitles: false });
+				reason = 'context_mismatch'; if (object(described?.session)?.sessionId !== metadata.sessionId || object(described?.session)?.key !== metadata.sessionKey) return false;
+				const files = await rpc('agents.files.list', { agentId: metadata.agentId });
+				reason = 'context_mismatch'; return files?.agentId === metadata.agentId && files.workspace === metadata.workspaceDir;
+			};
+			if (!await canonical()) return catalog();
+			const result = await rpc('commands.list', { agentId: metadata.agentId, scope: 'text', includeArgs: true });
+			if (!await canonical()) return catalog();
+			assertOwner();
+			reason = 'native_unavailable';
+			if (!Array.isArray(result?.commands) || result.commands.length > 500) return catalog();
+			const skills: Array<{ name: string; description: string; aliases: string[]; native: Record<string, unknown>; parameters: AgentCapabilityCatalog['capabilities'][number]['parameters'] }> = [];
+			for (const raw of result.commands) {
+				const item = object(raw); if (!item || !['skill', 'native', 'plugin'].includes(String(item.source))) return catalog();
+				if (item.source !== 'skill' || !['text', 'both'].includes(String(item.scope))) continue;
+				if (item.textAliases === undefined || (Array.isArray(item.textAliases) && !item.textAliases.length)) continue;
+				if (typeof item.name !== 'string' || !item.name || item.name.length > 200 || /[\x00-\x1f\x7f]/.test(item.name) || typeof item.description !== 'string' || item.description.length > 2000 || typeof item.acceptsArgs !== 'boolean' || !Array.isArray(item.textAliases) || !item.textAliases.length || item.textAliases.length > 20 || item.textAliases.some(v => typeof v !== 'string' || !v || v.length > 200)) return catalog();
+				if ((item.args !== undefined && (!Array.isArray(item.args) || item.args.length > 20)) ||
+					(item.nativeName !== undefined && (typeof item.nativeName !== 'string' || !item.nativeName || item.nativeName.length > 200))) return catalog();
+				const nativeArgs: Array<Record<string, unknown>> = [];
+				const parameters: AgentCapabilityCatalog['capabilities'][number]['parameters'] = [];
+				for (const rawArg of (item.args ?? []) as unknown[]) {
+					const arg = object(rawArg);
+					if (!arg || typeof arg.name !== 'string' || !arg.name || arg.name.length > 200 || typeof arg.description !== 'string' || arg.description.length > 500 || !['string', 'number', 'boolean'].includes(String(arg.type)) ||
+						(arg.required !== undefined && typeof arg.required !== 'boolean') || (arg.dynamic !== undefined && typeof arg.dynamic !== 'boolean') ||
+						(arg.choices !== undefined && (!Array.isArray(arg.choices) || arg.choices.length > 50))) return catalog();
+					const choices: Array<{ value: string; label: string }> = [];
+					for (const rawChoice of (arg.choices ?? []) as unknown[]) {
+						const choice = object(rawChoice);
+						if (!choice || typeof choice.value !== 'string' || choice.value.length > 200 || typeof choice.label !== 'string' || choice.label.length > 200) return catalog();
+						choices.push({ value: choice.value, label: choice.label });
+					}
+					nativeArgs.push({ name: arg.name, description: arg.description, type: arg.type, required: arg.required === true, dynamic: arg.dynamic === true, choices });
+					parameters.push({ name: arg.name, type: String(arg.type), required: arg.required === true, ...(choices.length ? { enum: choices.map(choice => choice.value) } : {}) });
+				}
+				if (skills.some(skill => skill.name === item.name)) return catalog();
+				skills.push({ name: item.name, description: item.description, aliases: [...item.textAliases as string[]].sort(),
+					native: { nativeName: item.nativeName, scope: item.scope, acceptsArgs: item.acceptsArgs, args: nativeArgs }, parameters });
+			}
+			skills.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+			const version = createHash('sha256').update(JSON.stringify(['openclaw-native-commands-v1', metadata.agentId, metadata.sessionId, metadata.workspaceDir, bind.generation, skills])).digest('hex');
+			reason = 'native_limit';
+			return catalog(skills.map(skill => ({ id: 'skill:' + skill.name, kind: 'skill', name: skill.name, description: skill.description,
+				supported: true, executable: false, reason: 'execution_not_connected', defaultVisibility: 'public', scope: 'conversation', parameters: skill.parameters, source: 'skill' })), version, result.commands.length === 500 ? 'partial' : 'complete');
+		} catch { return catalog(); }
+	}
+
+	private readDiscovery(method: string, params: Record<string, unknown>, signal: AbortSignal, transport = this.ws): Promise<unknown> {
+		return new Promise((resolve, reject) => {
+			if (!this.connected || !transport || this.ws !== transport || signal.aborted) { reject(new Error('native unavailable')); return; }
+			const id = randomUUID();
+			const finish = (error?: Error, value?: unknown) => { clearTimeout(timer); signal.removeEventListener('abort', abort); if (this.ws === transport) this.pending.delete(id); error ? reject(error) : resolve(value); };
+			const abort = () => finish(new Error('discovery cancelled'));
+			const timer = setTimeout(() => finish(new Error('discovery timed out')), 15000);
+			this.pending.set(id, { resolve: value => finish(undefined, value), reject: error => finish(error), expectFinal: false, timeout: timer });
+			signal.addEventListener('abort', abort, { once: true });
+			try { transport.send(JSON.stringify({ type: 'req', id, method, params })); } catch { finish(new Error('native unavailable')); }
+		});
+	}
+
 	/** Core owns the native gateway key; the legacy binding store is not consulted by this path. */
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
@@ -344,6 +465,12 @@ export class OpenclawDriver implements RunDriver {
 			// submit native work whose sends would go out unassociated while claiming association.
 			!/^[0-9a-f]{64}$/.test(input.replyToken ?? ''))
 			throw new TypeError('Invalid OpenClaw prepared run');
+		const transport = this.connected ? this.ws : null;
+		const observerStamp = this.observerConnection?.ws === transport ? this.observerConnection.stamp : undefined;
+		const assertCurrent = () => {
+			if (!transport || this.ws !== transport || !this.connected) throw new Error('NATIVE_OUTCOME_UNKNOWN: OpenClaw original transport unavailable; do not resubmit');
+			input.conversation.assertCurrent();
+		};
 		let consumed = false, submitted = false, completed = false, cancelled = input.signal.aborted;
 		let session: OpenclawSession | undefined;
 		const workspace = process.platform === 'win32' ? resolve(this.workspaceDir).toLowerCase() : resolve(this.workspaceDir);
@@ -370,6 +497,7 @@ export class OpenclawDriver implements RunDriver {
 			let held = false;
 			try {
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
+				assertCurrent();
 				const previous = input.conversation.nativeState?.value;
 				if (previous !== undefined && (!previous || typeof previous !== 'object' ||
 					!('token' in previous) || typeof previous.token !== 'string' ||
@@ -389,17 +517,18 @@ export class OpenclawDriver implements RunDriver {
 				if (active && (active.owner !== identityId || active.prompt !== input.systemPrompt))
 					throw new Error('PROMPT_SCOPE_CONFLICT: active OpenClaw run uses another identity or prompt');
 				promptActive.set(workspace, { owner: identityId, prompt: input.systemPrompt, count: (active?.count ?? 0) + 1 }); held = true;
-				input.conversation.assertCurrent();
+				assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 				if (!previous) {
 					if (!input.conversation.registerNative) throw new Error('OpenClaw atomic native registration unavailable');
 					await input.conversation.registerNative(token, { version: 1, value: { token, nativeRef } });
+					assertCurrent();
 				}
 				// Publish sticky ownership only after core actually owns a native history.
 				promptOwners.set(workspace, identityId);
 				await input.saveRecovery({ version: 1, value: { provider: 'openclaw', runId: input.runId,
 					nativeRef, stopProbe: 'unconfirmed' } });
-				input.conversation.assertCurrent();
+				assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 				// A shared gateway workspace offers only a mutable AGENTS.md. Failure must block submission,
 				// not silently run under a previous identity's prompt.
@@ -410,14 +539,14 @@ export class OpenclawDriver implements RunDriver {
 					void writing.finally(() => { if (promptWrites.get(workspace) === writing) promptWrites.delete(workspace); }).catch(() => {});
 				}
 				await writing;
-				input.conversation.assertCurrent();
+				assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef, sink, () => { submitted = true; },
 					// #406: freeze this run's binding for the request; the accepted frame links it
 					// to the exact native runId (publish happens there — never a pre-submit guess).
 					{ token: input.replyToken!, runId: input.runId,
-						conversationId: input.conversation.id, generation: input.conversation.generation }),
-					() => input.conversation.assertCurrent());
+						conversationId: input.conversation.id, generation: input.conversation.generation, input, transport: transport!, observerStamp }),
+					assertCurrent);
 				const stream = session.send(input.message);
 				let terminal: AgentEvent | undefined;
 				for await (const event of stream) {
@@ -478,8 +607,8 @@ export class OpenclawDriver implements RunDriver {
 	 * processAgentStreamEvent (assistant → thinking, lifecycle end/error → done/error).
 	 */
 	private beginChat(message: string, sessionKey: string, sink: ChatSink, onSubmit?: () => void,
-		runBind?: { token: string; runId: string; conversationId: string; generation: number }): void {
-		if (!this.connected || !this.ws) {
+		runBind?: { token: string; runId: string; conversationId: string; generation: number; input?: PreparedRun; transport?: WebSocket; observerStamp?: string }): void {
+		if (!this.connected || !this.ws || (runBind?.transport && runBind.transport !== this.ws)) {
 			sink.push({ type: 'error', message: 'openclaw gateway not connected' });
 			sink.finish();
 			return;
@@ -525,7 +654,7 @@ export class OpenclawDriver implements RunDriver {
 		// 预注册 chat state + 放弃-run 兜底定时（gateway 永不终结本 run 时到点回收三 map，防长稳泄漏）。
 		// .unref()：兜底定时不应单独把进程钉活（正常终结会清它）。
 		this.requestToRunId.set(requestId, '');
-		if (runBind) this.pendingRunBinds.set(requestId, runBind);
+		if (runBind) this.pendingRunBinds.set(requestId, { ...runBind, sessionKey });
 		const chat: PendingChat = { sink, done: false, startTime: Date.now() };
 		chat.timeout = setTimeout(() => this.expireChat(requestId), OPENCLAW_CHAT_TIMEOUT_MS);
 		chat.timeout.unref?.();
@@ -552,6 +681,7 @@ export class OpenclawDriver implements RunDriver {
 		this.ws = ws;
 
 		ws.on('open', () => {
+			if (this.ws !== ws || this.closed) return;
 			console.log('[openclaw] WebSocket opened, waiting for connect challenge...');
 			this.connectNonce = null;
 			this.connectSent = false;
@@ -561,6 +691,7 @@ export class OpenclawDriver implements RunDriver {
 			this.connId = null;
 			// 设置 challenge 超时
 			this.connectTimer = setTimeout(() => {
+				if (this.ws !== ws || this.closed) return;
 				if (!this.connectSent) {
 					console.error('[openclaw] Connect challenge timeout');
 					ws.close(1008, 'connect challenge timeout');
@@ -569,10 +700,12 @@ export class OpenclawDriver implements RunDriver {
 		});
 
 		ws.on('message', (data) => {
+			if (this.ws !== ws || this.closed) return;
 			this.handleMessage(data.toString());
 		});
 
 		ws.on('close', (code, reason) => {
+			if (this.ws !== ws) return;
 			const reasonText = reason.toString();
 			console.log(`[openclaw] Disconnected: code=${code}, reason=${reasonText}`);
 			this.connected = false;
@@ -585,6 +718,7 @@ export class OpenclawDriver implements RunDriver {
 		});
 
 		ws.on('error', (err) => {
+			if (this.ws !== ws || this.closed) return;
 			console.error('[openclaw] WebSocket error:', err.message);
 			if (!this.connectSent && this.connectReject) {
 				this.connectReject(err instanceof Error ? err : new Error(String(err)));
@@ -729,6 +863,7 @@ export class OpenclawDriver implements RunDriver {
 
 	private sendConnect(): void {
 		if (this.connectSent || !this.ws || !this.connectNonce) return;
+		const ws = this.ws;
 		this.connectSent = true;
 
 		if (this.connectTimer) {
@@ -798,19 +933,21 @@ export class OpenclawDriver implements RunDriver {
 			params,
 		};
 
-		this.ws.send(JSON.stringify(frame));
+		ws.send(JSON.stringify(frame));
 
 		// 等待 hello-ok response
 		const connectPromise = new Promise<void>((resolve, reject) => {
 			const timeout = setTimeout(() => {
-				this.pending.delete(requestId);
+				if (this.ws === ws) this.pending.delete(requestId);
 				reject(new Error('connect handshake timeout'));
 			}, 10000);
 
 			this.pending.set(requestId, {
 				resolve: (payload) => {
 					clearTimeout(timeout);
+					if (this.ws !== ws || this.closed) { reject(new Error('obsolete connect response')); return; }
 					const parsed = parseHelloOk(payload);
+					this.gatewayVersion = parsed.version;
 					if (parsed.ok) {
 						if (typeof parsed.protocol === 'number') {
 							this.negotiatedProtocol = parsed.protocol;
@@ -827,6 +964,16 @@ export class OpenclawDriver implements RunDriver {
 						);
 					}
 					this.connected = true;
+					const observer: { ws: WebSocket; stamp?: string } = { ws };
+					this.observerConnection = observer;
+					// Availability probe only. Never delays connect/ordinary or refreshes this socket's stamp.
+					if (parsed.authRole === 'operator' && parsed.authScopes?.some(scope => ['operator.read', 'operator.write', 'operator.admin'].includes(scope))) {
+						void this.readDiscovery('aichat.gatewayContext', { kind: 'observer' }, new AbortController().signal, ws).then(value => {
+							if (this.ws !== ws || this.observerConnection !== observer || !this.connected || this.closed) return;
+							const result = value as { schema?: unknown; stamp?: unknown; healthy?: unknown } | undefined;
+							if (result?.schema === 1 && result.healthy === true && typeof result.stamp === 'string' && result.stamp.length > 0 && result.stamp.length <= 128) observer.stamp = result.stamp;
+						}).catch(() => {});
+					}
 					this.reconnectDelay = 1000;
 					this.lastTick = Date.now();
 					this.startTickWatch();
@@ -843,6 +990,7 @@ export class OpenclawDriver implements RunDriver {
 
 		connectPromise
 			.then(() => {
+				if (this.ws !== ws || this.closed) return;
 				if (this.connectResolve) {
 					this.connectResolve();
 					this.connectResolve = null;
@@ -850,6 +998,7 @@ export class OpenclawDriver implements RunDriver {
 				}
 			})
 			.catch((err) => {
+				if (this.ws !== ws || this.closed) return;
 				console.error('[openclaw] Connect handshake failed:', err.message);
 				if (this.connectReject) {
 					this.connectReject(err instanceof Error ? err : new Error(String(err)));
@@ -868,13 +1017,14 @@ export class OpenclawDriver implements RunDriver {
 		// binding now (first exact moment it exists). Publish failure fails this run loudly:
 		// a turn that cannot prove its binding must never run native work unassociated.
 		const bind = this.pendingRunBinds.get(requestId);
-		this.pendingRunBinds.delete(requestId);
-		if (bind) {
+		if (bind && !bind.nativeRunId) {
+			bind.nativeRunId = runId;
 			const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
 			this.runBindOwners.set(runId, bind.runId);
 			writeOpenclawRunBindFile(dir, runId, { token: bind.token, runId: bind.runId,
 				conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now() })
 				.catch((error) => {
+					if (this.pendingRunBinds.get(requestId) !== bind || (bind.transport && bind.transport !== this.ws)) return;
 					const chat = this.findChatByRequestId(requestId);
 					if (chat && !chat.done) {
 						chat.done = true;
@@ -966,6 +1116,7 @@ export class OpenclawDriver implements RunDriver {
 				if (reqChat?.timeout) clearTimeout(reqChat.timeout);
 				this.activeChats.delete(`req:${reqId}`);
 				this.requestToRunId.delete(reqId);
+				this.pendingRunBinds.delete(reqId);
 				this.pending.delete(reqId);
 				break;
 			}

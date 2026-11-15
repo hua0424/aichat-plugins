@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexNativeDriver } from './native-driver.js';
@@ -70,7 +71,7 @@ async function fixture(mode = '') {
  return { home, path, store, driver, grants, channels, subscriptions, frames, send, receipts, request, result, lines, grantPath, catalog, context,
   async notify(index: number, method: string, params: { threadId: string; turn: { id: string; status: string; items: unknown[] } }) {
    let seen = false; const off = channels[index].onNotification((name, value) => { if (name === method && JSON.stringify(value) === JSON.stringify(params)) seen = true; });
-   try { await writeFile(join(home, 'notify-' + index), JSON.stringify({ method, params })); await waitFor(() => expect(seen).toBe(true)); } finally { off(); }
+   try { const file = join(home, 'notify-' + index), pending = file + '.' + randomUUID() + '.pending'; await writeFile(pending, JSON.stringify({ method, params })); await rename(pending, file); await waitFor(() => expect(seen).toBe(true)); } finally { off(); }
   },
   async setEpoch(epoch: string) { currentEpoch = epoch; await handler.prewarmGroupConfigs(); },
   rejectStart(index = 0) { const frame = frames.filter(x => x.type === 20)[index]; handler.handle({ type: 'thinkingEnd', data: { ...frame.data, fromUid: 'u', thinkingId: 'thinking-' + frame.data.clientRunId, status: 'error', error: 'authorization_revoked' } }); },

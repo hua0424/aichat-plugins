@@ -360,6 +360,7 @@ export class MessageHandler {
 		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, {
 			prepare: (request, workspace) => this.prepareCommand(request, workspace),
 			generation: (request) => this.snapshotGeneration(request),
+			conversation: (request) => this.discoveryConversation(request),
 		});
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
@@ -395,6 +396,24 @@ export class MessageHandler {
 	/** Trusted native generation at probe time; an absent local record is reported as 0 (initial), never guessed from server state. */
 	private snapshotGeneration(request: AgentCommandRequest): number {
 		return this.getConversations().get(this.selfUid, request.roomId)?.generation ?? 0;
+	}
+
+	private discoveryConversation(request: AgentCommandRequest) {
+		const epoch = request.context.authorizationEpoch;
+		if (!epoch) return undefined;
+		try {
+			const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
+			if (!record || record.adapterInstanceId !== this.driver.type) return undefined;
+			const assertCurrent = () => {
+				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
+				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
+					this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch ||
+					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
+					throw new Error('discovery context changed');
+			};
+			assertCurrent();
+			return { id: record.conversationId, generation: record.generation, assertCurrent };
+		} catch { return undefined; }
 	}
 
 	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
@@ -1266,7 +1285,11 @@ export class MessageHandler {
 						? deriveWorkspaceDir(this.workspaceBase, this.selfUid, workspaceContext) : undefined,
 					conversation: {
 						id: bound.conversationId, generation: bound.generation,
-						assertCurrent: () => bound.assertCurrent(),
+						assertCurrent: () => {
+							bound.assertCurrent();
+							if (this.driver.type === 'openclaw' && this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch !== authorizationEpoch)
+								throw new Error('native run authorization changed');
+						},
 						nativeState: bound.nativeState[this.driver.type]
 							? { version: 1, value: bound.nativeState[this.driver.type] } : undefined,
 						saveNativeState: async (v) => bound.saveNativeState(this.driver.type, v.value as Record<string, unknown>),

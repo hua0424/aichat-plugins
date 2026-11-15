@@ -100,8 +100,11 @@ export interface AgentCapabilityCatalog {
 	runtimeVersion: string;
 	capabilities: AgentCapability[];
 	models?: { items: { providerId: string; modelId: string; label: string; connected: boolean }[]; total: number; offset: number; nextOffset?: number };
+	discovery?: { source: 'native'; coverage: 'complete' | 'partial' | 'unavailable'; reason?: 'context_unavailable' | 'context_mismatch' | 'native_limit' | 'native_unavailable' };
 }
 export interface AgentCapabilityContext {
+	/** Read-only core lookup only; absence never authorizes workspace-based conversation guessing. */
+	conversation?: Pick<BoundConversation, 'id' | 'generation' | 'assertCurrent'>;
 	/** Prepared by core from trusted room context, never supplied directly by the UI. */
 	workspace?: string;
 	signal: AbortSignal;
