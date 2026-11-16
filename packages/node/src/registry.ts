@@ -17,6 +17,8 @@ export interface AgentEntry {
 	cwd?: string;
 	/** 模型覆盖（本切片未用，透传）。 */
 	model?: string;
+	/** 仅 codex：显式启用 POSIX native driver；缺省/false 保持 SDK。 */
+	codexNative?: boolean;
 }
 
 /**
@@ -43,6 +45,10 @@ export function loadAgentRegistry(config: AichatConfig): AgentEntry[] {
 			console.warn(`[registry] skipping invalid agent entry #${i}: missing/empty 'tool'`);
 			continue;
 		}
+		if (entry.codexNative !== undefined && (typeof entry.codexNative !== 'boolean' || entry.tool !== 'codex')) {
+			console.warn(`[registry] skipping invalid agent entry #${i}: 'codexNative' must be a boolean and is only supported for 'codex'`);
+			continue;
+		}
 		// 去重：同一 aiclaw 激活 token 配置了两次 → 跳过重复项（保留首次出现），不抛。
 		if (seenTokens.has(entry.token)) {
 			console.warn(
@@ -56,6 +62,7 @@ export function loadAgentRegistry(config: AichatConfig): AgentEntry[] {
 			token: entry.token,
 			...(entry.cwd !== undefined ? { cwd: entry.cwd } : {}),
 			...(entry.model !== undefined ? { model: entry.model } : {}),
+			...(entry.codexNative !== undefined ? { codexNative: entry.codexNative } : {}),
 		});
 	}
 	return valid;
