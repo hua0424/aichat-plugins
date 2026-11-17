@@ -7,7 +7,7 @@ import { isDshDriftGateError } from '../agent/dsh/dsh-driver.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
-import { MessageDebouncer } from '../util/debounce.js';
+import { MessageDebouncer, type BufferedMessage } from '../util/debounce.js';
 import { AgentCommandHandler } from './agent-command.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -187,7 +187,7 @@ interface LastMessageContext {
  */
 interface RoomChannel {
 	debouncer: MessageDebouncer;
-	pendingMessages: string[];
+	pendingMessages: BufferedMessage[];
 	lastCtx: LastMessageContext;
 	/**
 	 * REQ-004 S5: 群聊惰性积累缓冲。
@@ -486,7 +486,7 @@ export class MessageHandler {
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
-			if (owner && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
+			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
 				throw new Error('native ordinary authorization changed');
 		};
 		return {
@@ -506,6 +506,26 @@ export class MessageHandler {
 			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref); },
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {
+				assertCurrent();
+				if (provider === 'openclaw') {
+					const stopped = new Set<string>();
+					for (const pending of store.assertGeneration(this.selfUid, room, generation).pendingRuns ?? []) {
+						if (pending.generation !== generation) continue;
+						const session = [...this.thinkingSessions.values(), ...this.nativeThinking.values()].find(item => item.run?.id === pending.runId && item.run.generation === generation);
+						if (!session?.run || (await session.run.agent.cancel('native reset settled')).status !== 'stopped') {
+							store.markStopUnconfirmed(pending.runId);
+							throw new Error('native reset stop unconfirmed');
+						}
+						assertCurrent();
+						stopped.add(pending.runId);
+					}
+					for (const pending of store.assertGeneration(this.selfUid, room, generation).pendingRuns ?? []) {
+						if (pending.generation === generation && !stopped.has(pending.runId)) {
+							store.markStopUnconfirmed(pending.runId);
+							throw new Error('native reset run changed');
+						}
+					}
+				}
 				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>, expectedModel);
 				for (const session of this.nativeThinking.values()) if (session.roomId === room && session.run?.generation === generation && session.timeoutId) {
 					clearTimeout(session.timeoutId); session.timeoutId = undefined;
@@ -873,8 +893,8 @@ export class MessageHandler {
 	private getRoomChannel(roomId: string): RoomChannel {
 		let channel = this.roomChannels.get(roomId);
 		if (!channel) {
-			const debouncer = new MessageDebouncer((merged) => {
-				this.triggerAgentLoop(roomId, merged).catch((err) => {
+			const debouncer = new MessageDebouncer((_merged, current) => {
+				this.triggerAgentLoop(roomId, current).catch((err) => {
 					console.error(`[handler] triggerAgentLoop unhandled error (room ${roomId}):`, err.message);
 				});
 			}, this.debounceOptions);
@@ -1094,7 +1114,12 @@ export class MessageHandler {
 	 * 因此防循环守卫在此处按本轮 BATCH 统一评估，杜绝排队消息绕过守卫（issue #22）。
 	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
 	 */
-	private async triggerAgentLoop(roomId: string, message: string, skipGuard = false): Promise<void> {
+	private async triggerAgentLoop(roomId: string, input: BufferedMessage, skipGuard = false): Promise<void> {
+		const message = typeof input === 'function' ? input() : input;
+		if (!message) {
+			if (skipGuard && !this.destroyed) this.flushPendingMessages(roomId);
+			return;
+		}
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
@@ -1109,7 +1134,7 @@ export class MessageHandler {
 		const { msgId, roomType, fromUid, isOwner, authorizationEpoch } = channel.lastCtx;
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (!this.runReady(roomId)) {
-			channel.pendingMessages.push(message);
+			channel.pendingMessages.push(input);
 			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
@@ -1147,7 +1172,7 @@ export class MessageHandler {
 					const ch = this.roomChannels.get(roomId);
 					if (ch) ch.antiLoopDelaying = false;
 					// 退避窗口结束：rescheduled 触发不再重复评估守卫（skipGuard=true）
-					this.triggerAgentLoop(roomId, message, true).catch((err) => {
+					this.triggerAgentLoop(roomId, input, true).catch((err) => {
 						console.error(`[handler] triggerAgentLoop (anti-loop reschedule) unhandled error (room ${roomId}):`, err.message);
 					});
 				}, guardResult.delayMs);
@@ -1161,7 +1186,7 @@ export class MessageHandler {
 		// 与 openclaw/opencode/codex 共用此标准守卫与 drop 语义（其消息内容不会因此丢失）。
 		if ((!this.driver.createNativeInput && this.thinkingSessions.has(sessionKey)) || !this.runReady(roomId)) {
 			console.warn(`[handler] Thinking session already active or paused for ${sessionKey}`);
-			channel.pendingMessages.push(message);
+			channel.pendingMessages.push(input);
 			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
@@ -1316,7 +1341,7 @@ export class MessageHandler {
 					catch (releaseError) { console.error(`[handler] pre-submit run ${begunId} remains occupied: ${errMsg(releaseError)}`); }
 				}
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
-				channel.pendingMessages.unshift(message);
+				channel.pendingMessages.unshift(input);
 					this.syncSuspensionNotice(roomId, channel); // #343: 准备失败常因暂停竞态——通告真实状态
 				console.error(`[handler] run preparation failed for ${sessionKey}: ${errMsg(error)}`);
 				return;
@@ -1386,7 +1411,8 @@ export class MessageHandler {
 				} catch (releaseError) { console.error(`[handler] unconfirmed run ${barrierRunId} remains occupied: ${errMsg(releaseError)}`); }
 				try { await barrierRun.agent.dispose(); }
 				catch (disposeError) { console.error(`[handler] unconfirmed run ${barrierRunId} dispose failed: ${errMsg(disposeError)}`); }
-				if (this.thinkingSessions.get(sessionKey) === session) this.thinkingSessions.delete(sessionKey);
+				if (this.thinkingSessions.get(session.sessionKey) === session) this.thinkingSessions.delete(session.sessionKey);
+				if (this.getConversations().get(this.selfUid, roomId)?.generation !== barrierRun.generation) return;
 				if (outcome.status === 'rejected') {
 					// The authorization/approval behind this input is gone: the batch is spent for good.
 					// Do NOT repush the debouncer — a retried turn would just be refused again, and
@@ -1398,7 +1424,8 @@ export class MessageHandler {
 				// through the debouncer (2s backoff, no hot loop) rather than parking it in pendingMessages.
 				// After teardown the turn is dropped with everything else — never resurrected.
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
-				if (!this.destroyed) channel.debouncer.push(message);
+				if (!this.destroyed) channel.debouncer.push(() =>
+					this.getConversations().get(this.selfUid, roomId)?.generation === barrierRun.generation ? message : '');
 				console.error(`[thinking] START unconfirmed; native run not submitted run=${barrierRunId}`);
 				return;
 			}
