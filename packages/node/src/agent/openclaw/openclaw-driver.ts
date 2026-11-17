@@ -351,15 +351,16 @@ export class OpenclawDriver implements RunDriver {
 			input.conversation?.assertCurrent();
 			if (!input.conversation || input.signal.aborted || !this.connected || !transport || this.ws !== transport ||
 				this.observerConnection?.ws !== transport || !this.observerConnection.admin || this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') return skills;
-			return { ...skills, version: createHash('sha256').update(JSON.stringify(['openclaw-reset-v1', skills.version, input.conversation.id, input.conversation.generation])).digest('hex'),
-				capabilities: [...skills.capabilities, { id: 'session.reset', kind: 'command', name: 'Reset session', supported: true, executable: true,
-					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' }] };
+			return { ...skills, version: createHash('sha256').update(JSON.stringify(['openclaw-session-controls-v1', skills.version, input.conversation.id, input.conversation.generation])).digest('hex'),
+				capabilities: [...skills.capabilities, ...['reset', 'compact'].map((name): AgentCapabilityCatalog['capabilities'][number] => ({
+					id: `session.${name}`, kind: 'command', name: name === 'reset' ? 'Reset session' : 'Compact session', supported: true, executable: true,
+					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' }))] };
 		} catch { return skills; }
 	}
 
 	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
 		if (input.recovery) return input.recovery.receipt;
-		if (input.capabilityId !== 'session.reset') return { status: 'unsupported', error: 'execution_not_connected' };
+		if (input.capabilityId !== 'session.reset' && input.capabilityId !== 'session.compact') return { status: 'unsupported', error: 'execution_not_connected' };
 		const execution = input.execution, transport = this.ws;
 		if (!execution || !transport) return { status: 'failed', error: 'native_request_failed' };
 		const generation = String(execution.conversation.generation);
@@ -375,7 +376,7 @@ export class OpenclawDriver implements RunDriver {
 			current();
 			if (Object.keys(input.parameters ?? {}).length) return { status: 'failed', error: 'invalid_parameters', generation };
 			const catalog = await this.discoverCapabilities({ ...input, conversation: execution.conversation }); current();
-			if (catalog.version !== input.catalogVersion || !catalog.capabilities.some(capability => capability.id === 'session.reset' && capability.executable))
+			if (catalog.version !== input.catalogVersion || !catalog.capabilities.some(capability => capability.id === input.capabilityId && capability.executable))
 				return { status: 'failed', error: 'catalog_stale', generation };
 			const previous = object(execution.conversation.nativeState?.value), rawK = previous?.nativeRef;
 			if (!previous || !key(rawK)) return { status: 'failed', error: 'native_request_failed', generation };
@@ -390,6 +391,21 @@ export class OpenclawDriver implements RunDriver {
 			await execution.saveRecovery({ version: 1, value: { key: canonicalK, previousSessionId: oldSession?.sessionId } }); current();
 			await execution.submitted({ sessionId: rawK }); current();
 			submitted = true;
+			if (input.capabilityId === 'session.compact') {
+				// Native owns interruption/compaction and may rotate S; K and the core generation stay bound.
+				const result = object(await this.readDiscovery('sessions.compact', { key: canonicalK }, input.signal, transport)); current();
+				const detail = object(result?.result);
+				if (!result || result.key !== canonicalK || typeof result.ok !== 'boolean' || typeof result.compacted !== 'boolean' ||
+					(result.reason !== undefined && typeof result.reason !== 'string') ||
+					(result.result !== undefined && (!detail || typeof detail.summary !== 'string')))
+					return { status: 'unknown', error: 'native_request_failed', generation };
+				const summary = typeof detail?.summary === 'string' && detail.summary.trim() ? detail.summary : undefined;
+				const nativeResult = { ...(result.reason !== undefined ? { reason: result.reason } : {}), ...(summary ? { summary } : {}) };
+				const evidence = { generation, nativeRef: { sessionId: rawK }, ...(Object.keys(nativeResult).length ? { nativeResult } : {}) };
+				if (!result.ok) return { ...evidence, status: 'failed', error: 'native_request_failed' };
+				if (!result.compacted) return { ...evidence, status: 'noop' };
+				return { ...evidence, status: 'completed', effect: { kind: 'compact', controlId: execution.requestId, summary: !!summary } };
+			}
 			const result = object(await this.readDiscovery('sessions.reset', { key: canonicalK, reason: 'reset' }, input.signal, transport)); current();
 			const sessionId = object(result?.entry)?.sessionId;
 			if (result?.ok !== true || result.key !== canonicalK || !key(sessionId) || sessionId === oldSession?.sessionId)
