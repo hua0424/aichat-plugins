@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadAgentRegistry, resolveAgentCredential, cacheFilePath, type AgentEntry } from './registry.js';
 import type { AichatConfig } from './config.js';
@@ -15,7 +15,29 @@ function jsonResponse(json: unknown): Response {
 	} as unknown as Response;
 }
 
+vi.mock('node:os', async (original) => ({
+	...await original<typeof import('node:os')>(),
+	platform: vi.fn(),
+}));
+
 describe('loadAgentRegistry', () => {
+	beforeEach(() => { vi.mocked(platform).mockReturnValue('linux'); });
+	afterEach(() => { vi.resetAllMocks(); });
+
+	it('preserves the first native identity on Windows for non-start management callers', () => {
+		vi.mocked(platform).mockReturnValue('win32');
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const agents = [
+				{ tool: 'codex', token: 'secret-native', codexNative: true },
+				{ tool: 'codex', token: 'sdk-default' },
+				{ tool: 'codex', token: 'sdk-explicit', codexNative: false },
+			];
+			expect(loadAgentRegistry({ agents })).toEqual(agents);
+			expect(warn).not.toHaveBeenCalled();
+		} finally { warn.mockRestore(); }
+	});
+
 	it('returns [] when config.agents is absent', () => {
 		expect(loadAgentRegistry({} as AichatConfig)).toEqual([]);
 		expect(loadAgentRegistry({ agents: undefined } as AichatConfig)).toEqual([]);
@@ -32,6 +54,44 @@ describe('loadAgentRegistry', () => {
 		expect(out).toHaveLength(2);
 		expect(out[0]).toEqual({ tool: 'openclaw', token: 'tok-A' });
 		expect(out[1]).toEqual({ tool: 'opencode', token: 'tok-B', cwd: '/proj', model: 'gpt-x' });
+	});
+
+	it('preserves per-agent Codex native opt-in, explicit false, and the SDK default', () => {
+		const agents = [
+			{ tool: 'codex', token: 'native', codexNative: true, model: 'native-model', cwd: '/native' },
+			{ tool: 'codex', token: 'sdk-explicit', codexNative: false, model: 'sdk-model' },
+			{ tool: 'codex', token: 'sdk-default' },
+		];
+		expect(loadAgentRegistry({ agents })).toEqual(agents);
+	});
+
+	it.each([null, 'true', 1, {}, []])('skips invalid codexNative=%j instead of silently using SDK, without leaking config', (codexNative) => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const config = JSON.parse(JSON.stringify({ agents: [
+				{ tool: 'codex', token: 'secret-token', codexNative, model: 'private-model', cwd: '/private' },
+				{ tool: 'codex', token: 'secret-token' },
+			] }));
+			expect(loadAgentRegistry(config)).toEqual([{ tool: 'codex', token: 'secret-token' }]);
+			expect(warn.mock.calls).toEqual([[
+				"[registry] skipping invalid agent entry #0: 'codexNative' must be a boolean and is only supported for 'codex'",
+			]]);
+		} finally { warn.mockRestore(); }
+	});
+
+	it.each(['openclaw', 'opencode', 'cc', 'dsh', 'unknown'])('rejects codexNative on %s entries, even when false', (tool) => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		try {
+			const agents = [
+				{ tool, token: 'secret-native', codexNative: true },
+				{ tool, token: 'secret-sdk', codexNative: false },
+				{ tool, token: 'unchanged' },
+			];
+			expect(loadAgentRegistry({ agents })).toEqual([{ tool, token: 'unchanged' }]);
+			expect(warn.mock.calls).toEqual([0, 1].map((index) => [
+				`[registry] skipping invalid agent entry #${index}: 'codexNative' must be a boolean and is only supported for 'codex'`,
+			]));
+		} finally { warn.mockRestore(); }
 	});
 
 	it('skips + warns invalid entries (missing/empty token or tool, non-object) without throwing', () => {

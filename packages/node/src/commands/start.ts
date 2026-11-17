@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, getServerUrl, detectClawConfig, AICHAT_HOME, type AichatConfig } from '../config.js';
 import { HulaWSClient } from '../server/hula-ws.js';
@@ -8,6 +9,7 @@ import { OpenclawDriver } from '../agent/openclaw/openclaw-driver.js';
 import { OpencodeDriver } from '../agent/opencode/opencode-driver.js';
 import { OpencodeServerManager, defaultServerManagerDeps } from '../agent/opencode/server-manager.js';
 import { CodexDriver } from '../agent/codex/codex-driver.js';
+import { CodexNativeDriver } from '../agent/codex/native-driver.js';
 import { Codex } from '@openai/codex-sdk';
 import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
 import { DshHeadlessDriver } from '../agent/dsh/dsh-driver.js';
@@ -35,6 +37,27 @@ import { installSkill } from '../capability/skill.js';
 import { ensureAichatOnPath } from '../util/path-inject.js';
 import { errMsg } from '../util/err.js';
 
+export function createCodexDriver(entry: AgentEntry, env: Record<string, string>): CodexDriver | CodexNativeDriver {
+	if (entry.codexNative === true) {
+		if (platform() === 'win32') throw new Error('codexNative: true is not supported on Windows; use the SDK adapter (omit codexNative or set it to false)');
+		return new CodexNativeDriver({ command: 'codex', env, ...(entry.model !== undefined ? { model: entry.model } : {}) });
+	}
+	return new CodexDriver({
+		createCodex: (systemPrompt: string, runEnv?: Record<string, string>) => new Codex({ env: { ...env, ...runEnv },
+			config: { developer_instructions: systemPrompt } }),
+		...(entry.model !== undefined ? { model: entry.model } : {}),
+	});
+}
+
+// Keep runtime availability out of the shared registry (also used by management commands).
+export function selectStartAgents(registry: AgentEntry[]): AgentEntry[] {
+	return registry.filter((entry, i) => {
+		if (entry.codexNative !== true || platform() !== 'win32') return true;
+		console.warn(`[start] skipping agent entry #${i}: codexNative: true is not supported on Windows; use the SDK adapter (omit codexNative or set it to false)`);
+		return false;
+	});
+}
+
 /**
  * aichat start — 读取本地配置自动连接。
  * 单一构建路径：加载 registry；为空则打印带迁移示例的错误并非零退出，否则走多身份监督器路径。
@@ -48,7 +71,7 @@ export async function start(): Promise<void> {
 	if (pathBin) console.log(`[start] PATH += ${pathBin} (aichat launcher)`);
 
 	const config = loadConfig();
-	const registry = loadAgentRegistry(config);
+	const registry = selectStartAgents(loadAgentRegistry(config));
 
 	if (registry.length === 0) {
 		console.error(
@@ -156,11 +179,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		['codex', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'codex', workspaceBase: codexWorkspaceBase,
 			context: nativeContext('codex'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' },
-			create: (entry) => new CodexDriver({
-				createCodex: (systemPrompt: string, runEnv?: Record<string, string>) => new Codex({ env: { ...codexEnv, ...runEnv },
-					config: { developer_instructions: systemPrompt } }),
-				...(entry.model !== undefined ? { model: entry.model } : {}),
-			}) }],
+			create: (entry) => createCodexDriver(entry, codexEnv) }],
 		['cc', { contractVersion: DRIVER_CONTRACT_VERSION, type: 'cc', workspaceBase: ccWorkspaceBase,
 			context: nativeContext('cc'),
 			features: { cancel: 'best-effort', reset: 'supported', promptUpdate: 'per-run' },
