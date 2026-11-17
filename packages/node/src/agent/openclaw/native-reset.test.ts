@@ -119,6 +119,72 @@ it('does not replace a core generation merely because native reset returned a ne
  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
 });
 
+it('resets an accepted active run and ignores its late error while the new generation completes normally', async () => {
+ const f = await fixture(), catalog = (await f.command('discover-active-reset')).catalog!;
+ f.hula.onSend = frame => {
+  if (frame.type === WSReqType.THINKING_START) {
+   queueMicrotask(() => f.handler.handle({ type: 'thinkingStart', data: { fromUid: '1', roomId: '2', triggerMsgId: frame.data.triggerMsgId as string, thinkingId: `active-grant-${frame.data.triggerMsgId}`, clientRunId: frame.data.clientRunId as string } }));
+  }
+ };
+ f.handler.handle({ type: 'receiveMessage', data: {
+  fromUser: { uid: '7', name: 'user', userType: 1 },
+  message: { id: 'active-old-input', roomId: '2', type: 1, roomType: 2, body: { content: 'ordinary input before active reset' } },
+ } });
+ await waitFor(() => expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(1));
+ const oldStart = f.hula.frames.find(frame => frame.type === WSReqType.THINKING_START)!.data;
+ const oldRequest = f.sockets[0].sent.find(frame => frame.method === 'agent')!;
+ const oldNativeRun = 'active-native-old', newNativeRun = 'active-native-new';
+ f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'res', id: oldRequest.id, ok: true, payload: { status: 'accepted', runId: oldNativeRun } })));
+ expect(f.store.pendingRuns()).toMatchObject([{ runId: oldStart.clientRunId, generation: 1 }]);
+ expect(f.store.get('1', '2')!.replyBindings).toMatchObject([{ runId: oldStart.clientRunId, generation: 1, thinkingId: 'active-grant-active-old-input' }]);
+ // Native reset, not an AIChat pre-abort, supplies the exact accepted old run's stop proof.
+ f.native.onReset = () => {
+  expect(f.store.pendingRuns()).toMatchObject([{ runId: oldStart.clientRunId, generation: 1 }]);
+  f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: { runId: oldNativeRun, seq: 1, stream: 'lifecycle', ts: Date.now(), data: { phase: 'error', error: 'native reset stopped old run' } } })));
+ };
+ const reset = await f.command('reset-active-run', { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version });
+ expect(reset.status).toBe('completed');
+ expect(reset.effect).toMatchObject({ kind: 'reset', sessionId: 'native-session-new', generation: '2' });
+ await waitFor(() => expect(f.store.pendingRuns()).toHaveLength(0));
+ expect(f.store.get('1', '2')).toMatchObject({ generation: 2, state: 'ready', nativeState: { openclaw: { nativeRef: f.rawK, sessionId: 'native-session-new' } } });
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset').map(frame => frame.params)).toEqual([{ key: f.canonicalK, reason: 'reset' }]);
+ // Reset alone neither starts ordinary work nor creates a reply grant for generation 2.
+ expect(f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_START)).toHaveLength(1);
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(1);
+ expect((f.store.get('1', '2')!.replyBindings ?? []).filter(binding => binding.generation === 2)).toHaveLength(0);
+ f.handler.handle({ type: 'receiveMessage', data: {
+  fromUser: { uid: '7', name: 'user', userType: 1 },
+  message: { id: 'active-new-input', roomId: '2', type: 1, roomType: 2, body: { content: 'genuinely new ordinary input after active reset' } },
+ } });
+ await waitFor(() => expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(2));
+ const newStart = f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_START)[1].data;
+ const newRequest = f.sockets[0].sent.filter(frame => frame.method === 'agent')[1];
+ expect(newStart.clientRunId).not.toBe(oldStart.clientRunId);
+ expect(newRequest.params.message).toBe('[HuLa 私聊]\n[user(7)]: genuinely new ordinary input after active reset');
+ expect(newRequest.params.sessionKey).toBe(oldRequest.params.sessionKey);
+ f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'res', id: newRequest.id, ok: true, payload: { status: 'accepted', runId: newNativeRun } })));
+ expect(f.store.pendingRuns()).toMatchObject([{ runId: newStart.clientRunId, generation: 2 }]);
+ expect((f.store.get('1', '2')!.replyBindings ?? []).filter(binding => binding.generation === 2)).toMatchObject([{ runId: newStart.clientRunId, thinkingId: 'active-grant-active-new-input' }]);
+ const activeSlot = f.store.pendingRuns();
+ const newEnds = () => f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_END && frame.data.clientRunId === newStart.clientRunId);
+ f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: { runId: oldNativeRun, seq: 2, stream: 'lifecycle', ts: Date.now(), data: { phase: 'error', error: 'late old error must not settle the new run' } } })));
+ await new Promise<void>(resolve => setImmediate(resolve));
+ expect(f.store.pendingRuns()).toEqual(activeSlot);
+ expect(f.store.get('1', '2')).toMatchObject({ generation: 2, state: 'ready' });
+ expect(newEnds()).toHaveLength(0);
+ f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: { runId: newNativeRun, seq: 1, stream: 'assistant', ts: Date.now(), data: { delta: 'new run remains generation 2' } } })));
+ f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: { runId: newNativeRun, seq: 2, stream: 'lifecycle', ts: Date.now(), data: { phase: 'end' } } })));
+ await waitFor(() => expect(f.store.pendingRuns()).toHaveLength(0));
+ expect(newEnds().map(frame => frame.data)).toMatchObject([{ clientRunId: newStart.clientRunId, thinkingId: 'active-grant-active-new-input', status: 'complete', content: 'new run remains generation 2' }]);
+ expect(f.store.get('1', '2')).toMatchObject({ generation: 2, state: 'ready' });
+ expect(f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_START)).toHaveLength(2);
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(2);
+ // Exhaustive request allowlist excludes any extra abort/pre-stop RPC around native reset.
+ expect(f.sockets[0].sent.map(frame => frame.method)).toEqual(expect.arrayContaining(['agent', 'sessions.resolve', 'sessions.describe', 'sessions.reset']));
+ expect(f.sockets[0].sent.filter(frame => !['connect', 'aichat.gatewayContext', 'agent', 'sessions.resolve', 'sessions.describe', 'sessions.reset'].includes(frame.method))).toHaveLength(0);
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
+});
+
 it('does not replay a START-pending input after reset when its old START receipt arrives late', async () => {
  const f = await fixture(), catalog = (await f.command('discover-start-pending')).catalog!;
  f.handler.handle({ type: 'receiveMessage', data: {
