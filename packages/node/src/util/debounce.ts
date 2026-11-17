@@ -2,18 +2,20 @@
  * 消息防抖合并器
  * 规则：2s 缓冲 / 5 条上限 / 10s 最大等待
  */
+export type BufferedMessage = string | (() => string);
+
 export class MessageDebouncer {
-	private buffer: string[] = [];
+	private buffer: BufferedMessage[] = [];
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	private startTime = 0;
-	private onFlush: (merged: string) => void;
+	private onFlush: (merged: string, current: () => string) => void;
 
 	private readonly waitMs: number;
 	private readonly maxCount: number;
 	private readonly maxWaitMs: number;
 
 	constructor(
-		onFlush: (merged: string) => void,
+		onFlush: (merged: string, current: () => string) => void,
 		options?: { waitMs?: number; maxCount?: number; maxWaitMs?: number },
 	) {
 		this.onFlush = onFlush;
@@ -22,7 +24,7 @@ export class MessageDebouncer {
 		this.maxWaitMs = options?.maxWaitMs ?? 10000;
 	}
 
-	push(message: string): void {
+	push(message: BufferedMessage): void {
 		if (this.buffer.length === 0) {
 			this.startTime = Date.now();
 		}
@@ -55,10 +57,13 @@ export class MessageDebouncer {
 		}
 		if (this.buffer.length === 0) return;
 
-		const merged = this.buffer.join('\n');
+		const buffer = this.buffer;
 		this.buffer = [];
 		this.startTime = 0;
-		this.onFlush(merged);
+		// Deferred retries stay generation-checked if the consumer has to queue them again.
+		const current = () => buffer.map(message => typeof message === 'function' ? message() : message).filter(Boolean).join('\n');
+		const merged = current();
+		if (merged) this.onFlush(merged, current);
 	}
 
 	/** 取消并丢弃缓冲（teardown 时用，避免 flush 重新触发回调） */

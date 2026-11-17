@@ -371,6 +371,7 @@ describe('native OpenClaw AgentRun (#303)', () => {
 				stream: 'lifecycle', ts: Date.now(), data: { phase: 'error', error: 'boom' } } });
 			expect(await pending).toEqual([{ type: 'thinking', text: 'foo' }, { type: 'thinking', text: 'bar' },
 				{ type: 'error', message: 'boom' }]);
+			expect(await run.cancel('native reset settled')).toEqual({ status: 'stopped' });
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 
