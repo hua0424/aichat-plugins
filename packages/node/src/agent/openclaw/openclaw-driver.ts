@@ -3,7 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey, createHash } from 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { AgentEvent, AgentRun, PreparedRun, RunDriver, AgentCapabilityCatalog, AgentCapabilityContext } from '../events.js';
+import type { AgentEvent, AgentRun, PreparedRun, RunDriver, AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
 import {
 	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile, readOpenclawRunBindFile,
@@ -216,6 +216,7 @@ interface PendingRequest {
 interface ChatSink {
 	push: (ev: AgentEvent) => void;
 	finish: () => void;
+	confirmStopped?: () => void;
 }
 
 /**
@@ -310,7 +311,7 @@ export class OpenclawDriver implements RunDriver {
 	 */
 	private pendingRunBinds = new Map<string, { token: string; runId: string; conversationId: string; generation: number; input?: PreparedRun; transport?: WebSocket; observerStamp?: string; sessionKey?: string; nativeRunId?: string }>();
 	private gatewayVersion?: string;
-	private observerConnection?: { ws: WebSocket; stamp?: string };
+	private observerConnection?: { ws: WebSocket; stamp?: string; admin?: boolean };
 	/** #406: native runId → owning core runId, for runId-guarded withdrawal at cleanup. */
 	private runBindOwners = new Map<string, string>();
 	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
@@ -344,6 +345,65 @@ export class OpenclawDriver implements RunDriver {
 	}
 
 	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		const transport = this.ws;
+		const skills = await this.discoverSkills(input);
+		try {
+			input.conversation?.assertCurrent();
+			if (!input.conversation || input.signal.aborted || !this.connected || !transport || this.ws !== transport ||
+				this.observerConnection?.ws !== transport || !this.observerConnection.admin || this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') return skills;
+			return { ...skills, version: createHash('sha256').update(JSON.stringify(['openclaw-reset-v1', skills.version, input.conversation.id, input.conversation.generation])).digest('hex'),
+				capabilities: [...skills.capabilities, { id: 'session.reset', kind: 'command', name: 'Reset session', supported: true, executable: true,
+					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' }] };
+		} catch { return skills; }
+	}
+
+	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		if (input.recovery) return input.recovery.receipt;
+		if (input.capabilityId !== 'session.reset') return { status: 'unsupported', error: 'execution_not_connected' };
+		const execution = input.execution, transport = this.ws;
+		if (!execution || !transport) return { status: 'failed', error: 'native_request_failed' };
+		const generation = String(execution.conversation.generation);
+		const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+		const key = (value: unknown): value is string => typeof value === 'string' && !!value.trim() && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
+		const current = () => {
+			execution.conversation.assertCurrent();
+			if (input.signal.aborted || !this.connected || this.ws !== transport || this.observerConnection?.ws !== transport || !this.observerConnection.admin ||
+				this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') throw new Error('native reset context changed');
+		};
+		let submitted = false;
+		try {
+			current();
+			if (Object.keys(input.parameters ?? {}).length) return { status: 'failed', error: 'invalid_parameters', generation };
+			const catalog = await this.discoverCapabilities({ ...input, conversation: execution.conversation }); current();
+			if (catalog.version !== input.catalogVersion || !catalog.capabilities.some(capability => capability.id === 'session.reset' && capability.executable))
+				return { status: 'failed', error: 'catalog_stale', generation };
+			const previous = object(execution.conversation.nativeState?.value), rawK = previous?.nativeRef;
+			if (!previous || !key(rawK)) return { status: 'failed', error: 'native_request_failed', generation };
+			const resolved = object(await this.readDiscovery('sessions.resolve', { key: rawK }, input.signal, transport)); current();
+			if (resolved?.ok !== true || !key(resolved.key)) return { status: 'failed', error: 'native_request_failed', generation };
+			const canonicalK = resolved.key;
+			const described = object(await this.readDiscovery('sessions.describe', { key: canonicalK }, input.signal, transport)); current();
+			const oldSession = object(described?.session);
+			if (!described || (described.session !== null && (!oldSession || oldSession.key !== canonicalK || !key(oldSession.sessionId))))
+				return { status: 'failed', error: 'native_request_failed', generation };
+			const selectedModel = execution.getSelectedModel?.() ?? execution.selectedModel ?? null;
+			await execution.saveRecovery({ version: 1, value: { key: canonicalK, previousSessionId: oldSession?.sessionId } }); current();
+			await execution.submitted({ sessionId: rawK }); current();
+			submitted = true;
+			const result = object(await this.readDiscovery('sessions.reset', { key: canonicalK, reason: 'reset' }, input.signal, transport)); current();
+			const sessionId = object(result?.entry)?.sessionId;
+			if (result?.ok !== true || result.key !== canonicalK || !key(sessionId) || sessionId === oldSession?.sessionId)
+				return { status: 'unknown', error: 'native_request_failed', generation };
+			await execution.saveRecovery({ version: 1, value: { key: canonicalK, previousSessionId: oldSession?.sessionId, sessionId } }); current();
+			const next = await execution.replaceSession(rawK, { version: 1, value: { ...previous, sessionId } }, selectedModel);
+			return { status: 'completed', generation, nativeRef: { sessionId: rawK }, effect: { kind: 'reset', sessionId, generation: String(next) } };
+		} catch (error) {
+			return { status: submitted && !/^\[(FORBIDDEN|UNAUTHORIZED)\]/.test(error instanceof Error ? error.message : '') ? 'unknown' : 'failed',
+				error: 'native_request_failed', generation };
+		}
+	}
+
+	private async discoverSkills(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
 		let reason: NonNullable<AgentCapabilityCatalog['discovery']>['reason'] = 'context_unavailable';
 		const catalog = (capabilities: AgentCapabilityCatalog['capabilities'] = [], version = 'unavailable', coverage: 'complete' | 'partial' | 'unavailable' = 'unavailable'): AgentCapabilityCatalog => ({
 			version, framework: 'openclaw', runtimeVersion: this.gatewayVersion ?? 'unknown', capabilities,
@@ -471,7 +531,7 @@ export class OpenclawDriver implements RunDriver {
 			if (!transport || this.ws !== transport || !this.connected) throw new Error('NATIVE_OUTCOME_UNKNOWN: OpenClaw original transport unavailable; do not resubmit');
 			input.conversation.assertCurrent();
 		};
-		let consumed = false, submitted = false, completed = false, cancelled = input.signal.aborted;
+		let consumed = false, submitted = false, completed = false, nativeStopped = false, cancelled = input.signal.aborted;
 		let session: OpenclawSession | undefined;
 		const workspace = process.platform === 'win32' ? resolve(this.workspaceDir).toLowerCase() : resolve(this.workspaceDir);
 		const onAbort = () => { void run.cancel('aborted'); };
@@ -485,7 +545,7 @@ export class OpenclawDriver implements RunDriver {
 			async cancel(reason) {
 				cancelled = true;
 				await session?.close(); // Local stream wake, NOT proof of gateway cancellation.
-				return completed || !submitted ? { status: 'stopped' } :
+				return completed || nativeStopped || !submitted ? { status: 'stopped' } :
 					{ status: 'unconfirmed', reason: `${reason}: OpenClaw gateway run stop not verified` };
 			},
 			async dispose() {
@@ -541,7 +601,8 @@ export class OpenclawDriver implements RunDriver {
 				await writing;
 				assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
-				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef, sink, () => { submitted = true; },
+				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef,
+					{ ...sink, confirmStopped: () => { nativeStopped = true; } }, () => { submitted = true; },
 					// #406: freeze this run's binding for the request; the accepted frame links it
 					// to the exact native runId (publish happens there — never a pre-submit guess).
 					{ token: input.replyToken!, runId: input.runId,
@@ -839,6 +900,8 @@ export class OpenclawDriver implements RunDriver {
 		// lifecycle 流 → thinking end (REQ-004)
 		if (evt.stream === 'lifecycle' && !chat.done) {
 			const phase = evt.data.phase as string | undefined;
+			// Only the correlated native lifecycle proves stop; cleanup/local close never does.
+			if (phase === 'end' || phase === 'error') chat.sink.confirmStopped?.();
 			if (phase === 'end') {
 				chat.done = true;
 				const durationMs = Date.now() - chat.startTime;
@@ -964,7 +1027,7 @@ export class OpenclawDriver implements RunDriver {
 						);
 					}
 					this.connected = true;
-					const observer: { ws: WebSocket; stamp?: string } = { ws };
+					const observer = { ws, admin: parsed.authRole === 'operator' && parsed.authScopes?.includes('operator.admin') === true, stamp: undefined as string | undefined };
 					this.observerConnection = observer;
 					// Availability probe only. Never delays connect/ordinary or refreshes this socket's stamp.
 					if (parsed.authRole === 'operator' && parsed.authScopes?.some(scope => ['operator.read', 'operator.write', 'operator.admin'].includes(scope))) {
