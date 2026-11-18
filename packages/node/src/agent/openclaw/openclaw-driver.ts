@@ -9,6 +9,16 @@ import {
 	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile, readOpenclawRunBindFile,
 } from './run-bind.js';
 import { errMsg } from '../../util/err.js';
+import { capabilityParameters } from '../capability-parameters.js';
+
+const modelCapability: AgentCapabilityCatalog['capabilities'][number] = {
+	id: 'model.set', kind: 'model', name: 'Select model', source: 'model', supported: true, executable: true,
+	defaultVisibility: 'public', scope: 'conversation',
+	description: 'Browse the default-agent instance catalog; availability is not session permission. Selection applies to subsequent requests, not the live stream.',
+	parameters: [{ name: 'providerId', type: 'string', required: true }, { name: 'modelId', type: 'string', required: true }],
+};
+
+const catalogDigest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 /**
  * REQ (openclaw empty thinking): upstream openclaw's built-in agent contract emits the literal
@@ -182,6 +192,12 @@ interface ResponseFrame {
 	error?: { code: string; message: string; details?: unknown };
 }
 
+class GatewayResponseError extends Error {
+	constructor(readonly code: string, message: string) {
+		super(`[${code}] ${message}`);
+	}
+}
+
 interface EventFrame {
 	type: 'event';
 	event: string;
@@ -311,7 +327,7 @@ export class OpenclawDriver implements RunDriver {
 	 */
 	private pendingRunBinds = new Map<string, { token: string; runId: string; conversationId: string; generation: number; input?: PreparedRun; transport?: WebSocket; observerStamp?: string; sessionKey?: string; nativeRunId?: string }>();
 	private gatewayVersion?: string;
-	private observerConnection?: { ws: WebSocket; stamp?: string; admin?: boolean };
+	private observerConnection?: { ws: WebSocket; connectionId: string; stamp?: string; admin: boolean };
 	/** #406: native runId → owning core runId, for runId-guarded withdrawal at cleanup. */
 	private runBindOwners = new Map<string, string>();
 	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
@@ -344,40 +360,86 @@ export class OpenclawDriver implements RunDriver {
 		this.workspaceDir = workspaceDir ?? resolve(homedir(), '.openclaw', 'workspace');
 	}
 
+	private controlScope(input: AgentCapabilityContext, transport: WebSocket) {
+		const conversation = input.conversation, observer = this.observerConnection;
+		if (!conversation || input.signal.aborted || !this.connected || this.ws !== transport || observer?.ws !== transport ||
+			!observer.admin || this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') throw new Error('native control context changed');
+		conversation.assertCurrent();
+		return catalogDigest([observer.connectionId, conversation.id, conversation.generation, input.workspace ?? this.workspaceDir,
+			this.negotiatedProtocol, this.gatewayVersion]);
+	}
+
 	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
 		const transport = this.ws;
+		// Model browse has its own inventory. Neither a live skill run nor models.list gates the other menu.
+		if (input.capabilityId === modelCapability.id) {
+			const unavailable: AgentCapabilityCatalog = { framework: 'openclaw', runtimeVersion: this.gatewayVersion ?? 'unknown',
+				version: 'unavailable', capabilities: [] };
+			if (!transport) return unavailable;
+			try {
+				const params = capabilityParameters('discover', input.capabilityId, input.parameters);
+				const snapshot = await this.discoverModels(input, transport);
+				const query = String(params.query).toLowerCase(), offset = Number(params.offset);
+				const all = snapshot.models.filter(model => `${model.providerId} ${model.modelId} ${model.label}`.toLowerCase().includes(query));
+				return { ...unavailable, version: snapshot.version, capabilities: [modelCapability],
+					models: { items: all.slice(offset, offset + 100), total: all.length, offset, ...(offset + 100 < all.length ? { nextOffset: offset + 100 } : {}) } };
+			} catch { return unavailable; }
+		}
 		const skills = await this.discoverSkills(input);
+		if (!transport) return skills;
 		try {
-			input.conversation?.assertCurrent();
-			if (!input.conversation || input.signal.aborted || !this.connected || !transport || this.ws !== transport ||
-				this.observerConnection?.ws !== transport || !this.observerConnection.admin || this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') return skills;
-			return { ...skills, version: createHash('sha256').update(JSON.stringify(['openclaw-session-controls-v1', skills.version, input.conversation.id, input.conversation.generation])).digest('hex'),
+			const scope = this.controlScope(input, transport);
+			return { ...skills, version: `openclaw-menu:${scope}:${catalogDigest(skills.version)}`,
 				capabilities: [...skills.capabilities, ...['reset', 'compact'].map((name): AgentCapabilityCatalog['capabilities'][number] => ({
 					id: `session.${name}`, kind: 'command', name: name === 'reset' ? 'Reset session' : 'Compact session', supported: true, executable: true,
-					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' }))] };
+					defaultVisibility: 'public', scope: 'conversation', parameters: [], source: 'session' })), modelCapability] };
 		} catch { return skills; }
+	}
+
+	private async discoverModels(input: AgentCapabilityContext, transport: WebSocket) {
+		const scope = this.controlScope(input, transport);
+		const payload: unknown = await this.readDiscovery('models.list', { view: 'default' }, input.signal, transport);
+		if (this.controlScope(input, transport) !== scope || !payload || typeof payload !== 'object' || !('models' in payload) || !Array.isArray(payload.models))
+			throw new Error('native model catalog unavailable');
+		const identifier = (value: unknown): value is string => typeof value === 'string' && !!value.trim() && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+		const seen = new Set<string>();
+		const models = (payload.models as unknown[]).flatMap(entry => {
+			if (!entry || typeof entry !== 'object' || !('provider' in entry) || !identifier(entry.provider) || !('id' in entry) || !identifier(entry.id) ||
+				('name' in entry && typeof entry.name !== 'string') || ('available' in entry && typeof entry.available !== 'boolean')) return [];
+			const id = JSON.stringify([entry.provider, entry.id]);
+			if (seen.has(id)) return [];
+			seen.add(id);
+			const label = ('name' in entry ? String(entry.name) : '').replace(/[\x00-\x1f\x7f]/g, '').trim() || `${entry.provider}/${entry.id}`;
+			return [{ providerId: entry.provider, modelId: entry.id, label: label.slice(0, 256), connected: 'available' in entry && entry.available === true }];
+		}).sort((a, b) => a.providerId < b.providerId ? -1 : a.providerId > b.providerId ? 1 : a.modelId < b.modelId ? -1 : Number(a.modelId > b.modelId));
+		return { models, version: `openclaw-models:${scope}:${catalogDigest([modelCapability, models])}` };
 	}
 
 	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
 		if (input.recovery) return input.recovery.receipt;
-		if (input.capabilityId !== 'session.reset' && input.capabilityId !== 'session.compact') return { status: 'unsupported', error: 'execution_not_connected' };
+		if (!['session.reset', 'session.compact', 'model.set'].includes(input.capabilityId)) return { status: 'unsupported', error: 'execution_not_connected' };
 		const execution = input.execution, transport = this.ws;
 		if (!execution || !transport) return { status: 'failed', error: 'native_request_failed' };
 		const generation = String(execution.conversation.generation);
 		const object = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 		const key = (value: unknown): value is string => typeof value === 'string' && !!value.trim() && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
-		const current = () => {
-			execution.conversation.assertCurrent();
-			if (input.signal.aborted || !this.connected || this.ws !== transport || this.observerConnection?.ws !== transport || !this.observerConnection.admin ||
-				this.negotiatedProtocol !== 4 || this.gatewayVersion !== '2026.6.5') throw new Error('native reset context changed');
-		};
+		const context = { ...input, conversation: execution.conversation };
+		const stale: AgentCapabilityResult = { status: 'failed', error: 'catalog_stale', generation };
+		const current = () => this.controlScope(context, transport);
 		let submitted = false;
 		try {
-			current();
-			if (Object.keys(input.parameters ?? {}).length) return { status: 'failed', error: 'invalid_parameters', generation };
-			const catalog = await this.discoverCapabilities({ ...input, conversation: execution.conversation }); current();
-			if (catalog.version !== input.catalogVersion || !catalog.capabilities.some(capability => capability.id === input.capabilityId && capability.executable))
-				return { status: 'failed', error: 'catalog_stale', generation };
+			const scope = current();
+			const params = input.capabilityId === 'model.set' ? capabilityParameters('invoke', input.capabilityId, input.parameters) : {};
+			if (input.capabilityId === 'model.set') {
+				if (!input.catalogVersion.startsWith(`openclaw-models:${scope}:`)) return stale;
+				const snapshot = await this.discoverModels(context, transport); current();
+				if (snapshot.version !== input.catalogVersion) return stale;
+				if (!snapshot.models.some(model => model.providerId === params.providerId && model.modelId === params.modelId)) return { status: 'failed', error: 'invalid_parameters', generation };
+			} else {
+				if (input.parameters && Object.keys(input.parameters).length) return { status: 'failed', error: 'invalid_parameters', generation };
+				const catalog = await this.discoverCapabilities({ ...context, capabilityId: undefined, parameters: undefined }); current();
+				if (catalog.version !== input.catalogVersion || !catalog.capabilities.some(capability => capability.id === input.capabilityId && capability.executable)) return stale;
+			}
 			const previous = object(execution.conversation.nativeState?.value), rawK = previous?.nativeRef;
 			if (!previous || !key(rawK)) return { status: 'failed', error: 'native_request_failed', generation };
 			const resolved = object(await this.readDiscovery('sessions.resolve', { key: rawK }, input.signal, transport)); current();
@@ -387,10 +449,22 @@ export class OpenclawDriver implements RunDriver {
 			const oldSession = object(described?.session);
 			if (!described || (described.session !== null && (!oldSession || oldSession.key !== canonicalK || !key(oldSession.sessionId))))
 				return { status: 'failed', error: 'native_request_failed', generation };
+			if (input.capabilityId === 'model.set' && !oldSession) return { status: 'failed', error: 'native_request_failed', generation };
 			const selectedModel = execution.getSelectedModel?.() ?? execution.selectedModel ?? null;
 			await execution.saveRecovery({ version: 1, value: { key: canonicalK, previousSessionId: oldSession?.sessionId } }); current();
 			await execution.submitted({ sessionId: rawK }); current();
 			submitted = true;
+			if (input.capabilityId === 'model.set') {
+				const providerId = String(params.providerId), modelId = String(params.modelId);
+				const result = object(await this.readDiscovery('sessions.patch', { key: canonicalK, model: `${providerId}/${modelId}` }, input.signal, transport)); current();
+				const entry = object(result?.entry), resolvedModel = object(result?.resolved);
+				if (result?.ok !== true || result.key !== canonicalK || entry?.sessionId !== oldSession?.sessionId ||
+					resolvedModel?.modelProvider !== providerId || resolvedModel.model !== modelId)
+					return { status: 'unknown', error: 'native_request_failed', generation };
+				// Native owns session selection. Reply order cannot establish a current core mirror.
+				return { status: 'completed', generation, nativeRef: { sessionId: rawK }, text: 'This request selected a Native session model for subsequent requests; it does not establish the current/latest selection or actual model use.',
+					effect: { kind: 'model', providerId, modelId, effective: 'next_request' } };
+			}
 			if (input.capabilityId === 'session.compact') {
 				// Native owns interruption/compaction and may rotate S; K and the core generation stay bound.
 				const result = object(await this.readDiscovery('sessions.compact', { key: canonicalK }, input.signal, transport)); current();
@@ -414,8 +488,9 @@ export class OpenclawDriver implements RunDriver {
 			const next = await execution.replaceSession(rawK, { version: 1, value: { ...previous, sessionId } }, selectedModel);
 			return { status: 'completed', generation, nativeRef: { sessionId: rawK }, effect: { kind: 'reset', sessionId, generation: String(next) } };
 		} catch (error) {
-			return { status: submitted && !/^\[(FORBIDDEN|UNAUTHORIZED)\]/.test(error instanceof Error ? error.message : '') ? 'unknown' : 'failed',
-				error: 'native_request_failed', generation };
+			const code = error instanceof GatewayResponseError ? error.code : undefined;
+			const refused = code === 'FORBIDDEN' || code === 'UNAUTHORIZED' || (input.capabilityId === 'model.set' && code === 'INVALID_REQUEST');
+			return { status: submitted && !refused ? 'unknown' : 'failed', error: 'native_request_failed', generation };
 		}
 	}
 
@@ -885,7 +960,8 @@ export class OpenclawDriver implements RunDriver {
 			pending.resolve(payload);
 		} else {
 			const errMsg = res.error?.message || 'unknown gateway error';
-			pending.reject(new Error(`[${res.error?.code || 'UNKNOWN'}] ${errMsg}`));
+			const code = typeof res.error?.code === 'string' && res.error.code ? res.error.code : 'UNKNOWN';
+			pending.reject(new GatewayResponseError(code, errMsg));
 		}
 	}
 
@@ -1043,7 +1119,7 @@ export class OpenclawDriver implements RunDriver {
 						);
 					}
 					this.connected = true;
-					const observer = { ws, admin: parsed.authRole === 'operator' && parsed.authScopes?.includes('operator.admin') === true, stamp: undefined as string | undefined };
+					const observer = { ws, connectionId: requestId, admin: parsed.authRole === 'operator' && parsed.authScopes?.includes('operator.admin') === true, stamp: undefined as string | undefined };
 					this.observerConnection = observer;
 					// Availability probe only. Never delays connect/ordinary or refreshes this socket's stamp.
 					if (parsed.authRole === 'operator' && parsed.authScopes?.some(scope => ['operator.read', 'operator.write', 'operator.admin'].includes(scope))) {
