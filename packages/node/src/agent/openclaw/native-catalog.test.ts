@@ -259,7 +259,26 @@ describe('catalog native boundaries', () => {
   const receipt = await f.discover('eligible');
   expect(receipt.catalog!.discovery?.coverage).toBe('complete'); expect(receipt.catalog!.capabilities.map(item => item.name)).toEqual(['usable']);
  });
- it('changes the version when native argument choices change', async () => {
+  it('omits explicit and implicit slash collisions without hiding unrelated skills', async () => {
+   const f = await fixture();
+   const longPluginName = 'x'.repeat(200);
+   f.socket.overrides.set('commands.list', { commands: [
+    { name: 'probe', description: '', source: 'skill', scope: 'both', textAliases: ['/probe', '/pick'], acceptsArgs: true },
+    { name: 'plugin-pick', description: '', source: 'plugin', scope: 'both', textAliases: ['/PiCk'], acceptsArgs: false },
+    { name: 'implicit', description: '', source: 'skill', scope: 'both', textAliases: ['/different'], acceptsArgs: false },
+    { name: 'ImPlIcIt', description: '', source: 'native', scope: 'both', textAliases: ['/native-alias'], acceptsArgs: false },
+    { name: longPluginName, description: '', source: 'plugin', scope: 'both', textAliases: [`/${longPluginName}`], acceptsArgs: false },
+    { name: 'other', description: '', source: 'skill', scope: 'both', textAliases: ['/other'], acceptsArgs: false },
+   ] });
+   const originalAgentSubmissions = f.socket.sent.filter(frame => frame.method === 'agent').length;
+   expect(originalAgentSubmissions).toBe(1);
+   const { catalog } = await f.discover('ambiguous-alias');
+   expect(catalog?.discovery?.coverage).toBe('complete');
+   expect(catalog?.capabilities.map(item => item.id)).toEqual(['skill:other']);
+   expect(f.socket.sent.filter(frame => frame.method === 'agent')).toHaveLength(originalAgentSubmissions);
+   expect(f.socket.sent.filter(frame => frame.method === 'chat.send')).toHaveLength(0);
+  });
+  it('changes the version when native argument choices change', async () => {
   const f = await fixture(); const first = await f.discover('before-args');
   f.socket.transform = (method, payload) => method === 'commands.list' ? { commands: [{ name: 'probe', description: 'Native eligible skill', source: 'skill', scope: 'text', textAliases: ['/probe'], acceptsArgs: true,
    args: [{ name: 'input', description: 'Literal input', type: 'string', choices: [{ value: 'literal', label: 'Literal' }] }] }] } : payload;
