@@ -25,7 +25,7 @@ const all=Array.from({length:205},(_,i)=>({id:'entry-'+i,model:'model-'+String(i
 upgrade:null,upgradeInfo:null,availabilityNux:null,supportedReasoningEfforts:[],defaultReasoningEffort:'medium',inputModalities:['text'],supportsPersonality:false,additionalSpeedTiers:[],serviceTiers:[],defaultServiceTier:null,isDefault:i===0}));
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const x=JSON.parse(line),p=x.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={};
 if(x.method==='initialize')result={userAgent:'aichat/0.142.3'};
-if(x.method==='config/read')result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};
+if(x.method==='config/read'){if(process.env.MODE==='close-first-discovery'&&process.env.CHANNEL==='1')process.exit(0);result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};}
 if(x.method==='skills/list')result={data:[{cwd:process.env.MODE==='wrong-cwd'?'/untrusted':p.cwds[0],skills:JSON.parse(fs.readFileSync(process.env.INVENTORY,'utf8')),errors:process.env.MODE==='scan-error'?[{path:'/private',message:'scan failed'}]:[]}]};
 if(x.method==='model/list'){const opaque='opaque:'+ 'x'.repeat(300),at=p.cursor===opaque?100:p.cursor?Number(p.cursor):0;result={data:all.slice(at,at+100),nextCursor:at+100<all.length?String(at+100):null};if(process.env.MODE==='cursor-loop')result.nextCursor='100';if(process.env.MODE==='long-cursor'&&at===0)result.nextCursor=opaque;}
 if(x.method==='thread/start'||x.method==='thread/resume'){const id=p.threadId||'thread-'+process.env.CHANNEL;model=p.model||(threads[id]&&threads[id].model)||'model-000';threads[id]={model,cwd:p.cwd,modelProvider:(threads[id]&&threads[id].modelProvider)||(process.env.MODE==='provider-mismatch'?'other':'openai')};save(id);result={thread:thread(id),model,modelProvider:threads[id].modelProvider};}
@@ -116,6 +116,21 @@ describe('Codex native catalog and model control', () => {
 		const pages = (await f.lines()).filter((x) => x.method === 'model/list');
 		expect(pages.slice(0, 3).map((x) => x.params)).toEqual([{ limit: 100, includeHidden: true }, { limit: 100, includeHidden: true, cursor: '100' }, { limit: 100, includeHidden: true, cursor: '200' }]);
 		expect(JSON.stringify(first)).not.toContain(f.skillPath); expect(first.capabilities.find((c) => c.id === 'skill:local-skill')).toMatchObject({ supported: true, executable: true });
+	});
+	it('uses a fresh channel only for new requests after the native discovery child exits', async () => {
+		const f = await fixture('close-first-discovery');
+		await expect(f.discover()).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+		const afterExit = await f.lines();
+		expect(afterExit.map((x) => x.method)).toEqual(['initialize', 'initialized', 'config/read']);
+		const [first, next] = await Promise.all([f.discover(), f.discover({ offset: 100 })]);
+		expect(first.models).toMatchObject({ total: 205, offset: 0 });
+		expect(next.models).toMatchObject({ total: 205, offset: 100 });
+		expect(next.version).toBe(first.version);
+		await f.driver.disconnect();
+		await expect(f.discover()).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+		const wire = await f.lines();
+		expect(wire.filter((x) => x.method === 'initialize')).toHaveLength(2);
+		expect(wire.some((x) => /^(thread|turn)\//.test(x.method))).toBe(false);
 	});
 	it('round-trips an opaque native cursor longer than public model identifiers without truncating inventory', async () => {
 		const f = await fixture('long-cursor'), catalog = await f.discover();
