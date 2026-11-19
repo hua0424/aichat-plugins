@@ -558,11 +558,18 @@ export class OpenclawDriver implements RunDriver {
 			reason = 'native_unavailable';
 			if (!Array.isArray(result?.commands) || result.commands.length > 500) return catalog();
 			const skills: Array<{ name: string; description: string; aliases: string[]; native: Record<string, unknown>; parameters: AgentCapabilityCatalog['capabilities'][number]['parameters'] }> = [];
+			const aliasOwners = new Map<string, number>();
+			const slashTokens = (name: string, aliases: string[] = []) => new Set([`/${name}`, ...aliases].map(alias => alias.trim().toLowerCase()));
 			for (const raw of result.commands) {
 				const item = object(raw); if (!item || !['skill', 'native', 'plugin'].includes(String(item.source))) return catalog();
-				if (item.source !== 'skill' || !['text', 'both'].includes(String(item.scope))) continue;
+				if (!['text', 'both'].includes(String(item.scope))) continue;
+				// Native clamps the name to 200 before prefixing the slash.
+				if (typeof item.name !== 'string' || !item.name || item.name.length > 200 || /[\x00-\x1f\x7f]/.test(item.name) ||
+					(item.textAliases !== undefined && (!Array.isArray(item.textAliases) || item.textAliases.length > 20 || item.textAliases.some(v => typeof v !== 'string' || !v || v.length > (v.startsWith('/') ? 201 : 200))))) return catalog();
+				for (const alias of slashTokens(item.name, item.textAliases as string[] | undefined)) aliasOwners.set(alias, (aliasOwners.get(alias) ?? 0) + 1);
+				if (item.source !== 'skill') continue;
 				if (item.textAliases === undefined || (Array.isArray(item.textAliases) && !item.textAliases.length)) continue;
-				if (typeof item.name !== 'string' || !item.name || item.name.length > 200 || /[\x00-\x1f\x7f]/.test(item.name) || typeof item.description !== 'string' || item.description.length > 2000 || typeof item.acceptsArgs !== 'boolean' || !Array.isArray(item.textAliases) || !item.textAliases.length || item.textAliases.length > 20 || item.textAliases.some(v => typeof v !== 'string' || !v || v.length > 200)) return catalog();
+				if (typeof item.description !== 'string' || item.description.length > 2000 || typeof item.acceptsArgs !== 'boolean') return catalog();
 				if ((item.args !== undefined && (!Array.isArray(item.args) || item.args.length > 20)) ||
 					(item.nativeName !== undefined && (typeof item.nativeName !== 'string' || !item.nativeName || item.nativeName.length > 200))) return catalog();
 				const nativeArgs: Array<Record<string, unknown>> = [];
@@ -585,10 +592,12 @@ export class OpenclawDriver implements RunDriver {
 				skills.push({ name: item.name, description: item.description, aliases: [...item.textAliases as string[]].sort(),
 					native: { nativeName: item.nativeName, scope: item.scope, acceptsArgs: item.acceptsArgs, args: nativeArgs }, parameters });
 			}
-			skills.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-			const version = createHash('sha256').update(JSON.stringify(['openclaw-native-commands-v1', metadata.agentId, metadata.sessionId, metadata.workspaceDir, bind.generation, skills])).digest('hex');
+			// The catalog mixes sources; a colliding slash token is not proof of skill routing.
+			const unambiguous = skills.filter(skill => [...slashTokens(skill.name, skill.aliases)].every(alias => aliasOwners.get(alias) === 1));
+			unambiguous.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+			const version = createHash('sha256').update(JSON.stringify(['openclaw-native-commands-v1', metadata.agentId, metadata.sessionId, metadata.workspaceDir, bind.generation, unambiguous])).digest('hex');
 			reason = 'native_limit';
-			return catalog(skills.map(skill => ({ id: 'skill:' + skill.name, kind: 'skill', name: skill.name, description: skill.description,
+			return catalog(unambiguous.map(skill => ({ id: 'skill:' + skill.name, kind: 'skill', name: skill.name, description: skill.description,
 				supported: true, executable: false, reason: 'execution_not_connected', defaultVisibility: 'public', scope: 'conversation', parameters: skill.parameters, source: 'skill' })), version, result.commands.length === 500 ? 'partial' : 'complete');
 		} catch { return catalog(); }
 	}
