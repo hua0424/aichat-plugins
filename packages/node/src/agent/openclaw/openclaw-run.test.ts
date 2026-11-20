@@ -4,9 +4,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
-import type { AgentEvent, PreparedRun, RunDriver } from '../events.js';
+import { DriverDisconnectIncompleteError, type AgentEvent, type PreparedRun, type RunDriver } from '../events.js';
 import { OpenclawDriver } from './openclaw-driver.js';
 import { readOpenclawRunBindFile, writeOpenclawRunBindFile } from './run-bind.js';
+
+const filesystem = vi.hoisted(() => ({ aroundRename: undefined as ((destination: string, rename: () => Promise<void>) => Promise<void>) | undefined }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('node:fs/promises')>();
+	return {
+		...actual,
+		rename(from: Parameters<typeof actual.rename>[0], to: Parameters<typeof actual.rename>[1]) {
+			return filesystem.aroundRename?.(String(to), () => actual.rename(from, to)) ?? actual.rename(from, to);
+		},
+	};
+});
 
 const binding = 'aiclaw-9007199254740993-room-9007199254740995';
 const oldToken = 'a'.repeat(64);
@@ -225,6 +236,72 @@ describe('native OpenClaw AgentRun (#303)', () => {
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 
+	it.each(['terminal', 'disconnect', 'stalled disconnect'] as const)('withdraws a late run binding: %s', async (ending) => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		const nativeRunId = 'stalled-bind';
+		const file = join(f.workspace, 'run-bind', `${nativeRunId}.json`);
+		let release: () => void = () => {};
+		const held = new Promise<void>((resolve) => { release = resolve; });
+		let publication: Promise<void> | undefined;
+		let disconnect: Promise<void> | undefined;
+		let disconnectFailure: unknown;
+		filesystem.aroundRename = (to, rename) => {
+			if (to !== file) return rename();
+			publication = held.then(rename);
+			return publication;
+		};
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const run = driver.createRun(f.input);
+			const events = collect(run.events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			expect(await run.cancel('reset')).toMatchObject({ status: 'unconfirmed' });
+			socket.accept(socket.agents[0], nativeRunId);
+			await vi.waitFor(() => expect(publication).toBeDefined());
+			if (ending !== 'disconnect') {
+				socket.end(nativeRunId);
+				await events;
+				await run.dispose();
+			}
+			if (ending !== 'terminal') {
+				if (ending === 'stalled disconnect') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+				let settled = false;
+				try {
+					disconnect = driver.disconnect().catch((error) => { disconnectFailure = error; }).finally(() => { settled = true; });
+					await tick();
+					expect(settled).toBe(false);
+					if (ending === 'stalled disconnect') {
+						await vi.advanceTimersByTimeAsync(3_000);
+						expect(settled).toBe(true);
+						expect(disconnectFailure).toBeInstanceOf(DriverDisconnectIncompleteError);
+					}
+				} finally {
+					if (ending === 'stalled disconnect') vi.useRealTimers();
+				}
+			}
+			release();
+			await publication;
+			if (ending === 'disconnect') {
+				await disconnect;
+				await events;
+				await run.dispose();
+				expect(disconnectFailure).toBeUndefined();
+				expect(existsSync(file)).toBe(false);
+			} else {
+				await vi.waitFor(() => expect(existsSync(file)).toBe(false));
+				if (ending === 'terminal') expect(driver.isConnected).toBe(true);
+			}
+		} finally {
+			release();
+			await publication?.catch(() => {});
+			await (disconnect ?? driver.disconnect());
+			filesystem.aroundRename = undefined;
+			f.cleanup();
+		}
+	});
+
 	it('buffers pre-accepted events by gateway runId without assigning another pending room', async () => {
 		const f = fixture(oldState);
 		const driver = f.driver();
@@ -426,6 +503,43 @@ describe('OpenClaw run-bind bridge (#406)', () => {
 			// Withdrawn (guarded by core runId): late execs from A fall back to fail-closed empty.
 			await vi.waitFor(() => expect(existsSync(file)).toBe(false));
 		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+
+	it('does not start queued same-ID publication after its owner has terminated', async () => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		const nativeRunId = 'gateway-run-reused';
+		const file = join(f.workspace, 'run-bind', `${nativeRunId}.json`);
+		let release: () => void = () => {};
+		const held = new Promise<void>((resolve) => { release = resolve; });
+		let publishes = 0;
+		filesystem.aroundRename = (to, rename) => {
+			if (to !== file) return rename();
+			return ++publishes === 1 ? held.then(rename) : rename();
+		};
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const first = collect(driver.createRun(f.input).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			socket.accept(socket.agents[0], nativeRunId);
+			await vi.waitFor(() => expect(publishes).toBe(1));
+			socket.end(nativeRunId);
+			expect(await first).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			const second = collect(driver.createRun({ ...f.input, runId: 'core-run-2', replyToken: 'e'.repeat(64) }).events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(2));
+			socket.accept(socket.agents[1], nativeRunId);
+			socket.end(nativeRunId);
+			expect(await second).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			release();
+			await driver.disconnect();
+			expect({ publishes, staleBinding: existsSync(file) }).toEqual({ publishes: 1, staleBinding: false });
+		} finally {
+			release();
+			await driver.disconnect();
+			filesystem.aroundRename = undefined;
+			f.cleanup();
+		}
 	});
 
 	it('a second accepted run overwrites with its own token; the first withdrawal keeps it', async () => {

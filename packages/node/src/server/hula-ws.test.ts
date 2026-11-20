@@ -955,6 +955,21 @@ describe('HulaWSClient connection generations (#459)', () => {
 		expect(ws2.send).toHaveBeenCalled();
 	});
 
+	it('does not dispatch a buffered command from the current socket after close starts', () => {
+		vi.useFakeTimers();
+		const { client, ws, onMessage } = makeClient();
+		ws.emit('open');
+		const frame = Buffer.from(JSON.stringify({ type: 'agentCommand', data: {} }));
+		ws.emit('message', frame);
+		expect(onMessage).toHaveBeenCalledOnce();
+		// ws.close() starts a handshake; a buffered frame may arrive before the close event.
+		ws.close.mockImplementationOnce(() => { ws.readyState = 2; });
+		client.close();
+		expect(ws.close).toHaveBeenCalledOnce();
+		ws.emit('message', frame);
+		expect(onMessage).toHaveBeenCalledOnce();
+	});
+
 	it('late permanent handshake result for a superseded socket must not circuit-break the live one', () => {
 		vi.useFakeTimers();
 		vi.spyOn(console, 'warn').mockImplementation(() => {});

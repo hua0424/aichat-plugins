@@ -3,7 +3,7 @@ import { randomUUID, createPrivateKey, sign, createPublicKey, createHash } from 
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
-import type { AgentEvent, AgentRun, PreparedRun, RunDriver, AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult } from '../events.js';
+import { DriverDisconnectIncompleteError, type AgentEvent, type AgentRun, type PreparedRun, type RunDriver, type AgentCapabilityCatalog, type AgentCapabilityContext, type AgentCapabilityInvocation, type AgentCapabilityResult } from '../events.js';
 import { syncAgentsMdFile } from '../agents-md.js';
 import {
 	defaultOpenclawRunBindDir, removeOpenclawRunBindFile, writeOpenclawRunBindFile, readOpenclawRunBindFile,
@@ -329,7 +329,7 @@ export class OpenclawDriver implements RunDriver {
 	private gatewayVersion?: string;
 	private observerConnection?: { ws: WebSocket; connectionId: string; stamp?: string; admin: boolean };
 	/** #406: native runId → owning core runId, for runId-guarded withdrawal at cleanup. */
-	private runBindOwners = new Map<string, string>();
+	private runBindOwners = new Map<string, { runId: string; io: Promise<void>; retiring: boolean }>();
 	/** Early frames are keyed by real gateway runId, never assigned to an arbitrary pending request. */
 	private earlyEvents = new Map<string, GatewayAgentEvent[]>();
 	private earlyOverflow = new Set<string>();
@@ -514,7 +514,8 @@ export class OpenclawDriver implements RunDriver {
 			const [requestId, bind] = matches[0], original = bind.input!, nativeRunId = bind.nativeRunId!, dir = this.runBindDir ?? defaultOpenclawRunBindDir();
 			const assertOwner = () => {
 				reason = 'context_unavailable'; input.conversation!.assertCurrent(); original.conversation.assertCurrent();
-				if (input.signal.aborted || !this.connected || !bind.transport || this.ws !== bind.transport || !bind.observerStamp || this.observerConnection?.ws !== bind.transport || this.observerConnection.stamp !== bind.observerStamp || !original.replyThinkingId || this.pendingRunBinds.get(requestId) !== bind || this.requestToRunId.get(requestId) !== nativeRunId || this.runBindOwners.get(nativeRunId) !== bind.runId) throw new Error('inactive original context');
+				const owner = this.runBindOwners.get(nativeRunId);
+				if (input.signal.aborted || !this.connected || !bind.transport || this.ws !== bind.transport || !bind.observerStamp || this.observerConnection?.ws !== bind.transport || this.observerConnection.stamp !== bind.observerStamp || !original.replyThinkingId || this.pendingRunBinds.get(requestId) !== bind || this.requestToRunId.get(requestId) !== nativeRunId || owner?.runId !== bind.runId || owner.retiring) throw new Error('inactive original context');
 			};
 			const check = async () => {
 				assertOwner();
@@ -761,6 +762,18 @@ export class OpenclawDriver implements RunDriver {
 		this.flushPendingErrors(new Error('driver disconnected'));
 		this.ws?.close();
 		this.ws = null;
+		if (!this.runBindOwners.size) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.all([...this.runBindOwners.values()].map(({ io }) => io)),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new DriverDisconnectIncompleteError('OpenClaw run binding cleanup still pending')), 2_000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	get isConnected(): boolean {
@@ -1189,11 +1202,14 @@ export class OpenclawDriver implements RunDriver {
 		if (bind && !bind.nativeRunId) {
 			bind.nativeRunId = runId;
 			const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
-			this.runBindOwners.set(runId, bind.runId);
-			writeOpenclawRunBindFile(dir, runId, { token: bind.token, runId: bind.runId,
-				conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now() })
-				.catch((error) => {
-					if (this.pendingRunBinds.get(requestId) !== bind || (bind.transport && bind.transport !== this.ws)) return;
+			const prior = this.runBindOwners.get(runId)?.io ?? Promise.resolve();
+			const owner = { runId: bind.runId, io: prior, retiring: false };
+			owner.io = prior.then(() => {
+				if (this.runBindOwners.get(runId) !== owner || owner.retiring) return;
+				return writeOpenclawRunBindFile(dir, runId, { token: bind.token, runId: bind.runId,
+					conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now() });
+			}).catch((error) => {
+					if (this.runBindOwners.get(runId) !== owner || owner.retiring || this.pendingRunBinds.get(requestId) !== bind || (bind.transport && bind.transport !== this.ws)) return;
 					const chat = this.findChatByRequestId(requestId);
 					if (chat && !chat.done) {
 						chat.done = true;
@@ -1202,6 +1218,7 @@ export class OpenclawDriver implements RunDriver {
 					}
 					this.cleanupChat(requestId);
 				});
+			this.runBindOwners.set(runId, owner);
 		}
 		const chat = this.activeChats.get(`req:${requestId}`);
 		if (chat) {
@@ -1299,10 +1316,14 @@ export class OpenclawDriver implements RunDriver {
 	 */
 	private withdrawRunBind(nativeRunId: string): void {
 		const owner = this.runBindOwners.get(nativeRunId);
-		this.runBindOwners.delete(nativeRunId);
-		if (!nativeRunId) return;
+		if (!owner || owner.retiring) return;
+		owner.retiring = true;
 		const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
-		void removeOpenclawRunBindFile(dir, nativeRunId, owner).catch(() => {});
+		// A terminal frame may beat the atomic rename. Withdraw only after this owner's publication settles.
+		owner.io = owner.io.then(() => removeOpenclawRunBindFile(dir, nativeRunId, owner.runId))
+			.catch(() => {}).then(() => {
+				if (this.runBindOwners.get(nativeRunId) === owner) this.runBindOwners.delete(nativeRunId);
+			});
 	}
 
 	// ─── Reconnect & heartbeat ───
@@ -1364,11 +1385,7 @@ export class OpenclawDriver implements RunDriver {
 		this.requestToRunId.clear();
 		// #406: disconnect/Error-shutdown also withdraws every published binding (guarded by
 		// owner, best-effort) — a leftover file only ever carries a verified-or-rejected token.
-		for (const [nativeRunId, owner] of this.runBindOwners) {
-			const dir = this.runBindDir ?? defaultOpenclawRunBindDir();
-			void removeOpenclawRunBindFile(dir, nativeRunId, owner).catch(() => {});
-		}
-		this.runBindOwners.clear();
+		for (const nativeRunId of this.runBindOwners.keys()) this.withdrawRunBind(nativeRunId);
 		this.pendingRunBinds.clear();
 		this.earlyEvents.clear();
 		this.earlyOverflow.clear();
