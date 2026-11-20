@@ -442,6 +442,40 @@ describe('#459 recovery with a real HulaWSClient + loopback server', () => {
 		15000,
 	);
 
+	it('does not dispatch an established WebSocket command while closing', async () => {
+		await server.listen();
+		const onMessage = vi.fn();
+		let disconnected!: () => void;
+		const closed = new Promise<void>((resolve) => { disconnected = resolve; });
+		const client = new HulaWSClient({
+			url: server.url, token: 'conn-1', clientId: 'mc-1', uid: '1',
+			onMessage, onDisconnected: disconnected,
+		});
+		const command = (requestId: string) => ({ type: 'agentCommand', data: { requestId } });
+		client.connect();
+		try {
+			await waitUntil(() => client.isConnected && server.sockets.length === 1, 'connection open');
+			const peer = server.sockets[0]!;
+			peer.send(JSON.stringify(command('while-open')));
+			await waitUntil(() => onMessage.mock.calls.length === 1, 'live command dispatched');
+
+			// Hold the peer's read of the close frame, not the client's parser or callback.
+			peer.pause();
+			client.close();
+			expect(client.closed).toBe(true);
+			expect(peer.readyState).toBe(peer.OPEN);
+			await new Promise<void>((resolve, reject) => {
+				peer.send(JSON.stringify(command('while-closing')), (error) => error ? reject(error) : resolve());
+			});
+			peer.resume();
+			await closed;
+			expect(onMessage.mock.calls).toEqual([[command('while-open')]]);
+			expect(server.upgradeRequests).toBe(1);
+		} finally {
+			client.close();
+		}
+	});
+
 	it(
 		'one identity degraded by a permanent auth error does not affect another identity',
 		async () => {
