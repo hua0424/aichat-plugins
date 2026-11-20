@@ -8,7 +8,15 @@ import type { AgentCapabilityResult, NativeRef } from '../agent/events.js';
 export interface ControlEntry {
  requestId: string; fingerprint: string; authorizationEpoch: string; generation: number;
  state: 'prepared' | 'submitted' | 'settled'; nativeRef?: NativeRef; receipt?: AgentCapabilityResult; recovery?: RecoveryData;
+	mayHaveResetNativeSession?: true;
 }
+
+export function hasUnconfirmedNativeReset(record: ConversationRecord, ownRequestId?: string): boolean {
+	// Success advances the generation; only proven failure releases it without an advance.
+	return record.controls?.some(c => c.generation === record.generation && c.requestId !== ownRequestId &&
+		c.mayHaveResetNativeSession === true && c.receipt?.status !== 'failed') ?? false;
+}
+
 const executionRuns = (r: ConversationRecord) => (r.pendingRuns ?? []).filter((run) =>
  !r.detachedGenerations?.includes(run.generation));
 
@@ -137,11 +145,13 @@ export type SuspensionReason =
 	| 'cc-native-history-lost' // #382：ready 会话真实轮次证明不可续（原生历史丢失，No conversation found），重试无法恢复，仅 owner 重置重建
 	| 'codex-original-thread-unconfirmed'
 	| 'stop-unconfirmed'
+	| 'native-reset-unconfirmed'
 	| 'occupied'
 	| 'disabled';
 
 export function suspensionReason(record: ConversationRecord | undefined): SuspensionReason | undefined {
-	if (!record || record.state === 'ready') return record && executionRuns(record).length ? 'occupied' : undefined;
+	if (!record) return undefined;
+	if (record.state === 'ready') return hasUnconfirmedNativeReset(record) ? 'native-reset-unconfirmed' : executionRuns(record).length ? 'occupied' : undefined;
 	if (record.state === 'disabled') return 'disabled';
 	if (record.state === 'stop_unconfirmed') return 'stop-unconfirmed';
 	if (record.pendingRuns?.length) return 'occupied'; // suspended+pendingRuns = 取消进行中的瞬态
@@ -341,10 +351,12 @@ export class ConversationStore {
 		if (!r || !c) throw new Error('control not prepared');
 		return { r, c };
 	}
-	submitControl(uid: string, room: string, requestId: string, ref?: NativeRef): void {
+	submitControl(uid: string, room: string, requestId: string, ref?: NativeRef, nativeReset = false): void {
 		const { r, c } = this.controlRecord(uid, room, requestId);
 		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (hasUnconfirmedNativeReset(r, requestId)) throw new Error('native reset outcome unconfirmed');
 		if (ref) c.nativeRef = copy(ref);
+		if (nativeReset) c.mayHaveResetNativeSession = true;
 		c.state = 'submitted'; this.replace(r);
 	}
 	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
@@ -430,7 +442,7 @@ export class ConversationStore {
 	beginRun(identityId: string, roomId: string, runId: string, options?: { authorizationEpoch?: string; nativeTurn?: NativeRef }): BoundConversationRun {
 		if (!validId(runId)) throw new Error('invalid runId');
 		const record = this.getOrCreate(identityId, roomId);
-		if (record.state !== 'ready' || (!options?.nativeTurn && executionRuns(record).length)) throw new Error('conversation paused or occupied');
+		if (record.state !== 'ready' || hasUnconfirmedNativeReset(record) || (!options?.nativeTurn && executionRuns(record).length)) throw new Error('conversation paused or occupied');
 		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
 		record.pendingRuns = [...(record.pendingRuns ?? []), { runId, generation: record.generation, startedAt: new Date().toISOString(),
 			...(options?.nativeTurn ? { recovery: { version: 1, value: { provider: record.adapterInstanceId, ...options.nativeTurn } } } : {}) }];
@@ -896,7 +908,8 @@ export class ConversationStore {
 			if (r.detachedGenerations && (!Array.isArray(r.detachedGenerations) || r.detachedGenerations.some((g) => !Number.isSafeInteger(g) || g < 1 || g >= r.generation))) throw new Error('invalid detached generation');
 			if (r.selectedModel && (!validId(r.selectedModel.providerID) || !validId(r.selectedModel.modelID))) throw new Error('invalid selected model');
 			if (r.controls && (!Array.isArray(r.controls) || r.controls.length > 10000 || new Set(r.controls.map((c) => c.requestId)).size !== r.controls.length ||
-				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state)))) throw new Error('invalid control journal');
+				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state) ||
+					(c.mayHaveResetNativeSession !== undefined && (c.mayHaveResetNativeSession !== true || r.adapterInstanceId !== 'openclaw' || c.state === 'prepared'))))) throw new Error('invalid control journal');
 			if (r.replyBindings !== undefined && !Array.isArray(r.replyBindings)) throw new Error('invalid reply bindings');
 			for (const b of r.replyBindings ?? []) {
 				if (!b || typeof b.token !== 'string' || !/^[0-9a-f]{64}$/.test(b.token) ||

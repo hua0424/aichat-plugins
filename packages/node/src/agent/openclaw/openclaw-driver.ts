@@ -427,6 +427,7 @@ export class OpenclawDriver implements RunDriver {
 		const stale: AgentCapabilityResult = { status: 'failed', error: 'catalog_stale', generation };
 		const current = () => this.controlScope(context, transport);
 		let submitted = false;
+		let submittedRef: AgentCapabilityResult['nativeRef'];
 		try {
 			const scope = current();
 			const params = input.capabilityId === 'model.set' ? capabilityParameters('invoke', input.capabilityId, input.parameters) : {};
@@ -452,7 +453,10 @@ export class OpenclawDriver implements RunDriver {
 			if (input.capabilityId === 'model.set' && !oldSession) return { status: 'failed', error: 'native_request_failed', generation };
 			const selectedModel = execution.getSelectedModel?.() ?? execution.selectedModel ?? null;
 			await execution.saveRecovery({ version: 1, value: { key: canonicalK, previousSessionId: oldSession?.sessionId } }); current();
-			await execution.submitted({ sessionId: rawK }); current();
+			const nativeRef = { sessionId: rawK };
+			await execution.submitted(nativeRef);
+			submittedRef = nativeRef;
+			current();
 			submitted = true;
 			if (input.capabilityId === 'model.set') {
 				const providerId = String(params.providerId), modelId = String(params.modelId);
@@ -490,7 +494,8 @@ export class OpenclawDriver implements RunDriver {
 		} catch (error) {
 			const code = error instanceof GatewayResponseError ? error.code : undefined;
 			const refused = code === 'FORBIDDEN' || code === 'UNAUTHORIZED' || (input.capabilityId === 'model.set' && code === 'INVALID_REQUEST');
-			return { status: submitted && !refused ? 'unknown' : 'failed', error: 'native_request_failed', generation };
+			if (submitted && !refused) return { status: 'unknown', error: 'native_request_failed', generation };
+			return { status: 'failed', error: 'native_request_failed', generation, ...(submittedRef ? { nativeRef: submittedRef } : {}) };
 		}
 	}
 

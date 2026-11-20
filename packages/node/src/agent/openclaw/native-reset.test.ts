@@ -15,13 +15,15 @@ const waitFor = <T>(check: () => T | Promise<T>) => vi.waitFor(check, { timeout:
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); for (const close of cleanup.splice(0).reverse()) await close(); });
 
-async function fixture(options: { scopes?: string[]; version?: string; debounce?: { waitMs: number; maxWaitMs: number }; respondToAi?: boolean } = {}) {
+async function fixture(options: { scopes?: string[]; version?: string; debounce?: { waitMs: number; maxWaitMs: number }; respondToAi?: boolean; signDownload?: () => Promise<{ url: string }> } = {}) {
  const home = await mkdtemp(join(tmpdir(), 'openclaw-reset-'));
- const store = new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['1']), activeProviders: new Map([['1', 'openclaw']]) });
+ const openStore = () => new ConversationStore({ home, serverNamespace: 'server', activeUids: new Set(['1']), activeProviders: new Map([['1', 'openclaw']]) });
+ let store = openStore();
  const token = store.contextKey('1', '2'), rawK = `${token}:aiclaw-1-room-2`, canonicalK = 'agent:native-a:' + rawK;
  store.registerNative('openclaw', token, '1', '2', { token, nativeRef: rawK });
  store.selectModel('1', '2', 1, { providerID: 'provider-b', modelID: 'model-b' });
- const native: { resetPayload: unknown; onReset?: () => void | Promise<void>; onResolve?: () => void | Promise<void>; denied?: boolean } = {
+ const native: { sessionId: string; resetPayload: unknown; onReset?: () => void | Promise<void>; onResolve?: () => void | Promise<void>; denied?: boolean } = {
+  sessionId: 'native-session-old',
   resetPayload: { ok: true, key: canonicalK, entry: { sessionId: 'native-session-new' } },
  };
  class Socket extends EventEmitter {
@@ -33,7 +35,8 @@ async function fixture(options: { scopes?: string[]; version?: string; debounce?
     if (frame.method === 'connect') payload = { type: 'hello-ok', protocol: 4, server: { version: options.version ?? '2026.6.5', connId: 'reset-connection' }, auth: { role: 'operator', scopes: options.scopes ?? ['operator.admin', 'operator.read'] } };
     if (frame.method === 'aichat.gatewayContext') payload = { schema: 1, healthy: false };
     if (frame.method === 'sessions.resolve') { await native.onResolve?.(); payload = { ok: true, key: canonicalK }; }
-    if (frame.method === 'sessions.describe') payload = { session: { key: canonicalK, sessionId: 'native-session-old' } };
+    if (frame.method === 'sessions.describe') payload = { session: { key: canonicalK, sessionId: native.sessionId } };
+     if (frame.method === 'sessions.compact') payload = { ok: true, key: canonicalK, compacted: true };
     if (frame.method === 'sessions.reset') {
      await native.onReset?.();
      if (native.denied) { this.emit('message', Buffer.from(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: { code: 'FORBIDDEN', message: 'native scope denied' } }))); return; }
@@ -50,7 +53,8 @@ async function fixture(options: { scopes?: string[]; version?: string; debounce?
  const receipts: AgentCommandResponse[] = [];
  const hula: { frames: Array<{ type: number; data: Record<string, unknown> }>; onSend?: (frame: { type: number; data: Record<string, unknown> }) => void } = { frames: [] };
  let currentEpoch = 'epoch';
- const handler = new MessageHandler({ send: (type: number, data: Record<string, unknown>) => { const frame = { type, data }; hula.frames.push(frame); hula.onSend?.(frame); }, isConnected: true } as unknown as HulaWSClient, driver, '1', { reportAgentCommandResult: async (receipt: AgentCommandResponse) => { receipts.push(receipt); }, listSelfGroupConfigs: async () => [{ roomId: '2', approved: 1, authorizationEpoch: currentEpoch, respondToAi: options.respondToAi }] } as unknown as HulaApiClient, options.debounce ?? { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
+ const notices: string[] = [];
+ const handler = new MessageHandler({ send: (type: number, data: Record<string, unknown>) => { const frame = { type, data }; hula.frames.push(frame); hula.onSend?.(frame); }, isConnected: true } as unknown as HulaWSClient, driver, '1', { reportAgentCommandResult: async (receipt: AgentCommandResponse) => { receipts.push(receipt); }, sendMessage: async (_room: string, text: string) => { notices.push(text); return { msgId: 'notice' }; }, signDownload: options.signDownload, listSelfGroupConfigs: async () => [{ roomId: '2', approved: 1, authorizationEpoch: currentEpoch, respondToAi: options.respondToAi }] } as unknown as HulaApiClient, options.debounce ?? { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
  cleanup.push(async () => { handler.destroy(); await driver.disconnect(); store.close(); await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }); });
  await driver.connect(); await handler.prewarmGroupConfigs();
  const command = async (requestId: string, patch: Record<string, unknown> = {}) => {
@@ -59,7 +63,7 @@ async function fixture(options: { scopes?: string[]; version?: string; debounce?
   await waitFor(() => expect(receipts.slice(start).find(r => r.requestId === requestId)).toBeDefined());
   return receipts.slice(start).find(r => r.requestId === requestId)!;
  };
- return { store, driver, sockets, native, token, rawK, canonicalK, command, handler, hula, setEpoch: async (epoch: string) => { currentEpoch = epoch; await handler.prewarmGroupConfigs(); } };
+ return { get store() { return store; }, reopenStore: () => { store.close(); store = openStore(); }, driver, sockets, native, token, rawK, canonicalK, command, handler, hula, notices, setEpoch: async (epoch: string) => { currentEpoch = epoch; await handler.prewarmGroupConfigs(); } };
 }
 
 it('resets an idle core-bound K to a new native S without borrowing a directory R or losing the selected model', async () => {
@@ -90,6 +94,27 @@ it.each([
  const f = await fixture(options), catalog = (await f.command('discover-denied')).catalog!;
  expect(catalog.capabilities.some(capability => capability.id === 'session.reset' && capability.executable)).toBe(false);
  expect(f.sockets[0].sent.some(frame => frame.method === 'sessions.reset')).toBe(false);
+});
+
+it('does not submit a new compact against a session rotated by an unconfirmed reset', async () => {
+ const f = await fixture(), catalog = (await f.command('discover-before-unknown-reset')).catalog!;
+ const reset = { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version };
+ f.native.onReset = () => { f.native.sessionId = 'native-session-new'; };
+ f.native.resetPayload = {}; // The Gateway changed S, but the reply cannot prove the effect.
+ expect((await f.command('reset-unconfirmed', reset)).status).toBe('unknown');
+ expect(f.store.get('1', '2')?.generation).toBe(1);
+ expect((await f.command('reset-unconfirmed', { ...reset, reconcileOnly: true })).status).toBe('unknown');
+ f.reopenStore(); // An unknown reply must not release the fence when the persisted journal is reloaded.
+ f.handler.handle({ type: 'receiveMessage', data: {
+  fromUser: { uid: '7', name: 'user', userType: 1 },
+  message: { id: 'after-reset-ordinary', roomId: '2', type: 1, roomType: 2, body: { content: 'must not execute on the unconfirmed session' } },
+ } });
+ expect((await f.command('compact-after-unknown-reset', { ...reset, capabilityId: 'session.compact' })).status).toBe('failed');
+ expect(f.notices).toEqual([expect.stringContaining('原生会话重置的结果尚未确认')]);
+ expect(f.hula.frames.some(frame => frame.type === WSReqType.THINKING_START)).toBe(false);
+ expect(f.sockets[0].sent.some(frame => frame.method === 'agent')).toBe(false);
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.compact')).toHaveLength(0);
 });
 
 it.each([
@@ -365,10 +390,97 @@ it.each(['before', 'after'])('fences real cached authorization changes %s native
  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(when === 'before' ? 0 : 1);
 });
 
+it.each(['refused', 'completed'])('does not queue ordinary input during a held reset that is later %s', async outcome => {
+  const f = await fixture(), catalog = (await f.command('discover-held-reset')).catalog!;
+  const reset = { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version };
+  vi.useFakeTimers();
+  const gate = Promise.withResolvers<void>();
+  f.native.onReset = () => gate.promise;
+  f.native.denied = outcome === 'refused';
+  const original = f.command('held-reset', reset);
+  try {
+   await waitFor(() => expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1));
+   expect((await f.command('held-reset', { ...reset, reconcileOnly: true })).status).toBe('unknown');
+   expect(f.store.getControl('1', '2', 'held-reset')).toMatchObject({ state: 'submitted' });
+   f.handler.handle({ type: 'receiveMessage', data: {
+    fromUser: { uid: '7', name: 'user', userType: 1 },
+    message: { id: 'blocked-during-reset', roomId: '2', type: 1, roomType: 2, body: { content: 'blocked input must not replay' } },
+   } });
+   f.handler.handle({ type: 'receiveMessage', data: {
+    fromUser: { uid: '9', name: 'group-user', userType: 1 },
+    message: { id: 'unmentioned-during-reset', roomId: '2', type: 1, roomType: 1, body: { content: 'unmentioned text must not become later context' } },
+   } });
+   await waitFor(() => expect(f.notices).toEqual([expect.stringContaining('不会自动重试')]));
+  } finally { gate.resolve(); }
+  const status = outcome === 'refused' ? 'failed' : 'completed';
+  // The fixture's same-ID waiter may see the overlapping query; wait for the journal's actual outcome.
+  await original;
+  await waitFor(() => expect(f.store.getControl('1', '2', 'held-reset')?.receipt?.status).toBe(status));
+  expect((await f.command('held-reset', { ...reset, reconcileOnly: true })).status).toBe(status);
+  f.hula.onSend = frame => {
+   if (frame.type === WSReqType.THINKING_START) queueMicrotask(() => f.handler.handle({ type: 'thinkingStart', data: {
+    fromUid: '1', roomId: '2', triggerMsgId: frame.data.triggerMsgId as string, clientRunId: frame.data.clientRunId as string, thinkingId: 'after-held-reset',
+   } }));
+  };
+  await f.setEpoch('epoch-after-held-reset');
+  f.handler.handle({ type: 'receiveMessage', data: {
+   fromUser: { uid: '8', name: 'next', userType: 1 },
+   message: { id: 'fresh-after-reset', roomId: '2', type: 1, roomType: 1, body: { content: 'fresh input', atUidList: ['1'] } },
+  } });
+  await waitFor(() => expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(1));
+  const call = f.sockets[0].sent.find(frame => frame.method === 'agent')!, runId = 'after-held-reset';
+  expect(call.params.message).toBe('[HuLa 群聊]\n[next(8)]: fresh input');
+  f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'res', id: call.id, ok: true, payload: { status: 'accepted', runId } })));
+  f.sockets[0].emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: { runId, seq: 1, stream: 'lifecycle', ts: Date.now(), data: { phase: 'end' } } })));
+  await waitFor(() => expect(f.store.pendingRuns()).toHaveLength(0));
+  await vi.advanceTimersByTimeAsync(10);
+  expect(f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_START).map(frame => frame.data.triggerMsgId)).toEqual(['fresh-after-reset']);
+  expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(1);
+  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
+});
+
+it('does not admit already-signing media into a replacement generation', async () => {
+  const signing = Promise.withResolvers<{ url: string }>();
+  const signDownload = vi.fn(() => signing.promise);
+  const f = await fixture({ signDownload }), catalog = (await f.command('discover-before-media-reset')).catalog!;
+  f.handler.handle({ type: 'receiveMessage', data: {
+   fromUser: { uid: '7', name: 'user', userType: 1 },
+   message: { id: 'media-before-reset', roomId: '2', type: 4, roomType: 2, body: { fileName: 'fixture.txt' } },
+  } });
+  try {
+   await waitFor(() => expect(signDownload).toHaveBeenCalledTimes(1));
+   expect(await f.command('reset-while-signing', { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version })).toMatchObject({ status: 'completed', effect: { generation: '2' } });
+  } finally { signing.resolve({ url: 'https://fixture.invalid/signed' }); }
+  await waitFor(() => expect(f.notices).toEqual([expect.stringContaining('本条媒体消息未执行')]));
+  expect(f.hula.frames.some(frame => frame.type === WSReqType.THINKING_START)).toBe(false);
+  expect(f.sockets[0].sent.some(frame => frame.method === 'agent')).toBe(false);
+});
+
+it('reconciles the exact late native denial after the command watchdog without resetting again', async () => {
+  const f = await fixture(), catalog = (await f.command('discover-late-denial')).catalog!;
+  const reset = { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version };
+  vi.useFakeTimers();
+  f.native.denied = true;
+  f.native.onResolve = () => new Promise(resolve => setTimeout(resolve, 5000));
+  f.native.onReset = () => new Promise(resolve => setTimeout(resolve, 11000));
+  const original = f.command('late-reset-denial', reset);
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(await original).toMatchObject({ status: 'unknown', error: 'native_timeout' });
+  expect(f.store.get('1', '2')?.generation).toBe(1);
+  await vi.advanceTimersByTimeAsync(1500);
+  expect((await f.command('late-reset-denial', { ...reset, reconcileOnly: true }))).toMatchObject({ status: 'failed', reconciled: true, nativeRef: { sessionId: f.rawK } });
+  f.native.onResolve = undefined;
+  expect((await f.command('compact-after-late-denial', { ...reset, capabilityId: 'session.compact' })).status).toBe('completed');
+  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
+  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.compact')).toHaveLength(1);
+});
+
 it('preserves native permission denial without retrying or escalating the connection', async () => {
  const f = await fixture(), catalog = (await f.command('discover-native-denial')).catalog!;
  f.native.denied = true;
  expect((await f.command('reset-native-denial', { operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog.version })).status).toBe('failed');
+ expect((await f.command('compact-after-native-denial', { operation: 'invoke', capabilityId: 'session.compact', catalogVersion: catalog.version })).status).toBe('completed');
+ expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.compact')).toHaveLength(1);
  expect(f.sockets).toHaveLength(1);
  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
  expect(f.store.get('1', '2')!.generation).toBe(1);
