@@ -276,7 +276,7 @@ export class CodexNativeDriver implements AgentDriver {
 			input.conversation.assertCurrent();
 			const raw = await channel.request(scope.threadId ? 'thread/resume' : 'thread/start', {
 				...(scope.threadId ? { threadId: scope.threadId } : {}), cwd: input.workspace,
-				developerInstructions: scope.systemPrompt, approvalPolicy: 'never', sandbox: 'danger-full-access',
+				developerInstructions: scope.systemPrompt, approvalPolicy: 'never',
 				...((input.selectedModel?.modelID ?? this.deps.model) ? { model: input.selectedModel?.modelID ?? this.deps.model } : {}),
 			}, input.runId);
 			const response = object(raw), thread = object(response?.thread);

@@ -186,6 +186,20 @@ describe('Codex native catalog and model control', () => {
 		expect((await f.lines()).find((x) => x.method === 'thread/resume').params).toMatchObject({ threadId, model: 'model-204' });
 		expect(f.store.getOrCreate('owner', 'room', 'codex').selectedModel).toEqual({ providerID: 'openai', modelID: 'model-204' });
 	});
+	it('leaves native sandbox permissions to app-server on model thread start and resume', async () => {
+		const f = await fixture();
+		expect((await f.driver.executeCapability(await f.invoke('select-with-native-sandbox'))).status).toBe('accepted');
+		await f.restart();
+		expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-204' });
+		const opens = (await f.lines()).filter((x) => x.method === 'thread/start' || x.method === 'thread/resume');
+		expect(opens.map((x) => x.method)).toEqual(['thread/start', 'thread/resume']);
+		for (const { params } of opens) {
+			expect(params).toMatchObject({ cwd: f.workspace, approvalPolicy: 'never' });
+			expect(params).not.toHaveProperty('sandbox');
+			expect(params).not.toHaveProperty('permissions');
+			expect(params).not.toHaveProperty('config');
+		}
+	});
 	it('refuses a persisted selected provider absent from the actual config before start or resume', async () => {
 		const f = await fixture(); f.store.getOrCreate('owner', 'room', 'codex');
 		f.store.selectModel('owner', 'room', 1, { providerID: 'other', modelID: 'model-204' });
