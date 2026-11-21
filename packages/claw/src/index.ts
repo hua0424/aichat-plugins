@@ -34,12 +34,7 @@ export default function register(api: OpenClawPluginApi) {
 		api.on(
 			'resolve_exec_env',
 			(event, ctx) => {
-				const sessionKey = extractExecEnvSessionKey(event, ctx);
-				const env = buildOpenclawExecEnv(sessionKey);
-				if (env.OPENCLAW_BIND) {
-					api.logger.info(`aichat-claw resolve_exec_env: injecting OPENCLAW_BIND=${env.OPENCLAW_BIND}`);
-				}
-				return env;
+				return buildOpenclawExecEnv(extractExecEnvSessionKey(event, ctx));
 			},
 			{ priority: 100 },
 		);
