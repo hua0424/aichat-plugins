@@ -3,7 +3,7 @@ import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
-import { NATIVE_SESSION_LOST } from '../events.js';
+import { DriverDisconnectIncompleteError, NATIVE_SESSION_LOST } from '../events.js';
 import { buildCcSettings, writeCcSettings } from './launch.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
 import { errMsg } from '../../util/err.js';
@@ -68,7 +68,10 @@ export class CcHeadlessDriver implements RunDriver {
 		if ((this.deps.platform ?? process.platform) === 'win32' && !this.deps.spawn) assertWindowsJobAvailable();
 	}
 	async disconnect(): Promise<void> {
-		await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
+		const results = await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
+		if (results.some((result) => result.status !== 'stopped')) {
+			throw new DriverDisconnectIncompleteError('Claude Code process-group exit not confirmed');
+		}
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||

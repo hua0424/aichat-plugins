@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CcHeadlessDriver, type CcChild, type CcHeadlessDriverDeps, type CcSpawnOptions } from './headless-driver.js';
-import type { AgentEvent, PreparedRun } from '../events.js';
+import { DriverDisconnectIncompleteError, type AgentEvent, type PreparedRun } from '../events.js';
 import { CcSessionRegistry } from './sink.js';
 
 const dirs: string[] = [];
@@ -169,6 +169,22 @@ describe('CC PreparedRun native execution', () => {
 		await okayDone;
 		const okayError = okayEvents.find((e) => e.type === 'error') as { message: string } | undefined;
 		expect((okayError?.message ?? '').startsWith('native_session_lost:')).toBe(false);
+	});
+
+	posix('reports incomplete disconnect until the original CC group has stopped', async () => {
+		const f = fixture({ stopTimeoutMs: 40 });
+		const { collected, done } = await f.start();
+		try {
+			f.close(0); // the child exited, but its process group still has a live member
+			await expect(f.driver.disconnect()).rejects.toBeInstanceOf(DriverDisconnectIncompleteError);
+			expect(collected).not.toContainEqual(expect.objectContaining({ type: 'done' }));
+			f.groupExit();
+			await expect(f.driver.disconnect()).resolves.toBeUndefined();
+			expect(f.spawnCalls).toHaveLength(1);
+		} finally {
+			f.groupExit();
+			await done;
+		}
 	});
 
 	posix('does not spawn a never-consumed run during disconnect', async () => {

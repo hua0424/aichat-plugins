@@ -156,7 +156,7 @@ export interface CapabilityExecution {
 	bindTurn(turn: NativeTurnEvent, ready?: Promise<void>): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
 }
 
-/** Disconnect stopped the transport, but a shared binding write has not quiesced. */
+/** Disconnect could not confirm that driver-owned processes or shared writes have stopped. */
 export class DriverDisconnectIncompleteError extends Error {}
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */

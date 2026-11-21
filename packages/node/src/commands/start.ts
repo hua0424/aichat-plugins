@@ -308,8 +308,8 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		await opencodeServer.stop().catch(() => {});
 		conversations?.close();
 		if (!writersQuiesced) {
-			// A timed-out filesystem write is not cancelled. Keep the lease until process exit.
-			console.error('[start] Shared binding cleanup incomplete; exiting without releasing the writer lease');
+			// Incomplete driver cleanup is not a confirmed stop. Leave the writer lease in place.
+			console.error('[start] Driver cleanup incomplete; exiting without releasing the writer lease');
 			process.exit(1);
 		}
 		await endpoint.close().catch(() => {});
