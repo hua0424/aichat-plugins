@@ -297,12 +297,22 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		}
 		supervisor.connectInbound();
 	} catch (err) {
-		await supervisor.stop().catch(() => {});
+		await closeRuntime();
+		throw err;
+	}
+
+	async function closeRuntime(): Promise<void> {
+		// Stop every identity before closing shared servers or releasing the home writer lease.
+		const writersQuiesced = await supervisor.stop();
 		await ccBroker?.close().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		conversations?.close();
+		if (!writersQuiesced) {
+			// A timed-out filesystem write is not cancelled. Keep the lease until process exit.
+			console.error('[start] Shared binding cleanup incomplete; exiting without releasing the writer lease');
+			process.exit(1);
+		}
 		await endpoint.close().catch(() => {});
-		throw err;
 	}
 
 	let shuttingDown = false;
@@ -310,15 +320,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		if (shuttingDown) return;
 		shuttingDown = true;
 		console.log('\n[start] Shutting down...');
-		// Stop per-identity supervision first, THEN close the shared opencode server. The
-		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
-		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
-		// Quiesce every writer before releasing the home lease held by endpoint.close().
-		await supervisor.stop().catch(() => {});
-		await ccBroker?.close().catch(() => {});
-		await opencodeServer.stop().catch(() => {});
-		conversations?.close();
-		await endpoint.close().catch(() => {});
+		await closeRuntime();
 		// ConversationStore commits each binding synchronously before exposing it; no queued binding writes.
 		process.exit(0);
 	};

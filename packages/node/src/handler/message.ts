@@ -7,7 +7,7 @@ import { isDshDriftGateError } from '../agent/dsh/dsh-driver.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import { reduceThinking } from '../agent/thinking-map.js';
 import { bindingKey } from '../agent/bind-token-store.js';
-import { MessageDebouncer } from '../util/debounce.js';
+import { MessageDebouncer, type BufferedMessage } from '../util/debounce.js';
 import { AgentCommandHandler } from './agent-command.js';
 import { AntiLoopGuard } from './anti-loop.js';
 import { GroupConfigCache } from './group-config-cache.js';
@@ -21,7 +21,7 @@ import type { AgentCommandRequest } from '../stream/protocol.js';
 import type { CapabilityExecution, AgentCapabilityResult, NativeTurnEvent, NativeRef } from '../agent/events.js';
 import type { CapabilityRegistry } from '../capability/registry.js';
 import type { AgentRun, PreparedRun } from '../agent/events.js';
-import { suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
+import { hasUnconfirmedNativeReset, suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -187,7 +187,7 @@ interface LastMessageContext {
  */
 interface RoomChannel {
 	debouncer: MessageDebouncer;
-	pendingMessages: string[];
+	pendingMessages: BufferedMessage[];
 	lastCtx: LastMessageContext;
 	/**
 	 * REQ-004 S5: 群聊惰性积累缓冲。
@@ -243,6 +243,7 @@ const SUSPENSION_NOTICES: Record<Exclude<SuspensionReason, 'occupied' | 'disable
 	'cc-native-history-lost': '助理会话已暂停：原生 CC 会话历史丢失，无法续接会话。你的消息已排队暂不执行，重试无法恢复，owner 重置会话（reset-session）后重建。',
 	'codex-original-thread-unconfirmed': '助理会话已暂停：原线程待 owner 离线核验（confirm-codex-thread）。你的消息已排队暂不执行，恢复或重置后处理。',
 	'stop-unconfirmed': '助理会话已暂停：上一轮执行停止尚未确认。你的消息已排队暂不执行，确认停止或重置后处理。',
+	'native-reset-unconfirmed': '助理会话已暂停：原生会话重置的结果尚未确认。受阻消息不会执行，也不会自动重试。请勿重发重置命令。',
 };
 
 /**
@@ -455,8 +456,10 @@ export class MessageHandler {
 		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
 		if (!prepared.fresh) {
 			const entry = prepared.entry;
-			const receipt = entry.receipt ?? store.recordControl(this.selfUid, room, request.requestId,
-				{ status: 'unknown', phase: 'outcome', error: 'native_request_failed', generation: String(entry.generation), nativeRef: entry.nativeRef });
+			const unknown = { status: 'unknown', phase: 'outcome', error: 'native_request_failed', generation: String(entry.generation), nativeRef: entry.nativeRef } as const;
+			// A read of an in-flight reset must not settle its original journal entry.
+			if (!entry.receipt && this.driver.type === 'openclaw' && request.capabilityId === 'session.reset') return { receipt: unknown };
+			const receipt = entry.receipt ?? store.recordControl(this.selfUid, room, request.requestId, unknown);
 			// #505: a reconcileOnly query of this request's own terminal journal is durable native
 			// evidence. Replay it as reconciled so the server can repair a record that raced to
 			// unknown; never manufacture completed without evidence and never re-execute here.
@@ -476,17 +479,18 @@ export class MessageHandler {
 		}
 		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
 		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
-		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch }, generation, systemPrompt,
+		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch, capabilityId: request.capabilityId }, generation, systemPrompt,
 			(receipt) => { void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
 				.catch(() => console.error('[command] control receipt publication failed; retained for explicit query')); }) };
 	}
-	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string }, generation: number, systemPrompt: string,
+	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string; capabilityId?: string }, generation: number, systemPrompt: string,
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
-			if (owner && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
+			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
+			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
 				throw new Error('native ordinary authorization changed');
 		};
 		return {
@@ -503,9 +507,29 @@ export class MessageHandler {
 				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
 			},
 			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, requestId, value),
-			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref); },
+			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref, provider === 'openclaw' && scope.capabilityId === 'session.reset'); },
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {
+				assertCurrent();
+				if (provider === 'openclaw') {
+					const stopped = new Set<string>();
+					for (const pending of store.assertGeneration(this.selfUid, room, generation).pendingRuns ?? []) {
+						if (pending.generation !== generation) continue;
+						const session = [...this.thinkingSessions.values(), ...this.nativeThinking.values()].find(item => item.run?.id === pending.runId && item.run.generation === generation);
+						if (!session?.run || (await session.run.agent.cancel('native reset settled')).status !== 'stopped') {
+							store.markStopUnconfirmed(pending.runId);
+							throw new Error('native reset stop unconfirmed');
+						}
+						assertCurrent();
+						stopped.add(pending.runId);
+					}
+					for (const pending of store.assertGeneration(this.selfUid, room, generation).pendingRuns ?? []) {
+						if (pending.generation === generation && !stopped.has(pending.runId)) {
+							store.markStopUnconfirmed(pending.runId);
+							throw new Error('native reset run changed');
+						}
+					}
+				}
 				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>, expectedModel);
 				for (const session of this.nativeThinking.values()) if (session.roomId === room && session.run?.generation === generation && session.timeoutId) {
 					clearTimeout(session.timeoutId); session.timeoutId = undefined;
@@ -836,7 +860,7 @@ export class MessageHandler {
 	private runReady(roomId: string): boolean {
 		if (!this.getConversations) return true;
 		const record = this.getConversations().get(this.selfUid, roomId);
-		return !record || (record.state === 'ready' && (Boolean(this.driver.createNativeInput) || !record.pendingRuns?.some((run) => !record.detachedGenerations?.includes(run.generation))));
+		return !record || (record.state === 'ready' && !hasUnconfirmedNativeReset(record) && (Boolean(this.driver.createNativeInput) || !record.pendingRuns?.some((run) => !record.detachedGenerations?.includes(run.generation))));
 	}
 
 	/**
@@ -873,8 +897,8 @@ export class MessageHandler {
 	private getRoomChannel(roomId: string): RoomChannel {
 		let channel = this.roomChannels.get(roomId);
 		if (!channel) {
-			const debouncer = new MessageDebouncer((merged) => {
-				this.triggerAgentLoop(roomId, merged).catch((err) => {
+			const debouncer = new MessageDebouncer((_merged, current) => {
+				this.triggerAgentLoop(roomId, current).catch((err) => {
 					console.error(`[handler] triggerAgentLoop unhandled error (room ${roomId}):`, err.message);
 				});
 			}, this.debounceOptions);
@@ -968,12 +992,22 @@ export class MessageHandler {
 		if (String(data.fromUser.uid) === String(this.selfUid)) return;
 		// Visible system/command feedback never enters media signing, accumulation or the agent queue.
 		if (isFeedbackMessage(data.message)) return;
-		// REQ-007 #73: 文本(1)直接用；图片(3)/文件(4)注入 file-attachment；其余类型跳过。
-		// REQ-146 (#146): server 已停发 7 天下载地址——图片(3)/文件(4)落地时先 async 换取一个短效签名地址
-		// （signDownload），把它作为 resolvedFileUrl 注入本轮 agent 输入；文本(1)不触发任何网络调用（同步路径不变）。
+		// REQ-029 (#29): normalize inbound ids with String(...) (NOT Number()) — opaque strings end-to-end.
+		const roomId = String(data.message.roomId);
 		const mediaType = data.message.type;
-		const resolvedFileUrl =
-			mediaType === 3 || mediaType === 4 ? await this.resolveDownloadUrl(data.message) : undefined;
+		const media = mediaType === 3 || mediaType === 4;
+		const freezeMediaContext = media && this.driver.type === 'openclaw' && this.getConversations;
+		if (this.rejectDuringNativeReset(roomId)) return;
+		const generation = freezeMediaContext ? this.getConversations().get(this.selfUid, roomId)?.generation ?? 1 : undefined;
+		const epoch = freezeMediaContext ? this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch : undefined;
+		// REQ-146 (#146): resolve a short-lived download URL only for media; text stays synchronous.
+		const resolvedFileUrl = media ? await this.resolveDownloadUrl(data.message) : undefined;
+		if (media && this.rejectDuringNativeReset(roomId)) return;
+		if (freezeMediaContext && (generation !== (this.getConversations().get(this.selfUid, roomId)?.generation ?? 1) ||
+			 epoch !== this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch)) {
+			this.sendNotice(roomId, '助理会话或授权已变化，本条媒体消息未执行，也不会自动重试。');
+			return;
+		}
 		const content = buildAgentInjection(data.message, resolvedFileUrl);
 		if (!content?.trim()) {
 			// #146: 空注入即跳过——补一行观测（曾是静默黑洞，导致 objectKey-only 文件消息无声丢失）。
@@ -987,8 +1021,6 @@ export class MessageHandler {
 			return;
 		}
 
-		// REQ-029 (#29): normalize inbound ids with String(...) (NOT Number()) — opaque strings end-to-end.
-		const roomId = String(data.message.roomId);
 		const fromUid = String(data.fromUser.uid);
 		const isFromAi = data.fromUser.userType === 4; // 4 = AICLAW
 
@@ -1094,7 +1126,12 @@ export class MessageHandler {
 	 * 因此防循环守卫在此处按本轮 BATCH 统一评估，杜绝排队消息绕过守卫（issue #22）。
 	 * @param skipGuard 退避 reschedule 调用时为 true：本轮守卫已评估过，不再重复评估/退避。
 	 */
-	private async triggerAgentLoop(roomId: string, message: string, skipGuard = false): Promise<void> {
+	private async triggerAgentLoop(roomId: string, input: BufferedMessage, skipGuard = false): Promise<void> {
+		const message = typeof input === 'function' ? input() : input;
+		if (!message) {
+			if (skipGuard && !this.destroyed) this.flushPendingMessages(roomId);
+			return;
+		}
 		if (!this.ws.isConnected) {
 			console.warn('[handler] WS not connected, dropping AI request');
 			return;
@@ -1106,10 +1143,15 @@ export class MessageHandler {
 			return;
 		}
 
+		if (this.rejectDuringNativeReset(roomId, channel)) {
+			channel.batchSawHuman = false;
+			channel.batchAiFromUid = '';
+			return;
+		}
 		const { msgId, roomType, fromUid, isOwner, authorizationEpoch } = channel.lastCtx;
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (!this.runReady(roomId)) {
-			channel.pendingMessages.push(message);
+			channel.pendingMessages.push(input);
 			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
@@ -1147,7 +1189,7 @@ export class MessageHandler {
 					const ch = this.roomChannels.get(roomId);
 					if (ch) ch.antiLoopDelaying = false;
 					// 退避窗口结束：rescheduled 触发不再重复评估守卫（skipGuard=true）
-					this.triggerAgentLoop(roomId, message, true).catch((err) => {
+					this.triggerAgentLoop(roomId, input, true).catch((err) => {
 						console.error(`[handler] triggerAgentLoop (anti-loop reschedule) unhandled error (room ${roomId}):`, err.message);
 					});
 				}, guardResult.delayMs);
@@ -1161,7 +1203,7 @@ export class MessageHandler {
 		// 与 openclaw/opencode/codex 共用此标准守卫与 drop 语义（其消息内容不会因此丢失）。
 		if ((!this.driver.createNativeInput && this.thinkingSessions.has(sessionKey)) || !this.runReady(roomId)) {
 			console.warn(`[handler] Thinking session already active or paused for ${sessionKey}`);
-			channel.pendingMessages.push(message);
+			channel.pendingMessages.push(input);
 			this.syncSuspensionNotice(roomId, channel); // #343
 			return;
 		}
@@ -1287,8 +1329,10 @@ export class MessageHandler {
 						id: bound.conversationId, generation: bound.generation,
 						assertCurrent: () => {
 							bound.assertCurrent();
-							if (this.driver.type === 'openclaw' && this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch !== authorizationEpoch)
-								throw new Error('native run authorization changed');
+							if (this.driver.type === 'openclaw') {
+								if (this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch !== authorizationEpoch) throw new Error('native run authorization changed');
+								if (hasUnconfirmedNativeReset(store.assertGeneration(this.selfUid, roomId, bound.generation))) throw new Error('native reset outcome unconfirmed');
+							}
 						},
 						nativeState: bound.nativeState[this.driver.type]
 							? { version: 1, value: bound.nativeState[this.driver.type] } : undefined,
@@ -1316,7 +1360,7 @@ export class MessageHandler {
 					catch (releaseError) { console.error(`[handler] pre-submit run ${begunId} remains occupied: ${errMsg(releaseError)}`); }
 				}
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
-				channel.pendingMessages.unshift(message);
+				channel.pendingMessages.unshift(input);
 					this.syncSuspensionNotice(roomId, channel); // #343: 准备失败常因暂停竞态——通告真实状态
 				console.error(`[handler] run preparation failed for ${sessionKey}: ${errMsg(error)}`);
 				return;
@@ -1386,7 +1430,8 @@ export class MessageHandler {
 				} catch (releaseError) { console.error(`[handler] unconfirmed run ${barrierRunId} remains occupied: ${errMsg(releaseError)}`); }
 				try { await barrierRun.agent.dispose(); }
 				catch (disposeError) { console.error(`[handler] unconfirmed run ${barrierRunId} dispose failed: ${errMsg(disposeError)}`); }
-				if (this.thinkingSessions.get(sessionKey) === session) this.thinkingSessions.delete(sessionKey);
+				if (this.thinkingSessions.get(session.sessionKey) === session) this.thinkingSessions.delete(session.sessionKey);
+				if (this.getConversations().get(this.selfUid, roomId)?.generation !== barrierRun.generation) return;
 				if (outcome.status === 'rejected') {
 					// The authorization/approval behind this input is gone: the batch is spent for good.
 					// Do NOT repush the debouncer — a retried turn would just be refused again, and
@@ -1398,7 +1443,8 @@ export class MessageHandler {
 				// through the debouncer (2s backoff, no hot loop) rather than parking it in pendingMessages.
 				// After teardown the turn is dropped with everything else — never resurrected.
 				channel.accumulatedMessages = [...accumulated, ...channel.accumulatedMessages];
-				if (!this.destroyed) channel.debouncer.push(message);
+				if (!this.destroyed) channel.debouncer.push(() =>
+					this.getConversations().get(this.selfUid, roomId)?.generation === barrierRun.generation ? message : '');
 				console.error(`[thinking] START unconfirmed; native run not submitted run=${barrierRunId}`);
 				return;
 			}
@@ -1406,16 +1452,20 @@ export class MessageHandler {
 
 		// Native runs consume only the prepared, generation-bound core input.
 		// done 事件：clean finalize-complete，用 reduceThinking 归约整段事件序列，
-		// 帧字节必须与既有 onThinkingEnd 完全一致。
-		const finalizeComplete = () => {
+		// 普通完成沿用既有 END；已确认取消使用相同的自然收尾，但不能报成功。
+		const finalizeCleanTerminal = (cancelledReason?: string) => {
 			if (session.finalized) return;
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
 			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
 			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
-			this.sendThinkingEnd(session, { durationMs: outcome.durationMs, status: 'complete', content: rawContent });
-			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}`);
+			const durationMs = cancelledReason === undefined ? outcome.durationMs : Date.now() - session.startTime;
+			this.sendThinkingEnd(session, {
+				durationMs, content: rawContent,
+				...(cancelledReason !== undefined ? { status: 'error', error: cancelledReason } : { status: 'complete' }),
+			});
+			console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs}`);
 			// clean-complete：迭代器已自然结束，不再 close（closeDriver=false）。
 			this.teardownSession(session, roomId, false);
 		};
@@ -1436,6 +1486,7 @@ export class MessageHandler {
 		};
 
 		let runDone = false;
+		let nativeCancelledReason: string | undefined;
 		try {
 			const stream = session.run!.agent.events;
 			for await (const ev of stream) {
@@ -1460,6 +1511,11 @@ export class MessageHandler {
 					else await this.stopRun(session, ev.message);
 					break;
 				} else if (ev.type === 'cancelled') {
+					if (ev.nativeTerminalConfirmed) {
+						nativeCancelledReason = ev.reason;
+						runDone = true;
+						continue; // Same terminal-and-stream-return gate as done; no local cancel or suspension.
+					}
 					finalizeError(ev.reason);
 					await this.stopRun(session, ev.reason);
 					break;
@@ -1471,7 +1527,7 @@ export class MessageHandler {
 			}
 			if (session.run && !session.finalized) {
 				if (runDone && this.canSettleGeneration(roomId, session.run.generation)) {
-					finalizeComplete();
+					finalizeCleanTerminal(nativeCancelledReason);
 					this.releaseRun(session); // done AND stream return: bridge must prove upstream terminal.
 				} else {
 					finalizeError('UNEXPECTED_EOF');
@@ -1831,6 +1887,20 @@ export class MessageHandler {
 			// REQ-008 #75 P1-1②: best-effort 收尾 driver session（唤醒仍 park 的 for-await）。
 			this.teardownSession(session, String(roomId), true);
 		}
+	}
+
+	private rejectDuringNativeReset(roomId: string, channel?: RoomChannel): boolean {
+		if (this.driver.type !== 'openclaw') return false;
+		const record = this.getConversations?.().get(this.selfUid, roomId);
+		if (!record || !hasUnconfirmedNativeReset(record)) return false;
+		// A rejected input is never queued, even if an old run also has unconfirmed stop.
+		const pending = channel ?? this.getRoomChannel(roomId);
+		const reason = 'native-reset-unconfirmed';
+		if (pending.suspendNoticeKey !== reason) {
+			pending.suspendNoticeKey = reason;
+			this.sendNotice(roomId, SUSPENSION_NOTICES[reason]);
+		}
+		return true;
 	}
 
 	/**

@@ -1,5 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { buildOpenclawExecEnv, extractExecEnvSessionKey } from './exec-env.js';
+import register from './index.js';
+
+it('passes the exec binding to the registered hook output without writing it to the plugin logger', () => {
+	const log = vi.fn();
+	const on = vi.fn<(event: string, handler: unknown) => void>();
+	register({ logger: { info: log, warn: log, error: log, debug: log }, registerChannel: vi.fn(), on });
+	const handler = on.mock.calls.find(([event]) => event === 'resolve_exec_env')?.[1];
+	if (typeof handler !== 'function') throw new Error('resolve_exec_env was not registered');
+	const binding = 'synthetic-exec-binding';
+	expect(handler(undefined, { sessionKey: `agent:main:${binding}:aiclaw-1-room-2` }))
+		.toMatchObject({ OPENCLAW_BIND: binding });
+	expect(JSON.stringify(log.mock.calls).includes(binding)).toBe(false);
+});
 
 /**
  * REQ-010 S6 Phase-2 / #141 B+ — buildOpenclawExecEnv: pure helper for the resolve_exec_env hook.

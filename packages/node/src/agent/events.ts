@@ -11,7 +11,7 @@ export type AgentEvent =
 	| { type: 'tool'; name: string; phase: 'start' | 'end' }
 	| { type: 'done'; durationMs: number; usage?: Record<string, unknown> }
 	| { type: 'error'; message: string }
-	| { type: 'cancelled'; reason: string };
+	| { type: 'cancelled'; reason: string; nativeTerminalConfirmed?: true };
 
 /**
  * #382 — error-message prefix a driver stamps when a live run PROVED a persisted native session
@@ -155,6 +155,9 @@ export interface CapabilityExecution {
 	/** A pending ready reserves correlation only; the returned lease still requires durable proof and exact START. */
 	bindTurn(turn: NativeTurnEvent, ready?: Promise<void>): Promise<{ token: string; runId: string; thinkingId: string; relation?: 'new' | 'attached' }>;
 }
+
+/** Disconnect stopped the transport, but a shared binding write has not quiesced. */
+export class DriverDisconnectIncompleteError extends Error {}
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
 export interface AgentDriver {
