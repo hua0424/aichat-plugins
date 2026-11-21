@@ -20,7 +20,7 @@ export interface OpenClawPluginApi {
 		setRunContext(patch: { runId: string; namespace: string; value: PluginJsonValue }): boolean;
 	};
 	registerGatewayMethod?(method: string, handler: (opts: { params: Record<string, unknown>; respond: (ok: boolean, value?: unknown) => void }) => void, opts: { scope: 'operator.read' }): void;
-	agent?: { events: { registerAgentEventSubscription(subscription: { id: string; streams: string[]; handle: (event: { runId: string; stream: string; data: Record<string, unknown> }) => void }): void } };
+	agent?: { events: { registerAgentEventSubscription(subscription: { id: string; streams: string[]; handle: (event: { runId: string; stream: string; data: Record<string, unknown> }, ctx?: { setRunContext(namespace: string, value: PluginJsonValue): void }) => void }): void } };
 	/**
 	 * 注册 openclaw plugin hook（REQ-010 S6 Phase-2 实测可用）。
 	 * `resolve_exec_env` 的真实 handler 签名为 `(event, ctx)`（ctx 是第 2 个参数），
