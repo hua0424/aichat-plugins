@@ -383,6 +383,34 @@ it('records side-effect-without-response as unknown after the existing deadline 
  expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.compact')).toHaveLength(1);
 });
 
+it('reports the old run as cancelled without suspending a separately submitted compact', async () => {
+ const f = await fixture(), socket = f.sockets[0];
+ f.hula.onSend = frame => {
+  if (frame.type === WSReqType.THINKING_START) queueMicrotask(() => f.handler.handle({ type: 'thinkingStart', data: { fromUid: '1', roomId: '2', triggerMsgId: frame.data.triggerMsgId as string, thinkingId: 'ordinary-grant', clientRunId: frame.data.clientRunId as string } }));
+ };
+ f.handler.handle({ type: 'receiveMessage', data: { fromUser: { uid: '7', name: 'user', userType: 1 }, message: { id: 'ordinary-input', roomId: '2', type: 1, roomType: 2, body: { content: 'ordinary input before compact' } } } });
+ await waitFor(() => expect(socket.sent.filter(frame => frame.method === 'agent')).toHaveLength(1));
+ const start = f.hula.frames.find(frame => frame.type === WSReqType.THINKING_START)!;
+ const agent = socket.sent.find(frame => frame.method === 'agent')!;
+ socket.reply(agent.id, { status: 'accepted', runId: 'ordinary-native-run' });
+ const markCancelling = vi.spyOn(f.store, 'markCancelling');
+ f.native.beforeCompact = () => {
+  expect(f.store.pendingRuns()).toHaveLength(1);
+  socket.emit('message', Buffer.from(JSON.stringify({ type: 'event', event: 'agent', payload: {
+   runId: 'ordinary-native-run', sessionKey: f.canonicalK, seq: 1, stream: 'lifecycle', ts: Date.now(),
+   data: { phase: 'end', status: 'cancelled', aborted: true, stopReason: 'rpc' },
+  } })));
+ };
+ expect(await f.invoke('compact-active-cancel')).toMatchObject({ status: 'completed', effect: { kind: 'compact', controlId: 'compact-active-cancel', summary: true } });
+ await waitFor(() => expect(f.store.pendingRuns()).toHaveLength(0));
+ expect(markCancelling).not.toHaveBeenCalled();
+ expect(f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_END).map(frame => frame.data)).toEqual([
+  expect.objectContaining({ clientRunId: start.data.clientRunId, thinkingId: 'ordinary-grant', status: 'error', error: 'OpenClaw run cancelled' }),
+ ]);
+ expect(socket.sent.filter(frame => !['connect', 'aichat.gatewayContext', 'agent', 'sessions.resolve', 'sessions.describe', 'sessions.compact'].includes(frame.method))).toHaveLength(0);
+ expect(socket.sent.filter(frame => frame.method === 'sessions.compact')).toHaveLength(1);
+});
+
 it('does not impose an AIChat busy rejection or pre-abort on an accepted Native run', async () => {
  const f = await fixture(), choice = await f.modelChoice();
  f.hula.onSend = frame => {

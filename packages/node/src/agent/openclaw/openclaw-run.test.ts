@@ -49,8 +49,8 @@ class Socket extends EventEmitter {
 	accept(request: (typeof this.sent)[number], runId: string) {
 		this.deliver({ type: 'res', id: request.id, ok: true, payload: { status: 'accepted', runId } });
 	}
-	end(runId: string) {
-		this.deliver({ type: 'event', event: 'agent', payload: { runId, seq: 1, stream: 'lifecycle', ts: Date.now(), data: { phase: 'end' } } });
+	end(runId: string, outcome: Record<string, unknown> = {}) {
+		this.deliver({ type: 'event', event: 'agent', payload: { runId, seq: 1, stream: 'lifecycle', ts: Date.now(), data: { phase: 'end', ...outcome } } });
 	}
 	get agents() { return this.sent.filter((frame) => frame.method === 'agent'); }
 }
@@ -86,21 +86,55 @@ function fixture(nativeState?: unknown) {
 }
 
 describe('native OpenClaw AgentRun (#303)', () => {
-	it('resumes an exact historical compound nativeRef without minting or rewriting it', async () => {
+	it.each([
+		{ outcome: {}, probeReset: false }, { outcome: { status: 'cancelled' }, probeReset: false },
+		{ outcome: { aborted: true }, probeReset: false }, { outcome: {}, probeReset: true },
+	])('preserves existing ordinary terminal behavior for %j', async ({ outcome, probeReset }) => {
 		const f = fixture(oldState);
 		const driver = f.driver();
 		try {
 			await driver.connect();
 			const socket = f.sockets[0];
-			const pending = collect(driver.createRun(f.input).events);
+			const run = driver.createRun(f.input);
+			const pending = collect(run.events);
 			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
 			const request = socket.agents[0];
 			expect(request.params).toEqual(expect.objectContaining({ message: 'raw user message', sessionKey: oldRef }));
 			expect(f.registerNative).not.toHaveBeenCalled();
 			socket.accept(request, 'gateway-run-old');
-			socket.end('gateway-run-old');
-			expect(await pending).toEqual([{ type: 'done', durationMs: expect.any(Number) }]);
+			socket.end('gateway-run-old', outcome);
+			if (probeReset) expect(await run.cancel('native reset settled')).toEqual({ status: 'stopped' });
+			expect(await pending).toEqual(probeReset
+				? [{ type: 'cancelled', reason: 'OpenClaw stop not confirmed' }]
+				: [{ type: 'done', durationMs: expect.any(Number) }]);
 			expect(f.native).toEqual(oldState);
+		} finally { await driver.disconnect(); f.cleanup(); }
+	});
+
+	it.each([false, true])('reports a correlated native cancellation (reset stop probe before drain: %s)', async (probeReset) => {
+		const f = fixture(oldState);
+		const driver = f.driver();
+		try {
+			await driver.connect();
+			const socket = f.sockets[0];
+			const run = driver.createRun(f.input);
+			const pending = collect(run.events);
+			await vi.waitFor(() => expect(socket.agents).toHaveLength(1));
+			const request = socket.agents[0];
+			socket.accept(request, 'gateway-cancelled-run');
+			socket.deliver({ type: 'event', event: 'agent', payload: {
+				runId: 'gateway-cancelled-run', sessionKey: oldRef, seq: 1, stream: 'lifecycle', ts: Date.now(),
+				data: { phase: 'end', status: 'cancelled', aborted: true, stopReason: 'rpc' },
+			} });
+			const resetProbe = probeReset ? run.cancel('native reset settled') : undefined;
+			socket.end('gateway-cancelled-run'); // The first terminal owns the result.
+			if (resetProbe) expect(await resetProbe).toEqual({ status: 'stopped' });
+			expect(await pending).toEqual([{ type: 'cancelled', reason: 'OpenClaw run cancelled', nativeTerminalConfirmed: true }]);
+			const cancel = vi.spyOn(run, 'cancel');
+			await run.dispose();
+			expect(cancel).not.toHaveBeenCalled();
+			expect(await run.cancel('settle original run')).toEqual({ status: 'stopped' });
+			expect(socket.sent.map(({ method }) => method)).toEqual(['connect', 'agent']);
 		} finally { await driver.disconnect(); f.cleanup(); }
 	});
 

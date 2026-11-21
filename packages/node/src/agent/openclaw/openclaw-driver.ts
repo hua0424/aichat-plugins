@@ -232,7 +232,7 @@ interface PendingRequest {
 interface ChatSink {
 	push: (ev: AgentEvent) => void;
 	finish: () => void;
-	confirmStopped?: () => void;
+	confirmStopped?: (wasCancelled: boolean) => void;
 }
 
 /**
@@ -637,7 +637,8 @@ export class OpenclawDriver implements RunDriver {
 			if (!transport || this.ws !== transport || !this.connected) throw new Error('NATIVE_OUTCOME_UNKNOWN: OpenClaw original transport unavailable; do not resubmit');
 			input.conversation.assertCurrent();
 		};
-		let consumed = false, submitted = false, completed = false, nativeStopped = false, cancelled = input.signal.aborted;
+		let consumed = false, submitted = false, settled = false, cancelled = input.signal.aborted;
+		let nativeTerminal: 'cancelled' | 'ended' | undefined;
 		let session: OpenclawSession | undefined;
 		const workspace = process.platform === 'win32' ? resolve(this.workspaceDir).toLowerCase() : resolve(this.workspaceDir);
 		const onAbort = () => { void run.cancel('aborted'); };
@@ -649,14 +650,16 @@ export class OpenclawDriver implements RunDriver {
 				return execute();
 			} },
 			async cancel(reason) {
+				// A reset's stop probe must not overwrite an already observed native cancellation.
+				if (nativeTerminal === 'cancelled') return { status: 'stopped' };
 				cancelled = true;
 				await session?.close(); // Local stream wake, NOT proof of gateway cancellation.
-				return completed || nativeStopped || !submitted ? { status: 'stopped' } :
+				return settled || nativeTerminal !== undefined || !submitted ? { status: 'stopped' } :
 					{ status: 'unconfirmed', reason: `${reason}: OpenClaw gateway run stop not verified` };
 			},
 			async dispose() {
 				input.signal.removeEventListener('abort', onAbort);
-				if (!completed) await run.cancel('dispose');
+				if (!settled) await run.cancel('dispose');
 			},
 		};
 		const execute = async function* (this: OpenclawDriver): AsyncGenerator<AgentEvent> {
@@ -708,7 +711,7 @@ export class OpenclawDriver implements RunDriver {
 				assertCurrent();
 				if (cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 				session = new OpenclawSession((message, sink) => this.beginChat(message, nativeRef,
-					{ ...sink, confirmStopped: () => { nativeStopped = true; } }, () => { submitted = true; },
+					{ ...sink, confirmStopped: (wasCancelled) => { nativeTerminal = wasCancelled ? 'cancelled' : 'ended'; } }, () => { submitted = true; },
 					// #406: freeze this run's binding for the request; the accepted frame links it
 					// to the exact native runId (publish happens there — never a pre-submit guess).
 					{ token: input.replyToken!, runId: input.runId,
@@ -722,8 +725,10 @@ export class OpenclawDriver implements RunDriver {
 					else if (!terminal) yield event;
 				}
 				if (cancelled) yield { type: 'cancelled', reason: 'OpenClaw stop not confirmed' };
-				else if (terminal?.type === 'done') { completed = true; yield terminal; }
-				else yield terminal ?? { type: 'error', message: 'UNEXPECTED_EOF: OpenClaw gateway did not confirm completion' };
+				else {
+					settled = terminal?.type === 'done' || (terminal?.type === 'cancelled' && terminal.nativeTerminalConfirmed === true);
+					yield terminal ?? { type: 'error', message: 'UNEXPECTED_EOF: OpenClaw gateway did not confirm completion' };
+				}
 			} catch (error) {
 				yield { type: 'error', message: errMsg(error) };
 			} finally {
@@ -733,7 +738,7 @@ export class OpenclawDriver implements RunDriver {
 					if (active.count === 1) promptActive.delete(workspace);
 					else promptActive.set(workspace, { ...active, count: active.count - 1 });
 				}
-				if (!completed) void session?.close();
+				if (!settled) void session?.close();
 			}
 		}.bind(this);
 		return run;
@@ -1019,12 +1024,14 @@ export class OpenclawDriver implements RunDriver {
 		// lifecycle 流 → thinking end (REQ-004)
 		if (evt.stream === 'lifecycle' && !chat.done) {
 			const phase = evt.data.phase as string | undefined;
+			const wasCancelled = phase === 'end' && evt.data.status === 'cancelled' && evt.data.aborted === true;
 			// Only the correlated native lifecycle proves stop; cleanup/local close never does.
-			if (phase === 'end' || phase === 'error') chat.sink.confirmStopped?.();
+			if (phase === 'end' || phase === 'error') chat.sink.confirmStopped?.(wasCancelled);
 			if (phase === 'end') {
 				chat.done = true;
-				const durationMs = Date.now() - chat.startTime;
-				chat.sink.push({ type: 'done', durationMs });
+				chat.sink.push(wasCancelled
+					? { type: 'cancelled', reason: 'OpenClaw run cancelled', nativeTerminalConfirmed: true }
+					: { type: 'done', durationMs: Date.now() - chat.startTime });
 				chat.sink.finish();
 				// P1-2 假设：openclaw 在 lifecycle phase==='end' 之前已投递本 run 内所有 tool 流
 				// 事件（end 语义即"run 已完成"，按协议先于它的 tool result 都应已处理）。此处同步

@@ -1452,16 +1452,20 @@ export class MessageHandler {
 
 		// Native runs consume only the prepared, generation-bound core input.
 		// done 事件：clean finalize-complete，用 reduceThinking 归约整段事件序列，
-		// 帧字节必须与既有 onThinkingEnd 完全一致。
-		const finalizeComplete = () => {
+		// 普通完成沿用既有 END；已确认取消使用相同的自然收尾，但不能报成功。
+		const finalizeCleanTerminal = (cancelledReason?: string) => {
 			if (session.finalized) return;
 			session.finalized = true;
 			if (session.timeoutId) clearTimeout(session.timeoutId);
 			const outcome = reduceThinking(session.events);
 			// 可选 driver 钩子：openclaw 借此过滤自有的 NO_REPLY 哨兵及空/纯空白思考正文；其它 driver 无钩子 → 逐字节不变。
 			const rawContent = this.driver.finalizeThinking?.(outcome.content) ?? outcome.content;
-			this.sendThinkingEnd(session, { durationMs: outcome.durationMs, status: 'complete', content: rawContent });
-			console.log(`[thinking] end session=${sessionKey} durationMs=${outcome.durationMs}`);
+			const durationMs = cancelledReason === undefined ? outcome.durationMs : Date.now() - session.startTime;
+			this.sendThinkingEnd(session, {
+				durationMs, content: rawContent,
+				...(cancelledReason !== undefined ? { status: 'error', error: cancelledReason } : { status: 'complete' }),
+			});
+			console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs}`);
 			// clean-complete：迭代器已自然结束，不再 close（closeDriver=false）。
 			this.teardownSession(session, roomId, false);
 		};
@@ -1482,6 +1486,7 @@ export class MessageHandler {
 		};
 
 		let runDone = false;
+		let nativeCancelledReason: string | undefined;
 		try {
 			const stream = session.run!.agent.events;
 			for await (const ev of stream) {
@@ -1506,6 +1511,11 @@ export class MessageHandler {
 					else await this.stopRun(session, ev.message);
 					break;
 				} else if (ev.type === 'cancelled') {
+					if (ev.nativeTerminalConfirmed) {
+						nativeCancelledReason = ev.reason;
+						runDone = true;
+						continue; // Same terminal-and-stream-return gate as done; no local cancel or suspension.
+					}
 					finalizeError(ev.reason);
 					await this.stopRun(session, ev.reason);
 					break;
@@ -1517,7 +1527,7 @@ export class MessageHandler {
 			}
 			if (session.run && !session.finalized) {
 				if (runDone && this.canSettleGeneration(roomId, session.run.generation)) {
-					finalizeComplete();
+					finalizeCleanTerminal(nativeCancelledReason);
 					this.releaseRun(session); // done AND stream return: bridge must prove upstream terminal.
 				} else {
 					finalizeError('UNEXPECTED_EOF');

@@ -11,7 +11,7 @@ export type AgentEvent =
 	| { type: 'tool'; name: string; phase: 'start' | 'end' }
 	| { type: 'done'; durationMs: number; usage?: Record<string, unknown> }
 	| { type: 'error'; message: string }
-	| { type: 'cancelled'; reason: string };
+	| { type: 'cancelled'; reason: string; nativeTerminalConfirmed?: true };
 
 /**
  * #382 — error-message prefix a driver stamps when a live run PROVED a persisted native session
