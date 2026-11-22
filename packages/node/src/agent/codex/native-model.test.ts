@@ -24,7 +24,7 @@ const save=id=>{const current=fs.existsSync(process.env.NATIVE_STATE)?JSON.parse
 const all=Array.from({length:205},(_,i)=>({id:'entry-'+i,model:'model-'+String(i).padStart(3,'0'),displayName:'Model '+i,description:'Native model',hidden:i===204,
 upgrade:null,upgradeInfo:null,availabilityNux:null,supportedReasoningEfforts:[],defaultReasoningEffort:'medium',inputModalities:['text'],supportsPersonality:false,additionalSpeedTiers:[],serviceTiers:[],defaultServiceTier:null,isDefault:i===0}));
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const x=JSON.parse(line),p=x.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={};
-if(x.method==='initialize')result={userAgent:'aichat/0.142.3'};
+if(x.method==='initialize')result={userAgent:'aichat/0.142.3',codexHome:process.cwd(),platformFamily:process.platform==='win32'?'windows':'unix',platformOs:process.platform};
 if(x.method==='config/read'){if(process.env.MODE==='close-first-discovery'&&process.env.CHANNEL==='1')process.exit(0);result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};}
 if(x.method==='skills/list')result={data:[{cwd:process.env.MODE==='wrong-cwd'?'/untrusted':p.cwds[0],skills:JSON.parse(fs.readFileSync(process.env.INVENTORY,'utf8')),errors:process.env.MODE==='scan-error'?[{path:'/private',message:'scan failed'}]:[]}]};
 if(x.method==='model/list'){const opaque='opaque:'+ 'x'.repeat(300),at=p.cursor===opaque?100:p.cursor?Number(p.cursor):0;result={data:all.slice(at,at+100),nextCursor:at+100<all.length?String(at+100):null};if(process.env.MODE==='cursor-loop')result.nextCursor='100';if(process.env.MODE==='long-cursor'&&at===0)result.nextCursor=opaque;}

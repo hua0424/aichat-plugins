@@ -26,7 +26,7 @@ if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.
 const send=p=>process.stdout.write(JSON.stringify(p)+'\\n');let number=0;
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const r=JSON.parse(line);fs.appendFileSync(process.env.WIRE,JSON.stringify(r)+'\\n');
- if(r.method==='initialize')return send({id:r.id,result:{userAgent:'aichat/0.142.3 (test; 1)'}});
+ if(r.method==='initialize')return send({id:r.id,result:{userAgent:'aichat/0.142.3 (test; 1)',codexHome:process.cwd(),platformFamily:process.platform==='win32'?'windows':'unix',platformOs:process.platform}});
  if(r.method==='initialized')return;
  if(r.method==='thread/start'||r.method==='thread/resume')return send({id:r.id,result:{thread:{id:r.params.threadId||'native-thread',cwd:r.params.cwd,cliVersion:process.env.BAD_CLI||'0.142.3'}}});
  if(r.method==='turn/interrupt')return send({id:r.id,result:{}});

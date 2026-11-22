@@ -20,7 +20,7 @@ async function fixture(mode = '') {
  await writeFile(path, 'deterministic fake skill');
  await writeFile(script, `const fs=require('node:fs');if(process.argv.includes('--version')){console.log('codex-cli 0.142.3');process.exit(0)}const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');let seq=0;const ended=new Set();setInterval(()=>{if(process.env.NOTIFY&&fs.existsSync(process.env.NOTIFY)){const frame=JSON.parse(fs.readFileSync(process.env.NOTIFY,'utf8'));fs.unlinkSync(process.env.NOTIFY);if(frame.method==='turn/completed')ended.add(frame.params.threadId+'/'+frame.params.turn.id);send(frame);}},5);
  require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line),p=r.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={},deferAck=false;
- if(r.method==='initialize')result={userAgent:'aichat/0.142.3'};
+ if(r.method==='initialize')result={userAgent:'aichat/0.142.3',codexHome:process.cwd(),platformFamily:process.platform==='win32'?'windows':'unix',platformOs:process.platform};
  if(r.method==='config/read')result={config:{model_provider:'openai'}};
  if(r.method==='skills/list')result={data:[{cwd:p.cwds[0],skills:[{name:'probe',scope:'user',path:process.env.SKILL,enabled:true,description:'native'}],errors:[]}]};
  if(r.method==='model/list')result={data:[],nextCursor:null};

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 
 /** The pinned native protocol, not an SDK exec stream. No retry/reconnect of mutations. */
 export class CodexAppServer {
@@ -57,7 +58,13 @@ export class CodexAppServer {
 		child.stdin.on('error', () => this.fail('CODEX_CHANNEL_FAILED'));
 		child.on('error', () => this.fail('CODEX_CHANNEL_FAILED'));
 		child.on('close', () => this.fail('CODEX_CHANNEL_CLOSED'));
-		await this.request('initialize', { clientInfo: { name: 'aichat', version: '1' }, capabilities: { experimentalApi: true } });
+		const result = await this.request('initialize', { clientInfo: { name: 'aichat', version: '1' }, capabilities: { experimentalApi: true } });
+		if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('CODEX_INITIALIZE_UNVERIFIED');
+		const { userAgent, codexHome, platformFamily, platformOs } = result as Record<string, unknown>;
+		if (typeof userAgent !== 'string' || !userAgent.trim() ||
+			typeof codexHome !== 'string' || codexHome.includes('\0') || !isAbsolute(codexHome) ||
+			typeof platformFamily !== 'string' || !platformFamily.trim() ||
+			typeof platformOs !== 'string' || !platformOs.trim()) throw new Error('CODEX_INITIALIZE_UNVERIFIED');
 		this.notify('initialized', {});
 	}
 
