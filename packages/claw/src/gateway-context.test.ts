@@ -5,7 +5,7 @@ import { expect, it, vi } from 'vitest';
 import register from './index.js';
 import type { BeforePromptBuildCtx, OpenClawPluginApi, PluginJsonValue } from './types.js';
 
-it('denies a terminal run before host cleanup without losing discovery after a duplicate terminal', async () => {
+it('requires the current observer stamp and denies closed runs without disabling discovery for the next run', async () => {
  const dir = await mkdtemp(join(tmpdir(), 'aichat-claw-terminal-'));
  vi.stubEnv('AICHAT_OPENCLAW_RUNBIND_DIR', dir);
  try {
@@ -47,8 +47,8 @@ it('denies a terminal run before host cleanup without losing discovery after a d
   const { stamp } = rpc({ kind: 'observer' });
   const owner = (nativeRunId: string) => ({ nativeRunId, runId: `request-${nativeRunId}`, conversationId: 'conversation', generation: 1, createdAt: 1 });
   const discover = (runId: string) => rpc({ kind: 'context', stamp, nativeRunId: runId, owner: owner(runId) });
-  const start = async (runId: string) => {
-   await writeFile(join(dir, `${runId}.json`), JSON.stringify({ ...owner(runId), token: '1'.repeat(64) }));
+  const start = async (runId: string, observerStamp: string | null = stamp) => {
+   await writeFile(join(dir, `${runId}.json`), JSON.stringify({ ...owner(runId), token: '1'.repeat(64), observerStamp: observerStamp ?? undefined }));
    await prompt(undefined, { runId, agentId: 'agent', sessionKey: 'key', sessionId: 'session', workspaceDir: dir });
   };
   const end = (runId: string, { phase = 'end', writable = true, scoped = true } = {}) => {
@@ -61,6 +61,10 @@ it('denies a terminal run before host cleanup without losing discovery after a d
    closed.add(runId);
   };
 
+  await start('wrong-observer', 'previous-observer');
+  expect(discover('wrong-observer')).toEqual({ available: false });
+  await start('no-observer', null);
+  expect(discover('no-observer')).toEqual({ available: false });
   await start('old');
   expect(discover('old')).toMatchObject({ available: true });
   end('old');

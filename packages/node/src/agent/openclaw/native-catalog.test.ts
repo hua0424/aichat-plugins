@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi, describe } from 'vitest';
 import type WebSocket from 'ws';
 import { OpenclawDriver } from './openclaw-driver.js';
-import { readOpenclawRunBindFile } from './run-bind.js';
+import { readOpenclawRunBindFile, writeOpenclawRunBindFile } from './run-bind.js';
 import { ConversationStore } from '../../capability/conversations.js';
 import { MessageHandler } from '../../handler/message.js';
 import type { HulaWSClient } from '../../server/hula-ws.js';
@@ -164,9 +164,21 @@ it('uses SDK runContext through one read method without metadata filesystem writ
  const receipt = await f.discover('sdk-catalog');
  expect(receipt.catalog!.discovery?.coverage).toBe('complete');
  expect(f.socket.sent.filter(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'observer')).toHaveLength(1);
- expect(f.socket.sent.some(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'context')).toBe(true);
+ const context = f.socket.sent.find(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'context');
+ expect(context?.params.stamp).toEqual(expect.any(String));
+ expect(f.originalBinding?.observerStamp).toBe(context?.params.stamp);
  expect(faults.metadataWrites).toBe(0);
  expect(await readOpenclawRunBindFile(f.bindDir, 'native-run-1')).toEqual(f.originalBinding);
+});
+
+it('refuses discovery if only the original binding stamp changes after the observer is ready', async () => {
+ const f = await fixture();
+ expect(f.observation()).toMatchObject({ state: 'ready' });
+ const binding = f.originalBinding;
+ if (!binding?.observerStamp) throw new Error('Expected the frozen observer stamp');
+ await writeOpenclawRunBindFile(f.bindDir, 'native-run-1', { ...binding, observerStamp: binding.observerStamp + '-other' });
+ expect((await f.discover('binding-stamp-changed')).catalog!.discovery?.coverage).toBe('unavailable');
+ expect(f.socket.sent.filter(frame => frame.method === 'commands.list')).toHaveLength(0);
 });
 
 it.each(['pending', 'missing', 'denied'] as const)('keeps ordinary independent of an observer %s result and never fills its old stamp', async observer => {

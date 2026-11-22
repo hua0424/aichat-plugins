@@ -46,7 +46,7 @@ export function registerGatewayContext(api: OpenClawPluginApi): void {
    const captured = previous ?? pending;
    const dir = resolveOpenclawRunBindDir();
    const binding = await waitForOpenclawRunBind(dir, runId);
-   if (!healthy || !same(get(runId), captured) || !binding) return;
+   if (!healthy || !same(get(runId), captured) || !binding || binding.observerStamp !== stamp) return;
    const owner: Owner = { nativeRunId: runId, runId: binding.runId, conversationId: binding.conversationId,
     generation: binding.generation, createdAt: binding.createdAt };
    if (previous?.owner && !same(previous.owner, owner)) { deny(runId, previous); return; }

@@ -28,6 +28,8 @@ export interface OpenclawRunBindPayload {
 	conversationId: string;
 	generation: number;
 	createdAt: number;
+	/** Optional discovery metadata; the #406 reply reader does not authorize from it. */
+	observerStamp?: unknown;
 }
 
 export function defaultOpenclawRunBindDir(home?: string): string {

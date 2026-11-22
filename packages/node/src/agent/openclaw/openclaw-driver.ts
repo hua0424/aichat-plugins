@@ -521,7 +521,7 @@ export class OpenclawDriver implements RunDriver {
 				assertOwner();
 				const live = await readOpenclawRunBindFile(dir, nativeRunId);
 				assertOwner();
-				if (!live || live.token !== bind.token || live.runId !== bind.runId || live.conversationId !== bind.conversationId || live.generation !== bind.generation || this.pendingRunBinds.get(requestId) !== bind) throw new Error('original binding unavailable');
+				if (!live || live.token !== bind.token || live.runId !== bind.runId || live.conversationId !== bind.conversationId || live.generation !== bind.generation || live.observerStamp !== bind.observerStamp || this.pendingRunBinds.get(requestId) !== bind) throw new Error('original binding unavailable');
 				return live;
 			};
 			const readObservation = async () => {
@@ -1214,7 +1214,7 @@ export class OpenclawDriver implements RunDriver {
 			owner.io = prior.then(() => {
 				if (this.runBindOwners.get(runId) !== owner || owner.retiring) return;
 				return writeOpenclawRunBindFile(dir, runId, { token: bind.token, runId: bind.runId,
-					conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now() });
+					conversationId: bind.conversationId, generation: bind.generation, createdAt: Date.now(), observerStamp: bind.observerStamp });
 			}).catch((error) => {
 					if (this.runBindOwners.get(runId) !== owner || owner.retiring || this.pendingRunBinds.get(requestId) !== bind || (bind.transport && bind.transport !== this.ws)) return;
 					const chat = this.findChatByRequestId(requestId);
