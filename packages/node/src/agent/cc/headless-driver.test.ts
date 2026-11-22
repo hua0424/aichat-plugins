@@ -82,9 +82,9 @@ describe('CC PreparedRun native execution', () => {
 		expect(JSON.parse(f.writes[0]).message.content[0].text).toBe(f.input.message);
 		expect(f.transcript).toHaveBeenCalledWith('aiclaw-5-room-9', expect.objectContaining({ kind: 'inbound' }));
 		f.line({ type: 'system', subtype: 'init', session_id: 'historical-id' });
-		f.line({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking' }] } });
+		f.line({ type: 'assistant', session_id: 'historical-id', message: { content: [{ type: 'text', text: 'thinking' }] } });
 		f.registry.pushContext('opaque-new-key', f.spawnCalls[0].options.env.AICHAT_CC_RUN!, { type: 'tool', name: 'Bash', phase: 'end' });
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'result', session_id: 'historical-id', is_error: false });
 		await tick();
 		expect(events.some((e) => e.type === 'done')).toBe(false); // result != child close
 		f.groupExit(); f.close(0);
@@ -185,6 +185,25 @@ describe('CC PreparedRun native execution', () => {
 		expect(f.input.saveRecovery).not.toHaveBeenCalledWith(expect.objectContaining({
 			value: expect.objectContaining({ sessionId: 'unexpected' }),
 		}));
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+	});
+
+	posix.each([
+		{ type: 'assistant', session_id: 'other', message: { content: [{ type: 'text', text: 'foreign text' }] } },
+		{ type: 'result', session_id: 'other', is_error: false },
+	])('rejects a $type from another session after matching init', async (foreign) => {
+		const f = fixture();
+		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'original', workspace: f.dir } };
+		const { collected, done } = await f.start();
+		f.line({ type: 'system', subtype: 'init', session_id: 'original' });
+		f.line(foreign);
+		if (foreign.type === 'assistant') f.line({ type: 'result', session_id: 'original', is_error: false });
+		f.groupExit(); f.close(0);
+		await done;
+		expect(collected).toEqual([{ type: 'error', message: 'CC native session changed unexpectedly' }]);
+		expect(f.transcript).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ kind: 'assistant' }));
+		expect(f.persisted).toEqual([{ version: 1, value: { sessionId: 'original', workspace: f.dir } }]);
 		expect(f.spawnCalls).toHaveLength(1);
 		expect(f.writes).toHaveLength(1);
 	});

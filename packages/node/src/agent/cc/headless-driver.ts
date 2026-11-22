@@ -273,11 +273,13 @@ class CcRun implements AgentRun {
 				try { obj = JSON.parse(notice.text.trim().replace(/^data:\s*/, '')) as Record<string, unknown>; }
 				catch { continue; }
 				if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-				if (obj.type === 'system' && obj.subtype === 'init' && typeof obj.session_id === 'string' && obj.session_id) {
-					if (sessionId && obj.session_id !== sessionId) {
-						resultError = 'CC native session changed unexpectedly';
-						break;
-					}
+				const isInit = obj.type === 'system' && obj.subtype === 'init';
+				if (sessionId && (isInit || obj.type === 'assistant' || obj.type === 'result') &&
+					obj.session_id !== undefined && obj.session_id !== sessionId) {
+					resultError = 'CC native session changed unexpectedly';
+					break;
+				}
+				if (isInit && typeof obj.session_id === 'string' && obj.session_id) {
 					sessionId = obj.session_id;
 					initSeen = true; // #382: resume accepted — later failures are execution failures, not "history lost"
 					try {
