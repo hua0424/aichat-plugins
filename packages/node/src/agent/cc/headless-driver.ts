@@ -274,7 +274,11 @@ class CcRun implements AgentRun {
 				catch { continue; }
 				if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
 				if (obj.type === 'system' && obj.subtype === 'init' && typeof obj.session_id === 'string' && obj.session_id) {
-						sessionId = obj.session_id;
+					if (sessionId && obj.session_id !== sessionId) {
+						resultError = 'CC native session changed unexpectedly';
+						break;
+					}
+					sessionId = obj.session_id;
 					initSeen = true; // #382: resume accepted — later failures are execution failures, not "history lost"
 					try {
 						await input.conversation.saveNativeState({ version: 1, value: {

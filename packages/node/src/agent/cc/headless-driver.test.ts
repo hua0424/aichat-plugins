@@ -171,6 +171,24 @@ describe('CC PreparedRun native execution', () => {
 		expect((okayError?.message ?? '').startsWith('native_session_lost:')).toBe(false);
 	});
 
+	posix('does not rebind the chat when a resumed CC invocation reports a different native session', async () => {
+		const f = fixture();
+		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'original', workspace: f.dir } };
+		const { collected, done } = await f.start();
+		f.line({ type: 'system', subtype: 'init', session_id: 'unexpected' });
+		f.line({ type: 'assistant', message: { content: [{ type: 'text', text: 'wrong session' }] } });
+		f.line({ type: 'result', is_error: false });
+		f.groupExit(); f.close(0);
+		await done;
+		expect(collected).toEqual([{ type: 'error', message: 'CC native session changed unexpectedly' }]);
+		expect(f.persisted).toEqual([]);
+		expect(f.input.saveRecovery).not.toHaveBeenCalledWith(expect.objectContaining({
+			value: expect.objectContaining({ sessionId: 'unexpected' }),
+		}));
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+	});
+
 	posix('reports incomplete disconnect until the original CC group has stopped', async () => {
 		const f = fixture({ stopTimeoutMs: 40 });
 		const { collected, done } = await f.start();
