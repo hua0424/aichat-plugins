@@ -69,11 +69,13 @@ describe('CC native capability observation', () => {
 		const { done } = await f.start();
 		try {
 			f.line({ type: 'system', subtype: 'init', session_id: 'native-session', cwd: f.dir,
-				claude_code_version: '2.1.195', slash_commands: ['compact', 'example:hello'], skills: ['example:hello'] });
+				claude_code_version: '2.1.195', slash_commands: ['x'.repeat(121), 'x'.repeat(120), 'compact', 'example:hello'], skills: ['example:hello'] });
 			const context = { conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal };
 			await vi.waitFor(async () => expect(await f.driver.discoverCapabilities(context)).toMatchObject({
 				framework: 'cc', runtimeVersion: '2.1.195', discovery: { source: 'native', coverage: 'partial' },
-				capabilities: [{ id: 'command:compact', executable: false }, { id: 'skill:example:hello', executable: false }],
+				capabilities: [{ id: 'command:compact', executable: false, defaultVisibility: 'hidden' },
+					{ id: 'command:example:hello', executable: false, defaultVisibility: 'hidden' },
+					{ id: `command:${'x'.repeat(120)}`, executable: false, defaultVisibility: 'hidden' }],
 			}));
 			expect((await f.driver.discoverCapabilities({ ...context, conversation: { ...context.conversation, generation: 2 } })).capabilities).toEqual([]);
 			expect((await f.driver.discoverCapabilities({ ...context, workspace: join(f.dir, 'other') })).capabilities).toEqual([]);
@@ -88,6 +90,28 @@ describe('CC native capability observation', () => {
 			await done;
 		}
 		expect((await f.driver.discoverCapabilities({ conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal })).capabilities).toEqual([]);
+	});
+	posix('withholds the catalog while the consumer has not processed a received directory change', async () => {
+		const f = fixture();
+		const run = f.driver.createRun(f.input);
+		const events = run.events[Symbol.asyncIterator]();
+		const first = events.next();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session', cwd: f.dir,
+				claude_code_version: '2.1.195', slash_commands: ['compact'], skills: [] });
+			f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'text', text: 'thinking' }] } });
+			expect((await first).value).toEqual({ type: 'thinking', text: 'thinking' });
+			const context = { conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal };
+			expect((await f.driver.discoverCapabilities(context)).capabilities).toHaveLength(1);
+			f.line({ type: 'system', subtype: 'commands_changed', session_id: 'native-session', commands: [] });
+			expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable');
+		} finally {
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.groupExit(); f.close(0);
+			await first;
+			while (!(await events.next()).done) { /* drain the owned iterator */ }
+		}
 	});
 });
 

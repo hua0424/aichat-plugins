@@ -124,7 +124,8 @@ class CcRun implements AgentRun {
 
 	matchesCatalogOrigin(context: AgentCapabilityContext): boolean {
 		const { conversation, workspace, signal } = this.input;
-		if (this.finished || this.closed || this.cancelled || signal.aborted || conversation.id !== context.conversation?.id ||
+		// The event consumer can pause after yielding; unread frames may invalidate this snapshot.
+		if (this.finished || this.closed || this.cancelled || this.notices.length || signal.aborted || conversation.id !== context.conversation?.id ||
 			conversation.generation !== context.conversation.generation || workspace !== context.workspace) return false;
 		conversation.assertCurrent();
 		return true;
@@ -133,14 +134,15 @@ class CcRun implements AgentRun {
 	private observeCatalog(frame: Record<string, unknown>, sessionId: string, workspace: string): void {
 		const runtimeVersion = frame.claude_code_version;
 		if (frame.cwd !== workspace || typeof runtimeVersion !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(runtimeVersion) ||
-			runtimeVersion.length > 64 || !Array.isArray(frame.slash_commands) || !Array.isArray(frame.skills)) return;
-		const name = (value: unknown): value is string => typeof value === 'string' && value.length <= 128 && /^[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*$/.test(value);
-		const skills = new Set(frame.skills.filter(name));
-		const capabilities: AgentCapability[] = [...new Set(frame.slash_commands.filter(name))].sort().map((nativeName) => {
-			const kind = skills.has(nativeName) ? 'skill' : 'command';
-			return { id: `${kind}:${nativeName}`, kind, source: kind, name: nativeName, supported: true, executable: false,
-				reason: 'execution_not_connected', defaultVisibility: 'public', scope: 'conversation', parameters: [] };
-		});
+			runtimeVersion.length > 64 || !Array.isArray(frame.slash_commands)) return;
+		const prefix = 'command:';
+		const name = (value: unknown): value is string => typeof value === 'string' && value.length + prefix.length <= 128 &&
+			/^[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*$/.test(value);
+		// The flat lists can overlap without identifying which source the dispatcher would select.
+		const capabilities: AgentCapability[] = [...new Set(frame.slash_commands.filter(name))].sort().map((nativeName) => ({
+			id: `${prefix}${nativeName}`, kind: 'command', name: nativeName, supported: true, executable: false,
+			reason: 'execution_not_connected', defaultVisibility: 'hidden', scope: 'conversation', parameters: [],
+		}));
 		const { id, generation } = this.input.conversation;
 		const version = createHash('sha256').update(JSON.stringify([id, generation, workspace, sessionId, runtimeVersion, capabilities])).digest('hex');
 		// The init lists names only; it does not prove model inventory or execution provenance.
@@ -317,6 +319,7 @@ class CcRun implements AgentRun {
 					break;
 				}
 				if (isInit && typeof obj.session_id === 'string' && obj.session_id) {
+					this.observedCatalog = undefined;
 					sessionId = obj.session_id;
 					initSeen = true; // #382: resume accepted — later failures are execution failures, not "history lost"
 					try {
@@ -327,10 +330,8 @@ class CcRun implements AgentRun {
 						await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
 							attempt, sessionId, workspace, pid: this.child.pid ?? null, stopProbe: 'unknown-after-restart' } });
 					} catch (error) { resultError = `session registration failed: ${errMsg(error)}`; break; }
-					this.observedCatalog = undefined;
 					this.observeCatalog(obj, sessionId, workspace);
 				} else if (obj.type === 'system' && obj.subtype === 'commands_changed' && obj.session_id === sessionId) {
-					// The changed list has no separate skill classification; do not serve the old snapshot.
 					this.observedCatalog = undefined;
 				} else if (obj.type === 'result') {
 					this.observedCatalog = undefined;
