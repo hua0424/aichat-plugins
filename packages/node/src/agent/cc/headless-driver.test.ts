@@ -81,7 +81,8 @@ describe('CC native capability observation', () => {
 			expect((await f.driver.discoverCapabilities({ ...context, workspace: join(f.dir, 'other') })).capabilities).toEqual([]);
 			expect((await f.driver.discoverCapabilities({ ...context, capabilityId: 'model.set' })).capabilities).toEqual([]);
 			f.line({ type: 'system', subtype: 'commands_changed', session_id: 'native-session', commands: [] });
-			await vi.waitFor(async () => expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable'));
+			await Promise.resolve(); // The waiting consumer has woken, but has not handled the frame yet.
+			expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable');
 			expect(f.spawnCalls).toHaveLength(1);
 			expect(f.writes).toHaveLength(1);
 		} finally {

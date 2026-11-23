@@ -166,10 +166,9 @@ class CcRun implements AgentRun {
 		this.notices.push(notice);
 		this.wake?.();
 	}
-	private async next(): Promise<Notice> {
+	private async waitForNotice(): Promise<void> {
 		while (!this.notices.length) await new Promise<void>((resolve) => { this.wake = resolve; });
 		this.wake = undefined;
-		return this.notices.shift()!;
 	}
 	private probeGroup(): boolean {
 		if ((this.deps.platform ?? process.platform) === 'win32')
@@ -298,7 +297,8 @@ class CcRun implements AgentRun {
 			this.child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			this.child.stdin?.end();
 			while (true) {
-				const notice = await this.next();
+				await this.waitForNotice();
+				const notice = this.notices.shift()!;
 				if (notice.type === 'failure') { resultError = notice.message; break; }
 				if (notice.type === 'close') {
 					if (!this.groupGone) resultError = 'CC process group exit unconfirmed';
@@ -374,7 +374,8 @@ class CcRun implements AgentRun {
 				const timer = setTimeout(() => this.notify({ type: 'drain-end' }), this.deps.drainMs ?? 250);
 				try {
 					while (true) {
-						const notice = await this.next();
+						await this.waitForNotice();
+						const notice = this.notices.shift()!;
 						if (notice.type === 'drain-end') break;
 						if (notice.type === 'hook' && !this.cancelled) yield notice.event;
 					}
