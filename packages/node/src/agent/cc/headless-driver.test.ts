@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -67,6 +67,8 @@ const posix = it;
 describe('CC native capability observation', () => {
 	posix('discovers and lists models from the idle native instance without sending user input', async () => {
 		const f = fixture();
+		const derived = join(f.dir, 'agent', 'owner');
+		expect(existsSync(derived)).toBe(false);
 		const prepare = vi.fn();
 		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare });
 		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true } };
@@ -82,6 +84,8 @@ describe('CC native capability observation', () => {
 		const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
 		await reply(0, 'provider-choice');
 		const catalog = (await discovery)?.catalog;
+		expect(f.spawnCalls[0].options.cwd).toBe(derived);
+		expect(existsSync(derived)).toBe(true);
 		expect(catalog?.capabilities).toEqual([expect.objectContaining({ id: 'model.list', executable: true, defaultVisibility: 'public', scope: 'instance' })]);
 		const invoke = { ...scope, requestId: 'list', operation: 'invoke', capabilityId: 'model.list', catalogVersion: catalog!.version };
 		const result = handler.handle(invoke);

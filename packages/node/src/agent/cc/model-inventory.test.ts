@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -117,6 +118,12 @@ it('escalates only the owned group and reports unconfirmed cleanup, not a succes
 
 const hasSupervisor = process.platform !== 'win32' ||
 	existsSync(join(import.meta.dirname, '../../../dist/native/cc-job-supervisor.exe'));
+it.skipIf(process.platform !== 'win32' || !hasSupervisor)('classifies a Windows helper that never launched as a failed read, not uncertain cleanup', async () => {
+	const missing = join(process.cwd(), `missing-${randomUUID()}`);
+	const error = await readCcModelInventory({ cwd: missing, signal: AbortSignal.timeout(4000) }).catch((value: unknown) => value);
+	expect(error).toBeInstanceOf(Error);
+	expect(error).not.toBeInstanceOf(DriverDisconnectIncompleteError);
+}, 12_000);
 it.skipIf(!hasSupervisor)('finishes a real owned subprocess over the initialize/EOF handshake', async () => {
 	// Substitute Node for Claude, but keep the actual platform's ownership and pipe implementation.
 	const nativeFixture = `const lines = require('node:readline').createInterface({ input: process.stdin });

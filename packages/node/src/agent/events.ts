@@ -107,6 +107,8 @@ export interface AgentCapabilityContext {
 	conversation?: Pick<BoundConversation, 'id' | 'generation' | 'assertCurrent'>;
 	/** Prepared by core from trusted room context, never supplied directly by the UI. */
 	workspace?: string;
+	/** Core-derived default directory, not an owner-supplied host override. */
+	defaultWorkspace?: true;
 	signal: AbortSignal;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;

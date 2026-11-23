@@ -105,9 +105,14 @@ export class CcHeadlessDriver implements RunDriver {
 		context.signal.throwIfAborted();
 		context.conversation?.assertCurrent();
 		const controller = new AbortController();
-		const done = readCcModelInventory({ cwd, signal: AbortSignal.any([context.signal, controller.signal]),
-			claudeBin: this.deps.claudeBin, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform,
-		}).catch((error: unknown) => {
+		const signal = AbortSignal.any([context.signal, controller.signal]);
+		const done = (async () => {
+			if (context.defaultWorkspace) await mkdir(cwd, { recursive: true, mode: 0o700 });
+			signal.throwIfAborted();
+			context.conversation?.assertCurrent();
+			return readCcModelInventory({ cwd, signal,
+				claudeBin: this.deps.claudeBin, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
+		})().catch((error: unknown) => {
 			if (error instanceof DriverDisconnectIncompleteError) this.modelReadStopUnconfirmed = true;
 			throw error;
 		});
@@ -149,6 +154,7 @@ export class CcHeadlessDriver implements RunDriver {
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
 			!input.workspace || !input.contextKey || !input.bindToken || !input.replyToken) throw new TypeError('Invalid CC prepared run');
+		this.modelRead?.controller.abort();
 		const run = new CcRun(input, this.deps, this.transcript, async (workspace) => {
 			await mkdir(workspace, { recursive: true });
 			let path = this.settings.get(workspace);

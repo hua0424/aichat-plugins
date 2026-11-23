@@ -86,6 +86,9 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 			else { this.fail(new Error('CC Windows supervisor invalid frame sequence')); this.kill(); return; }
 		}
 	}
+	/** Missing native P is not proof: only a failed OS launch of the helper cannot own a Job. */
+	get helperNeverLaunched(): boolean { return this.exited && this.helper.pid === undefined; }
+
 	private sendControl(bytes: Buffer): boolean {
 		if (this.exited || this.doneCode !== undefined || !this.helper.stdin.writable) return false;
 		return this.helper.stdin.write(bytes);

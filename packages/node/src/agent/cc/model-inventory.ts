@@ -44,7 +44,7 @@ export async function readCcModelInventory({ cwd, signal, claudeBin = 'claude', 
 		const ownedPid = () => child.pid && child.pid > 0 && Number.isSafeInteger(child.pid) ? child.pid : undefined;
 
 		function groupGone(): boolean {
-			if (windows) return child instanceof WindowsJobChild && child.verifiedGone;
+			if (windows) return child instanceof WindowsJobChild && (child.verifiedGone || child.helperNeverLaunched);
 			const pid = ownedPid();
 			if (!pid) return child instanceof ChildProcess && child.pid === undefined;
 			try { kill(-pid, 0); return false; }
