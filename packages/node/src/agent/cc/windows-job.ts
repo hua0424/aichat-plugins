@@ -45,9 +45,11 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 		this.helper = spawn(binary, [command, ...args], { cwd: options.cwd, env: options.env, windowsHide: true,
 			stdio: ['pipe', 'pipe', 'pipe'] });
 		this.stdin = {
-			write: (text) => { this.helper.stdin.write(frame('I', Buffer.from(text))); },
-			end: () => { this.helper.stdin.write(frame('E')); },
+			write: (text) => { this.sendControl(frame('I', Buffer.from(text))); },
+			end: () => { this.sendControl(frame('E')); },
 		};
+		// A closing helper can race a control write; only its D frame and actual close prove stop.
+		this.helper.stdin.on('error', () => {});
 		this.helper.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
 		this.helper.stderr.on('data', (chunk: Buffer) => { this.helperStderr = (this.helperStderr + chunk.toString()).slice(-500); });
 		this.helper.on('error', (error) => { this.fail(error); this.emit('error', error); });
@@ -84,10 +86,11 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 			else { this.fail(new Error('CC Windows supervisor invalid frame sequence')); this.kill(); return; }
 		}
 	}
-	kill(): boolean {
-		if (this.exited) return false;
-		return this.helper.stdin.write(frame('K'));
+	private sendControl(bytes: Buffer): boolean {
+		if (this.exited || this.doneCode !== undefined || !this.helper.stdin.writable) return false;
+		return this.helper.stdin.write(bytes);
 	}
+	kill(): boolean { return this.sendControl(frame('K')); }
 	/** Last-resort containment on timeout: killing our helper closes its Job handle; never stop proof. */
 	forceKillHelper(): void { if (!this.exited) this.helper.kill(); }
 }
