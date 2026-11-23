@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CcHeadlessDriver, type CcChild, type CcHeadlessDriverDeps, type CcSpawnOptions } from './headless-driver.js';
 import { DriverDisconnectIncompleteError, type AgentEvent, type PreparedRun } from '../events.js';
 import { CcSessionRegistry } from './sink.js';
+import { AgentCommandHandler } from '../../handler/agent-command.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -64,6 +65,36 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 const posix = it;
 
 describe('CC native capability observation', () => {
+	posix('discovers and lists models from the idle native instance without sending user input', async () => {
+		const f = fixture();
+		const prepare = vi.fn();
+		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare });
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true } };
+		async function reply(index: number, value: string) {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+			const frame = JSON.parse(f.writes[index]);
+			expect(frame).toMatchObject({ type: 'control_request', request: { subtype: 'initialize' } });
+			f.line({ type: 'control_response', response: { request_id: frame.request_id, subtype: 'success',
+				response: { models: [{ value, displayName: 'Native model' }] } } });
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(index + 1));
+			f.groupExit(); f.close(0);
+		}
+		const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
+		await reply(0, 'provider-choice');
+		const catalog = (await discovery)?.catalog;
+		expect(catalog?.capabilities).toEqual([expect.objectContaining({ id: 'model.list', executable: true, defaultVisibility: 'public', scope: 'instance' })]);
+		const invoke = { ...scope, requestId: 'list', operation: 'invoke', capabilityId: 'model.list', catalogVersion: catalog!.version };
+		const result = handler.handle(invoke);
+		await reply(1, 'provider-choice');
+		expect(await result).toMatchObject({ requestId: 'list', roomId: 'room', status: 'completed', text: expect.stringContaining('Native model — provider-choice') });
+		expect(await handler.handle(invoke)).toEqual(await result);
+		const changed = handler.handle({ ...invoke, requestId: 'list-new' });
+		await reply(2, 'changed-model');
+		expect(await changed).toEqual({ requestId: 'list-new', roomId: 'room', status: 'failed', error: 'catalog_stale' });
+		expect(f.spawnCalls).toHaveLength(3);
+		expect(prepare).not.toHaveBeenCalled();
+		expect(f.transcript).not.toHaveBeenCalled();
+	});
 	posix('projects the actual init catalog only from the exact live conversation without submitting another input', async () => {
 		const f = fixture();
 		const { done } = await f.start();
@@ -90,7 +121,14 @@ describe('CC native capability observation', () => {
 			f.groupExit(); f.close(0);
 			await done;
 		}
-		expect((await f.driver.discoverCapabilities({ conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal })).capabilities).toEqual([]);
+		const idle = f.driver.discoverCapabilities({ conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal });
+		await vi.waitFor(() => expect(f.writes).toHaveLength(2));
+		const request = JSON.parse(f.writes[1]);
+		expect(request).toMatchObject({ type: 'control_request', request: { subtype: 'initialize' } });
+		f.line({ type: 'control_response', response: { request_id: request.request_id, subtype: 'success',
+			response: { models: [{ value: 'model-a', displayName: 'Model A' }] } } });
+		f.close(0);
+		expect((await idle).capabilities.map((capability) => capability.id)).toEqual(['model.list']);
 	});
 	posix('withholds the catalog while the consumer has not processed a received directory change', async () => {
 		const f = fixture();

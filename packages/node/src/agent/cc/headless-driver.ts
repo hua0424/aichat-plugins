@@ -2,12 +2,14 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
-import type { AgentCapability, AgentCapabilityCatalog, AgentCapabilityContext, AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
+import type { AgentCapability, AgentCapabilityCatalog, AgentCapabilityContext, AgentCapabilityInvocation, AgentCapabilityResult, AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { DriverDisconnectIncompleteError, NATIVE_SESSION_LOST } from '../events.js';
 import { buildCcSettings, writeCcSettings } from './launch.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
 import { errMsg } from '../../util/err.js';
 import { assertWindowsJobAvailable, spawnWindowsJob, type WindowsJobChild } from './windows-job.js';
+import { capabilityParameters } from '../capability-parameters.js';
+import { readCcModelInventory } from './model-inventory.js';
 
 interface ReadableStreamish {
 	on(event: 'data', listener: (chunk: Buffer | string) => void): void;
@@ -60,28 +62,89 @@ export class CcHeadlessDriver implements RunDriver {
 	private readonly active = new Set<CcRun>();
 	private readonly settings = new Map<string, string>();
 	private readonly transcript: CcTranscriptWriter;
+	private modelRead?: { controller: AbortController; done: ReturnType<typeof readCcModelInventory> };
+	private modelReadStopUnconfirmed = false;
+	private closing = false;
 
 	constructor(private readonly deps: CcHeadlessDriverDeps) {
 		this.transcript = deps.transcript ?? new FileCcTranscriptWriter();
 	}
 	async connect(): Promise<void> {
+		if (this.modelReadStopUnconfirmed) throw new DriverDisconnectIncompleteError('CC model inventory cleanup unconfirmed');
 		if ((this.deps.platform ?? process.platform) === 'win32' && !this.deps.spawn) assertWindowsJobAvailable();
+		this.closing = false;
 	}
 	async disconnect(): Promise<void> {
-		const results = await Promise.all([...this.active].map((run) => run.cancel('driver disconnect')));
-		if (results.some((result) => result.status !== 'stopped')) {
+		this.closing = true;
+		const modelRead = this.modelRead;
+		modelRead?.controller.abort();
+		const [results] = await Promise.all([
+			Promise.all([...this.active].map((run) => run.cancel('driver disconnect'))),
+			modelRead?.done.catch(() => undefined),
+		]);
+		if (this.modelReadStopUnconfirmed || results.some((result) => result.status !== 'stopped')) {
 			throw new DriverDisconnectIncompleteError('Claude Code process-group exit not confirmed');
 		}
 	}
 	async discoverCapabilities(context: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
 		const unavailable = (): AgentCapabilityCatalog => ({ framework: 'cc', runtimeVersion: 'unknown', version: 'cc-unavailable',
 			capabilities: [], discovery: { source: 'native', coverage: 'unavailable', reason: 'context_unavailable' } });
-		if (context.capabilityId || !context.conversation || !context.workspace || context.signal.aborted) return unavailable();
+		if (context.capabilityId || !context.workspace || context.signal.aborted || this.closing) return unavailable();
 		try {
-			context.conversation.assertCurrent();
+			context.conversation?.assertCurrent();
+			if (!this.active.size) return (await this.readModelCatalog(context)).catalog;
+			if (!context.conversation) return unavailable();
 			const candidates = [...this.active].filter((run) => run.matchesCatalogOrigin(context));
 			return (candidates.length === 1 ? candidates[0].observedCatalog : undefined) ?? unavailable();
 		} catch { return unavailable(); }
+	}
+
+	private async readModelCatalog(context: AgentCapabilityContext) {
+		const cwd = context.workspace;
+		if (!cwd || this.active.size || this.closing || this.modelRead || this.modelReadStopUnconfirmed) throw new Error('CC model inventory unavailable');
+		context.signal.throwIfAborted();
+		context.conversation?.assertCurrent();
+		const controller = new AbortController();
+		const done = readCcModelInventory({ cwd, signal: AbortSignal.any([context.signal, controller.signal]),
+			claudeBin: this.deps.claudeBin, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform,
+		}).catch((error: unknown) => {
+			if (error instanceof DriverDisconnectIncompleteError) this.modelReadStopUnconfirmed = true;
+			throw error;
+		});
+		const read = { controller, done };
+		this.modelRead = read;
+		try {
+			const models = await done;
+			context.signal.throwIfAborted();
+			controller.signal.throwIfAborted();
+			context.conversation?.assertCurrent();
+			const version = createHash('sha256').update(JSON.stringify([cwd, this.deps.claudeBin ?? 'claude', models])).digest('hex');
+			const catalog: AgentCapabilityCatalog = { framework: 'cc', runtimeVersion: 'unknown', version: `cc-models:${version}`,
+				capabilities: [{ id: 'model.list', kind: 'model', source: 'model', name: 'Models',
+					description: 'List native models reported by this Claude instance in safe mode.', supported: true,
+					executable: true, defaultVisibility: 'public', scope: 'instance', parameters: [] }],
+				discovery: { source: 'native', coverage: 'partial' } };
+			return { catalog, models };
+		} finally { if (this.modelRead === read) this.modelRead = undefined; }
+	}
+
+	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		if (input.capabilityId !== 'model.list' || input.execution || input.recovery) return { status: 'unsupported', error: 'execution_not_connected' };
+		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
+		catch { return { status: 'failed', error: 'invalid_parameters' }; }
+		if (!/^cc-models:[a-f0-9]{64}$/.test(input.catalogVersion)) return { status: 'failed', error: 'catalog_stale' };
+		try {
+			const { catalog, models } = await this.readModelCatalog(input);
+			if (input.catalogVersion !== catalog.version) return { status: 'failed', error: 'catalog_stale' };
+			const lines = ['Available models (Claude safe mode):'];
+			let length = lines[0].length;
+			for (const model of models) {
+				const line = `${model.displayName} — ${model.value}`;
+				if (length + line.length + 1 > 1750) { lines.push(`Showing ${lines.length - 1} of ${models.length} models.`); break; }
+				lines.push(line); length += line.length + 1;
+			}
+			return { status: 'completed', text: lines.join('\n') };
+		} catch { return { status: 'failed', error: 'native_request_failed' }; }
 	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
