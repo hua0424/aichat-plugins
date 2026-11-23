@@ -336,6 +336,10 @@ class CcRun implements AgentRun {
 					this.observedCatalog = undefined;
 				} else if (obj.type === 'result') {
 					this.observedCatalog = undefined;
+					if (!initSeen || obj.session_id !== sessionId) {
+						resultError = 'CC native result session unconfirmed';
+						break;
+					}
 					// The native turn can settle while stdin is open; the frozen reply binding still owns only this input.
 					if (!resultSeen && !this.closed) this.child.stdin?.end();
 					resultSeen = true;

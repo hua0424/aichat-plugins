@@ -138,6 +138,26 @@ describe('CC PreparedRun native execution', () => {
 		expect(collected.map((event) => event.type)).toEqual(['thinking', 'done']);
 	});
 
+	posix.each([
+		{ init: false, resultSession: 'foreign' },
+		{ init: true, resultSession: undefined },
+	])('does not close stdin or report success without matching result identity ($init, $resultSession)', async ({ init, resultSession }) => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			if (init) f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			f.line({ type: 'result', session_id: resultSession, is_error: false });
+			await vi.waitFor(() => expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM'));
+			expect(f.endInput).not.toHaveBeenCalled();
+		} finally {
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		expect(collected).toEqual([{ type: 'error', message: 'CC native result session unconfirmed' }]);
+		expect(f.writes).toHaveLength(1);
+	});
+
 	posix('starts only on consumption, uses opaque core capability key, persists historical session, keeps transcript path', async () => {
 		const f = fixture();
 		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'historical-id', workspace: f.dir } };
@@ -193,7 +213,8 @@ describe('CC PreparedRun native execution', () => {
 
 	posix('does not finish on EOF or close while a descendant survives; cancel remains unconfirmed', async () => {		const f = fixture();
 		const { run, collected, done } = await f.start();
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.output.emit('end');
 		await tick();
 		expect(collected.some((event) => event.type === 'done')).toBe(false);
@@ -246,7 +267,7 @@ describe('CC PreparedRun native execution', () => {
 		okay.input.conversation.nativeState = { version: 1, value: { sessionId: 'healthy', workspace: okay.dir } };
 		const { collected: okayEvents, done: okayDone } = await okay.start();
 		okay.line({ type: 'system', subtype: 'init', session_id: 'healthy' });
-		okay.line({ type: 'result', is_error: true, errors: ['boom after resume'] });
+		okay.line({ type: 'result', session_id: 'healthy', is_error: true, errors: ['boom after resume'] });
 		okay.groupExit(); okay.close(1);
 		await okayDone;
 		const okayError = okayEvents.find((e) => e.type === 'error') as { message: string } | undefined;
@@ -259,7 +280,8 @@ describe('CC PreparedRun native execution', () => {
 		const { collected, done } = await f.start();
 		f.line({ type: 'system', subtype: 'init', session_id: 'unexpected' });
 		f.line({ type: 'assistant', message: { content: [{ type: 'text', text: 'wrong session' }] } });
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		expect(collected).toEqual([{ type: 'error', message: 'CC native session changed unexpectedly' }]);
@@ -349,6 +371,24 @@ describe('CC PreparedRun native execution', () => {
 		f.registry.pushContext('opaque-new-key', 'core-run:unknown', { type: 'tool', name: 'late', phase: 'end' });
 	});
 
+	posix('stops the original process without EOF or replay when aborted after init without a result', async () => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			await vi.waitFor(() => expect(f.persisted).toHaveLength(1));
+			f.controller.abort();
+			await vi.waitFor(() => expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM'));
+			expect(f.endInput).not.toHaveBeenCalled();
+		} finally {
+			f.groupExit(); f.close(null);
+			await done;
+		}
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+		expect(collected).not.toContainEqual(expect.objectContaining({ type: 'done' }));
+	});
+
 	posix('first-event watchdog cannot turn a live process into a confirmed success', async () => {
 		const f = fixture({ firstEventTimeoutMs: 5, stopTimeoutMs: 40, killGraceMs: 5 });
 		const { collected, done } = await f.start();
@@ -361,9 +401,10 @@ describe('CC PreparedRun native execution', () => {
 	posix('keeps tool transcript truncation explicit and never duplicates a terminal event', async () => {
 		const f = fixture();
 		const { collected, done } = await f.start();
-		f.line({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { script: 'x'.repeat(3000) } }] } });
-		f.line({ type: 'result', is_error: false });
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'tool_use', name: 'Bash', input: { script: 'x'.repeat(3000) } }] } });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		expect(collected).toEqual([expect.objectContaining({ type: 'done' })]);
@@ -375,7 +416,8 @@ describe('CC PreparedRun native execution', () => {
 		const f = fixture({ drainMs: 40 });
 		const { collected, done } = await f.start();
 		const attempt = f.spawnCalls[0].options.env.AICHAT_CC_RUN!;
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await tick(); // the native stream closed, but the broker hook is still in flight
 		f.registry.pushContext('opaque-new-key', attempt, { type: 'tool', name: 'Bash', phase: 'end' });
@@ -387,7 +429,8 @@ describe('CC PreparedRun native execution', () => {
 		const f = fixture();
 		const { collected, done } = await f.start();
 		const runId = f.spawnCalls[0].options.env.AICHAT_CC_RUN!;
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		f.registry.pushContext('opaque-new-key', runId, { type: 'tool', name: 'late', phase: 'end' });
@@ -410,7 +453,8 @@ describe('CC PreparedRun native execution', () => {
 	posix('never re-kills a normally completed job on disconnect', async () => {
 		const f = fixture();
 		const { done } = await f.start();
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		await f.driver.disconnect();

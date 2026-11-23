@@ -43,6 +43,25 @@ function monitor(helper: ChildProcessWithoutNullStreams) {
 }
 const windows = process.platform === 'win32' && existsSync(binary) ? describe : describe.skip;
 windows('real Windows Job Object supervisor', () => {
+	it('delivers the prompt and reads the child result before sending EOF', async () => {
+		const { dir, file } = script(`const lines = require('node:readline').createInterface({ input: process.stdin });
+lines.on('line', (text) => { if (text === 'prompt') process.stdout.write('result\\n'); });
+lines.on('close', () => process.exit(0));`);
+		const child = new WindowsJobChild(process.execPath, [file], options(dir), binary);
+		const finished = waitClose(child);
+		let output = '';
+		child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+		try {
+			await child.ready;
+			child.stdin.write('prompt\n');
+			for (let i = 0; !output.includes('\n') && i < 100; i++) await delay(20);
+			expect(output).toBe('result\n');
+			child.stdin.end();
+			expect(await bounded(finished)).toBe(0);
+			expect(child.verifiedGone).toBe(true);
+		} finally { await cleanup(child, finished); }
+	}, 10_000);
+
 	it('waits for a detached descendant after root exit, then confirms empty job', async () => {
 		const { dir, file } = script(`const {spawn}=require('node:child_process');
 const descendant=spawn(process.execPath,['-e','process.stdout.write("child-start\\\\n");setTimeout(()=>process.stdout.write("descendant\\\\n"),350)'],{stdio:'inherit',detached:true});
@@ -104,7 +123,7 @@ process.stdout.write('pid:'+descendant.pid+'\\n'); descendant.unref(); setTimeou
 		const finished = waitClose(child);
 		try {
 			await child.ready;
-			child.stdin.write('x'.repeat(1024 * 1024)); child.stdin.end();
+			child.stdin.write('x'.repeat(1024 * 1024));
 			await delay(100);
 			child.kill();
 			expect(await bounded(finished)).not.toBe(0);
