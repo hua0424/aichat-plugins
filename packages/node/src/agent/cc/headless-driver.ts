@@ -1,8 +1,8 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
-import type { AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
+import type { AgentCapability, AgentCapabilityCatalog, AgentCapabilityContext, AgentEvent, AgentRun, PreparedRun, RunDriver } from '../events.js';
 import { DriverDisconnectIncompleteError, NATIVE_SESSION_LOST } from '../events.js';
 import { buildCcSettings, writeCcSettings } from './launch.js';
 import { FileCcTranscriptWriter, type CcTranscriptWriter } from './transcript.js';
@@ -73,6 +73,16 @@ export class CcHeadlessDriver implements RunDriver {
 			throw new DriverDisconnectIncompleteError('Claude Code process-group exit not confirmed');
 		}
 	}
+	async discoverCapabilities(context: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
+		const unavailable = (): AgentCapabilityCatalog => ({ framework: 'cc', runtimeVersion: 'unknown', version: 'cc-unavailable',
+			capabilities: [], discovery: { source: 'native', coverage: 'unavailable', reason: 'context_unavailable' } });
+		if (context.capabilityId || !context.conversation || !context.workspace || context.signal.aborted) return unavailable();
+		try {
+			context.conversation.assertCurrent();
+			const candidates = [...this.active].filter((run) => run.matchesCatalogOrigin(context));
+			return (candidates.length === 1 ? candidates[0].observedCatalog : undefined) ?? unavailable();
+		} catch { return unavailable(); }
+	}
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
 			!input.workspace || !input.contextKey || !input.bindToken || !input.replyToken) throw new TypeError('Invalid CC prepared run');
@@ -110,6 +120,33 @@ class CcRun implements AgentRun {
 	private stdoutOverflow = false;
 	private readonly stdoutDecoder = new StringDecoder('utf8');
 	private stderr = '';
+	observedCatalog?: AgentCapabilityCatalog;
+
+	matchesCatalogOrigin(context: AgentCapabilityContext): boolean {
+		const { conversation, workspace, signal } = this.input;
+		if (this.finished || this.closed || this.cancelled || signal.aborted || conversation.id !== context.conversation?.id ||
+			conversation.generation !== context.conversation.generation || workspace !== context.workspace) return false;
+		conversation.assertCurrent();
+		return true;
+	}
+
+	private observeCatalog(frame: Record<string, unknown>, sessionId: string, workspace: string): void {
+		const runtimeVersion = frame.claude_code_version;
+		if (frame.cwd !== workspace || typeof runtimeVersion !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(runtimeVersion) ||
+			runtimeVersion.length > 64 || !Array.isArray(frame.slash_commands) || !Array.isArray(frame.skills)) return;
+		const name = (value: unknown): value is string => typeof value === 'string' && value.length <= 128 && /^[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*$/.test(value);
+		const skills = new Set(frame.skills.filter(name));
+		const capabilities: AgentCapability[] = [...new Set(frame.slash_commands.filter(name))].sort().map((nativeName) => {
+			const kind = skills.has(nativeName) ? 'skill' : 'command';
+			return { id: `${kind}:${nativeName}`, kind, source: kind, name: nativeName, supported: true, executable: false,
+				reason: 'execution_not_connected', defaultVisibility: 'public', scope: 'conversation', parameters: [] };
+		});
+		const { id, generation } = this.input.conversation;
+		const version = createHash('sha256').update(JSON.stringify([id, generation, workspace, sessionId, runtimeVersion, capabilities])).digest('hex');
+		// The init lists names only; it does not prove model inventory or execution provenance.
+		this.observedCatalog = { framework: 'cc', runtimeVersion, version: `cc-init:${version}`, capabilities: capabilities.slice(0, 256),
+			discovery: { source: 'native', coverage: 'partial' } };
+	}
 
 	constructor(
 		private readonly input: PreparedRun,
@@ -290,7 +327,13 @@ class CcRun implements AgentRun {
 						await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
 							attempt, sessionId, workspace, pid: this.child.pid ?? null, stopProbe: 'unknown-after-restart' } });
 					} catch (error) { resultError = `session registration failed: ${errMsg(error)}`; break; }
+					this.observedCatalog = undefined;
+					this.observeCatalog(obj, sessionId, workspace);
+				} else if (obj.type === 'system' && obj.subtype === 'commands_changed' && obj.session_id === sessionId) {
+					// The changed list has no separate skill classification; do not serve the old snapshot.
+					this.observedCatalog = undefined;
 				} else if (obj.type === 'result') {
+					this.observedCatalog = undefined;
 					resultSeen = true;
 					if (obj.is_error === true || obj.subtype === 'error_during_execution')
 						resultError = `claude result error: ${Array.isArray(obj.errors) ? obj.errors.join('; ') : obj.subtype}`;

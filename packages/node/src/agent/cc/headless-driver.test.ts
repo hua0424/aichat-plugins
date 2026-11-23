@@ -63,6 +63,34 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 // POSIX group probes need the native -pgid API; on Windows this driver deliberately cannot confirm stop.
 const posix = it;
 
+describe('CC native capability observation', () => {
+	posix('projects the actual init catalog only from the exact live conversation without submitting another input', async () => {
+		const f = fixture();
+		const { done } = await f.start();
+		try {
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session', cwd: f.dir,
+				claude_code_version: '2.1.195', slash_commands: ['compact', 'example:hello'], skills: ['example:hello'] });
+			const context = { conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal };
+			await vi.waitFor(async () => expect(await f.driver.discoverCapabilities(context)).toMatchObject({
+				framework: 'cc', runtimeVersion: '2.1.195', discovery: { source: 'native', coverage: 'partial' },
+				capabilities: [{ id: 'command:compact', executable: false }, { id: 'skill:example:hello', executable: false }],
+			}));
+			expect((await f.driver.discoverCapabilities({ ...context, conversation: { ...context.conversation, generation: 2 } })).capabilities).toEqual([]);
+			expect((await f.driver.discoverCapabilities({ ...context, workspace: join(f.dir, 'other') })).capabilities).toEqual([]);
+			expect((await f.driver.discoverCapabilities({ ...context, capabilityId: 'model.set' })).capabilities).toEqual([]);
+			f.line({ type: 'system', subtype: 'commands_changed', session_id: 'native-session', commands: [] });
+			await vi.waitFor(async () => expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable'));
+			expect(f.spawnCalls).toHaveLength(1);
+			expect(f.writes).toHaveLength(1);
+		} finally {
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		expect((await f.driver.discoverCapabilities({ conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal })).capabilities).toEqual([]);
+	});
+});
+
 describe('CC PreparedRun native execution', () => {
 	posix('starts only on consumption, uses opaque core capability key, persists historical session, keeps transcript path', async () => {
 		const f = fixture();
