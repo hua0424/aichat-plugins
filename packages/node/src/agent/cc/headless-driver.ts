@@ -297,7 +297,6 @@ class CcRun implements AgentRun {
 			const envelope = { type: 'user', uuid: inputId, session_id: sessionId ?? '', parent_tool_use_id: null,
 				message: { role: 'user', content: [{ type: 'text', text: input.message }] } };
 			this.child.stdin?.write(`${JSON.stringify(envelope)}\n`);
-			this.child.stdin?.end();
 			while (true) {
 				await this.waitForNotice();
 				const notice = this.notices.shift()!;
@@ -337,6 +336,8 @@ class CcRun implements AgentRun {
 					this.observedCatalog = undefined;
 				} else if (obj.type === 'result') {
 					this.observedCatalog = undefined;
+					// The native turn can settle while stdin is open; the frozen reply binding still owns only this input.
+					if (!resultSeen && !this.closed) this.child.stdin?.end();
 					resultSeen = true;
 					if (obj.is_error === true || obj.subtype === 'error_during_execution')
 						resultError = `claude result error: ${Array.isArray(obj.errors) ? obj.errors.join('; ') : obj.subtype}`;

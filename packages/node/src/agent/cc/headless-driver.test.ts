@@ -55,7 +55,7 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 		return { run, collected, done };
 	};
 	return { dir, driver, input, controller, start, spawnCalls, output, errors, process, writes,
-		persisted, registry, transcript, kill,
+		persisted, registry, transcript, kill, endInput: child.stdin!.end,
 		groupExit: () => { groupAlive = false; }, close: (code: number | null) => { process.emit('close', code, null); },
 		line: (value: object) => output.emit('data', `${JSON.stringify(value)}\n`) };
 }
@@ -117,6 +117,27 @@ describe('CC native capability observation', () => {
 });
 
 describe('CC PreparedRun native execution', () => {
+	posix('keeps stdin open through the native result without sending a second input or completing early', async () => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'text', text: 'reply' }] } });
+			await vi.waitFor(() => expect(collected).toEqual([{ type: 'thinking', text: 'reply' }]));
+			expect(f.endInput).not.toHaveBeenCalled();
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(1));
+			expect(f.writes).toHaveLength(1);
+			expect(collected.map((event) => event.type)).toEqual(['thinking']);
+		} finally {
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		expect(collected.map((event) => event.type)).toEqual(['thinking', 'done']);
+	});
+
 	posix('starts only on consumption, uses opaque core capability key, persists historical session, keeps transcript path', async () => {
 		const f = fixture();
 		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'historical-id', workspace: f.dir } };
