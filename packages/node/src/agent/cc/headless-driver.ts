@@ -232,6 +232,7 @@ class CcRun implements AgentRun {
 				'--include-partial-messages', '--allowedTools', 'Bash(aichat:*)', '--settings', settings];
 			if (input.systemPrompt) argv.push('--append-system-prompt', input.systemPrompt);
 			if (sessionId) argv.push('--resume', sessionId);
+			const inputId = randomUUID();
 			const attempt = `${input.runId}:${randomUUID()}`;
 			// #404: every run carries exactly one frozen reply binding; the inherited value (if any)
 			// from an outer run env is overwritten, never merged — a late reply can only target A.
@@ -245,7 +246,7 @@ class CcRun implements AgentRun {
 			this.deregister = this.deps.registerHook(contextKey, attempt,
 				(ev) => this.notify({ type: 'hook', event: ev }));
 			await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
-				attempt, sessionId: sessionId ?? null, workspace, stopProbe: 'unknown-after-restart' } });
+				attempt, inputId, sessionId: sessionId ?? null, workspace, stopProbe: 'unknown-after-restart' } });
 			input.conversation.assertCurrent();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			this.child = this.spawn(this.deps.claudeBin ?? 'claude', argv, {
@@ -285,7 +286,7 @@ class CcRun implements AgentRun {
 				await (this.child as WindowsJobChild).ready; // persist real assigned PID before submitting input
 			// Persist the exact process locator before submitting input; a crash before init must not lose it.
 			await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
-				attempt, sessionId: sessionId ?? null, workspace, pid: this.child.pid ?? null,
+				attempt, inputId, sessionId: sessionId ?? null, workspace, pid: this.child.pid ?? null,
 				stopProbe: 'unknown-after-restart' } });
 			if (this.cancelled || input.signal.aborted) {
 				await this.cancel('cancelled before native submit');
@@ -293,7 +294,8 @@ class CcRun implements AgentRun {
 				return;
 			}
 			input.conversation.assertCurrent();
-			const envelope = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: input.message }] } };
+			const envelope = { type: 'user', uuid: inputId, session_id: sessionId ?? '', parent_tool_use_id: null,
+				message: { role: 'user', content: [{ type: 'text', text: input.message }] } };
 			this.child.stdin?.write(`${JSON.stringify(envelope)}\n`);
 			this.child.stdin?.end();
 			while (true) {
@@ -328,7 +330,7 @@ class CcRun implements AgentRun {
 								? previous : {}), sessionId, workspace,
 						} });
 						await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
-							attempt, sessionId, workspace, pid: this.child.pid ?? null, stopProbe: 'unknown-after-restart' } });
+							attempt, inputId, sessionId, workspace, pid: this.child.pid ?? null, stopProbe: 'unknown-after-restart' } });
 					} catch (error) { resultError = `session registration failed: ${errMsg(error)}`; break; }
 					this.observeCatalog(obj, sessionId, workspace);
 				} else if (obj.type === 'system' && obj.subtype === 'commands_changed' && obj.session_id === sessionId) {

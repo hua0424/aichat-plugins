@@ -132,7 +132,7 @@ describe('CC PreparedRun native execution', () => {
 		// #404: exactly one frozen reply binding per run, inherited values never merged.
 		expect(f.spawnCalls[0].options.env.AICHAT_RUN_BIND).toBe('f'.repeat(64));
 		expect(f.spawnCalls[0].options.env.OPENCODE_SESSION_ID).toBeUndefined();
-		expect(JSON.parse(f.writes[0]).message.content[0].text).toBe(f.input.message);
+		const wire = JSON.parse(f.writes[0]);
 		expect(f.transcript).toHaveBeenCalledWith('aiclaw-5-room-9', expect.objectContaining({ kind: 'inbound' }));
 		f.line({ type: 'system', subtype: 'init', session_id: 'historical-id' });
 		f.line({ type: 'assistant', session_id: 'historical-id', message: { content: [{ type: 'text', text: 'thinking' }] } });
@@ -144,7 +144,15 @@ describe('CC PreparedRun native execution', () => {
 		await done;
 		expect(events.map((e) => e.type)).toEqual(['thinking', 'tool', 'done']);
 		expect(f.persisted).toEqual([{ version: 1, value: { sessionId: 'historical-id', workspace: f.dir } }]);
-		expect(f.input.saveRecovery).toHaveBeenCalledWith(expect.objectContaining({ value: expect.objectContaining({ pid: 4242 }) }));
+		expect(wire).toMatchObject({ type: 'user', uuid: expect.stringMatching(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/),
+			session_id: 'historical-id', parent_tool_use_id: null,
+			message: { role: 'user', content: [{ type: 'text', text: f.input.message }] } });
+		expect(f.writes).toHaveLength(1);
+		expect(vi.mocked(f.input.saveRecovery).mock.calls.map(([snapshot]) => snapshot.value)).toEqual([
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id' }),
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id', pid: 4242 }),
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id', pid: 4242 }),
+		]);
 	});
 
 	posix('overwrites an inherited AICHAT_RUN_BIND with the frozen per-run token', async () => {
