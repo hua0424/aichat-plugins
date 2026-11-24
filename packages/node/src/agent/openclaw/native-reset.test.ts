@@ -57,13 +57,15 @@ async function fixture(options: { scopes?: string[]; version?: string; debounce?
  const handler = new MessageHandler({ send: (type: number, data: Record<string, unknown>) => { const frame = { type, data }; hula.frames.push(frame); hula.onSend?.(frame); }, isConnected: true } as unknown as HulaWSClient, driver, '1', { reportAgentCommandResult: async (receipt: AgentCommandResponse) => { receipts.push(receipt); }, sendMessage: async (_room: string, text: string) => { notices.push(text); return { msgId: 'notice' }; }, signDownload: options.signDownload, listSelfGroupConfigs: async () => [{ roomId: '2', approved: 1, authorizationEpoch: currentEpoch, respondToAi: options.respondToAi }] } as unknown as HulaApiClient, options.debounce ?? { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
  cleanup.push(async () => { handler.destroy(); await driver.disconnect(); store.close(); await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 }); });
  await driver.connect(); await handler.prewarmGroupConfigs();
+ const sendCommand = (requestId: string, patch: Record<string, unknown>) =>
+  handler.handle({ type: 'agentCommand', data: { requestId, roomId: '2', aiclawUid: '1', operation: 'discover', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: currentEpoch }, ...patch } });
  const command = async (requestId: string, patch: Record<string, unknown> = {}) => {
   const start = receipts.length;
-  handler.handle({ type: 'agentCommand', data: { requestId, roomId: '2', aiclawUid: '1', operation: 'discover', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: currentEpoch }, ...patch } });
+  sendCommand(requestId, patch);
   await waitFor(() => expect(receipts.slice(start).find(r => r.requestId === requestId)).toBeDefined());
   return receipts.slice(start).find(r => r.requestId === requestId)!;
  };
- return { get store() { return store; }, reopenStore: () => { store.close(); store = openStore(); }, driver, sockets, native, token, rawK, canonicalK, command, handler, hula, notices, setEpoch: async (epoch: string) => { currentEpoch = epoch; await handler.prewarmGroupConfigs(); } };
+ return { get store() { return store; }, reopenStore: () => { store.close(); store = openStore(); }, driver, sockets, native, token, rawK, canonicalK, command, sendCommand, receipts, handler, hula, notices, setEpoch: async (epoch: string) => { currentEpoch = epoch; await handler.prewarmGroupConfigs(); } };
 }
 
 it('resets an idle core-bound K to a new native S without borrowing a directory R or losing the selected model', async () => {
@@ -400,7 +402,10 @@ it.each(['refused', 'completed'])('does not queue ordinary input during a held r
   const original = f.command('held-reset', reset);
   try {
    await waitFor(() => expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1));
-   expect((await f.command('held-reset', { ...reset, reconcileOnly: true })).status).toBe('unknown');
+   f.sendCommand('held-reset', { ...reset, reconcileOnly: true });
+   await vi.advanceTimersByTimeAsync(0);
+   expect(f.receipts.some(r => r.requestId === 'held-reset')).toBe(false);
+   expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
    expect(f.store.getControl('1', '2', 'held-reset')).toMatchObject({ state: 'submitted' });
    f.handler.handle({ type: 'receiveMessage', data: {
     fromUser: { uid: '7', name: 'user', userType: 1 },
@@ -413,7 +418,7 @@ it.each(['refused', 'completed'])('does not queue ordinary input during a held r
    await waitFor(() => expect(f.notices).toEqual([expect.stringContaining('不会自动重试')]));
   } finally { gate.resolve(); }
   const status = outcome === 'refused' ? 'failed' : 'completed';
-  // The fixture's same-ID waiter may see the overlapping query; wait for the journal's actual outcome.
+  // The overlapping query did not publish; the original caller now receives the native outcome.
   await original;
   await waitFor(() => expect(f.store.getControl('1', '2', 'held-reset')?.receipt?.status).toBe(status));
   expect((await f.command('held-reset', { ...reset, reconcileOnly: true })).status).toBe(status);
