@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -7,6 +8,8 @@ import { CcHeadlessDriver, type CcChild, type CcHeadlessDriverDeps, type CcSpawn
 import { DriverDisconnectIncompleteError, type AgentEvent, type PreparedRun } from '../events.js';
 import { CcSessionRegistry } from './sink.js';
 import { AgentCommandHandler } from '../../handler/agent-command.js';
+import * as preflight from './native-compact-preflight.js';
+import * as compact from './compact.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -65,6 +68,58 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 const posix = it;
 
 describe('CC native capability observation', () => {
+	posix('executes the discovered compact once with the original idle session and returns its verified effect', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const controlId = 'a2a059dd-ef7a-4120-864b-a3d7f3d99aa4';
+		const summaryId = '4ec5d7fe-0a1b-4260-9f6e-d02054d84698';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir } } };
+		const path = join(f.dir, `${sessionId}.jsonl`), originalBytes = Buffer.from('original\n');
+		writeFileSync(path, originalBytes);
+		const handles: Awaited<ReturnType<typeof open>>[] = [];
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockImplementation(async () => {
+			const handle = await open(path, 'r');
+			handles.push(handle);
+			return { cwd: f.dir, cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {},
+				assertIntact: async () => {}, history: { path, handle, originalBytes } };
+		});
+		const release = vi.fn();
+		const reserve = vi.fn(() => release);
+		const observe = vi.spyOn(compact, 'observeCcCompact').mockImplementation(async ({ inputId, assertCurrent, beforeInput, onSubmit }) => {
+			expect(reserve).toHaveBeenCalledWith(sessionId, inputId);
+			await beforeInput!();
+			assertCurrent();
+			onSubmit!();
+			return { controlId, summaryId, summaryHash: 'native', preTokens: 1570, postTokens: 1213 };
+		});
+		const verify = vi.spyOn(compact, 'verifyCcCompactAppend').mockResolvedValue({ status: 'completed', controlId, summaryId });
+		const execute = { requestId: 'compact', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+			authorizationEpoch: 'epoch', reserveCcCompact: reserve, saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(),
+			replaceSession: vi.fn(), emit: vi.fn(), bindTurn: vi.fn() };
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir } };
+		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution: execute }), conversation: () => conversation });
+		try {
+			const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success',
+				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledOnce());
+			f.groupExit(); f.close(0);
+			const catalog = (await discovery)?.catalog;
+			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'session.compact', executable: true }));
+			const invoke = { ...scope, requestId: 'compact', operation: 'invoke', capabilityId: 'session.compact', catalogVersion: catalog!.version };
+			const original = handler.handle(invoke), duplicate = handler.handle(invoke);
+			const result = await original;
+			expect(result).toMatchObject({ requestId: 'compact', status: 'completed', generation: '1', nativeRef: { sessionId },
+				effect: { kind: 'compact', controlId, summaryId, summary: true } });
+			expect(await duplicate).toEqual(result);
+			expect(observe).toHaveBeenCalledOnce();
+			expect(verify).toHaveBeenCalledOnce();
+			expect(release).toHaveBeenCalledOnce();
+			expect(handles.map(handle => handle.fd)).toEqual([-1, -1]);
+			expect(execute.bindTurn).not.toHaveBeenCalled();
+		} finally { prepareNative.mockRestore(); observe.mockRestore(); verify.mockRestore(); }
+	});
 	posix('discovers and lists models from the idle native instance without sending user input', async () => {
 		const f = fixture();
 		const derived = join(f.dir, 'agent', 'owner');

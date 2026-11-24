@@ -79,16 +79,16 @@ export async function verifyCcCompactAppend({ handle, path, original, sessionId,
 
 /** Observe one owned native compact. The caller must reserve and verify the scope and durable native history separately. */
 export async function observeCcCompact({ cwd, sessionId, inputId, version, claudeBin, settingsPath, env, signal,
-	assertCurrent, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
+	assertCurrent, beforeInput, onSubmit, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
 	claudeBin: string; settingsPath: string; env: NodeJS.ProcessEnv; signal: AbortSignal;
-	assertCurrent(): void; spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
+	assertCurrent(): void; beforeInput?(): Promise<void>; onSubmit?(): void; spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
 }): Promise<ObservedCcCompact> {
 	if (!nativeId(sessionId) || !nativeId(inputId) || inputId === sessionId)
 		throw new Error('CC compact requires original native session and input IDs');
 	if (Object.keys(env).some(key => /^(?:AICHAT_.*|OPENCLAW_BIND|OPENCODE_SESSION_ID|CODEX_THREAD_ID)$/i.test(key)))
 		throw new Error('CC compact cannot inherit reply authority');
 	const initializeId = randomUUID();
-	let phase: 'initialize' | 'input' | 'effect' = 'initialize';
+	let phase: 'initialize' | 'checking' | 'input' | 'effect' = 'initialize';
 	let boundary: CompactBoundary | undefined;
 	let nativeSummary: { summaryId: string; summaryHash: string } | undefined;
 	let insufficientHistoryNoticeId: string | undefined;
@@ -104,14 +104,21 @@ export async function observeCcCompact({ cwd, sessionId, inputId, version, claud
 			if (phase === 'initialize') {
 				if (m?.type !== 'control_response' || m.response?.subtype !== 'success' || m.response.request_id !== initializeId)
 					return io.fail('unexpected initialize response');
-				try { assertCurrent(); }
-				catch { return io.fail('original scope changed'); }
-				phase = 'input';
-				io.write({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
-					message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
+				const submit = () => {
+					try { signal.throwIfAborted(); assertCurrent(); onSubmit?.(); }
+					catch { return io.fail('original scope changed'); }
+					phase = 'input';
+					io.write({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
+						message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
+				};
+				if (beforeInput) {
+					phase = 'checking';
+					void beforeInput().then(submit).catch(() => io.fail('original history changed'));
+				} else submit();
 				return;
 			}
 			const unconfirmed = () => io.fail('native compact effect unconfirmed');
+			if (phase === 'checking') return unconfirmed();
 			if (m?.session_id !== sessionId) return unconfirmed();
 			// Pinned Claude emits compact progress even before its per-input init; it proves no effect.
 			if (m.type === 'system' && m.subtype === 'status' &&

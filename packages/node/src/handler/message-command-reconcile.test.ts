@@ -36,12 +36,12 @@ const request = (requestId: string, extra: Record<string, unknown> = {}) => ({
 	parameters: {}, context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch' }, ...extra,
 });
 
-function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string, provider = 'opencode') {
+function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string, provider = 'opencode', groupRows = true) {
 	const posted: Posted[] = [];
 	const notices: string[] = [];
 	const api = { sendMessage: async (_room: string, body: string) => { notices.push(body); return { msgId: 'notice' }; },
 		reportAgentCommandResult: vi.fn(async (value: Posted) => { posted.push({ ...value }); }),
-		listSelfGroupConfigs: async () => [{ roomId: '20', authorizationEpoch: 'epoch', approved: 1 }],
+		listSelfGroupConfigs: async () => groupRows ? [{ roomId: '20', authorizationEpoch: 'epoch', approved: 1, mentionRequired: 1 }] : [],
 	} as unknown as HulaApiClient;
 	const driver = { type: provider, executeCapability } as unknown as AgentDriver;
 	let handler!: MessageHandler;
@@ -87,12 +87,23 @@ describe('command reconcile evidence', () => {
 			return { status: 'completed' as const, nativeRef: { sessionId }, effect: { kind: 'compact' as const, controlId: 'boundary', summaryId: 'summary', summary: true } };
 		});
 		const { handler, posted, notices, send } = setup(store, execute, home, 'cc');
-		submitCompetingInput = () => handler.handle({ type: 'receiveMessage', data: {
-			fromUser: { uid: 'owner', name: 'Owner', userType: 1 },
-			message: { id: 'during-compact', roomId: '20', roomType: 2, type: 1, aiclaw: { isOwner: true }, body: { content: 'do not queue' } },
-		} });
+		submitCompetingInput = () => {
+			handler.handle({ type: 'receiveMessage', data: {
+				fromUser: { uid: 'other-agent', userType: 4 },
+				message: { id: 'ignored-during-compact', roomId: '20', roomType: 1, type: 1, body: { content: 'ignore AI', atUidList: ['u'] } },
+			} });
+			handler.handle({ type: 'receiveMessage', data: {
+				fromUser: { uid: 'member', userType: 1 },
+				message: { id: 'unmentioned-during-compact', roomId: '20', roomType: 1, type: 1, body: { content: 'ordinary group context' } },
+			} });
+			expect(notices).toEqual([]);
+			handler.handle({ type: 'receiveMessage', data: {
+				fromUser: { uid: 'owner', name: 'Owner', userType: 1 },
+				message: { id: 'during-compact', roomId: '20', roomType: 1, type: 1, body: { content: 'do not queue', atUidList: ['u'] } },
+			} });
+		};
 		await handler.prewarmGroupConfigs();
-		const context = { roomType: 2, counterpartUid: 'owner', isOwner: true, expectedGeneration: '1' };
+		const context = { roomType: 1, account: 'test-group', expectedGeneration: '1' };
 		handler.handle({ type: 'agentCommand', data: request('stale-compact', { capabilityId: 'session.compact', context: { ...context, authorizationEpoch: 'stale' } }) });
 		await waitForReports(posted, 1);
 		expect(posted[0]).toMatchObject({ status: 'failed', error: 'authorization_changed' });
@@ -104,6 +115,51 @@ describe('command reconcile evidence', () => {
 		expect(store.getControl('u', '20', 'valid-compact')?.ccCompactFence).toBeUndefined();
 		expect(notices).toEqual([expect.stringContaining('不会自动重试')]);
 		expect(send.mock.calls.some(([type]) => type === 20)).toBe(false);
+	});
+	it('recovers the original Claude compact input privately without resubmitting it', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-compact-recovery-')); dirs.push(home);
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b', inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace: home });
+		const nativeSubmit = vi.fn();
+		let releaseOriginal!: () => void;
+		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
+			if (execution) {
+				releaseOriginal = execution.reserveCcCompact!(sessionId, inputId);
+				nativeSubmit();
+			}
+			return { status: 'unknown' as const };
+		});
+		const { handler, posted } = setup(store, execute, home, 'cc', false);
+		await handler.prewarmGroupConfigs();
+		const data = request('uncertain-compact', { capabilityId: 'session.compact', context: {
+			roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'a'.repeat(64),
+		} });
+		handler.handle({ type: 'agentCommand', data: { ...data, requestId: 'nonowner-compact', context: { ...data.context, isOwner: false } } });
+		await waitForReports(posted, 1);
+		expect(posted[0]).toMatchObject({ requestId: 'nonowner-compact', status: 'failed', error: 'authorization_changed' });
+		expect(execute).not.toHaveBeenCalled();
+		handler.handle({ type: 'agentCommand', data });
+		await waitForReports(posted, 2);
+		expect(execute).toHaveBeenCalledOnce();
+		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await waitForReports(posted, 3);
+		expect(execute).toHaveBeenCalledTimes(2);
+		expect(execute.mock.calls[1][0]).toMatchObject({ recovery: { generation: 1, nativeRef: { sessionId }, ccCompactInputId: inputId } });
+		expect(execute.mock.calls[1][0].execution).toBeUndefined();
+		expect(nativeSubmit).toHaveBeenCalledOnce();
+		expect(posted.every(value => !JSON.stringify(value).includes(inputId))).toBe(true);
+		expect(() => store.beginRun('u', '20', 'still-unconfirmed')).toThrow('CC_COMPACT_FENCED');
+
+		// Simulate independent containment proof (closure is not completion), then a later generation.
+		releaseOriginal();
+		const newSessionId = 'c940a8cd-66dc-4538-9158-585dd681c274';
+		store.replaceNativeSession('u', '20', 1, 'cc', newSessionId, { sessionId: newSessionId, workspace: home });
+		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({
+			requestId: data.requestId, status: 'unknown', error: 'authorization_changed',
+		})));
+		expect(execute).toHaveBeenCalledTimes(2);
 	});
 	it.each([false, true])('does not publish a replacement receipt for a live native control (ACK=%s)', async (ack) => {
 		const home = mkdtempSync(join(tmpdir(), 'c1diag-live-control-')); dirs.push(home);

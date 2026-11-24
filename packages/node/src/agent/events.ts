@@ -104,7 +104,7 @@ export interface AgentCapabilityCatalog {
 }
 export interface AgentCapabilityContext {
 	/** Read-only core lookup only; absence never authorizes workspace-based conversation guessing. */
-	conversation?: Pick<BoundConversation, 'id' | 'generation' | 'assertCurrent'>;
+	conversation?: Pick<BoundConversation, 'id' | 'generation' | 'assertCurrent'> & Partial<Pick<BoundConversation, 'nativeState'>>;
 	/** Prepared by core from trusted room context, never supplied directly by the UI. */
 	workspace?: string;
 	/** Core-derived default directory, not an owner-supplied host override. */
@@ -119,7 +119,9 @@ export interface AgentCapabilityInvocation extends AgentCapabilityContext {
 	catalogVersion: string;
 	execution?: CapabilityExecution;
 	/** Core journal only. Presence selects read-only reconciliation; never a submission fallback. */
-	recovery?: { generation: number; nativeRef?: NativeRef; receipt: AgentCapabilityResult; value?: { version: number; value: unknown } };
+	recovery?: { generation: number; nativeRef?: NativeRef; receipt: AgentCapabilityResult; value?: { version: number; value: unknown };
+		/** Private original input locator, never included in the public receipt. */
+		ccCompactInputId?: string };
 }
 export interface NativeRef { sessionId: string; inputId?: string; messageId?: string; parentId?: string; turnId?: string }
 export type CapabilityEffect =

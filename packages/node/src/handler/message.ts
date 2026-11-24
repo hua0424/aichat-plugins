@@ -408,16 +408,23 @@ export class MessageHandler {
 			const assertCurrent = () => {
 				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
 				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-					this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch ||
+					(this.driver.type === 'cc' ? !this.ccCompactAdmissionMatches(request.roomId, epoch, request.context) ||
+						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace
+						: this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch) ||
 					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
 					throw new Error('discovery context changed');
 			};
 			assertCurrent();
-			return { id: record.conversationId, generation: record.generation, assertCurrent };
+			return { id: record.conversationId, generation: record.generation, assertCurrent,
+				...(this.driver.type === 'cc' && record.nativeState.cc ? { nativeState: { version: 1, value: record.nativeState.cc } } : {}) };
 		} catch { return undefined; }
 	}
 
-	private ccCompactEpochCurrent(room: string, epoch: string): boolean {
+	private ccCompactAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context']): boolean {
+		if (context.roomType === 2) {
+			// Owner DM has no group-config row. Its authenticated IM command envelope is the admission source.
+			return this.ws.isConnected && context.isOwner === true && /^[a-f0-9]{64}$/.test(epoch);
+		}
 		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
 	}
 
@@ -428,9 +435,11 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
-		if (this.driver.type === 'cc' && request.capabilityId === 'session.compact') {
+		const ccCompactAdmission = this.driver.type === 'cc' && request.capabilityId === 'session.compact' ? request.context : undefined;
+		if (ccCompactAdmission) {
 			const current = store.get(this.selfUid, room);
-			if (!current || current.state !== 'ready' || !this.ccCompactEpochCurrent(room, epoch) || expectedGeneration === '0') {
+			if (!current || current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompactAdmission) ||
+				(expectedGeneration !== undefined && Number(expectedGeneration) === 0)) {
 				return request.reconcileOnly ? { receipt: { status: 'unknown', error: 'authorization_changed' } }
 					: { receipt: { status: 'failed', error: 'authorization_changed' } };
 			}
@@ -481,29 +490,40 @@ export class MessageHandler {
 			if (!['accepted', 'unknown'].includes(replay.status) || !this.driver.executeCapability) {
 				this.settleRecoveredControl(request, replay, entry.generation); return { receipt: replay };
 			}
+			if (entry.ccCompactInputId) {
+				const current = store.get(this.selfUid, room);
+				if (!current || current.generation !== entry.generation || current.nativeState.cc?.sessionId !== entry.nativeRef?.sessionId) {
+					return { receipt: { ...unknown, error: 'authorization_changed' } };
+				}
+			}
 			// Journal identity was checked above. This branch has no execution/mutation handles.
 			const recovered = await this.driver.executeCapability({ workspace, signal: AbortSignal.timeout(10_000), capabilityId: request.capabilityId!,
 				catalogVersion: request.catalogVersion!, parameters: request.parameters,
-				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt } });
+				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt,
+					...(entry.ccCompactInputId ? { ccCompactInputId: entry.ccCompactInputId } : {}) } });
 			const persisted = store.recordControl(this.selfUid, room, request.requestId, recovered);
 			this.settleRecoveredControl(request, persisted, entry.generation);
 			return { receipt: persisted };
 		}
 		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
 		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
-		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch, capabilityId: request.capabilityId }, generation, systemPrompt,
+		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch,
+			capabilityId: request.capabilityId, ccCompactAdmission }, generation, systemPrompt,
 			(receipt) => { void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
 				.catch(() => console.error('[command] control receipt publication failed; retained for explicit query')); }) };
 	}
-	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string; capabilityId?: string }, generation: number, systemPrompt: string,
+	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string; capabilityId?: string;
+		ccCompactAdmission?: AgentCommandRequest['context'] }, generation: number, systemPrompt: string,
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
-		const ccCompact = provider === 'cc' && scope.capabilityId === 'session.compact' && !owner;
+		const ccCompact = scope.ccCompactAdmission;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
-			if (ccCompact && (current.state !== 'ready' || !this.ccCompactEpochCurrent(room, epoch))) throw new Error('Claude compact authorization changed');
+			if (ccCompact && (current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompact) ||
+				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace))
+				throw new Error('Claude compact authorization changed');
 			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
 				throw new Error('native ordinary authorization changed');
 		};
@@ -1019,12 +1039,12 @@ export class MessageHandler {
 		const mediaType = data.message.type;
 		const media = mediaType === 3 || mediaType === 4;
 		const freezeMediaContext = media && this.driver.type === 'openclaw' && this.getConversations;
-		if (this.rejectDuringNativeControl(roomId)) return;
+		if (this.driver.type === 'openclaw' && this.rejectDuringNativeControl(roomId)) return;
 		const generation = freezeMediaContext ? this.getConversations().get(this.selfUid, roomId)?.generation ?? 1 : undefined;
 		const epoch = freezeMediaContext ? this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch : undefined;
 		// REQ-146 (#146): resolve a short-lived download URL only for media; text stays synchronous.
 		const resolvedFileUrl = media ? await this.resolveDownloadUrl(data.message) : undefined;
-		if (media && this.rejectDuringNativeControl(roomId)) return;
+		if (freezeMediaContext && this.rejectDuringNativeControl(roomId)) return;
 		if (freezeMediaContext && (generation !== (this.getConversations().get(this.selfUid, roomId)?.generation ?? 1) ||
 			 epoch !== this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch)) {
 			this.sendNotice(roomId, '助理会话或授权已变化，本条媒体消息未执行，也不会自动重试。');
@@ -1081,6 +1101,8 @@ export class MessageHandler {
 			console.log(`[handler] Message accumulated (not mentioned) room=${roomId}, buffer: ${channel.accumulatedMessages.length}`);
 			return;
 		}
+
+		if (this.driver.type === 'cc' && this.rejectDuringNativeControl(roomId, channel)) return;
 
 		// 缓存消息上下文（按房间隔离）。REQ-008 #77: roomType 透传给 driver 的 chatContext，
 		// 缺省/未知 roomType 与上方 @ 闸门一致按群聊（1）保守处理。

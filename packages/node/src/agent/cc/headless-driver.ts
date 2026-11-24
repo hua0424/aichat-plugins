@@ -10,6 +10,16 @@ import { errMsg } from '../../util/err.js';
 import { assertWindowsJobAvailable, spawnWindowsJob, type WindowsJobChild } from './windows-job.js';
 import { capabilityParameters } from '../capability-parameters.js';
 import { readCcModelInventory } from './model-inventory.js';
+import { prepareCcNativeCompact } from './native-compact-preflight.js';
+import { observeCcCompact, verifyCcCompactAppend } from './compact.js';
+
+function compactScope({ conversation, workspace }: Pick<AgentCapabilityContext, 'conversation' | 'workspace'>) {
+	const state = conversation?.nativeState?.value as { sessionId?: unknown; workspace?: unknown } | undefined;
+	if (!conversation || !workspace || state?.workspace !== workspace || typeof state.sessionId !== 'string' ||
+		!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(state.sessionId)) return;
+	return { cwd: workspace, sessionId: state.sessionId, generation: String(conversation.generation),
+		digest: createHash('sha256').update(JSON.stringify([conversation.id, conversation.generation, workspace, state.sessionId])).digest('hex') };
+}
 
 interface ReadableStreamish {
 	on(event: 'data', listener: (chunk: Buffer | string) => void): void;
@@ -64,25 +74,28 @@ export class CcHeadlessDriver implements RunDriver {
 	private readonly transcript: CcTranscriptWriter;
 	private modelRead?: { controller: AbortController; done: ReturnType<typeof readCcModelInventory> };
 	private modelReadStopUnconfirmed = false;
+	private compactWork?: { controller: AbortController; done: Promise<AgentCapabilityResult> };
+	private compactStopUnconfirmed = false;
 	private closing = false;
 
 	constructor(private readonly deps: CcHeadlessDriverDeps) {
 		this.transcript = deps.transcript ?? new FileCcTranscriptWriter();
 	}
 	async connect(): Promise<void> {
-		if (this.modelReadStopUnconfirmed) throw new DriverDisconnectIncompleteError('CC model inventory cleanup unconfirmed');
+		if (this.modelReadStopUnconfirmed || this.compactStopUnconfirmed) throw new DriverDisconnectIncompleteError('CC control cleanup unconfirmed');
 		if ((this.deps.platform ?? process.platform) === 'win32' && !this.deps.spawn) assertWindowsJobAvailable();
 		this.closing = false;
 	}
 	async disconnect(): Promise<void> {
 		this.closing = true;
-		const modelRead = this.modelRead;
+		const modelRead = this.modelRead, compactWork = this.compactWork;
 		modelRead?.controller.abort();
+		compactWork?.controller.abort();
 		const [results] = await Promise.all([
 			Promise.all([...this.active].map((run) => run.cancel('driver disconnect'))),
-			modelRead?.done.catch(() => undefined),
+			modelRead?.done.catch(() => undefined), compactWork?.done.catch(() => undefined),
 		]);
-		if (this.modelReadStopUnconfirmed || results.some((result) => result.status !== 'stopped')) {
+		if (this.modelReadStopUnconfirmed || this.compactStopUnconfirmed || results.some((result) => result.status !== 'stopped')) {
 			throw new DriverDisconnectIncompleteError('Claude Code process-group exit not confirmed');
 		}
 	}
@@ -92,7 +105,21 @@ export class CcHeadlessDriver implements RunDriver {
 		if (context.capabilityId || !context.workspace || context.signal.aborted || this.closing) return unavailable();
 		try {
 			context.conversation?.assertCurrent();
-			if (!this.active.size) return (await this.readModelCatalog(context)).catalog;
+			if (!this.active.size) {
+				const { catalog } = await this.readModelCatalog(context);
+				const scope = compactScope(context);
+				if (!scope || this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return catalog;
+				const native = await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env });
+				if (!native) return catalog;
+				await native.history.handle.close();
+				context.signal.throwIfAborted();
+				context.conversation?.assertCurrent();
+				if (this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return catalog;
+				return { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`, capabilities: [...catalog.capabilities, {
+					id: 'session.compact', kind: 'command', source: 'session', name: 'Compact', supported: true,
+					executable: true, defaultVisibility: 'public', scope: 'conversation', parameters: [],
+				}] };
+			}
 			if (!context.conversation) return unavailable();
 			const candidates = [...this.active].filter((run) => run.matchesCatalogOrigin(context));
 			return (candidates.length === 1 ? candidates[0].observedCatalog : undefined) ?? unavailable();
@@ -134,13 +161,14 @@ export class CcHeadlessDriver implements RunDriver {
 	}
 
 	async executeCapability(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		if (input.capabilityId === 'session.compact') return this.executeCompact(input);
 		if (input.capabilityId !== 'model.list' || input.execution || input.recovery) return { status: 'unsupported', error: 'execution_not_connected' };
 		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
-		if (!/^cc-models:[a-f0-9]{64}$/.test(input.catalogVersion)) return { status: 'failed', error: 'catalog_stale' };
+		if (!/^cc-models:[a-f0-9]{64}(?::[a-f0-9]{64})?$/.test(input.catalogVersion)) return { status: 'failed', error: 'catalog_stale' };
 		try {
 			const { catalog, models } = await this.readModelCatalog(input);
-			if (input.catalogVersion !== catalog.version) return { status: 'failed', error: 'catalog_stale' };
+			if (input.catalogVersion.split(':', 2).join(':') !== catalog.version) return { status: 'failed', error: 'catalog_stale' };
 			const lines = ['Available models (Claude safe mode):'];
 			let length = lines[0].length;
 			for (const model of models) {
@@ -151,6 +179,59 @@ export class CcHeadlessDriver implements RunDriver {
 			return { status: 'completed', text: lines.join('\n') };
 		} catch { return { status: 'failed', error: 'native_request_failed' }; }
 	}
+	private async executeCompact(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+		// This lane cannot establish teardown or recover the native write after a process restart.
+		if (input.recovery) return input.recovery.receipt;
+		const execution = input.execution, reserve = execution?.reserveCcCompact;
+		if (!execution || !reserve) return { status: 'unsupported', error: 'execution_not_connected' };
+		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
+		catch { return { status: 'failed', error: 'invalid_parameters' }; }
+		const scope = compactScope({ workspace: input.workspace, conversation: execution.conversation });
+		// Model inventory and compact use independent parts of the same catalog token.
+		if (!scope || !/^cc-models:[a-f0-9]{64}:[a-f0-9]{64}$/.test(input.catalogVersion) || !input.catalogVersion.endsWith(`:${scope.digest}`))
+			return { status: 'failed', error: 'catalog_stale' };
+		if (this.active.size || this.closing || this.modelRead || this.modelReadStopUnconfirmed || this.compactWork || this.compactStopUnconfirmed)
+			return { status: 'failed', error: 'command_busy' };
+		const controller = new AbortController(), signal = AbortSignal.any([input.signal, controller.signal]);
+		const assertCurrent = () => { signal.throwIfAborted(); execution.conversation.assertCurrent(); };
+		const done = (async (): Promise<AgentCapabilityResult> => {
+			let native: Awaited<ReturnType<typeof prepareCcNativeCompact>>;
+			let release: (() => void) | undefined;
+			let submitted = false;
+			const original = { generation: scope.generation, nativeRef: { sessionId: scope.sessionId } };
+			try {
+				assertCurrent();
+				native = await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env });
+				if (!native) return { status: 'failed', error: 'native_context_unavailable' };
+				assertCurrent();
+				if (this.active.size || this.closing) return { status: 'failed', error: 'command_busy' };
+				const inputId = randomUUID();
+				release = reserve(scope.sessionId, inputId);
+				const version = '2.1.195' as const;
+				const evidence = await observeCcCompact({ ...scope, inputId, version, claudeBin: native.cliPath,
+					settingsPath: native.settingsPath, env: native.env, signal, assertCurrent, beforeInput: native.assertIntact,
+					onSubmit: () => { submitted = true; }, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
+				const { handle, path, originalBytes } = native.history;
+				const effect = await verifyCcCompactAppend({ ...scope, version, handle, path, original: originalBytes, evidence });
+				release();
+				return effect.status === 'noop' ? { ...original, status: 'noop', text: 'Claude Code 历史不足，未压缩。' }
+					: { ...original, status: 'completed', effect: { kind: 'compact', controlId: effect.controlId, summaryId: effect.summaryId, summary: true } };
+			} catch (error) {
+				if (error instanceof DriverDisconnectIncompleteError) this.compactStopUnconfirmed = true;
+				if (release && !submitted && !this.compactStopUnconfirmed) {
+					try { release(); } catch { return { ...original, status: 'unknown', error: 'native_request_failed' }; }
+				}
+				return submitted || this.compactStopUnconfirmed
+					? { ...original, status: 'unknown', error: 'native_request_failed' }
+					: { ...original, status: 'failed', error: 'native_request_failed' };
+			} finally { await native?.history.handle.close(); }
+		})();
+		const work = { controller, done };
+		this.compactWork = work;
+		try { return await done; }
+		finally { if (this.compactWork === work) this.compactWork = undefined; }
+	}
+
 	createRun(input: PreparedRun): AgentRun {
 		if (!input.runId || !input.conversation || !input.signal || typeof input.message !== 'string' ||
 			!input.workspace || !input.contextKey || !input.bindToken || !input.replyToken) throw new TypeError('Invalid CC prepared run');
