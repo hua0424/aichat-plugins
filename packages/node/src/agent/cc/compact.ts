@@ -49,22 +49,24 @@ export async function verifyCcCompactAppend({ handle, path, original, sessionId,
 		const rows = appended.trimEnd().split('\n').map(line => JSON.parse(line));
 		const inScope = (m: { sessionId?: unknown; cwd?: unknown; version?: unknown; isSidechain?: unknown }) =>
 			m.sessionId === sessionId && m.cwd === cwd && m.version === version && m.isSidechain === false;
+		const freshUniqueId = (id: unknown) => nativeId(id) && !original.includes(id) && rows.filter(m => m?.uuid === id).length === 1;
 		const boundaries = rows.filter(m => m?.type === 'system' && m.subtype === 'compact_boundary');
 		const summaries = rows.filter(m => m?.type === 'user' && m.isCompactSummary === true);
+		const localResults = rows.filter(m => m?.type === 'system' && m.subtype === 'local_command');
+		const insufficient = `<local-command-stdout>${INSUFFICIENT_HISTORY}</local-command-stdout>`;
 		if ('insufficientHistoryNoticeId' in evidence) {
 			const id = evidence.insufficientHistoryNoticeId;
 			const commands = rows.filter(m => m?.type === 'user' && m.message?.role === 'user' && m.message.content === COMPACT_COMMAND);
-			const notices = rows.filter(m => m?.type === 'system' && m.subtype === 'local_command' &&
-				m.content === `<local-command-stdout>${INSUFFICIENT_HISTORY}</local-command-stdout>`);
-			const [command] = commands, [notice] = notices;
-			if (!nativeId(id) || original.includes(id) || boundaries.length || summaries.length ||
-				commands.length !== 1 || notices.length !== 1 || notice.uuid !== id || notice.parentUuid !== command.uuid ||
-				!nativeId(command.uuid) || command.uuid === id || original.includes(command.uuid) ||
-				rows.indexOf(command) >= rows.indexOf(notice) || ![command, notice].every(inScope)) throw unconfirmed();
+			const [command] = commands;
+			if (boundaries.length || summaries.length || commands.length !== 1 || !freshUniqueId(command.uuid) || !freshUniqueId(id)) throw unconfirmed();
+			const results = localResults.filter(m => m.parentUuid === command.uuid || m.content === insufficient);
+			const [notice] = results;
+			if (results.length !== 1 || notice.uuid !== id || notice.parentUuid !== command.uuid || notice.content !== insufficient ||
+				command.uuid === id || rows.indexOf(command) >= rows.indexOf(notice) || ![command, notice].every(inScope)) throw unconfirmed();
 			return { status: 'noop' };
 		}
 		const [boundary] = boundaries, [summary] = summaries;
-		if (original.includes(evidence.controlId) || original.includes(evidence.summaryId) ||
+		if (!freshUniqueId(evidence.controlId) || !freshUniqueId(evidence.summaryId) || localResults.some(m => m.content === insufficient) ||
 			boundaries.length !== 1 || summaries.length !== 1 || rows.indexOf(boundary) >= rows.indexOf(summary) ||
 			![boundary, summary].every(inScope) ||
 			boundary.uuid !== evidence.controlId || boundary.compactMetadata?.trigger !== 'manual' ||

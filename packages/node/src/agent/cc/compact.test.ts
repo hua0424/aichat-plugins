@@ -88,6 +88,13 @@ it('correlates the observed effect to newly appended boundary and summary in the
 			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
 			await writeFile(path, original + [boundary, record].map(x => JSON.stringify(x)).join('\n') + '\n');
 			await expect(verify()).resolves.toEqual({ status: 'completed', controlId, summaryId });
+			await appendFile(path, [
+				{ ...identity, type: 'user', uuid: inputId, message: { role: 'user',
+					content: '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>' } },
+				{ ...identity, type: 'system', subtype: 'local_command', uuid: displayId,
+					parentUuid: inputId, content: '<local-command-stdout>Not enough messages to compact.</local-command-stdout>' },
+			].map(row => JSON.stringify(row)).join('\n') + '\n');
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
 		} finally { await handle.close(); }
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -119,7 +126,13 @@ it('accepts the exact native insufficient-history row only as a linked no-op', a
 			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
 			await record(command, { ...notice, cwd: `${cwd}-foreign` });
 			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
-			await record(command, notice, { ...notice, uuid: controlId });
+			await record(command, notice, { ...notice, uuid: summaryId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...notice, uuid: summaryId, content: '<local-command-stdout>Compacted native display</local-command-stdout>' });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...command, message: { role: 'user', content: 'other' } });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...command, uuid: notice.uuid, message: { role: 'user', content: 'other' } });
 			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
 			await record(command, notice);
 			await expect(verify()).resolves.toEqual({ status: 'noop' });
