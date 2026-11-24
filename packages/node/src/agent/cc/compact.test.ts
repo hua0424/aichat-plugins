@@ -25,7 +25,7 @@ function fixture() {
 		if (pid === -child.pid && signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
 	});
 	const assertCurrent = vi.fn();
-	const start = (inputChecks: Pick<Parameters<typeof observeCcCompact>[0], 'beforeInput' | 'onSubmit'> = {}) =>
+	const start = (inputChecks: Pick<Parameters<typeof observeCcCompact>[0], 'beforeInput' | 'onSubmit' | 'onAccepted'> = {}) =>
 		observeCcCompact({ cwd, sessionId, inputId, version: '2.1.195', claudeBin: '/owned/claude',
 			settingsPath: '/owned/settings.json', env: { HOME: '/owned/home' }, signal: new AbortController().signal,
 			assertCurrent, spawn, kill, platform: 'linux', ...inputChecks });
@@ -49,7 +49,7 @@ function fixture() {
 }
 
 it('writes one resumed compact only after its native ACK and observes effect through contained close', async () => {
-	const f = fixture(), result = f.start(), settled = vi.fn();
+	const f = fixture(), onAccepted = vi.fn(), result = f.start({ onAccepted }), settled = vi.fn();
 	void result.then(settled, () => {});
 	expect(f.lines()).toHaveLength(1);
 	expect(f.spawn.mock.calls[0][1]).toEqual(expect.arrayContaining(['--resume', sessionId, '--settings', '/owned/settings.json']));
@@ -58,7 +58,10 @@ it('writes one resumed compact only after its native ACK and observes effect thr
 	expect(f.lines()).toHaveLength(2);
 	expect(f.lines()[1]).toMatchObject({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
 		message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
-	f.progress(); f.init(); f.boundary(); f.summary(); f.display(); f.result();
+	expect(onAccepted).not.toHaveBeenCalled();
+	f.progress(); f.progress();
+	expect(onAccepted).toHaveBeenCalledOnce();
+	f.init(); f.boundary(); f.summary(); f.display(); f.result();
 	expect(f.child.stdin.end).toHaveBeenCalledOnce();
 	await Promise.resolve();
 	expect(settled).not.toHaveBeenCalled();

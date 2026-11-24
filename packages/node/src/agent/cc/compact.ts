@@ -79,9 +79,10 @@ export async function verifyCcCompactAppend({ handle, path, original, sessionId,
 
 /** Observe one owned native compact. The caller must reserve and verify the scope and durable native history separately. */
 export async function observeCcCompact({ cwd, sessionId, inputId, version, claudeBin, settingsPath, env, signal,
-	assertCurrent, beforeInput, onSubmit, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
+	assertCurrent, beforeInput, onSubmit, onAccepted, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
 	claudeBin: string; settingsPath: string; env: NodeJS.ProcessEnv; signal: AbortSignal;
-	assertCurrent(): void; beforeInput?(): Promise<void>; onSubmit?(): void; spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
+	assertCurrent(): void; beforeInput?(): Promise<void>; onSubmit?(): void; onAccepted?(): void;
+	spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
 }): Promise<ObservedCcCompact> {
 	if (!nativeId(sessionId) || !nativeId(inputId) || inputId === sessionId)
 		throw new Error('CC compact requires original native session and input IDs');
@@ -93,6 +94,7 @@ export async function observeCcCompact({ cwd, sessionId, inputId, version, claud
 	let nativeSummary: { summaryId: string; summaryHash: string } | undefined;
 	let insufficientHistoryNoticeId: string | undefined;
 	let displaySeen = false;
+	let acceptanceSeen = false;
 	assertCurrent();
 	return runCcControlChild<ObservedCcCompact>({ label: 'compact', cwd, signal, claudeBin, spawn, kill, platform,
 		argv: ['-p', '--resume', sessionId, '--settings', settingsPath, '--safe-mode', '--input-format', 'stream-json',
@@ -120,10 +122,14 @@ export async function observeCcCompact({ cwd, sessionId, inputId, version, claud
 			const unconfirmed = () => io.fail('native compact effect unconfirmed');
 			if (phase === 'checking') return unconfirmed();
 			if (m?.session_id !== sessionId) return unconfirmed();
-			// Pinned Claude emits compact progress even before its per-input init; it proves no effect.
-			if (m.type === 'system' && m.subtype === 'status' &&
-				(m.status === 'compacting' && m.compact_result === undefined ||
-					m.status === null && (m.compact_result === undefined || m.compact_result === 'success'))) return;
+			// This initialized child has received only the original /compact. Progress proves admission, not effect.
+			if (m.type === 'system' && m.subtype === 'status') {
+				if (m.status === 'compacting' && m.compact_result === undefined) {
+					if (!acceptanceSeen) { acceptanceSeen = true; onAccepted?.(); }
+					return;
+				}
+				if (m.status === null && (m.compact_result === undefined || m.compact_result === 'success')) return;
+			}
 			if (phase === 'input') {
 				if (m.type !== 'system' || m.subtype !== 'init' || m.cwd !== cwd || m.claude_code_version !== version ||
 					m.permissionMode === 'bypassPermissions' || !Array.isArray(m.tools) || m.tools.length ||

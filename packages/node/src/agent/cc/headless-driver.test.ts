@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CcHeadlessDriver, type CcChild, type CcHeadlessDriverDeps, type CcSpawnOptions } from './headless-driver.js';
-import { DriverDisconnectIncompleteError, type AgentEvent, type PreparedRun } from '../events.js';
+import { DriverDisconnectIncompleteError, type AgentEvent, type CapabilityExecution, type PreparedRun } from '../events.js';
 import { CcSessionRegistry } from './sink.js';
 import { AgentCommandHandler } from '../../handler/agent-command.js';
 import * as preflight from './native-compact-preflight.js';
@@ -86,19 +86,20 @@ describe('CC native capability observation', () => {
 		});
 		const release = vi.fn();
 		const reserve = vi.fn(() => release);
-		const observe = vi.spyOn(compact, 'observeCcCompact').mockImplementation(async ({ inputId, assertCurrent, beforeInput, onSubmit }) => {
+		const observe = vi.spyOn(compact, 'observeCcCompact').mockImplementation(async ({ inputId, assertCurrent, beforeInput, onSubmit, onAccepted }) => {
 			expect(reserve).toHaveBeenCalledWith(sessionId, inputId);
 			expect(assertIntact).toHaveBeenLastCalledWith();
 			await beforeInput!();
 			expect(assertIntact).toHaveBeenLastCalledWith('native-resume');
 			assertCurrent();
 			onSubmit!();
+			onAccepted?.();
 			return { controlId, summaryId, summaryHash: 'native', preTokens: 1570, postTokens: 1213 };
 		});
 		const verify = vi.spyOn(compact, 'verifyCcCompactAppend').mockResolvedValue({ status: 'completed', controlId, summaryId });
 		const execute = { requestId: 'compact', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
 			authorizationEpoch: 'epoch', reserveCcCompact: reserve, saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(),
-			replaceSession: vi.fn(), emit: vi.fn(), bindTurn: vi.fn() };
+			replaceSession: vi.fn(), emit: vi.fn<CapabilityExecution['emit']>().mockResolvedValue(undefined), bindTurn: vi.fn() };
 		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir } };
 		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution: execute }), conversation: () => conversation });
 		try {
@@ -128,6 +129,10 @@ describe('CC native capability observation', () => {
 				effect: { kind: 'compact', controlId, summaryId, summary: true } });
 			expect(await duplicate).toEqual(result);
 			expect(observe).toHaveBeenCalledOnce();
+			expect(execute.emit.mock.calls.slice(-2)).toEqual([
+				[{ type: 'receipt', receipt: { status: 'accepted', phase: 'accepted', generation: '1', nativeRef: { sessionId } } }],
+				[{ type: 'receipt', receipt: expect.objectContaining({ status: 'completed', phase: 'outcome', nativeRef: { sessionId } }) }],
+			]);
 			expect(verify).toHaveBeenCalledOnce();
 			expect(release).toHaveBeenCalledOnce();
 			verify.mockRejectedValueOnce(new Error('no durable effect'));

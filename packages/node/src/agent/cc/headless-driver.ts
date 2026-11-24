@@ -235,7 +235,11 @@ export class CcHeadlessDriver implements RunDriver {
 				const { assertIntact } = native;
 				const evidence = await observeCcCompact({ ...scope, inputId, version, claudeBin: native.cliPath,
 					settingsPath: native.settingsPath, env: native.env, signal, assertCurrent, beforeInput: () => assertIntact('native-resume'),
-					onSubmit: () => { submitted = true; }, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
+					onSubmit: () => { submitted = true; }, onAccepted: () => {
+						if (!submitted) return;
+						try { assertCurrent(); } catch { return; }
+						void execution.emit({ type: 'receipt', receipt: { ...original, status: 'accepted', phase: 'accepted' } }).catch(() => {});
+					}, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
 				const { handle, path, originalBytes } = native.history;
 				const effect = await verifyCcCompactAppend({ ...scope, version, handle, path, original: originalBytes, evidence });
 				return finish(effect.status === 'noop' ? { ...original, status: 'noop', text: 'Claude Code 历史不足，未压缩。' }
