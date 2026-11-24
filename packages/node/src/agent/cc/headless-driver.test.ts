@@ -122,6 +122,7 @@ describe('CC native capability observation', () => {
 			await nativeInventory(2, 'different inventory');
 			expect(await stale).toMatchObject({ status: 'failed', error: 'catalog_stale' });
 			expect(reserve).not.toHaveBeenCalled();
+			execute.emit.mockRejectedValueOnce(new Error('admission publication unavailable'));
 			const original = handler.handle(invoke), duplicate = handler.handle(invoke);
 			await nativeInventory(3);
 			const result = await original;
