@@ -140,6 +140,27 @@ describe('CC native capability observation', () => {
 			expect(execute.bindTurn).not.toHaveBeenCalled();
 		} finally { prepareNative.mockRestore(); observe.mockRestore(); verify.mockRestore(); }
 	});
+	posix('does not advertise an ambient catalog when disconnect races a scoped inventory', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir } } };
+		const path = join(f.dir, `${sessionId}.jsonl`);
+		writeFileSync(path, 'original\n');
+		const handle = await open(path, 'r');
+		const assertIntact = vi.fn().mockResolvedValueOnce(undefined).mockImplementationOnce(() => f.driver.disconnect());
+		const prepare = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue({ cwd: f.dir,
+			cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {}, assertIntact,
+			history: { path, handle, originalBytes: Buffer.from('original\n') } });
+		try {
+			const discovery = f.driver.discoverCapabilities({ roomId: 'room', workspace: f.dir, conversation, signal: f.controller.signal });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success',
+				response: { models: [{ value: 'scoped', displayName: 'Scoped model' }] } } });
+			f.groupExit(); f.close(0);
+			expect(await discovery).toMatchObject({ capabilities: [], discovery: { coverage: 'unavailable' } });
+			expect(assertIntact).toHaveBeenCalledTimes(2);
+		} finally { prepare.mockRestore(); await handle.close(); }
+	});
 	posix('discovers and lists models from the idle native instance without sending user input', async () => {
 		const f = fixture();
 		const derived = join(f.dir, 'agent', 'owner');

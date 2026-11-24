@@ -16,7 +16,7 @@ const summary = 'This session is being continued from a previous conversation th
 const cwd = process.cwd();
 function fixture() {
 	const child = Object.assign(new EventEmitter(), {
-		pid: 4242, stdin: { write: vi.fn<(chunk: string) => void>(), end: vi.fn() },
+		pid: 4242, stdin: { writable: true, write: vi.fn<(chunk: string) => void>(), end: vi.fn() },
 		stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(() => true),
 	});
 	const spawn = vi.fn<CcSpawnFn>(() => child);
@@ -66,6 +66,22 @@ it('writes one resumed compact only after its native ACK and observes effect thr
 	await expect(result).resolves.toEqual({ controlId, summaryId, preTokens: 1570, postTokens: 1213,
 		summaryHash: createHash('sha256').update(summary).digest('hex') });
 	expect(f.lines()).toHaveLength(2);
+});
+
+it('never marks a late prewrite check as submitted when only stdin has closed', async () => {
+	const f = fixture(), onSubmit = vi.fn();
+	let allow!: () => void;
+	const ready = new Promise<void>(resolve => { allow = resolve; });
+	const result = f.start({ beforeInput: () => ready, onSubmit });
+	f.ack();
+	f.child.stdin.writable = false;
+	allow();
+	await ready;
+	await Promise.resolve();
+	f.close();
+	await expect(result).rejects.toThrow();
+	expect(onSubmit).not.toHaveBeenCalled();
+	expect(f.lines()).toHaveLength(1);
 });
 
 it('never marks a late prewrite check as a native submission once the child has closed', async () => {

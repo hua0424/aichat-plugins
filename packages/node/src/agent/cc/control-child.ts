@@ -42,6 +42,7 @@ export async function runCcControlChild<T>({ label, cwd, signal, argv, env, dead
 			write(frame, beforeWrite) {
 				if (signal.aborted) return onAbort();
 				if (!started || settled || failure || result || close) return;
+				if (!child.stdin || child.stdin.writable === false) return fail('input closed');
 				try { beforeWrite?.(); }
 				catch { return fail('original scope changed'); }
 				try { child.stdin!.write(`${JSON.stringify(frame)}\n`); }

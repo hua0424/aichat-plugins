@@ -25,7 +25,7 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 	pid?: number;
 	readonly stdout = new PassThrough();
 	readonly stderr = new PassThrough();
-	readonly stdin: { write(chunk: string): void; end(): void };
+	readonly stdin: NonNullable<CcChild['stdin']>;
 	readonly ready: Promise<void>;
 	verifiedGone = false;
 	private readonly helper: ChildProcessWithoutNullStreams;
@@ -44,7 +44,9 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 		this.ready = new Promise<void>((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
 		this.helper = spawn(binary, [command, ...args], { cwd: options.cwd, env: options.env, windowsHide: true,
 			stdio: ['pipe', 'pipe', 'pipe'] });
+		const child = this;
 		this.stdin = {
+			get writable() { return child.controlWritable; },
 			write: (text) => { this.sendControl(frame('I', Buffer.from(text))); },
 			end: () => { this.sendControl(frame('E')); },
 		};
@@ -89,8 +91,12 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 	/** Missing native P is not proof: only a failed OS launch of the helper cannot own a Job. */
 	get helperNeverLaunched(): boolean { return this.exited && this.helper.pid === undefined; }
 
+	private get controlWritable(): boolean {
+		return !this.exited && this.doneCode === undefined && this.helper.stdin.writable;
+	}
+
 	private sendControl(bytes: Buffer): boolean {
-		if (this.exited || this.doneCode !== undefined || !this.helper.stdin.writable) return false;
+		if (!this.controlWritable) return false;
 		return this.helper.stdin.write(bytes);
 	}
 	kill(): boolean { return this.sendControl(frame('K')); }

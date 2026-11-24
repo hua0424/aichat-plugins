@@ -27,7 +27,7 @@ interface ReadableStreamish {
 }
 export interface CcChild {
 	readonly pid?: number;
-	readonly stdin: { write(chunk: string): void; end(): void } | null;
+	readonly stdin: { readonly writable?: boolean; write(chunk: string): void; end(): void } | null;
 	readonly stdout: ReadableStreamish | null;
 	readonly stderr: ReadableStreamish | null;
 	on(event: 'error', listener: (err: Error) => void): void;
@@ -118,7 +118,7 @@ export class CcHeadlessDriver implements RunDriver {
 				if (!scope || !native) return catalog;
 				context.signal.throwIfAborted();
 				context.conversation?.assertCurrent();
-				if (this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return catalog;
+				if (this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return unavailable();
 				return { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`, capabilities: [...catalog.capabilities, {
 					id: 'session.compact', kind: 'command', source: 'session', name: 'Compact', supported: true,
 					executable: true, defaultVisibility: 'public', scope: 'conversation', parameters: [],
