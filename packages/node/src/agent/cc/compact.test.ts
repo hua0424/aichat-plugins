@@ -40,6 +40,8 @@ function fixture() {
 		boundary: (trigger = 'manual') => line({ type: 'system', subtype: 'compact_boundary', uuid: controlId, session_id: sessionId, compact_metadata: { trigger, pre_tokens: 1570, post_tokens: 1213 } }),
 		summary: () => line({ type: 'user', uuid: summaryId, session_id: sessionId, parent_tool_use_id: null, isSynthetic: true, isReplay: false, message: { role: 'user', content: summary } }),
 		display: () => line({ type: 'user', uuid: displayId, session_id: sessionId, parent_tool_use_id: null, isReplay: true, timestamp: '2026-11-24T02:00:00.000Z', message: { role: 'user', content: '<local-command-stdout>Compacted native display</local-command-stdout>' } }),
+		insufficientHistory: () => line({ type: 'assistant', uuid: displayId, session_id: sessionId, parent_tool_use_id: null,
+			message: { role: 'assistant', content: [{ type: 'text', text: 'Not enough messages to compact.' }] } }),
 		result: () => line({ type: 'result', subtype: 'success', session_id: sessionId, is_error: false }),
 		close: () => { groupAlive = false; child.emit('close', 0, null); },
 	};
@@ -85,7 +87,43 @@ it('correlates the observed effect to newly appended boundary and summary in the
 			await appendFile(path, [boundary, { ...record, parentUuid: displayId }].map(x => JSON.stringify(x)).join('\n') + '\n');
 			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
 			await writeFile(path, original + [boundary, record].map(x => JSON.stringify(x)).join('\n') + '\n');
-			await expect(verify()).resolves.toBeUndefined();
+			await expect(verify()).resolves.toEqual({ status: 'completed', controlId, summaryId });
+		} finally { await handle.close(); }
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+it('accepts the exact native insufficient-history row only as a linked no-op', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'cc-compact-noop-'));
+	const path = join(await realpath(dir), `${sessionId}.jsonl`);
+	const identity = { sessionId, cwd, version: '2.1.195', isSidechain: false };
+	const original = Buffer.from(JSON.stringify({ type: 'user', ...identity }) + '\n');
+	const command = { ...identity, type: 'user', uuid: controlId,
+		message: { role: 'user', content: '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>' } };
+	const notice = { ...identity, type: 'system', subtype: 'local_command', uuid: displayId, parentUuid: command.uuid,
+		content: '<local-command-stdout>Not enough messages to compact.</local-command-stdout>' };
+	try {
+		await writeFile(path, original, { mode: 0o600 });
+		const handle = await open(path, 'r');
+		try {
+			const f = fixture(), result = f.start();
+			f.ack(); f.init(); f.insufficientHistory(); f.result(); f.close();
+			const evidence = await result;
+			const verify = () => verifyCcCompactAppend({ handle, path, original, sessionId, cwd, version: '2.1.195', evidence });
+			const record = (...rows: object[]) => writeFile(path, Buffer.concat([original, Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')]));
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, uuid: summaryId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, parentUuid: inputId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...identity, type: 'system', subtype: 'compact_boundary', uuid: controlId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, cwd: `${cwd}-foreign` });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...notice, uuid: controlId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice);
+			await expect(verify()).resolves.toEqual({ status: 'noop' });
+			expect(evidence).toEqual({ insufficientHistoryNoticeId: displayId });
 		} finally { await handle.close(); }
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -107,8 +145,9 @@ it('rechecks the original control scope before writing the compact input', async
 	expect(f.lines()).toHaveLength(1);
 });
 
-it('does not treat success or an automatic boundary as the requested native effect', async () => {
-	for (const send of [(f: ReturnType<typeof fixture>) => f.result(), (f: ReturnType<typeof fixture>) => f.boundary('auto')]) {
+it('requires native outcome evidence before accepting a successful result', async () => {
+	for (const send of [(f: ReturnType<typeof fixture>) => f.result(), (f: ReturnType<typeof fixture>) => { f.boundary(); f.result(); },
+		(f: ReturnType<typeof fixture>) => f.boundary('auto'), (f: ReturnType<typeof fixture>) => { f.insufficientHistory(); f.boundary(); }]) {
 		const f = fixture(), result = f.start();
 		const rejected = expect(result).rejects.toThrow('native compact effect unconfirmed');
 		f.ack(); f.init(); send(f); f.close();
