@@ -97,6 +97,26 @@ it('pins the default launch candidate and returns the exact native profile and o
 	await result.history.handle.close();
 });
 
+it('uses an owned process HOME without moving the pinned installation or opening passwd-home history', async () => {
+	const { place, run, env } = fixture();
+	const owned = '/opt/issue506-private';
+	const ownedCwd = `${owned}/workspace`;
+	const ownedProfile = `${owned}/.claude`;
+	const ownedProject = `${ownedProfile}/projects/-opt-issue506-private-workspace`;
+	const ownedHistory = `${ownedProject}/${sessionId}.jsonl`;
+	for (const dir of ['/opt', owned, ownedCwd, ownedProfile, `${ownedProfile}/projects`, ownedProject]) place(dir).mode = 0o700;
+	place(`${ownedProfile}/.last-cleanup`, 'file');
+	place(`${ownedProfile}/settings.json`, 'file', Buffer.from(JSON.stringify({ env: approvedEnv })));
+	place(ownedHistory, 'file', rows({ cwd: ownedCwd }));
+	const input = { cwd: ownedCwd, env: { ...env, HOME: owned } };
+	const result = await run(input);
+	expect(result).toMatchObject({ cliPath: binary, env: { HOME: owned }, history: { path: ownedHistory } });
+	expect(fake.open).not.toHaveBeenCalledWith(historyPath, expect.any(Number));
+	await result?.history.handle.close();
+	place(owned).uid = 1000;
+	await expect(run(input)).resolves.toBeUndefined();
+});
+
 it('accepts the explicit native launcher or canonical binary and no other alias', async () => {
 	const { place, run } = fixture();
 	for (const cliPath of [launcher, binary]) {

@@ -48,9 +48,10 @@ function setup(store: ConversationStore, executeCapability: AgentDriver['execute
 	const send = vi.fn((type: number, data: Record<string, unknown>) => {
 		if (type === 20) queueMicrotask(() => handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: `thinking-${data.clientRunId}` } }));
 	});
-	handler = new MessageHandler({ send, isConnected: true } as unknown as HulaWSClient, driver, 'u', api, undefined, () => {}, () => store, home);
+	const socket = { send, isConnected: true, openConnectionAttempt: 1 };
+	handler = new MessageHandler(socket as unknown as HulaWSClient, driver, 'u', api, undefined, () => {}, () => store, home);
 	handlers.push(handler);
-	return { handler, posted, notices, send };
+	return { handler, posted, notices, send, socket };
 }
 
 const complete = vi.fn(async ({ execution: e }: AgentCapabilityInvocation) => {
@@ -68,6 +69,26 @@ const waitForReports = async (posted: Posted[], count: number) => {
 };
 
 describe('command reconcile evidence', () => {
+	it('does not submit Claude compact under an envelope from a replaced IM connection', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-compact-reconnect-')); dirs.push(home);
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace: home });
+		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
+			socket.openConnectionAttempt = 2;
+			// A replaced connection has not made the cached group epoch authoritative again.
+			execution!.reserveCcCompact!(sessionId, '94f1a809-4687-4f8f-8a80-0dc54fd7276c');
+			return { status: 'accepted' as const };
+		});
+		const { handler, posted, socket } = setup(store, execute, home, 'cc');
+		await handler.prewarmGroupConfigs();
+		handler.handle({ type: 'agentCommand', data: request('disconnected-compact', { capabilityId: 'session.compact',
+			context: { roomType: 1, account: 'test-group', expectedGeneration: '1', authorizationEpoch: 'epoch' } }) });
+		await waitForReports(posted, 1);
+		expect(execute).toHaveBeenCalledOnce();
+		expect(posted[0]).not.toMatchObject({ status: 'accepted' });
+		expect(store.getControl('u', '20', 'disconnected-compact')?.ccCompactInputId).toBeUndefined();
+	});
 	it('reserves only the authorized original Claude session and fences competing input until closure', async () => {
 		const home = mkdtempSync(join(tmpdir(), 'cc-compact-command-')); dirs.push(home);
 		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';

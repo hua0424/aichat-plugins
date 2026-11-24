@@ -25,9 +25,10 @@ function fixture() {
 		if (pid === -child.pid && signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
 	});
 	const assertCurrent = vi.fn();
-	const start = () => observeCcCompact({ cwd, sessionId, inputId, version: '2.1.195', claudeBin: '/owned/claude',
-		settingsPath: '/owned/settings.json', env: { HOME: '/owned/home' }, signal: new AbortController().signal,
-		assertCurrent, spawn, kill, platform: 'linux' });
+	const start = (inputChecks: Pick<Parameters<typeof observeCcCompact>[0], 'beforeInput' | 'onSubmit'> = {}) =>
+		observeCcCompact({ cwd, sessionId, inputId, version: '2.1.195', claudeBin: '/owned/claude',
+			settingsPath: '/owned/settings.json', env: { HOME: '/owned/home' }, signal: new AbortController().signal,
+			assertCurrent, spawn, kill, platform: 'linux', ...inputChecks });
 	const line = (value: object) => child.stdout.emit('data', JSON.stringify(value) + '\n');
 	const lines = () => child.stdin.write.mock.calls.map(([line]) => JSON.parse(line));
 	const ack = (requestId = lines()[0].request_id) => line({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } });
@@ -65,6 +66,20 @@ it('writes one resumed compact only after its native ACK and observes effect thr
 	await expect(result).resolves.toEqual({ controlId, summaryId, preTokens: 1570, postTokens: 1213,
 		summaryHash: createHash('sha256').update(summary).digest('hex') });
 	expect(f.lines()).toHaveLength(2);
+});
+
+it('never marks a late prewrite check as a native submission once the child has closed', async () => {
+	const f = fixture(), onSubmit = vi.fn();
+	let allow!: () => void;
+	const ready = new Promise<void>(resolve => { allow = resolve; });
+	const result = f.start({ beforeInput: () => ready, onSubmit });
+	f.ack();
+	f.close();
+	await expect(result).rejects.toThrow('did not complete');
+	allow();
+	await ready;
+	expect(onSubmit).not.toHaveBeenCalled();
+	expect(f.lines()).toHaveLength(1);
 });
 
 it('correlates the observed effect to newly appended boundary and summary in the original native history', async () => {

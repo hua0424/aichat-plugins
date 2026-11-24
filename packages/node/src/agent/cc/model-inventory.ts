@@ -10,12 +10,13 @@ type NativeModel = { value: string; displayName: string };
 
 /** One disposable native inventory request, not a chat run. Safe mode still permits admin managed policy. */
 export async function readCcModelInventory({ cwd, signal, claudeBin, spawn, kill,
-	platform }: { cwd: string; signal: AbortSignal; claudeBin?: string; spawn?: CcSpawnFn;
-	kill?: CcKillFn; platform?: NodeJS.Platform }): Promise<NativeModel[]> {
+	platform, profile }: { cwd: string; signal: AbortSignal; claudeBin?: string; spawn?: CcSpawnFn;
+	kill?: CcKillFn; platform?: NodeJS.Platform; profile?: { env: NodeJS.ProcessEnv; settingsPath: string } }): Promise<NativeModel[]> {
 	const requestId = randomUUID();
 	const argv = ['-p', '--safe-mode', '--no-session-persistence', '--input-format', 'stream-json',
 		'--output-format', 'stream-json', '--verbose', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
-	const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_NON_INTERACTIVE: '1', MAX_RETRIES: '0' };
+	if (profile) argv.push('--settings', profile.settingsPath);
+	const env: NodeJS.ProcessEnv = { ...(profile?.env ?? process.env), CLAUDE_NON_INTERACTIVE: '1', MAX_RETRIES: '0' };
 	for (const key of Object.keys(env)) {
 		if (/^(?:AICHAT_.*|OPENCLAW_BIND|OPENCODE_SESSION_ID|CODEX_THREAD_ID)$/i.test(key)) delete env[key];
 	}

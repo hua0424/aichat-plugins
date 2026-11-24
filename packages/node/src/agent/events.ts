@@ -153,7 +153,7 @@ export interface CapabilityExecution {
 	/** Persist native locator BEFORE the native mutation. */
 	submitted(ref?: NativeRef): Promise<void>;
 	/** Holds the original Claude control slot. Release only after proven containment or before launch. */
-	reserveCcCompact?(sessionId: string, inputId: string): () => void;
+	reserveCcCompact?(sessionId: string, inputId: string): (receipt?: AgentCapabilityResult) => void;
 	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
 	/** Optional model snapshot is checked atomically with generation; null means explicitly unselected. */
 	replaceSession(id: string, state: { version: number; value: unknown }, expectedModel?: { providerID: string; modelID: string } | null): Promise<number>;

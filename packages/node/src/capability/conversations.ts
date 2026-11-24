@@ -384,13 +384,17 @@ export class ConversationStore {
 		this.replace(r);
 	}
 	/** Only the caller that established containment (or proved no spawn) may release this fence. */
-	releaseCcCompact(uid: string, room: string, requestId: string, inputId: string): void {
+	releaseCcCompact(uid: string, room: string, requestId: string, inputId: string, receipt?: AgentCapabilityResult): void {
 		this.assertProvider('cc', uid);
 		const { r, c } = this.controlRecord(uid, room, requestId);
 		if (r.generation !== c.generation || c.ccCompactFence !== true || c.ccCompactInputId !== inputId)
 			throw new Error('CC compact fence ownership mismatch');
 		delete c.ccCompactFence;
-		this.replace(r);
+		if (receipt) {
+			// A live owned closer can settle its verified outcome even after the server watchdog reported unknown.
+			if (c.receipt?.status === 'unknown' && ['completed', 'noop', 'failed'].includes(receipt.status)) receipt = { ...receipt, reconciled: true };
+			this.writeControlReceipt(r, c, { ...receipt, phase: 'outcome' }, true);
+		} else this.replace(r);
 	}
 	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
 		this.assertRecovery(recovery);
@@ -398,13 +402,20 @@ export class ConversationStore {
 	}
 	recordControl(uid: string, room: string, requestId: string, result: AgentCapabilityResult): AgentCapabilityResult {
 		const { r, c } = this.controlRecord(uid, room, requestId);
+		return this.writeControlReceipt(r, c, result);
+	}
+	private writeControlReceipt(r: ConversationRecord, c: ControlEntry, result: AgentCapabilityResult, fenceReleased = false): AgentCapabilityResult {
 		const old = c.receipt;
-		if (old && !['accepted', 'unknown'].includes(old.status)) return copy(old);
+		const retain = (receipt: AgentCapabilityResult) => {
+			if (fenceReleased) this.replace(r);
+			return copy(receipt);
+		};
+		if (old && !['accepted', 'unknown'].includes(old.status)) return retain(old);
 		if (result.generation !== undefined && result.generation !== String(c.generation)) throw new Error('control generation conflict');
 		if (c.nativeRef && result.nativeRef && Object.entries(c.nativeRef).some(([k, v]) =>
 			result.nativeRef![k as keyof NativeRef] !== undefined && result.nativeRef![k as keyof NativeRef] !== v)) throw new Error('native reference conflict');
 		if (old?.status === 'unknown') {
-			if (!result.reconciled || !['completed', 'failed', 'noop'].includes(result.status)) return copy(old);
+			if (!result.reconciled || !['completed', 'failed', 'noop'].includes(result.status)) return retain(old);
 			if (!result.nativeRef && !result.effect) throw new Error('reconciliation evidence required');
 		}
 		if (result.nativeRef) c.nativeRef = { ...c.nativeRef, ...result.nativeRef };

@@ -106,12 +106,16 @@ export class CcHeadlessDriver implements RunDriver {
 		try {
 			context.conversation?.assertCurrent();
 			if (!this.active.size) {
-				const { catalog } = await this.readModelCatalog(context);
 				const scope = compactScope(context);
-				if (!scope || this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return catalog;
-				const native = await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env });
-				if (!native) return catalog;
-				await native.history.handle.close();
+				const native = scope && !this.compactWork && !this.compactStopUnconfirmed
+					? await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env }) : undefined;
+				let catalog: AgentCapabilityCatalog;
+				try {
+					await native?.assertIntact();
+					({ catalog } = await this.readModelCatalog(context, native));
+					await native?.assertIntact();
+				} finally { await native?.history.handle.close(); }
+				if (!scope || !native) return catalog;
 				context.signal.throwIfAborted();
 				context.conversation?.assertCurrent();
 				if (this.active.size || this.closing || this.compactWork || this.compactStopUnconfirmed) return catalog;
@@ -126,7 +130,7 @@ export class CcHeadlessDriver implements RunDriver {
 		} catch { return unavailable(); }
 	}
 
-	private async readModelCatalog(context: AgentCapabilityContext) {
+	private async readModelCatalog(context: AgentCapabilityContext, profile?: NonNullable<Awaited<ReturnType<typeof prepareCcNativeCompact>>>) {
 		const cwd = context.workspace;
 		if (!cwd || this.active.size || this.closing || this.modelRead || this.modelReadStopUnconfirmed) throw new Error('CC model inventory unavailable');
 		context.signal.throwIfAborted();
@@ -137,8 +141,8 @@ export class CcHeadlessDriver implements RunDriver {
 			if (context.defaultWorkspace) await mkdir(cwd, { recursive: true, mode: 0o700 });
 			signal.throwIfAborted();
 			context.conversation?.assertCurrent();
-			return readCcModelInventory({ cwd, signal,
-				claudeBin: this.deps.claudeBin, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
+			return readCcModelInventory({ cwd, signal, profile,
+				claudeBin: profile?.cliPath ?? this.deps.claudeBin, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
 		})().catch((error: unknown) => {
 			if (error instanceof DriverDisconnectIncompleteError) this.modelReadStopUnconfirmed = true;
 			throw error;
@@ -166,8 +170,19 @@ export class CcHeadlessDriver implements RunDriver {
 		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
 		if (!/^cc-models:[a-f0-9]{64}(?::[a-f0-9]{64})?$/.test(input.catalogVersion)) return { status: 'failed', error: 'catalog_stale' };
+		let native: Awaited<ReturnType<typeof prepareCcNativeCompact>>;
 		try {
-			const { catalog, models } = await this.readModelCatalog(input);
+			const [, , scopeVersion] = input.catalogVersion.split(':');
+			if (scopeVersion) {
+				const scope = compactScope(input);
+				if (!scope || scope.digest !== scopeVersion) return { status: 'failed', error: 'catalog_stale' };
+				native = await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env });
+				if (!native) return { status: 'failed', error: 'native_context_unavailable' };
+				await native.assertIntact();
+			}
+			const { catalog, models } = await this.readModelCatalog(input, native);
+			await native?.assertIntact();
+			input.conversation?.assertCurrent();
 			if (input.catalogVersion.split(':', 2).join(':') !== catalog.version) return { status: 'failed', error: 'catalog_stale' };
 			const lines = ['Available models (Claude safe mode):'];
 			let length = lines[0].length;
@@ -178,6 +193,7 @@ export class CcHeadlessDriver implements RunDriver {
 			}
 			return { status: 'completed', text: lines.join('\n') };
 		} catch { return { status: 'failed', error: 'native_request_failed' }; }
+		finally { await native?.history.handle.close(); }
 	}
 	private async executeCompact(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
 		// This lane cannot establish teardown or recover the native write after a process restart.
@@ -187,7 +203,6 @@ export class CcHeadlessDriver implements RunDriver {
 		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
 		const scope = compactScope({ workspace: input.workspace, conversation: execution.conversation });
-		// Model inventory and compact use independent parts of the same catalog token.
 		if (!scope || !/^cc-models:[a-f0-9]{64}:[a-f0-9]{64}$/.test(input.catalogVersion) || !input.catalogVersion.endsWith(`:${scope.digest}`))
 			return { status: 'failed', error: 'catalog_stale' };
 		if (this.active.size || this.closing || this.modelRead || this.modelReadStopUnconfirmed || this.compactWork || this.compactStopUnconfirmed)
@@ -196,13 +211,22 @@ export class CcHeadlessDriver implements RunDriver {
 		const assertCurrent = () => { signal.throwIfAborted(); execution.conversation.assertCurrent(); };
 		const done = (async (): Promise<AgentCapabilityResult> => {
 			let native: Awaited<ReturnType<typeof prepareCcNativeCompact>>;
-			let release: (() => void) | undefined;
+			let release: ((receipt: AgentCapabilityResult) => void) | undefined;
 			let submitted = false;
 			const original = { generation: scope.generation, nativeRef: { sessionId: scope.sessionId } };
+			const finish = (receipt: AgentCapabilityResult) => {
+				const closeFence = release;
+				release = undefined;
+				closeFence?.(receipt);
+				return receipt;
+			};
 			try {
 				assertCurrent();
 				native = await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env });
 				if (!native) return { status: 'failed', error: 'native_context_unavailable' };
+				const { catalog } = await this.readModelCatalog({ ...input, signal, conversation: execution.conversation }, native);
+				if (`${catalog.version}:${scope.digest}` !== input.catalogVersion) return { status: 'failed', error: 'catalog_stale' };
+				await native.assertIntact();
 				assertCurrent();
 				if (this.active.size || this.closing) return { status: 'failed', error: 'command_busy' };
 				const inputId = randomUUID();
@@ -213,17 +237,13 @@ export class CcHeadlessDriver implements RunDriver {
 					onSubmit: () => { submitted = true; }, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
 				const { handle, path, originalBytes } = native.history;
 				const effect = await verifyCcCompactAppend({ ...scope, version, handle, path, original: originalBytes, evidence });
-				release();
-				return effect.status === 'noop' ? { ...original, status: 'noop', text: 'Claude Code 历史不足，未压缩。' }
-					: { ...original, status: 'completed', effect: { kind: 'compact', controlId: effect.controlId, summaryId: effect.summaryId, summary: true } };
+				return finish(effect.status === 'noop' ? { ...original, status: 'noop', text: 'Claude Code 历史不足，未压缩。' }
+					: { ...original, status: 'completed', effect: { kind: 'compact', controlId: effect.controlId, summaryId: effect.summaryId, summary: true } });
 			} catch (error) {
-				if (error instanceof DriverDisconnectIncompleteError) this.compactStopUnconfirmed = true;
-				if (release && !submitted && !this.compactStopUnconfirmed) {
-					try { release(); } catch { return { ...original, status: 'unknown', error: 'native_request_failed' }; }
-				}
-				return submitted || this.compactStopUnconfirmed
-					? { ...original, status: 'unknown', error: 'native_request_failed' }
-					: { ...original, status: 'failed', error: 'native_request_failed' };
+				const unknown = { ...original, status: 'unknown', error: 'native_request_failed' } as const;
+				if (error instanceof DriverDisconnectIncompleteError) { this.compactStopUnconfirmed = true; return unknown; }
+				try { return finish(submitted ? unknown : { ...original, status: 'failed', error: 'native_request_failed' }); }
+				catch { return unknown; }
 			} finally { await native?.history.handle.close(); }
 		})();
 		const work = { controller, done };

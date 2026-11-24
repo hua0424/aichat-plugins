@@ -105,11 +105,11 @@ export async function observeCcCompact({ cwd, sessionId, inputId, version, claud
 				if (m?.type !== 'control_response' || m.response?.subtype !== 'success' || m.response.request_id !== initializeId)
 					return io.fail('unexpected initialize response');
 				const submit = () => {
-					try { signal.throwIfAborted(); assertCurrent(); onSubmit?.(); }
-					catch { return io.fail('original scope changed'); }
-					phase = 'input';
 					io.write({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
-						message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
+						message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } }, () => {
+						signal.throwIfAborted(); assertCurrent(); onSubmit?.();
+						phase = 'input';
+					});
 				};
 				if (beforeInput) {
 					phase = 'checking';

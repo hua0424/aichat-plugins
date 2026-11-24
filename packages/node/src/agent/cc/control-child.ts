@@ -8,7 +8,7 @@ const KILL_GRACE_MS = 3_000;
 const CLEANUP_MS = 7_000;
 
 interface ControlIO<T> {
-	write(frame: object): void;
+	write(frame: object, beforeWrite?: () => void): void;
 	complete(value: T): void;
 	fail(reason: string): void;
 }
@@ -39,9 +39,11 @@ export async function runCcControlChild<T>({ label, cwd, signal, argv, env, dead
 		const onAbort = () => fail('aborted');
 		const ownedPid = () => child.pid && child.pid > 0 && Number.isSafeInteger(child.pid) ? child.pid : undefined;
 		const io: ControlIO<T> = {
-			write(frame) {
+			write(frame, beforeWrite) {
 				if (signal.aborted) return onAbort();
 				if (!started || settled || failure || result || close) return;
+				try { beforeWrite?.(); }
+				catch { return fail('original scope changed'); }
 				try { child.stdin!.write(`${JSON.stringify(frame)}\n`); }
 				catch { fail('input failed'); }
 			},

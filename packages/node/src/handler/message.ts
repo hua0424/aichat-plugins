@@ -405,10 +405,11 @@ export class MessageHandler {
 		try {
 			const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
 			if (!record || record.adapterInstanceId !== this.driver.type) return undefined;
+			const connection = this.ws.openConnectionAttempt;
 			const assertCurrent = () => {
 				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
 				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-					(this.driver.type === 'cc' ? !this.ccCompactAdmissionMatches(request.roomId, epoch, request.context) ||
+					(this.driver.type === 'cc' ? !this.ccCompactAdmissionMatches(request.roomId, epoch, request.context, connection) ||
 						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace
 						: this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch) ||
 					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
@@ -420,10 +421,11 @@ export class MessageHandler {
 		} catch { return undefined; }
 	}
 
-	private ccCompactAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context']): boolean {
+	private ccCompactAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined): boolean {
+		if (connection === undefined || this.ws.openConnectionAttempt !== connection) return false;
 		if (context.roomType === 2) {
 			// Owner DM has no group-config row. Its authenticated IM command envelope is the admission source.
-			return this.ws.isConnected && context.isOwner === true && /^[a-f0-9]{64}$/.test(epoch);
+			return context.isOwner === true && /^[a-f0-9]{64}$/.test(epoch);
 		}
 		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
 	}
@@ -435,10 +437,11 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
-		const ccCompactAdmission = this.driver.type === 'cc' && request.capabilityId === 'session.compact' ? request.context : undefined;
+		const ccCompactAdmission = this.driver.type === 'cc' && request.capabilityId === 'session.compact'
+			? { context: request.context, connection: this.ws.openConnectionAttempt } : undefined;
 		if (ccCompactAdmission) {
 			const current = store.get(this.selfUid, room);
-			if (!current || current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompactAdmission) ||
+			if (!current || current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompactAdmission.context, ccCompactAdmission.connection) ||
 				(expectedGeneration !== undefined && Number(expectedGeneration) === 0)) {
 				return request.reconcileOnly ? { receipt: { status: 'unknown', error: 'authorization_changed' } }
 					: { receipt: { status: 'failed', error: 'authorization_changed' } };
@@ -513,7 +516,7 @@ export class MessageHandler {
 				.catch(() => console.error('[command] control receipt publication failed; retained for explicit query')); }) };
 	}
 	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string; capabilityId?: string;
-		ccCompactAdmission?: AgentCommandRequest['context'] }, generation: number, systemPrompt: string,
+		ccCompactAdmission?: { context: AgentCommandRequest['context']; connection: number | undefined } }, generation: number, systemPrompt: string,
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
@@ -521,7 +524,7 @@ export class MessageHandler {
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
-			if (ccCompact && (current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompact) ||
+			if (ccCompact && (current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompact.context, ccCompact.connection) ||
 				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace))
 				throw new Error('Claude compact authorization changed');
 			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
@@ -548,7 +551,7 @@ export class MessageHandler {
 			...(ccCompact ? { reserveCcCompact: (sessionId: string, inputId: string) => {
 				assertCurrent();
 				store.submitCcCompact(this.selfUid, room, requestId, sessionId, inputId);
-				return () => store.releaseCcCompact(this.selfUid, room, requestId, inputId);
+				return (receipt?: AgentCapabilityResult) => store.releaseCcCompact(this.selfUid, room, requestId, inputId, receipt);
 			} } : {}),
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {

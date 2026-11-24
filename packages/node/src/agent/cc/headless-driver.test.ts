@@ -33,12 +33,12 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 		if (signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
 	});
 	const registry = new CcSessionRegistry();
-	const spawnCalls: Array<{ args: readonly string[]; options: CcSpawnOptions }> = [];
+	const spawnCalls: Array<{ command: string; args: readonly string[]; options: CcSpawnOptions }> = [];
 	const transcript = vi.fn();
 	const driver = new CcHeadlessDriver({ workspaceBase: dir, brokerPort: 9100,
 		registerHook: (key, id, push) => registry.registerContext(key, id, push),
 		transcript: { append: transcript },
-		spawn: (_cmd, args, options) => { spawnCalls.push({ args, options }); return child; },
+		spawn: (command, args, options) => { spawnCalls.push({ command, args, options }); return child; },
 		kill, platform: 'linux', firstEventTimeoutMs: 500, stopTimeoutMs: 180, killGraceMs: 10, drainMs: 0,
 		...overrides });
 	const persisted: Array<unknown> = [];
@@ -99,16 +99,27 @@ describe('CC native capability observation', () => {
 		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir } };
 		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution: execute }), conversation: () => conversation });
 		try {
+			async function nativeInventory(index: number, value = 'native') {
+				await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+				f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[index]).request_id, subtype: 'success',
+					response: { models: [{ value, displayName: 'Native model' }] } } });
+				await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(index + 1));
+				f.groupExit(); f.close(0);
+			}
 			const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
-			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
-			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success',
-				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
-			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledOnce());
-			f.groupExit(); f.close(0);
+			await nativeInventory(0);
 			const catalog = (await discovery)?.catalog;
 			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'session.compact', executable: true }));
 			const invoke = { ...scope, requestId: 'compact', operation: 'invoke', capabilityId: 'session.compact', catalogVersion: catalog!.version };
+			const list = handler.handle({ ...invoke, requestId: 'list', capabilityId: 'model.list' });
+			await nativeInventory(1);
+			expect(await list).toMatchObject({ status: 'completed', text: expect.stringContaining('Native model') });
+			const stale = handler.handle({ ...invoke, requestId: 'stale' });
+			await nativeInventory(2, 'different inventory');
+			expect(await stale).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(reserve).not.toHaveBeenCalled();
 			const original = handler.handle(invoke), duplicate = handler.handle(invoke);
+			await nativeInventory(3);
 			const result = await original;
 			expect(result).toMatchObject({ requestId: 'compact', status: 'completed', generation: '1', nativeRef: { sessionId },
 				effect: { kind: 'compact', controlId, summaryId, summary: true } });
@@ -116,7 +127,16 @@ describe('CC native capability observation', () => {
 			expect(observe).toHaveBeenCalledOnce();
 			expect(verify).toHaveBeenCalledOnce();
 			expect(release).toHaveBeenCalledOnce();
-			expect(handles.map(handle => handle.fd)).toEqual([-1, -1]);
+			verify.mockRejectedValueOnce(new Error('no durable effect'));
+			const uncertain = handler.handle({ ...invoke, requestId: 'unconfirmed-effect' });
+			await nativeInventory(4);
+			expect(await uncertain).toMatchObject({ status: 'unknown', nativeRef: { sessionId } });
+			expect(release).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'unknown', nativeRef: { sessionId } }));
+			expect(handles.map(handle => handle.fd)).toEqual([-1, -1, -1, -1, -1]);
+			for (const [bin, args] of f.spawnCalls.map(call => [call.command, call.args] as const)) {
+				expect(bin).toBe('/owned/claude');
+				expect(args.slice(-2)).toEqual(['--settings', '/owned/settings.json']);
+			}
 			expect(execute.bindTurn).not.toHaveBeenCalled();
 		} finally { prepareNative.mockRestore(); observe.mockRestore(); verify.mockRestore(); }
 	});

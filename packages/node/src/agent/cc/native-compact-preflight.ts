@@ -151,14 +151,16 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 	if (platform() !== 'linux' || !UUID.test(sessionId) || !canonical(cwd) || cwd.length > 200 ||
 		Object.keys(env).some(key => UNSAFE_ENV.test(key) && !(key === 'CLAUDE_NON_INTERACTIVE' && env[key] === '1'))) return;
 	try {
-		const { uid: uidNumber, homedir: home } = userInfo();
-		if (env.HOME !== home || !canonical(home) || uidNumber < 0) return;
+		const { uid: uidNumber, homedir: installHome } = userInfo();
+		const home = env.HOME;
+		if (!home || !canonical(home) || !canonical(installHome) || uidNumber < 0) return;
 		const uid = BigInt(uidNumber);
 		const profile = path.join(home, '.claude');
 		const settings = path.join(profile, 'settings.json');
 		const dirs = env.PATH?.split(':');
 		if ((settingsPath !== undefined && settingsPath !== settings) || !dirs?.every(canonical) ||
-			!await controlledDirectory(cwd, uid) || !await controlledDirectory(profile, uid) || (await stat(profile)).uid !== uid) return;
+			!await controlledDirectory(cwd, uid) || !await controlledDirectory(profile, uid) ||
+			(await stat(home)).uid !== uid || (await stat(profile)).uid !== uid) return;
 		const markerBefore = await freshCleanupMarker(profile, uid);
 		if (!markerBefore) return;
 		// Reject unverified config sources, not disable them. In particular, safe mode does not bypass managed policy.
@@ -178,7 +180,7 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 		if (!await clearFences() || !await controlledPath(dirs, uid)) return;
 		const settingsBefore = await approvedSettings(settings, uid);
 		if (!settingsBefore) return;
-		const cli = await installedCli(cliPath, home, dirs, uid);
+		const cli = await installedCli(cliPath, installHome, dirs, uid);
 		if (!cli) return;
 		// Pinned native LE() maps every non-alphanumeric byte, not just slashes. Longer or non-ASCII cwd is not admitted.
 		const workspace = path.join(profile, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));

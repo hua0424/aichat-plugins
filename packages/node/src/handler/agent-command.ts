@@ -101,7 +101,9 @@ export class AgentCommandHandler {
     }
     if (!this.driver.executeCapability) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
     let result: AgentCapabilityResult;
-    try { result = await this.driver.executeCapability({ ...context, capabilityId: request.capabilityId!, parameters: request.parameters, catalogVersion: request.catalogVersion!, ...(execution ? { execution } : {}) }); }
+    try { result = await this.driver.executeCapability({ ...context, capabilityId: request.capabilityId!, parameters: request.parameters, catalogVersion: request.catalogVersion!, ...(execution ? { execution } : {}),
+						...(this.driver.type === 'cc' && request.capabilityId === 'model.list' && /^cc-models:[a-f0-9]{64}:[a-f0-9]{64}$/.test(request.catalogVersion ?? '')
+							? { conversation: this.preparation?.conversation?.(request) } : {}) }); }
     catch { result = { status: mutation ? 'unknown' : 'failed', error: 'native_request_failed' }; }
     if (execution) {
      result = { ...result, phase: 'outcome', ...(timedOut && ['completed', 'failed', 'noop'].includes(result.status) ? { reconciled: true } : {}) };
