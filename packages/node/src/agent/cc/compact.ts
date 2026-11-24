@@ -56,15 +56,16 @@ export async function verifyCcCompactAppend({ handle, path, original, sessionId,
 }
 
 /** Observe one owned native compact. The caller must reserve and verify the scope and durable native history separately. */
-export async function observeCcCompact({ cwd, sessionId, version, claudeBin, settingsPath, env, signal,
-	assertCurrent, spawn, kill, platform }: { cwd: string; sessionId: string; version: '2.1.195';
+export async function observeCcCompact({ cwd, sessionId, inputId, version, claudeBin, settingsPath, env, signal,
+	assertCurrent, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
 	claudeBin: string; settingsPath: string; env: NodeJS.ProcessEnv; signal: AbortSignal;
 	assertCurrent(): void; spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
 }): Promise<ObservedCcCompact> {
-	if (!nativeId(sessionId)) throw new Error('CC compact requires a native session ID');
+	if (!nativeId(sessionId) || !nativeId(inputId) || inputId === sessionId)
+		throw new Error('CC compact requires original native session and input IDs');
 	if (Object.keys(env).some(key => /^(?:AICHAT_.*|OPENCLAW_BIND|OPENCODE_SESSION_ID|CODEX_THREAD_ID)$/i.test(key)))
 		throw new Error('CC compact cannot inherit reply authority');
-	const initializeId = randomUUID(), inputId = randomUUID();
+	const initializeId = randomUUID();
 	let phase: 'initialize' | 'input' | 'effect' = 'initialize';
 	let boundary: CompactBoundary | undefined;
 	let nativeSummary: { summaryId: string; summaryHash: string } | undefined;
@@ -113,10 +114,8 @@ export async function observeCcCompact({ cwd, sessionId, version, claudeBin, set
 				const content = m.message.content;
 				if (!nativeSummary && m.isSynthetic === true && m.isReplay === false) {
 					const text = summaryText(content);
-					const marker = 'Summary:';
-					const summaryAt = text?.indexOf(marker) ?? -1;
-					if (text?.startsWith('This session is being continued from a previous conversation.') && summaryAt >= 0 &&
-						text.slice(summaryAt + marker.length).trim()) {
+					const header = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.';
+					if (text?.startsWith(header) && text.slice(header.length).trim()) {
 						nativeSummary = { summaryId: m.uuid, summaryHash: createHash('sha256').update(text).digest('hex') };
 						return;
 					}

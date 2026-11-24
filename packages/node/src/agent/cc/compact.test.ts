@@ -8,10 +8,11 @@ import { observeCcCompact, verifyCcCompactAppend } from './compact.js';
 import type { CcSpawnFn } from './headless-driver.js';
 
 const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+const inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';
 const controlId = 'e93a3c97-8d67-4db8-947a-9012b59e88cf';
 const summaryId = '86b6f7c7-48de-4bc2-98a2-893869878277';
 const displayId = '60a8e918-37bb-4f26-8109-76a99c7b7805';
-const summary = 'This session is being continued from a previous conversation.\n\nSummary: Synthetic fixture.';
+const summary = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSynthetic fixture.';
 const cwd = process.cwd();
 function fixture() {
 	const child = Object.assign(new EventEmitter(), {
@@ -24,7 +25,7 @@ function fixture() {
 		if (pid === -child.pid && signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
 	});
 	const assertCurrent = vi.fn();
-	const start = () => observeCcCompact({ cwd, sessionId, version: '2.1.195', claudeBin: '/owned/claude',
+	const start = () => observeCcCompact({ cwd, sessionId, inputId, version: '2.1.195', claudeBin: '/owned/claude',
 		settingsPath: '/owned/settings.json', env: { HOME: '/owned/home' }, signal: new AbortController().signal,
 		assertCurrent, spawn, kill, platform: 'linux' });
 	const line = (value: object) => child.stdout.emit('data', JSON.stringify(value) + '\n');
@@ -52,7 +53,7 @@ it('writes one resumed compact only after its native ACK and observes effect thr
 	expect(f.spawn.mock.calls[0][1]).not.toContain('--no-session-persistence');
 	f.ack();
 	expect(f.lines()).toHaveLength(2);
-	expect(f.lines()[1]).toMatchObject({ type: 'user', uuid: expect.any(String), session_id: sessionId, parent_tool_use_id: null,
+	expect(f.lines()[1]).toMatchObject({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
 		message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
 	f.progress(); f.init(); f.boundary(); f.summary(); f.display(); f.result();
 	expect(f.child.stdin.end).toHaveBeenCalledOnce();
