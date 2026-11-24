@@ -419,7 +419,8 @@ it.each(['refused', 'completed'])('does not queue ordinary input during a held r
   } finally { gate.resolve(); }
   const status = outcome === 'refused' ? 'failed' : 'completed';
   // The overlapping query did not publish; the original caller now receives the native outcome.
-  await original;
+  expect((await original).status).toBe(status);
+  expect(f.receipts.filter(r => r.requestId === 'held-reset' && r.status !== status)).toEqual([]);
   await waitFor(() => expect(f.store.getControl('1', '2', 'held-reset')?.receipt?.status).toBe(status));
   expect((await f.command('held-reset', { ...reset, reconcileOnly: true })).status).toBe(status);
   f.hula.onSend = frame => {
@@ -440,6 +441,7 @@ it.each(['refused', 'completed'])('does not queue ordinary input during a held r
   await waitFor(() => expect(f.store.pendingRuns()).toHaveLength(0));
   await vi.advanceTimersByTimeAsync(10);
   expect(f.hula.frames.filter(frame => frame.type === WSReqType.THINKING_START).map(frame => frame.data.triggerMsgId)).toEqual(['fresh-after-reset']);
+   expect(f.receipts.filter(r => r.requestId === 'held-reset' && r.status !== status)).toEqual([]);
   expect(f.sockets[0].sent.filter(frame => frame.method === 'agent')).toHaveLength(1);
   expect(f.sockets[0].sent.filter(frame => frame.method === 'sessions.reset')).toHaveLength(1);
 });
