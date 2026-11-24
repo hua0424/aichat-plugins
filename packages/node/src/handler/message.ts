@@ -21,7 +21,7 @@ import type { AgentCommandRequest } from '../stream/protocol.js';
 import type { CapabilityExecution, AgentCapabilityResult, NativeTurnEvent, NativeRef } from '../agent/events.js';
 import type { CapabilityRegistry } from '../capability/registry.js';
 import type { AgentRun, PreparedRun } from '../agent/events.js';
-import { hasUnconfirmedNativeReset, suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
+import { hasUnconfirmedCcCompact, hasUnconfirmedNativeReset, suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -417,6 +417,10 @@ export class MessageHandler {
 		} catch { return undefined; }
 	}
 
+	private ccCompactEpochCurrent(room: string, epoch: string): boolean {
+		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
+	}
+
 	private async prepareCommand(request: AgentCommandRequest, workspace?: string, matchingInvocationPending?: true): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult } | undefined> {
 		if (!workspace || !request.context.authorizationEpoch) {
 			if (request.reconcileOnly) return { receipt: { status: 'unknown', error: 'native_request_failed' } };
@@ -424,6 +428,13 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
+		if (this.driver.type === 'cc' && request.capabilityId === 'session.compact') {
+			const current = store.get(this.selfUid, room);
+			if (!current || current.state !== 'ready' || !this.ccCompactEpochCurrent(room, epoch) || expectedGeneration === '0') {
+				return request.reconcileOnly ? { receipt: { status: 'unknown', error: 'authorization_changed' } }
+					: { receipt: { status: 'failed', error: 'authorization_changed' } };
+			}
+		}
 		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
 		// A reconcileOnly query that hits this request's own terminal journal is read-only evidence,
 		// not a new execution: a pure session reset may advance the native generation legitimately.
@@ -488,9 +499,11 @@ export class MessageHandler {
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
+		const ccCompact = provider === 'cc' && scope.capabilityId === 'session.compact' && !owner;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
+			if (ccCompact && (current.state !== 'ready' || !this.ccCompactEpochCurrent(room, epoch))) throw new Error('Claude compact authorization changed');
 			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
 				throw new Error('native ordinary authorization changed');
 		};
@@ -508,7 +521,15 @@ export class MessageHandler {
 				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
 			},
 			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, requestId, value),
-			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref, provider === 'openclaw' && scope.capabilityId === 'session.reset'); },
+			submitted: async (ref) => {
+				if (ccCompact) throw new Error('Claude compact requires the original reserved input');
+				assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref, provider === 'openclaw' && scope.capabilityId === 'session.reset');
+			},
+			...(ccCompact ? { reserveCcCompact: (sessionId: string, inputId: string) => {
+				assertCurrent();
+				store.submitCcCompact(this.selfUid, room, requestId, sessionId, inputId);
+				return () => store.releaseCcCompact(this.selfUid, room, requestId, inputId);
+			} } : {}),
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state, expectedModel) => {
 				assertCurrent();
@@ -998,12 +1019,12 @@ export class MessageHandler {
 		const mediaType = data.message.type;
 		const media = mediaType === 3 || mediaType === 4;
 		const freezeMediaContext = media && this.driver.type === 'openclaw' && this.getConversations;
-		if (this.rejectDuringNativeReset(roomId)) return;
+		if (this.rejectDuringNativeControl(roomId)) return;
 		const generation = freezeMediaContext ? this.getConversations().get(this.selfUid, roomId)?.generation ?? 1 : undefined;
 		const epoch = freezeMediaContext ? this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch : undefined;
 		// REQ-146 (#146): resolve a short-lived download URL only for media; text stays synchronous.
 		const resolvedFileUrl = media ? await this.resolveDownloadUrl(data.message) : undefined;
-		if (media && this.rejectDuringNativeReset(roomId)) return;
+		if (media && this.rejectDuringNativeControl(roomId)) return;
 		if (freezeMediaContext && (generation !== (this.getConversations().get(this.selfUid, roomId)?.generation ?? 1) ||
 			 epoch !== this.groupConfigCache.get(this.selfUid, roomId)?.authorizationEpoch)) {
 			this.sendNotice(roomId, '助理会话或授权已变化，本条媒体消息未执行，也不会自动重试。');
@@ -1144,7 +1165,7 @@ export class MessageHandler {
 			return;
 		}
 
-		if (this.rejectDuringNativeReset(roomId, channel)) {
+		if (this.rejectDuringNativeControl(roomId, channel)) {
 			channel.batchSawHuman = false;
 			channel.batchAiFromUid = '';
 			return;
@@ -1890,16 +1911,18 @@ export class MessageHandler {
 		}
 	}
 
-	private rejectDuringNativeReset(roomId: string, channel?: RoomChannel): boolean {
-		if (this.driver.type !== 'openclaw') return false;
+	private rejectDuringNativeControl(roomId: string, channel?: RoomChannel): boolean {
+		if (this.driver.type !== 'openclaw' && this.driver.type !== 'cc') return false;
 		const record = this.getConversations?.().get(this.selfUid, roomId);
-		if (!record || !hasUnconfirmedNativeReset(record)) return false;
+		if (!record) return false;
+		const compact = this.driver.type === 'cc';
+		if (!(compact ? hasUnconfirmedCcCompact(record) : hasUnconfirmedNativeReset(record))) return false;
 		// A rejected input is never queued, even if an old run also has unconfirmed stop.
 		const pending = channel ?? this.getRoomChannel(roomId);
-		const reason = 'native-reset-unconfirmed';
+		const reason = compact ? 'cc-compact-unconfirmed' : 'native-reset-unconfirmed';
 		if (pending.suspendNoticeKey !== reason) {
 			pending.suspendNoticeKey = reason;
-			this.sendNotice(roomId, SUSPENSION_NOTICES[reason]);
+			this.sendNotice(roomId, compact ? 'Claude 原生压缩尚未确认收口，本条消息未执行，也不会自动重试。' : SUSPENSION_NOTICES['native-reset-unconfirmed']);
 		}
 		return true;
 	}

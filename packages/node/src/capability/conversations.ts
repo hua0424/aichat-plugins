@@ -9,6 +9,13 @@ export interface ControlEntry {
  requestId: string; fingerprint: string; authorizationEpoch: string; generation: number;
  state: 'prepared' | 'submitted' | 'settled'; nativeRef?: NativeRef; receipt?: AgentCapabilityResult; recovery?: RecoveryData;
 	mayHaveResetNativeSession?: true;
+	ccCompactInputId?: string;
+	/** Native process containment is independent of the command receipt. */
+	ccCompactFence?: true;
+}
+
+export function hasUnconfirmedCcCompact(record: ConversationRecord): boolean {
+	return record.controls?.some((c) => c.generation === record.generation && c.ccCompactFence === true) ?? false;
 }
 
 export function hasUnconfirmedNativeReset(record: ConversationRecord, ownRequestId?: string): boolean {
@@ -305,6 +312,7 @@ export class ConversationStore {
 			if ((this.snapshot.resetReceipts?.length ?? 0) >= 1024) throw new Error('reset receipt capacity exceeded');
 		}
 		const old = this.get(identityId, roomId) ?? this.newRecord(identityId, roomId);
+		if (hasUnconfirmedCcCompact(old)) throw new Error('CC_COMPACT_FENCED');
 		if (this.options.activeProviders?.has(identityId) && old.adapterInstanceId !== this.options.activeProviders.get(identityId))
 			throw new Error('activated provider changed for existing conversation');
 		if (!Number.isSafeInteger(old.generation + 1)) throw new Error('generation exhausted');
@@ -354,10 +362,35 @@ export class ConversationStore {
 	submitControl(uid: string, room: string, requestId: string, ref?: NativeRef, nativeReset = false): void {
 		const { r, c } = this.controlRecord(uid, room, requestId);
 		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (hasUnconfirmedCcCompact(r)) throw new Error('CC_COMPACT_FENCED');
 		if (hasUnconfirmedNativeReset(r, requestId)) throw new Error('native reset outcome unconfirmed');
 		if (ref) c.nativeRef = copy(ref);
 		if (nativeReset) c.mayHaveResetNativeSession = true;
 		c.state = 'submitted'; this.replace(r);
+	}
+	submitCcCompact(uid: string, room: string, requestId: string, sessionId: string, inputId: string): void {
+		this.assertProvider('cc', uid);
+		if (!validId(sessionId) || !validId(inputId)) throw new Error('invalid CC compact locator');
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (r.adapterInstanceId !== 'cc' || r.nativeState.cc?.sessionId !== sessionId) throw new Error('CC compact session mismatch');
+		if (hasUnconfirmedCcCompact(r)) throw new Error('CC_COMPACT_FENCED');
+		if (r.state !== 'ready' || executionRuns(r).length) throw new Error('conversation paused or occupied');
+		if (hasUnconfirmedNativeReset(r, requestId)) throw new Error('native reset outcome unconfirmed');
+		c.state = 'submitted';
+		c.nativeRef = { sessionId };
+		c.ccCompactInputId = inputId;
+		c.ccCompactFence = true;
+		this.replace(r);
+	}
+	/** Only the caller that established containment (or proved no spawn) may release this fence. */
+	releaseCcCompact(uid: string, room: string, requestId: string, inputId: string): void {
+		this.assertProvider('cc', uid);
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		if (r.generation !== c.generation || c.ccCompactFence !== true || c.ccCompactInputId !== inputId)
+			throw new Error('CC compact fence ownership mismatch');
+		delete c.ccCompactFence;
+		this.replace(r);
 	}
 	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
 		this.assertRecovery(recovery);
@@ -397,6 +430,7 @@ export class ConversationStore {
 	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>, expectedModel?: ConversationRecord['selectedModel'] | null): ConversationRecord {
 		this.assertProvider(provider, uid);
 		const old = this.assertGeneration(uid, room, generation);
+		if (hasUnconfirmedCcCompact(old)) throw new Error('CC_COMPACT_FENCED');
 		if (expectedModel !== undefined && ((expectedModel !== null && (!validId(expectedModel.providerID) || !validId(expectedModel.modelID))) ||
 			(old.selectedModel?.providerID ?? null) !== (expectedModel?.providerID ?? null) ||
 			(old.selectedModel?.modelID ?? null) !== (expectedModel?.modelID ?? null))) throw new Error('MODEL_SELECTION_CONFLICT');
@@ -442,6 +476,7 @@ export class ConversationStore {
 	beginRun(identityId: string, roomId: string, runId: string, options?: { authorizationEpoch?: string; nativeTurn?: NativeRef }): BoundConversationRun {
 		if (!validId(runId)) throw new Error('invalid runId');
 		const record = this.getOrCreate(identityId, roomId);
+		if (hasUnconfirmedCcCompact(record)) throw new Error('CC_COMPACT_FENCED');
 		if (record.state !== 'ready' || hasUnconfirmedNativeReset(record) || (!options?.nativeTurn && executionRuns(record).length)) throw new Error('conversation paused or occupied');
 		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
 		record.pendingRuns = [...(record.pendingRuns ?? []), { runId, generation: record.generation, startedAt: new Date().toISOString(),
@@ -909,7 +944,10 @@ export class ConversationStore {
 			if (r.selectedModel && (!validId(r.selectedModel.providerID) || !validId(r.selectedModel.modelID))) throw new Error('invalid selected model');
 			if (r.controls && (!Array.isArray(r.controls) || r.controls.length > 10000 || new Set(r.controls.map((c) => c.requestId)).size !== r.controls.length ||
 				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state) ||
-					(c.mayHaveResetNativeSession !== undefined && (c.mayHaveResetNativeSession !== true || r.adapterInstanceId !== 'openclaw' || c.state === 'prepared'))))) throw new Error('invalid control journal');
+					(c.mayHaveResetNativeSession !== undefined && (c.mayHaveResetNativeSession !== true || r.adapterInstanceId !== 'openclaw' || c.state === 'prepared')) ||
+					(c.ccCompactInputId !== undefined && (!validId(c.ccCompactInputId) || r.adapterInstanceId !== 'cc' || c.state === 'prepared' ||
+						!validId(c.nativeRef?.sessionId) || Object.keys(c.nativeRef).length !== 1)) ||
+					(c.ccCompactFence !== undefined && (c.ccCompactFence !== true || c.ccCompactInputId === undefined))))) throw new Error('invalid control journal');
 			if (r.replyBindings !== undefined && !Array.isArray(r.replyBindings)) throw new Error('invalid reply bindings');
 			for (const b of r.replyBindings ?? []) {
 				if (!b || typeof b.token !== 'string' || !/^[0-9a-f]{64}$/.test(b.token) ||

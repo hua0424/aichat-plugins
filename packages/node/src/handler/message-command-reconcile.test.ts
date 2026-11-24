@@ -36,17 +36,21 @@ const request = (requestId: string, extra: Record<string, unknown> = {}) => ({
 	parameters: {}, context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch' }, ...extra,
 });
 
-function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string) {
+function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string, provider = 'opencode') {
 	const posted: Posted[] = [];
-	const api = { reportAgentCommandResult: vi.fn(async (value: Posted) => { posted.push({ ...value }); }) } as unknown as HulaApiClient;
-	const driver = { type: 'opencode', executeCapability } as unknown as AgentDriver;
+	const notices: string[] = [];
+	const api = { sendMessage: async (_room: string, body: string) => { notices.push(body); return { msgId: 'notice' }; },
+		reportAgentCommandResult: vi.fn(async (value: Posted) => { posted.push({ ...value }); }),
+		listSelfGroupConfigs: async () => [{ roomId: '20', authorizationEpoch: 'epoch', approved: 1 }],
+	} as unknown as HulaApiClient;
+	const driver = { type: provider, executeCapability } as unknown as AgentDriver;
 	let handler!: MessageHandler;
 	const send = vi.fn((type: number, data: Record<string, unknown>) => {
 		if (type === 20) queueMicrotask(() => handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: `thinking-${data.clientRunId}` } }));
 	});
 	handler = new MessageHandler({ send, isConnected: true } as unknown as HulaWSClient, driver, 'u', api, undefined, () => {}, () => store, home);
 	handlers.push(handler);
-	return { handler, posted };
+	return { handler, posted, notices, send };
 }
 
 const complete = vi.fn(async ({ execution: e }: AgentCapabilityInvocation) => {
@@ -64,6 +68,43 @@ const waitForReports = async (posted: Posted[], count: number) => {
 };
 
 describe('command reconcile evidence', () => {
+	it('reserves only the authorized original Claude session and fences competing input until closure', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-compact-command-')); dirs.push(home);
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+		const inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		store.getOrCreate('u', '20');
+		store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace: home });
+		let submitCompetingInput!: () => void;
+		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
+			const release = execution!.reserveCcCompact!(sessionId, inputId);
+			expect(() => store.beginRun('u', '20', 'competing-input')).toThrow('CC_COMPACT_FENCED');
+			expect(store.getControl('u', '20', execution!.requestId)).toMatchObject({
+				state: 'submitted', ccCompactInputId: inputId, nativeRef: { sessionId },
+			});
+			submitCompetingInput();
+			release();
+			return { status: 'completed' as const, nativeRef: { sessionId }, effect: { kind: 'compact' as const, controlId: 'boundary', summaryId: 'summary', summary: true } };
+		});
+		const { handler, posted, notices, send } = setup(store, execute, home, 'cc');
+		submitCompetingInput = () => handler.handle({ type: 'receiveMessage', data: {
+			fromUser: { uid: 'owner', name: 'Owner', userType: 1 },
+			message: { id: 'during-compact', roomId: '20', roomType: 2, type: 1, aiclaw: { isOwner: true }, body: { content: 'do not queue' } },
+		} });
+		await handler.prewarmGroupConfigs();
+		const context = { roomType: 2, counterpartUid: 'owner', isOwner: true, expectedGeneration: '1' };
+		handler.handle({ type: 'agentCommand', data: request('stale-compact', { capabilityId: 'session.compact', context: { ...context, authorizationEpoch: 'stale' } }) });
+		await waitForReports(posted, 1);
+		expect(posted[0]).toMatchObject({ status: 'failed', error: 'authorization_changed' });
+		expect(execute).not.toHaveBeenCalled();
+		handler.handle({ type: 'agentCommand', data: request('valid-compact', { capabilityId: 'session.compact', context: { ...context, authorizationEpoch: 'epoch' } }) });
+		await vi.waitFor(() => expect(posted.find(value => value.requestId === 'valid-compact')).toMatchObject({ status: 'completed' }));
+		expect(execute).toHaveBeenCalledOnce();
+		expect(store.getControl('u', '20', 'valid-compact')).toMatchObject({ state: 'settled', ccCompactInputId: inputId });
+		expect(store.getControl('u', '20', 'valid-compact')?.ccCompactFence).toBeUndefined();
+		expect(notices).toEqual([expect.stringContaining('不会自动重试')]);
+		expect(send.mock.calls.some(([type]) => type === 20)).toBe(false);
+	});
 	it.each([false, true])('does not publish a replacement receipt for a live native control (ACK=%s)', async (ack) => {
 		const home = mkdtempSync(join(tmpdir(), 'c1diag-live-control-')); dirs.push(home);
 		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });

@@ -211,6 +211,47 @@ describe('ConversationStore', () => {
 		expect(store.get('44', '888')?.state).toBe('ready');
 	});
 
+	it('#506: an unknown CC compact receipt leaves execution fenced across reopen until exact release', () => {
+		const root = home(), opts = active(root, { '44': 'cc' });
+		const sessionId = 'f5060000-0000-4000-8000-000000000001';
+		const inputId = 'f5060000-0000-4000-8000-000000000002';
+		const store = new ConversationStore(opts);
+		store.registerNative('cc', sessionId, '44', '888', { sessionId, workspace: root });
+		const submit = (session = sessionId) => store.submitCcCompact('44', '888', 'compact', session, inputId);
+		expect(() => submit()).toThrow('control not prepared');
+		store.prepareControl('44', '888', 'compact', 'compact-fingerprint', 'epoch');
+		expect(() => submit('other-session')).toThrow('session mismatch');
+		store.beginRun('44', '888', 'prior-run');
+		expect(() => submit()).toThrow('occupied');
+		store.finishRun('prior-run');
+		submit();
+		const unknown = store.recordControl('44', '888', 'compact', { status: 'unknown' });
+		expect(unknown.nativeRef).toEqual({ sessionId });
+		store.close();
+
+		const reopened = new ConversationStore(opts);
+		expect(reopened.getControl('44', '888', 'compact')).toMatchObject({
+			state: 'settled', ccCompactInputId: inputId, receipt: { status: 'unknown' },
+		});
+		expect(() => reopened.beginRun('44', '888', 'blocked-run')).toThrow('CC_COMPACT_FENCED');
+		reopened.prepareControl('44', '888', 'other', 'other-fingerprint', 'epoch');
+		expect(() => reopened.submitControl('44', '888', 'other')).toThrow('CC_COMPACT_FENCED');
+		expect(() => reopened.submitCcCompact('44', '888', 'other', sessionId, 'other-input')).toThrow('CC_COMPACT_FENCED');
+		expect(() => reopened.reset('44', '888')).toThrow('CC_COMPACT_FENCED');
+		expect(() => reopened.replaceNativeSession('44', '888', 1, 'cc', 'other-session', { sessionId: 'other-session', workspace: root })).toThrow('CC_COMPACT_FENCED');
+		expect(() => reopened.releaseCcCompact('44', '888', 'other', inputId)).toThrow();
+		expect(() => reopened.releaseCcCompact('44', '888', 'compact', 'wrong-input')).toThrow();
+		expect(() => reopened.beginRun('44', '888', 'still-blocked')).toThrow('CC_COMPACT_FENCED');
+		reopened.releaseCcCompact('44', '888', 'compact', inputId);
+		reopened.close();
+
+		const released = new ConversationStore(opts);
+		expect(released.getControl('44', '888', 'compact')).toMatchObject({
+			state: 'settled', ccCompactInputId: inputId, receipt: { status: 'unknown' },
+		});
+		expect(released.beginRun('44', '888', 'after-release').generation).toBe(1);
+	});
+
 	it('#382: a run-proved non-resumable CC session suspends explainably; only reset reopens it', () => {
 		const root = home(), opts = active(root, { '44': 'cc' });
 		const store = new ConversationStore(opts);
