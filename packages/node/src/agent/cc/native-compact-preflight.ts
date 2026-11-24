@@ -14,8 +14,9 @@ const PROFILE_ENV = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MO
 	'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'];
 const UNSAFE_ENV = /^(?:CLAUDE(?:_|$)|ANTHROPIC(?:_|$)|XDG_|LD_|DYLD_|GLIBC_TUNABLES$|GCONV_PATH$|LOCPATH$|TZDIR$|NODE_|BUN_|GIT_|BASH_|SHELLOPTS$|ENV$|PROMPT_COMMAND$|ZDOTDIR$|TMP(?:DIR)?$|TEMP$|(?:HTTPS?|ALL|NO)_PROXY$|DISABLE_COMPACT$|MAX_RETRIES$|SSL_(?:CERT|KEYLOG)|CURL_CA_BUNDLE$)/i;
 const canonical = (p: string) => /^\/(?:[a-zA-Z0-9_.-]+\/)*[a-zA-Z0-9_.-]+$/.test(p) && path.normalize(p) === p;
-const same = (a: BigIntStats, b: BigIntStats) => a.dev === b.dev && a.ino === b.ino && a.uid === b.uid &&
-	a.mode === b.mode && a.nlink === b.nlink && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+const sameIdentity = (a: BigIntStats, b: BigIntStats) => a.dev === b.dev && a.ino === b.ino && a.uid === b.uid &&
+	a.gid === b.gid && a.mode === b.mode && a.nlink === b.nlink;
+const same = (a: BigIntStats, b: BigIntStats) => sameIdentity(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 const stat = (p: string) => lstat(p, { bigint: true });
 
 export interface CcNativeCompactPreflight {
@@ -23,7 +24,7 @@ export interface CcNativeCompactPreflight {
 	cliPath: string;
 	settingsPath: string;
 	env: NodeJS.ProcessEnv;
-	assertIntact(): Promise<void>;
+	assertIntact(phase?: 'native-resume'): Promise<void>;
 	/** On success the caller owns this descriptor and must close it, including on cancellation. */
 	history: { path: string; handle: FileHandle; originalBytes: Buffer };
 }
@@ -191,11 +192,25 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 		try {
 			const originalBytes = Buffer.alloc(Number(file.before.size));
 			await readExact(file.handle, originalBytes, originalBytes.length);
-			const assertIntact = async () => {
+			const resumeHistoryIntact = async () => {
+				// Pinned resume touches the same file and may re-append its normal-mode metadata before reading input.
+				const mode = Buffer.from(JSON.stringify({ type: 'mode', mode: 'normal', sessionId }) + '\n');
+				const snapshot = await file.handle.stat({ bigint: true });
+				const size = Number(snapshot.size);
+				if (!sameIdentity(file.before, snapshot) || size > MAX_HISTORY_BYTES ||
+					(size !== originalBytes.length && size !== originalBytes.length + mode.length) || !same(snapshot, await stat(transcript))) return false;
+				const bytes = Buffer.alloc(size);
+				await readExact(file.handle, bytes, size);
+				const suffix = bytes.subarray(originalBytes.length);
+				return bytes.subarray(0, originalBytes.length).equals(originalBytes) && (!suffix.length || suffix.equals(mode)) &&
+					same(snapshot, await file.handle.stat({ bigint: true })) && same(snapshot, await stat(transcript));
+			};
+			const assertIntact = async (phase?: 'native-resume') => {
 				const marker = await freshCleanupMarker(profile, uid);
 				if (!marker || !same(markerBefore, marker) || !await clearFences() ||
 					!await controlledDirectory(cwd, uid) || !await controlledDirectory(workspace, uid) ||
-					!same(settingsBefore, await stat(settings)) || !same(cli.before, await stat(cli.binary)) || !await file.current())
+					!same(settingsBefore, await stat(settings)) || !same(cli.before, await stat(cli.binary)) ||
+					!await (phase === 'native-resume' ? resumeHistoryIntact() : file.current()))
 					throw new Error('Original Claude compact scope changed');
 			};
 			if (!exactHistory(originalBytes, cwd, sessionId)) return;

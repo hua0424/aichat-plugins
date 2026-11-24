@@ -77,17 +77,20 @@ describe('CC native capability observation', () => {
 		const path = join(f.dir, `${sessionId}.jsonl`), originalBytes = Buffer.from('original\n');
 		writeFileSync(path, originalBytes);
 		const handles: Awaited<ReturnType<typeof open>>[] = [];
+		const assertIntact = vi.fn<preflight.CcNativeCompactPreflight['assertIntact']>().mockResolvedValue(undefined);
 		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockImplementation(async () => {
 			const handle = await open(path, 'r');
 			handles.push(handle);
 			return { cwd: f.dir, cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {},
-				assertIntact: async () => {}, history: { path, handle, originalBytes } };
+				assertIntact, history: { path, handle, originalBytes } };
 		});
 		const release = vi.fn();
 		const reserve = vi.fn(() => release);
 		const observe = vi.spyOn(compact, 'observeCcCompact').mockImplementation(async ({ inputId, assertCurrent, beforeInput, onSubmit }) => {
 			expect(reserve).toHaveBeenCalledWith(sessionId, inputId);
+			expect(assertIntact).toHaveBeenLastCalledWith();
 			await beforeInput!();
+			expect(assertIntact).toHaveBeenLastCalledWith('native-resume');
 			assertCurrent();
 			onSubmit!();
 			return { controlId, summaryId, summaryHash: 'native', preTokens: 1570, postTokens: 1213 };

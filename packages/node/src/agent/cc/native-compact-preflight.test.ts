@@ -225,6 +225,30 @@ it('rejects non-matching native transcript identity and invalid JSONL', async ()
 	expect(fake.close.mock.calls.filter(([path]) => path === historyPath)).toHaveLength(7);
 });
 
+it('allows only the original transcript plus pinned normal-mode metadata after native resume', async () => {
+	const { run } = fixture();
+	const result = await run();
+	if (!result) throw new Error('expected accepted preflight');
+	const history = fake.entries.get(historyPath)!;
+	const mode = (overrides = {}) => Buffer.from(JSON.stringify({ type: 'mode', mode: 'normal', sessionId, ...overrides }) + '\n');
+	try {
+		history.mtimeMs++;
+		await expect(result.assertIntact()).rejects.toThrow('scope changed');
+		await expect(result.assertIntact('native-resume')).resolves.toBeUndefined();
+		history.bytes = Buffer.concat([rows(), mode()]);
+		await expect(result.assertIntact('native-resume')).resolves.toBeUndefined();
+		for (const suffix of [mode({ mode: 'coordinator' }), mode({ sessionId: 'other' }), mode({ extra: true }), Buffer.concat([mode(), mode()])]) {
+			history.bytes = Buffer.concat([rows(), suffix]);
+			await expect(result.assertIntact('native-resume')).rejects.toThrow('scope changed');
+		}
+		history.bytes = Buffer.concat([rows({ version: '2.1.194' }), mode()]);
+		await expect(result.assertIntact('native-resume')).rejects.toThrow('scope changed');
+		history.bytes = Buffer.concat([rows(), mode()]);
+		history.nlink = 2;
+		await expect(result.assertIntact('native-resume')).rejects.toThrow('scope changed');
+	} finally { await result.history.handle.close(); }
+});
+
 it.each([historyPath, `${profile}/settings.json`, binary, `${profile}/.last-cleanup`, '/etc/claude-code'])('closes and rejects if %s changes while reading history', async (changedPath) => {
 	const { place, run } = fixture();
 	fake.read.mockImplementation((path: string) => {

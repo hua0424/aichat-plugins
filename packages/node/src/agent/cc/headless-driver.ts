@@ -232,8 +232,9 @@ export class CcHeadlessDriver implements RunDriver {
 				const inputId = randomUUID();
 				release = reserve(scope.sessionId, inputId);
 				const version = '2.1.195' as const;
+				const { assertIntact } = native;
 				const evidence = await observeCcCompact({ ...scope, inputId, version, claudeBin: native.cliPath,
-					settingsPath: native.settingsPath, env: native.env, signal, assertCurrent, beforeInput: native.assertIntact,
+					settingsPath: native.settingsPath, env: native.env, signal, assertCurrent, beforeInput: () => assertIntact('native-resume'),
 					onSubmit: () => { submitted = true; }, spawn: this.deps.spawn, kill: this.deps.kill, platform: this.deps.platform });
 				const { handle, path, originalBytes } = native.history;
 				const effect = await verifyCcCompactAppend({ ...scope, version, handle, path, original: originalBytes, evidence });
