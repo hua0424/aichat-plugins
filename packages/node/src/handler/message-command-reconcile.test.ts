@@ -67,6 +67,37 @@ const waitForReports = async (posted: Posted[], count: number) => {
 };
 
 describe('command reconcile evidence', () => {
+	it('does not settle a live native control when asked to read its original receipt', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'c1diag-live-control-')); dirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });
+		let markSubmitted!: () => void;
+		const submitted = new Promise<void>((resolve) => { markSubmitted = resolve; });
+		let finish!: () => void;
+		const nativeResult = new Promise<void>((resolve) => { finish = resolve; });
+		const nativeRef = { sessionId: 'native' };
+		const effect = { kind: 'compact' as const, controlId: 'boundary', summaryId: 'summary', summary: true };
+		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
+			if (!execution) return { status: 'unknown' as const, nativeRef };
+			await execution.submitted(nativeRef);
+			markSubmitted();
+			await nativeResult;
+			return { status: 'completed' as const, generation: '1', nativeRef, effect };
+		});
+		const { handler, posted } = setup(store, execute, home);
+		const data = request('compact', { capabilityId: 'session.compact' });
+		handler.handle({ type: 'agentCommand', data });
+		await submitted;
+		try {
+			handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+			await waitForReports(posted, 1);
+			expect(posted[0]).toMatchObject({ requestId: 'compact', status: 'unknown' });
+		} finally { finish(); }
+		await waitForReports(posted, 3);
+		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await waitForReports(posted, 4);
+		expect(posted.at(-1)).toMatchObject({ requestId: 'compact', status: 'completed', generation: '1', nativeRef, effect, reconciled: true });
+		expect(execute).toHaveBeenCalledOnce();
+	});
 	it('replays a cached completed receipt with reconciled:true so unknown can be repaired', async () => {
 		const home = mkdtempSync(join(tmpdir(), 'c1diag-replay-')); dirs.push(home);
 		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });

@@ -9,7 +9,7 @@ export interface CommandPreparation {
  conversation?(request: AgentCommandRequest): AgentCapabilityContext['conversation'];
 	/** Trusted local native generation snapshot for the approval fence probe; 0 means the conversation has no native record yet. */
 	generation?(request: AgentCommandRequest): number;
- prepare(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
+ prepare(request: AgentCommandRequest, workspace?: string, originalInFlight?: boolean): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
 }
 /** Independent native command lane; never acquires the ordinary chat queue/slot. */
 export class AgentCommandHandler {
@@ -44,8 +44,11 @@ export class AgentCommandHandler {
   catch { return fail('invalid_request'); }
   const fingerprint = JSON.stringify([request.roomId, request.operation, request.capabilityId, request.catalogVersion,
    request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch, ctx.expectedGeneration]);
-  // An internal evidence query must bypass an in-flight invocation promise/cache.
-   if (request.reconcileOnly) return this.execute(request);
+  // An evidence query reads the journal without awaiting or settling a live invocation.
+   if (request.reconcileOnly) {
+     const original = this.requests.get(request.requestId);
+     return this.execute(request, original?.fingerprint === fingerprint && !original.done);
+    }
    const prior = this.requests.get(request.requestId);
   if (prior) {
    if (prior.fingerprint !== fingerprint) return fail('request_id_conflict');
@@ -62,7 +65,7 @@ export class AgentCommandHandler {
   void entry.result.finally(() => { entry.done = true; });
   return entry.result;
  }
- private async execute(request: AgentCommandRequest): Promise<AgentCommandResponse> {
+ private async execute(request: AgentCommandRequest, originalInFlight = false): Promise<AgentCommandResponse> {
   const correlation = { requestId: request.requestId, roomId: request.roomId };
   const abort = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -75,7 +78,7 @@ export class AgentCommandHandler {
     ...((workspace && !request.context.workspaceDir?.trim()) ? { defaultWorkspace: true } : {}) };
    if (mutation) {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
-    const prepared = await this.preparation.prepare(request, workspace);
+    const prepared = await this.preparation.prepare(request, workspace, originalInFlight);
     if ('receipt' in prepared) return { ...prepared.receipt, ...correlation };
      if (request.reconcileOnly) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
     execution = { ...prepared.execution, emit: async (event) => {
