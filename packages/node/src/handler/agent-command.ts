@@ -9,11 +9,11 @@ export interface CommandPreparation {
  conversation?(request: AgentCommandRequest): AgentCapabilityContext['conversation'];
 	/** Trusted local native generation snapshot for the approval fence probe; 0 means the conversation has no native record yet. */
 	generation?(request: AgentCommandRequest): number;
- prepare(request: AgentCommandRequest, workspace?: string, originalInFlight?: boolean): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
+ prepare(request: AgentCommandRequest, workspace?: string, matchingInvocationPending?: true): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult } | undefined>;
 }
 /** Independent native command lane; never acquires the ordinary chat queue/slot. */
 export class AgentCommandHandler {
- private readonly requests = new Map<string, { fingerprint: string; result: Promise<AgentCommandResponse>; done: boolean }>();
+ private readonly requests = new Map<string, { fingerprint: string; result: Promise<AgentCommandResponse | undefined>; done: boolean }>();
  constructor(private readonly driver: AgentDriver, private readonly selfUid: string, private readonly workspaceBase?: string,
   private readonly preparation?: CommandPreparation) {}
  async handle(raw: unknown): Promise<AgentCommandResponse | undefined> {
@@ -44,12 +44,12 @@ export class AgentCommandHandler {
   catch { return fail('invalid_request'); }
   const fingerprint = JSON.stringify([request.roomId, request.operation, request.capabilityId, request.catalogVersion,
    request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch, ctx.expectedGeneration]);
-  // An evidence query reads the journal without awaiting or settling a live invocation.
-   if (request.reconcileOnly) {
-     const original = this.requests.get(request.requestId);
-     return this.execute(request, original?.fingerprint === fingerprint && !original.done);
-    }
-   const prior = this.requests.get(request.requestId);
+  const prior = this.requests.get(request.requestId);
+  // IM already returns its last receipt to GET; a matching pending invocation owns the result.
+  if (request.reconcileOnly) {
+   const matching = prior?.fingerprint === fingerprint && !prior.done;
+   return this.execute(request, matching ? true : undefined);
+  }
   if (prior) {
    if (prior.fingerprint !== fingerprint) return fail('request_id_conflict');
    // A completed watchdog promise may precede a persisted reconciliation. Re-read the same journal, never resubmit.
@@ -65,7 +65,7 @@ export class AgentCommandHandler {
   void entry.result.finally(() => { entry.done = true; });
   return entry.result;
  }
- private async execute(request: AgentCommandRequest, originalInFlight = false): Promise<AgentCommandResponse> {
+ private async execute(request: AgentCommandRequest, matchingInvocationPending?: true): Promise<AgentCommandResponse | undefined> {
   const correlation = { requestId: request.requestId, roomId: request.roomId };
   const abort = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -78,7 +78,10 @@ export class AgentCommandHandler {
     ...((workspace && !request.context.workspaceDir?.trim()) ? { defaultWorkspace: true } : {}) };
    if (mutation) {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
-    const prepared = await this.preparation.prepare(request, workspace, originalInFlight);
+    const prepared = matchingInvocationPending
+     ? await this.preparation.prepare(request, workspace, true)
+     : await this.preparation.prepare(request, workspace);
+    if (!prepared) return undefined;
     if ('receipt' in prepared) return { ...prepared.receipt, ...correlation };
      if (request.reconcileOnly) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
     execution = { ...prepared.execution, emit: async (event) => {

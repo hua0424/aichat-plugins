@@ -23,15 +23,12 @@ type ServerRecord = { status: string; reconciled?: boolean };
 /** Source-derived model of AgentCommandService.complete() (46e82ee7:628-647). */
 function applyServer(record: ServerRecord, callback: Posted): void {
 	const status = String(callback.status);
-	if ((callback.phase ?? 'outcome') === 'accepted') {
-		if (record.status !== 'unknown') record.status = 'accepted';
-		return;
-	}
+	if ((callback.phase ?? 'outcome') === 'accepted') return;
 	const uncertain = record.status === 'unknown';
 	const reconcile = uncertain && callback.reconciled === true && ['completed', 'failed', 'noop'].includes(status);
-	if (!reconcile) return;
+	if (record.status !== 'accepted' && !reconcile) return;
 	record.status = status;
-	record.reconciled = true;
+	if (reconcile) record.reconciled = true;
 }
 
 const request = (requestId: string, extra: Record<string, unknown> = {}) => ({
@@ -67,7 +64,7 @@ const waitForReports = async (posted: Posted[], count: number) => {
 };
 
 describe('command reconcile evidence', () => {
-	it('does not settle a live native control when asked to read its original receipt', async () => {
+	it.each([false, true])('does not publish a replacement receipt for a live native control (ACK=%s)', async (ack) => {
 		const home = mkdtempSync(join(tmpdir(), 'c1diag-live-control-')); dirs.push(home);
 		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'opencode' as const]]) });
 		let markSubmitted!: () => void;
@@ -79,6 +76,7 @@ describe('command reconcile evidence', () => {
 		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
 			if (!execution) return { status: 'unknown' as const, nativeRef };
 			await execution.submitted(nativeRef);
+			if (ack) await execution.emit({ type: 'receipt', receipt: { status: 'accepted', phase: 'accepted', generation: '1', nativeRef } });
 			markSubmitted();
 			await nativeResult;
 			return { status: 'completed' as const, generation: '1', nativeRef, effect };
@@ -89,12 +87,21 @@ describe('command reconcile evidence', () => {
 		await submitted;
 		try {
 			handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
-			await waitForReports(posted, 1);
-			expect(posted[0]).toMatchObject({ requestId: 'compact', status: 'unknown' });
+			// Drain both the WS handler continuation and immediate fixture recovery before releasing the original.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(posted.map((value) => value.status)).toEqual(ack ? ['accepted'] : []);
+			expect(store.getControl('u', '20', 'compact')?.receipt?.status).toBe(ack ? 'accepted' : undefined);
+			expect(execute).toHaveBeenCalledOnce();
 		} finally { finish(); }
-		await waitForReports(posted, 3);
+		const originalReports = ack ? 3 : 2;
+		await waitForReports(posted, originalReports);
+		expect(posted.filter((value) => value.status === 'completed')).toHaveLength(2);
+		const server: ServerRecord = { status: 'accepted' };
+		for (const callback of posted) applyServer(server, callback);
+		expect(server).toEqual({ status: 'completed' });
+		expect(store.getControl('u', '20', 'compact')?.receipt?.status).toBe('completed');
 		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
-		await waitForReports(posted, 4);
+		await waitForReports(posted, originalReports + 1);
 		expect(posted.at(-1)).toMatchObject({ requestId: 'compact', status: 'completed', generation: '1', nativeRef, effect, reconciled: true });
 		expect(execute).toHaveBeenCalledOnce();
 	});

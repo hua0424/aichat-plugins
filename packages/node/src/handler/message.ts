@@ -359,7 +359,7 @@ export class MessageHandler {
 		this.ws = ws;
 		this.driver = driver;
 		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, {
-			prepare: (request, workspace, originalInFlight) => this.prepareCommand(request, workspace, originalInFlight),
+			prepare: (request, workspace, matchingInvocationPending) => this.prepareCommand(request, workspace, matchingInvocationPending),
 			generation: (request) => this.snapshotGeneration(request),
 			conversation: (request) => this.discoveryConversation(request),
 		});
@@ -417,7 +417,7 @@ export class MessageHandler {
 		} catch { return undefined; }
 	}
 
-	private async prepareCommand(request: AgentCommandRequest, workspace?: string, originalInFlight = false): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
+	private async prepareCommand(request: AgentCommandRequest, workspace?: string, matchingInvocationPending?: true): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult } | undefined> {
 		if (!workspace || !request.context.authorizationEpoch) {
 			if (request.reconcileOnly) return { receipt: { status: 'unknown', error: 'native_request_failed' } };
 			throw new Error('trusted execution context required');
@@ -453,12 +453,13 @@ export class MessageHandler {
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };
 			}
 		}
+		if (request.reconcileOnly && matchingInvocationPending && !terminalReplay) return undefined;
 		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
 		if (!prepared.fresh) {
 			const entry = prepared.entry;
 			const unknown = { status: 'unknown', phase: 'outcome', error: 'native_request_failed', generation: String(entry.generation), nativeRef: entry.nativeRef } as const;
-			// Missing evidence while the original is live is not a durable unknown outcome.
-			if (!entry.receipt && (originalInFlight || (this.driver.type === 'openclaw' && request.capabilityId === 'session.reset'))) return { receipt: unknown };
+			// A read of an in-flight reset must not settle its original journal entry.
+			if (!entry.receipt && this.driver.type === 'openclaw' && request.capabilityId === 'session.reset') return { receipt: unknown };
 			const receipt = entry.receipt ?? store.recordControl(this.selfUid, room, request.requestId, unknown);
 			// #505: a reconcileOnly query of this request's own terminal journal is durable native
 			// evidence. Replay it as reconciled so the server can repair a record that raced to
