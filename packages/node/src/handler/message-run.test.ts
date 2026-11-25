@@ -259,7 +259,7 @@ describe('persisted MessageHandler run', () => {
 		expect(argv.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
 		expect(argv[argv.indexOf('--append-system-prompt') + 1].match(/identity:42/g)).toHaveLength(1);
 		expect(store.pendingRuns()).toHaveLength(1);
-		stdoutData.forEach((data) => data('{"type":"result","is_error":false}\n'));
+		stdoutData.forEach((data) => data('{"type":"system","subtype":"init","session_id":"cc-session"}\n{"type":"result","session_id":"cc-session","is_error":false}\n'));
 		childClose.forEach((close) => close(0, null));
 		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
 		expect(store.pendingRuns()).toHaveLength(0);

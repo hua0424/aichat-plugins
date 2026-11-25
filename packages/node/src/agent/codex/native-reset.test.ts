@@ -22,7 +22,7 @@ const rl=require('node:readline').createInterface({input:process.stdin});
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n'); let seq=0;
 rl.on('line',line=>{const x=JSON.parse(line);fs.appendFileSync(process.env.WIRE,line+'\\n');
 let result={}; const p=x.params||{};
-if(x.method==='initialize')result={userAgent:'aichat/0.142.3'};
+if(x.method==='initialize')result={userAgent:'aichat/0.142.3',codexHome:process.cwd(),platformFamily:process.platform==='win32'?'windows':'unix',platformOs:process.platform};
 if(x.method==='config/read')result={config:{model_provider:'openai'},origins:{},layers:null};
 if(x.method==='skills/list')result={data:[{cwd:p.cwds[0],skills:[],errors:[]}]};
 if(x.method==='model/list')result={data:[],nextCursor:null};

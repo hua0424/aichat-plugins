@@ -42,6 +42,8 @@ export interface OpenclawRunBindPayload {
 	conversationId: string;
 	generation: number;
 	createdAt: number;
+	/** Observer epoch frozen before native submission; absent leaves only the reply binding. */
+	observerStamp?: string;
 }
 
 export function defaultOpenclawRunBindDir(home?: string): string {

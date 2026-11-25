@@ -24,8 +24,8 @@ const save=id=>{const current=fs.existsSync(process.env.NATIVE_STATE)?JSON.parse
 const all=Array.from({length:205},(_,i)=>({id:'entry-'+i,model:'model-'+String(i).padStart(3,'0'),displayName:'Model '+i,description:'Native model',hidden:i===204,
 upgrade:null,upgradeInfo:null,availabilityNux:null,supportedReasoningEfforts:[],defaultReasoningEffort:'medium',inputModalities:['text'],supportsPersonality:false,additionalSpeedTiers:[],serviceTiers:[],defaultServiceTier:null,isDefault:i===0}));
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const x=JSON.parse(line),p=x.params||{};fs.appendFileSync(process.env.WIRE,line+'\\n');let result={};
-if(x.method==='initialize')result={userAgent:'aichat/0.142.3'};
-if(x.method==='config/read')result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};
+if(x.method==='initialize')result={userAgent:'aichat/0.142.3',codexHome:process.cwd(),platformFamily:process.platform==='win32'?'windows':'unix',platformOs:process.platform};
+if(x.method==='config/read'){if(process.env.MODE==='close-first-discovery'&&process.env.CHANNEL==='1')process.exit(0);result={config:{model_provider:process.env.MODE==='provider-null'?null:'openai'},origins:{},layers:null};}
 if(x.method==='skills/list')result={data:[{cwd:process.env.MODE==='wrong-cwd'?'/untrusted':p.cwds[0],skills:JSON.parse(fs.readFileSync(process.env.INVENTORY,'utf8')),errors:process.env.MODE==='scan-error'?[{path:'/private',message:'scan failed'}]:[]}]};
 if(x.method==='model/list'){const opaque='opaque:'+ 'x'.repeat(300),at=p.cursor===opaque?100:p.cursor?Number(p.cursor):0;result={data:all.slice(at,at+100),nextCursor:at+100<all.length?String(at+100):null};if(process.env.MODE==='cursor-loop')result.nextCursor='100';if(process.env.MODE==='long-cursor'&&at===0)result.nextCursor=opaque;}
 if(x.method==='thread/start'||x.method==='thread/resume'){const id=p.threadId||'thread-'+process.env.CHANNEL;model=p.model||(threads[id]&&threads[id].model)||'model-000';threads[id]={model,cwd:p.cwd,modelProvider:(threads[id]&&threads[id].modelProvider)||(process.env.MODE==='provider-mismatch'?'other':'openai')};save(id);result={thread:thread(id),model,modelProvider:threads[id].modelProvider};}
@@ -117,6 +117,21 @@ describe('Codex native catalog and model control', () => {
 		expect(pages.slice(0, 3).map((x) => x.params)).toEqual([{ limit: 100, includeHidden: true }, { limit: 100, includeHidden: true, cursor: '100' }, { limit: 100, includeHidden: true, cursor: '200' }]);
 		expect(JSON.stringify(first)).not.toContain(f.skillPath); expect(first.capabilities.find((c) => c.id === 'skill:local-skill')).toMatchObject({ supported: true, executable: true });
 	});
+	it('uses a fresh channel only for new requests after the native discovery child exits', async () => {
+		const f = await fixture('close-first-discovery');
+		await expect(f.discover()).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+		const afterExit = await f.lines();
+		expect(afterExit.map((x) => x.method)).toEqual(['initialize', 'initialized', 'config/read']);
+		const [first, next] = await Promise.all([f.discover(), f.discover({ offset: 100 })]);
+		expect(first.models).toMatchObject({ total: 205, offset: 0 });
+		expect(next.models).toMatchObject({ total: 205, offset: 100 });
+		expect(next.version).toBe(first.version);
+		await f.driver.disconnect();
+		await expect(f.discover()).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+		const wire = await f.lines();
+		expect(wire.filter((x) => x.method === 'initialize')).toHaveLength(2);
+		expect(wire.some((x) => /^(thread|turn)\//.test(x.method))).toBe(false);
+	});
 	it('round-trips an opaque native cursor longer than public model identifiers without truncating inventory', async () => {
 		const f = await fixture('long-cursor'), catalog = await f.discover();
 		expect(catalog.models!.total).toBe(205);
@@ -170,6 +185,20 @@ describe('Codex native catalog and model control', () => {
 		await f.restart(); expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-204' });
 		expect((await f.lines()).find((x) => x.method === 'thread/resume').params).toMatchObject({ threadId, model: 'model-204' });
 		expect(f.store.getOrCreate('owner', 'room', 'codex').selectedModel).toEqual({ providerID: 'openai', modelID: 'model-204' });
+	});
+	it('leaves native sandbox permissions to app-server on model thread start and resume', async () => {
+		const f = await fixture();
+		expect((await f.driver.executeCapability(await f.invoke('select-with-native-sandbox'))).status).toBe('accepted');
+		await f.restart();
+		expect(await f.chat()).toContainEqual({ type: 'thinking', text: 'model-204' });
+		const opens = (await f.lines()).filter((x) => x.method === 'thread/start' || x.method === 'thread/resume');
+		expect(opens.map((x) => x.method)).toEqual(['thread/start', 'thread/resume']);
+		for (const { params } of opens) {
+			expect(params).toMatchObject({ cwd: f.workspace, approvalPolicy: 'never' });
+			expect(params).not.toHaveProperty('sandbox');
+			expect(params).not.toHaveProperty('permissions');
+			expect(params).not.toHaveProperty('config');
+		}
 	});
 	it('refuses a persisted selected provider absent from the actual config before start or resume', async () => {
 		const f = await fixture(); f.store.getOrCreate('owner', 'room', 'codex');

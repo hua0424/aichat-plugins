@@ -31,7 +31,9 @@ export class HulaApiClient {
 
 	/** Result callback is authenticated with this identity's existing agent token. */
 	async reportAgentCommandResult(result: AgentCommandResponse): Promise<void> {
-		await this.post('/api/im/aiclaw/commands/result', result, AbortSignal.timeout(7000));
+		// Raw Native evidence is local; the IM callback receives only the command receipt.
+		const { nativeResult: _nativeResult, ...receipt } = result;
+		await this.post('/api/im/aiclaw/commands/result', receipt, AbortSignal.timeout(7000));
 	}
 
 	/** Probe the actual T15 endpoint: old servers ignoring unknown JSON fields are NOT receipt-capable. */

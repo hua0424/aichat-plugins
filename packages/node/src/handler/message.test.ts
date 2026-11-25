@@ -2186,7 +2186,7 @@ describe('MessageHandler REQ-011 S3: cc attribution wiring + data-routing + grou
 			return child;
 		};
 		return { spawn, stdinWrites, endStdout: () => {
-			dataCbs.forEach((cb) => cb('{"type":"result","is_error":false}\n'));
+			dataCbs.forEach((cb) => cb('{"type":"system","subtype":"init","session_id":"cc-session"}\n{"type":"result","session_id":"cc-session","is_error":false}\n'));
 			endCbs.forEach((cb) => cb());
 			closeCbs.forEach((cb) => cb(0, null));
 		}, get spawnCall() { return spawnCall; } };

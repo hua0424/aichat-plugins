@@ -1,6 +1,6 @@
 import type { AgentEntry } from './registry.js';
 import type { AichatCredentials } from './config.js';
-import type { RunDriver } from './agent/events.js';
+import { DriverDisconnectIncompleteError, type RunDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
@@ -312,9 +312,10 @@ export class Supervisor {
 	}
 
 	/**
-	 * 关停全部身份（best-effort，逐项 catch 不互相影响）。
+	 * 关停全部身份（best-effort，逐项 catch 不互相影响）。存在未停稳的共享写入时返回 false。
 	 */
-	async stop(): Promise<void> {
+	async stop(): Promise<boolean> {
+		let writersQuiesced = true;
 		for (const agent of this.supervised) {
 			// 先收尾 handler（清理 active thinking session + 定时器，避免泄漏），再关 ws。
 			try {
@@ -327,11 +328,15 @@ export class Supervisor {
 			} catch {
 				/* best-effort */
 			}
+		}
+		// Close inbound admission for every identity before any driver drain can wait.
+		for (const agent of this.supervised) {
 			try {
 				await agent.driver.disconnect();
-			} catch {
-				/* best-effort */
+			} catch (err) {
+				if (err instanceof DriverDisconnectIncompleteError) writersQuiesced = false;
 			}
 		}
+		return writersQuiesced;
 	}
 }

@@ -15,6 +15,29 @@ function okResponse(json: unknown): Response {
 	} as unknown as Response;
 }
 
+describe('HulaApiClient.reportAgentCommandResult', () => {
+	it('keeps raw Native data local while posting the bound command outcome', async () => {
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(okResponse({ success: true, code: 0 }));
+		const client = new HulaApiClient('http://host:8080', 'tok');
+		await client.reportAgentCommandResult({
+			requestId: 'compact-1', roomId: '20', status: 'completed', phase: 'outcome', reconciled: true,
+			generation: '1', nativeRef: { sessionId: 'native-key' },
+			effect: { kind: 'compact', controlId: 'compact-1', summary: true },
+			nativeResult: { summary: 'private original Native summary' },
+		});
+
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchSpy.mock.calls[0];
+		expect(url).toBe('http://host:8080/api/im/aiclaw/commands/result');
+		expect(init?.method).toBe('POST');
+		expect(JSON.parse(String(init?.body))).toEqual({
+			requestId: 'compact-1', roomId: '20', status: 'completed', phase: 'outcome', reconciled: true,
+			generation: '1', nativeRef: { sessionId: 'native-key' },
+			effect: { kind: 'compact', controlId: 'compact-1', summary: true },
+		});
+	});
+});
+
 describe('HulaApiClient.listSelfGroupConfigs (REQ #26)', () => {
 	it('GET /api/im/aiclaw/group/config/list 无 query，token 走 header', async () => {
 		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(

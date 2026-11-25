@@ -1,11 +1,15 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CcHeadlessDriver, type CcChild, type CcHeadlessDriverDeps, type CcSpawnOptions } from './headless-driver.js';
-import type { AgentEvent, PreparedRun } from '../events.js';
+import { DriverDisconnectIncompleteError, type AgentEvent, type CapabilityExecution, type PreparedRun } from '../events.js';
 import { CcSessionRegistry } from './sink.js';
+import { AgentCommandHandler } from '../../handler/agent-command.js';
+import * as preflight from './native-compact-preflight.js';
+import * as compact from './compact.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -29,12 +33,12 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 		if (signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
 	});
 	const registry = new CcSessionRegistry();
-	const spawnCalls: Array<{ args: readonly string[]; options: CcSpawnOptions }> = [];
+	const spawnCalls: Array<{ command: string; args: readonly string[]; options: CcSpawnOptions }> = [];
 	const transcript = vi.fn();
 	const driver = new CcHeadlessDriver({ workspaceBase: dir, brokerPort: 9100,
 		registerHook: (key, id, push) => registry.registerContext(key, id, push),
 		transcript: { append: transcript },
-		spawn: (_cmd, args, options) => { spawnCalls.push({ args, options }); return child; },
+		spawn: (command, args, options) => { spawnCalls.push({ command, args, options }); return child; },
 		kill, platform: 'linux', firstEventTimeoutMs: 500, stopTimeoutMs: 180, killGraceMs: 10, drainMs: 0,
 		...overrides });
 	const persisted: Array<unknown> = [];
@@ -55,7 +59,7 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 		return { run, collected, done };
 	};
 	return { dir, driver, input, controller, start, spawnCalls, output, errors, process, writes,
-		persisted, registry, transcript, kill,
+		persisted, registry, transcript, kill, endInput: child.stdin!.end,
 		groupExit: () => { groupAlive = false; }, close: (code: number | null) => { process.emit('close', code, null); },
 		line: (value: object) => output.emit('data', `${JSON.stringify(value)}\n`) };
 }
@@ -63,7 +67,329 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 // POSIX group probes need the native -pgid API; on Windows this driver deliberately cannot confirm stop.
 const posix = it;
 
+describe('CC native capability observation', () => {
+	posix('withdraws the previous skills before resuming even if the new child never initializes', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const state = { sessionId, workspace: f.dir, skillObservation: { runtimeVersion: '2.1.195', names: ['project:example'] } };
+		const { done } = await f.start({ ...f.input, conversation: { ...f.input.conversation, nativeState: { version: 1, value: state } } });
+		await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+		f.groupExit(); f.close(1);
+		await done;
+		expect(f.persisted).toEqual([{ version: 1, value: { sessionId, workspace: f.dir } }]);
+	});
+	posix('still offers the observed skill when a clean native inventory child returns no models under the original scope', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const observation = { runtimeVersion: '2.1.195', names: ['project:example'] };
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir, skillObservation: observation } } };
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		try {
+			const context = { roomType: 2, isOwner: true, workspace: f.dir, signal: f.controller.signal, conversation, authorizationEpoch: 'epoch' } as const;
+			const discovery = f.driver.discoverCapabilities(context);
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success', response: { models: [] } } });
+			f.groupExit(); f.close(0);
+			const catalog = await discovery;
+			expect(catalog.capabilities).toEqual([expect.objectContaining({ id: 'skill:project:example', executable: false, reason: 'submission_only' })]);
+			const execution = { requestId: 'skill', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+				authorizationEpoch: 'epoch', saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(), replaceSession: vi.fn(), emit: vi.fn(), bindTurn: vi.fn() };
+			expect(await f.driver.executeCapability({ ...context, execution, capabilityId: 'skill:project:example', parameters: {}, catalogVersion: catalog.version }))
+				.toMatchObject({ status: 'noop', text: '插件已收到技能指令，未执行。' });
+			expect(execution.submitted).not.toHaveBeenCalled();
+			expect(f.spawnCalls).toHaveLength(1);
+		} finally { prepareNative.mockRestore(); }
+	});
+	posix('offers observed native skills for typed receipt after the ordinary child settles, without starting another turn', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		try {
+			const { done } = await f.start({ ...f.input, authorizationEpoch: 'epoch' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: sessionId, cwd: f.dir, claude_code_version: '2.1.195',
+				slash_commands: ['ordinary', 'project:example'], skills: ['project:example'] });
+			f.line({ type: 'result', session_id: sessionId, is_error: false });
+			f.groupExit(); f.close(0);
+			await done;
+			const conversation = { ...f.input.conversation, get nativeState() {
+				return f.persisted.at(-1) as PreparedRun['conversation']['nativeState'];
+			} };
+			const emit = vi.fn<CapabilityExecution['emit']>().mockResolvedValue(undefined);
+			const execution = { requestId: 'skill', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+				authorizationEpoch: 'epoch', saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(), replaceSession: vi.fn(), emit, bindTurn: vi.fn() };
+			const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution }), conversation: () => conversation });
+			const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 1, account: 'group', workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
+			const discovery = handler.handle({ ...scope, requestId: 'discover-skill', operation: 'discover' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(2));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[1]).request_id, subtype: 'success',
+				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
+			f.close(0);
+			const catalog = (await discovery)?.catalog;
+			expect(catalog?.capabilities).toEqual([
+				expect.objectContaining({ id: 'model.list' }),
+				expect.objectContaining({ id: 'skill:project:example', source: 'skill', kind: 'skill', supported: true,
+					executable: false, reason: 'submission_only', defaultVisibility: 'public' }),
+			]);
+			const invoke = { ...scope, requestId: 'skill', operation: 'invoke', capabilityId: 'skill:project:example',
+				catalogVersion: catalog!.version, parameters: { arguments: '  original\narguments  ' } };
+			const result = await handler.handle(invoke);
+			expect(result).toEqual({ requestId: 'skill', roomId: 'room', status: 'noop', phase: 'outcome', text: '插件已收到技能指令，未执行。' });
+			expect(emit.mock.calls).toEqual([[{ type: 'receipt', receipt: { status: 'noop', phase: 'outcome', text: '插件已收到技能指令，未执行。' } }]]);
+			expect(await handler.handle({ ...invoke, requestId: 'unknown-skill', capabilityId: 'skill:ordinary' })).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(await handler.handle({ ...invoke, requestId: 'wrong-version', catalogVersion: 'cc-models:previous' })).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(execution.bindTurn).not.toHaveBeenCalled();
+			expect(execution.submitted).not.toHaveBeenCalled();
+			expect(f.spawnCalls).toHaveLength(2);
+			expect(f.writes).toHaveLength(2);
+			const rediscovery = handler.handle({ ...scope, context: { ...scope.context, authorizationEpoch: 'next-epoch' },
+				requestId: 'new-epoch', operation: 'discover' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(3));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[2]).request_id, subtype: 'success',
+				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
+			f.close(0);
+			expect((await rediscovery)?.catalog?.capabilities).toEqual([expect.objectContaining({ id: 'model.list' })]);
+		} finally { prepareNative.mockRestore(); }
+	});
+	posix('executes the discovered compact once with the original idle session and returns its verified effect', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const controlId = 'a2a059dd-ef7a-4120-864b-a3d7f3d99aa4';
+		const summaryId = '4ec5d7fe-0a1b-4260-9f6e-d02054d84698';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir,
+			skillObservation: { runtimeVersion: '2.1.195', names: ['project:example'] } } } };
+		const path = join(f.dir, `${sessionId}.jsonl`), originalBytes = Buffer.from('original\n');
+		writeFileSync(path, originalBytes);
+		const handles: Awaited<ReturnType<typeof open>>[] = [];
+		const assertIntact = vi.fn<preflight.CcNativeCompactPreflight['assertIntact']>().mockResolvedValue(undefined);
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockImplementation(async () => {
+			const handle = await open(path, 'r');
+			handles.push(handle);
+			return { cwd: f.dir, cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {},
+				assertIntact, history: { path, handle, originalBytes } };
+		});
+		const release = vi.fn();
+		const reserve = vi.fn(() => release);
+		const observe = vi.spyOn(compact, 'observeCcCompact').mockImplementation(async ({ inputId, assertCurrent, beforeInput, onSubmit, onAccepted }) => {
+			expect(reserve).toHaveBeenCalledWith(sessionId, inputId);
+			expect(assertIntact).toHaveBeenLastCalledWith();
+			await beforeInput!();
+			expect(assertIntact).toHaveBeenLastCalledWith('native-resume');
+			assertCurrent();
+			onSubmit!();
+			onAccepted?.();
+			return { controlId, summaryId, summaryHash: 'native', preTokens: 1570, postTokens: 1213 };
+		});
+		const verify = vi.spyOn(compact, 'verifyCcCompactAppend').mockResolvedValue({ status: 'completed', controlId, summaryId });
+		const execute = { requestId: 'compact', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+			authorizationEpoch: 'epoch', reserveCcCompact: reserve, saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(),
+			replaceSession: vi.fn(), emit: vi.fn<CapabilityExecution['emit']>().mockResolvedValue(undefined), bindTurn: vi.fn() };
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
+		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution: execute }), conversation: () => conversation });
+		try {
+			async function nativeInventory(index: number, value = 'native') {
+				await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+				f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[index]).request_id, subtype: 'success',
+					response: { models: [{ value, displayName: 'Native model' }] } } });
+				await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(index + 1));
+				f.groupExit(); f.close(0);
+			}
+			const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
+			await nativeInventory(0);
+			const catalog = (await discovery)?.catalog;
+			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'session.compact', executable: true }));
+			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'skill:project:example', executable: false }));
+			const invoke = { ...scope, requestId: 'compact', operation: 'invoke', capabilityId: 'session.compact', catalogVersion: catalog!.version };
+			const list = handler.handle({ ...invoke, requestId: 'list', capabilityId: 'model.list' });
+			await nativeInventory(1);
+			expect(await list).toMatchObject({ status: 'completed', text: expect.stringContaining('Native model') });
+			const stale = handler.handle({ ...invoke, requestId: 'stale' });
+			await nativeInventory(2, 'different inventory');
+			expect(await stale).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(reserve).not.toHaveBeenCalled();
+			execute.emit.mockRejectedValueOnce(new Error('admission publication unavailable'));
+			const original = handler.handle(invoke), duplicate = handler.handle(invoke);
+			await nativeInventory(3);
+			const result = await original;
+			expect(result).toMatchObject({ requestId: 'compact', status: 'completed', generation: '1', nativeRef: { sessionId },
+				effect: { kind: 'compact', controlId, summaryId, summary: true } });
+			expect(await duplicate).toEqual(result);
+			expect(observe).toHaveBeenCalledOnce();
+			expect(execute.emit.mock.calls.slice(-2)).toEqual([
+				[{ type: 'receipt', receipt: { status: 'accepted', phase: 'accepted', generation: '1', nativeRef: { sessionId } } }],
+				[{ type: 'receipt', receipt: expect.objectContaining({ status: 'completed', phase: 'outcome', nativeRef: { sessionId } }) }],
+			]);
+			expect(verify).toHaveBeenCalledOnce();
+			expect(release).toHaveBeenCalledOnce();
+			verify.mockRejectedValueOnce(new Error('no durable effect'));
+			const uncertain = handler.handle({ ...invoke, requestId: 'unconfirmed-effect' });
+			await nativeInventory(4);
+			expect(await uncertain).toMatchObject({ status: 'unknown', nativeRef: { sessionId } });
+			expect(release).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'unknown', nativeRef: { sessionId } }));
+			expect(handles.map(handle => handle.fd)).toEqual([-1, -1, -1, -1, -1]);
+			for (const [bin, args] of f.spawnCalls.map(call => [call.command, call.args] as const)) {
+				expect(bin).toBe('/owned/claude');
+				expect(args.slice(-2)).toEqual(['--settings', '/owned/settings.json']);
+			}
+			expect(execute.bindTurn).not.toHaveBeenCalled();
+		} finally { prepareNative.mockRestore(); observe.mockRestore(); verify.mockRestore(); }
+	});
+	posix('does not advertise an ambient catalog when disconnect races a scoped inventory', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir } } };
+		const path = join(f.dir, `${sessionId}.jsonl`);
+		writeFileSync(path, 'original\n');
+		const handle = await open(path, 'r');
+		const assertIntact = vi.fn().mockResolvedValueOnce(undefined).mockImplementationOnce(() => f.driver.disconnect());
+		const prepare = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue({ cwd: f.dir,
+			cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {}, assertIntact,
+			history: { path, handle, originalBytes: Buffer.from('original\n') } });
+		try {
+			const discovery = f.driver.discoverCapabilities({ roomId: 'room', workspace: f.dir, conversation, signal: f.controller.signal });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success',
+				response: { models: [{ value: 'scoped', displayName: 'Scoped model' }] } } });
+			f.groupExit(); f.close(0);
+			expect(await discovery).toMatchObject({ capabilities: [], discovery: { coverage: 'unavailable' } });
+			expect(assertIntact).toHaveBeenCalledTimes(2);
+		} finally { prepare.mockRestore(); await handle.close(); }
+	});
+	posix('discovers and lists models from the idle native instance without sending user input', async () => {
+		const f = fixture();
+		const derived = join(f.dir, 'agent', 'owner');
+		expect(existsSync(derived)).toBe(false);
+		const prepare = vi.fn();
+		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare });
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true } };
+		async function reply(index: number, value: string) {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+			const frame = JSON.parse(f.writes[index]);
+			expect(frame).toMatchObject({ type: 'control_request', request: { subtype: 'initialize' } });
+			f.line({ type: 'control_response', response: { request_id: frame.request_id, subtype: 'success',
+				response: { models: [{ value, displayName: 'Native model' }] } } });
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(index + 1));
+			f.groupExit(); f.close(0);
+		}
+		const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
+		await reply(0, 'provider-choice');
+		const catalog = (await discovery)?.catalog;
+		expect(f.spawnCalls[0].options.cwd).toBe(derived);
+		expect(existsSync(derived)).toBe(true);
+		expect(catalog?.capabilities).toEqual([expect.objectContaining({ id: 'model.list', executable: true, defaultVisibility: 'public', scope: 'instance' })]);
+		const invoke = { ...scope, requestId: 'list', operation: 'invoke', capabilityId: 'model.list', catalogVersion: catalog!.version };
+		const result = handler.handle(invoke);
+		await reply(1, 'provider-choice');
+		expect(await result).toMatchObject({ requestId: 'list', roomId: 'room', status: 'completed', text: expect.stringContaining('Native model — provider-choice') });
+		expect(await handler.handle(invoke)).toEqual(await result);
+		const changed = handler.handle({ ...invoke, requestId: 'list-new' });
+		await reply(2, 'changed-model');
+		expect(await changed).toEqual({ requestId: 'list-new', roomId: 'room', status: 'failed', error: 'catalog_stale' });
+		expect(f.spawnCalls).toHaveLength(3);
+		expect(prepare).not.toHaveBeenCalled();
+		expect(f.transcript).not.toHaveBeenCalled();
+	});
+	posix('projects the actual init catalog only from the exact live conversation without submitting another input', async () => {
+		const f = fixture();
+		const { done } = await f.start();
+		try {
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session', cwd: f.dir,
+				claude_code_version: '2.1.195', slash_commands: ['x'.repeat(121), 'x'.repeat(120), 'compact', 'example:hello'], skills: ['example:hello'] });
+			const context = { conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal };
+			await vi.waitFor(async () => expect(await f.driver.discoverCapabilities(context)).toMatchObject({
+				framework: 'cc', runtimeVersion: '2.1.195', discovery: { source: 'native', coverage: 'partial' },
+				capabilities: [{ id: 'command:compact', executable: false, defaultVisibility: 'hidden' },
+					{ id: 'command:example:hello', executable: false, defaultVisibility: 'hidden' },
+					{ id: `command:${'x'.repeat(120)}`, executable: false, defaultVisibility: 'hidden' }],
+			}));
+			expect((await f.driver.discoverCapabilities({ ...context, conversation: { ...context.conversation, generation: 2 } })).capabilities).toEqual([]);
+			expect((await f.driver.discoverCapabilities({ ...context, workspace: join(f.dir, 'other') })).capabilities).toEqual([]);
+			expect((await f.driver.discoverCapabilities({ ...context, capabilityId: 'model.set' })).capabilities).toEqual([]);
+			f.line({ type: 'system', subtype: 'commands_changed', session_id: 'native-session', commands: [] });
+			await Promise.resolve(); // The waiting consumer has woken, but has not handled the frame yet.
+			expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable');
+			expect(f.spawnCalls).toHaveLength(1);
+			expect(f.writes).toHaveLength(1);
+		} finally {
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		const idle = f.driver.discoverCapabilities({ conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal });
+		await vi.waitFor(() => expect(f.writes).toHaveLength(2));
+		const request = JSON.parse(f.writes[1]);
+		expect(request).toMatchObject({ type: 'control_request', request: { subtype: 'initialize' } });
+		f.line({ type: 'control_response', response: { request_id: request.request_id, subtype: 'success',
+			response: { models: [{ value: 'model-a', displayName: 'Model A' }] } } });
+		f.close(0);
+		expect((await idle).capabilities.map((capability) => capability.id)).toEqual(['model.list']);
+	});
+	posix('withholds the catalog while the consumer has not processed a received directory change', async () => {
+		const f = fixture();
+		const run = f.driver.createRun(f.input);
+		const events = run.events[Symbol.asyncIterator]();
+		const first = events.next();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session', cwd: f.dir,
+				claude_code_version: '2.1.195', slash_commands: ['compact'], skills: [] });
+			f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'text', text: 'thinking' }] } });
+			expect((await first).value).toEqual({ type: 'thinking', text: 'thinking' });
+			const context = { conversation: f.input.conversation, workspace: f.dir, signal: f.input.signal };
+			expect((await f.driver.discoverCapabilities(context)).capabilities).toHaveLength(1);
+			f.line({ type: 'system', subtype: 'commands_changed', session_id: 'native-session', commands: [] });
+			expect((await f.driver.discoverCapabilities(context)).discovery?.coverage).toBe('unavailable');
+		} finally {
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.groupExit(); f.close(0);
+			await first;
+			while (!(await events.next()).done) { /* drain the owned iterator */ }
+		}
+	});
+});
+
 describe('CC PreparedRun native execution', () => {
+	posix('keeps stdin open through the native result without sending a second input or completing early', async () => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'text', text: 'reply' }] } });
+			await vi.waitFor(() => expect(collected).toEqual([{ type: 'thinking', text: 'reply' }]));
+			expect(f.endInput).not.toHaveBeenCalled();
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			f.line({ type: 'result', session_id: 'native-session', is_error: false });
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(1));
+			expect(f.writes).toHaveLength(1);
+			expect(collected.map((event) => event.type)).toEqual(['thinking']);
+		} finally {
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		expect(collected.map((event) => event.type)).toEqual(['thinking', 'done']);
+	});
+
+	posix.each([
+		{ init: false, resultSession: 'foreign' },
+		{ init: true, resultSession: undefined },
+	])('does not close stdin or report success without matching result identity ($init, $resultSession)', async ({ init, resultSession }) => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			if (init) f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			f.line({ type: 'result', session_id: resultSession, is_error: false });
+			await vi.waitFor(() => expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM'));
+			expect(f.endInput).not.toHaveBeenCalled();
+		} finally {
+			f.groupExit(); f.close(0);
+			await done;
+		}
+		expect(collected).toEqual([{ type: 'error', message: 'CC native result session unconfirmed' }]);
+		expect(f.writes).toHaveLength(1);
+	});
+
 	posix('starts only on consumption, uses opaque core capability key, persists historical session, keeps transcript path', async () => {
 		const f = fixture();
 		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'historical-id', workspace: f.dir } };
@@ -79,19 +405,27 @@ describe('CC PreparedRun native execution', () => {
 		// #404: exactly one frozen reply binding per run, inherited values never merged.
 		expect(f.spawnCalls[0].options.env.AICHAT_RUN_BIND).toBe('f'.repeat(64));
 		expect(f.spawnCalls[0].options.env.OPENCODE_SESSION_ID).toBeUndefined();
-		expect(JSON.parse(f.writes[0]).message.content[0].text).toBe(f.input.message);
+		const wire = JSON.parse(f.writes[0]);
 		expect(f.transcript).toHaveBeenCalledWith('aiclaw-5-room-9', expect.objectContaining({ kind: 'inbound' }));
 		f.line({ type: 'system', subtype: 'init', session_id: 'historical-id' });
-		f.line({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking' }] } });
+		f.line({ type: 'assistant', session_id: 'historical-id', message: { content: [{ type: 'text', text: 'thinking' }] } });
 		f.registry.pushContext('opaque-new-key', f.spawnCalls[0].options.env.AICHAT_CC_RUN!, { type: 'tool', name: 'Bash', phase: 'end' });
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'result', session_id: 'historical-id', is_error: false });
 		await tick();
 		expect(events.some((e) => e.type === 'done')).toBe(false); // result != child close
 		f.groupExit(); f.close(0);
 		await done;
 		expect(events.map((e) => e.type)).toEqual(['thinking', 'tool', 'done']);
 		expect(f.persisted).toEqual([{ version: 1, value: { sessionId: 'historical-id', workspace: f.dir } }]);
-		expect(f.input.saveRecovery).toHaveBeenCalledWith(expect.objectContaining({ value: expect.objectContaining({ pid: 4242 }) }));
+		expect(wire).toMatchObject({ type: 'user', uuid: expect.stringMatching(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/),
+			session_id: 'historical-id', parent_tool_use_id: null,
+			message: { role: 'user', content: [{ type: 'text', text: f.input.message }] } });
+		expect(f.writes).toHaveLength(1);
+		expect(vi.mocked(f.input.saveRecovery).mock.calls.map(([snapshot]) => snapshot.value)).toEqual([
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id' }),
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id', pid: 4242 }),
+			expect.objectContaining({ inputId: wire.uuid, sessionId: 'historical-id', pid: 4242 }),
+		]);
 	});
 
 	posix('overwrites an inherited AICHAT_RUN_BIND with the frozen per-run token', async () => {
@@ -111,7 +445,8 @@ describe('CC PreparedRun native execution', () => {
 
 	posix('does not finish on EOF or close while a descendant survives; cancel remains unconfirmed', async () => {		const f = fixture();
 		const { run, collected, done } = await f.start();
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.output.emit('end');
 		await tick();
 		expect(collected.some((event) => event.type === 'done')).toBe(false);
@@ -164,11 +499,65 @@ describe('CC PreparedRun native execution', () => {
 		okay.input.conversation.nativeState = { version: 1, value: { sessionId: 'healthy', workspace: okay.dir } };
 		const { collected: okayEvents, done: okayDone } = await okay.start();
 		okay.line({ type: 'system', subtype: 'init', session_id: 'healthy' });
-		okay.line({ type: 'result', is_error: true, errors: ['boom after resume'] });
+		okay.line({ type: 'result', session_id: 'healthy', is_error: true, errors: ['boom after resume'] });
 		okay.groupExit(); okay.close(1);
 		await okayDone;
 		const okayError = okayEvents.find((e) => e.type === 'error') as { message: string } | undefined;
 		expect((okayError?.message ?? '').startsWith('native_session_lost:')).toBe(false);
+	});
+
+	posix('does not rebind the chat when a resumed CC invocation reports a different native session', async () => {
+		const f = fixture();
+		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'original', workspace: f.dir } };
+		const { collected, done } = await f.start();
+		f.line({ type: 'system', subtype: 'init', session_id: 'unexpected' });
+		f.line({ type: 'assistant', message: { content: [{ type: 'text', text: 'wrong session' }] } });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
+		f.groupExit(); f.close(0);
+		await done;
+		expect(collected).toEqual([{ type: 'error', message: 'CC native session changed unexpectedly' }]);
+		expect(f.persisted).toEqual([]);
+		expect(f.input.saveRecovery).not.toHaveBeenCalledWith(expect.objectContaining({
+			value: expect.objectContaining({ sessionId: 'unexpected' }),
+		}));
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+	});
+
+	posix.each([
+		{ type: 'assistant', session_id: 'other', message: { content: [{ type: 'text', text: 'foreign text' }] } },
+		{ type: 'result', session_id: 'other', is_error: false },
+	])('rejects a $type from another session after matching init', async (foreign) => {
+		const f = fixture();
+		f.input.conversation.nativeState = { version: 1, value: { sessionId: 'original', workspace: f.dir } };
+		const { collected, done } = await f.start();
+		f.line({ type: 'system', subtype: 'init', session_id: 'original' });
+		f.line(foreign);
+		if (foreign.type === 'assistant') f.line({ type: 'result', session_id: 'original', is_error: false });
+		f.groupExit(); f.close(0);
+		await done;
+		expect(collected).toEqual([{ type: 'error', message: 'CC native session changed unexpectedly' }]);
+		expect(f.transcript).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ kind: 'assistant' }));
+		expect(f.persisted).toEqual([{ version: 1, value: { sessionId: 'original', workspace: f.dir } }]);
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+	});
+
+	posix('reports incomplete disconnect until the original CC group has stopped', async () => {
+		const f = fixture({ stopTimeoutMs: 40 });
+		const { collected, done } = await f.start();
+		try {
+			f.close(0); // the child exited, but its process group still has a live member
+			await expect(f.driver.disconnect()).rejects.toBeInstanceOf(DriverDisconnectIncompleteError);
+			expect(collected).not.toContainEqual(expect.objectContaining({ type: 'done' }));
+			f.groupExit();
+			await expect(f.driver.disconnect()).resolves.toBeUndefined();
+			expect(f.spawnCalls).toHaveLength(1);
+		} finally {
+			f.groupExit();
+			await done;
+		}
 	});
 
 	posix('does not spawn a never-consumed run during disconnect', async () => {
@@ -214,6 +603,24 @@ describe('CC PreparedRun native execution', () => {
 		f.registry.pushContext('opaque-new-key', 'core-run:unknown', { type: 'tool', name: 'late', phase: 'end' });
 	});
 
+	posix('stops the original process without EOF or replay when aborted after init without a result', async () => {
+		const f = fixture();
+		const { collected, done } = await f.start();
+		try {
+			f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+			await vi.waitFor(() => expect(f.persisted).toHaveLength(1));
+			f.controller.abort();
+			await vi.waitFor(() => expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM'));
+			expect(f.endInput).not.toHaveBeenCalled();
+		} finally {
+			f.groupExit(); f.close(null);
+			await done;
+		}
+		expect(f.spawnCalls).toHaveLength(1);
+		expect(f.writes).toHaveLength(1);
+		expect(collected).not.toContainEqual(expect.objectContaining({ type: 'done' }));
+	});
+
 	posix('first-event watchdog cannot turn a live process into a confirmed success', async () => {
 		const f = fixture({ firstEventTimeoutMs: 5, stopTimeoutMs: 40, killGraceMs: 5 });
 		const { collected, done } = await f.start();
@@ -226,9 +633,10 @@ describe('CC PreparedRun native execution', () => {
 	posix('keeps tool transcript truncation explicit and never duplicates a terminal event', async () => {
 		const f = fixture();
 		const { collected, done } = await f.start();
-		f.line({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { script: 'x'.repeat(3000) } }] } });
-		f.line({ type: 'result', is_error: false });
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'assistant', session_id: 'native-session', message: { content: [{ type: 'tool_use', name: 'Bash', input: { script: 'x'.repeat(3000) } }] } });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		expect(collected).toEqual([expect.objectContaining({ type: 'done' })]);
@@ -240,7 +648,8 @@ describe('CC PreparedRun native execution', () => {
 		const f = fixture({ drainMs: 40 });
 		const { collected, done } = await f.start();
 		const attempt = f.spawnCalls[0].options.env.AICHAT_CC_RUN!;
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await tick(); // the native stream closed, but the broker hook is still in flight
 		f.registry.pushContext('opaque-new-key', attempt, { type: 'tool', name: 'Bash', phase: 'end' });
@@ -252,7 +661,8 @@ describe('CC PreparedRun native execution', () => {
 		const f = fixture();
 		const { collected, done } = await f.start();
 		const runId = f.spawnCalls[0].options.env.AICHAT_CC_RUN!;
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		f.registry.pushContext('opaque-new-key', runId, { type: 'tool', name: 'late', phase: 'end' });
@@ -275,7 +685,8 @@ describe('CC PreparedRun native execution', () => {
 	posix('never re-kills a normally completed job on disconnect', async () => {
 		const f = fixture();
 		const { done } = await f.start();
-		f.line({ type: 'result', is_error: false });
+		f.line({ type: 'system', subtype: 'init', session_id: 'native-session' });
+		f.line({ type: 'result', session_id: 'native-session', is_error: false });
 		f.groupExit(); f.close(0);
 		await done;
 		await f.driver.disconnect();

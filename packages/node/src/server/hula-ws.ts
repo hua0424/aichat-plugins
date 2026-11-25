@@ -191,7 +191,7 @@ export class HulaWSClient {
 		});
 
 		ws.on('message', (data) => {
-			if (!isCurrent()) return;
+			if (!isCurrent() || this.closed) return;
 			// #152 任意入站帧都证明连接存活，避免慢速但正常的流量被误杀
 			this.lastAliveAt = Date.now();
 			try {
@@ -440,6 +440,11 @@ export class HulaWSClient {
 
 	get isConnected(): boolean {
 		return this.ws?.readyState === WebSocket.OPEN;
+	}
+
+	/** Use the admitting connection only; a new open socket cannot inherit an old envelope. */
+	get openConnectionAttempt(): number | undefined {
+		return this.isConnected ? this.connectAttempt : undefined;
 	}
 
 	private startHeartbeat(): void {

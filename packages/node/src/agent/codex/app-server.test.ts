@@ -15,7 +15,12 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
  fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify(request) + '\\n');
  if (!request.method) return;
  if (request.method === 'initialized') return;
- if (request.method === 'initialize') { send({id:request.id,result:{userAgent:'aichat/0.142.3 (test; 1)'}}); return; }
+ if (request.method === 'initialize') {
+  const result = process.env.FAKE_INIT ? JSON.parse(process.env.FAKE_INIT) : {
+   userAgent:'aichat/0.142.3 (test; 1)', codexHome:process.cwd(), platformFamily:process.platform === 'win32' ? 'windows' : 'unix', platformOs:process.platform,
+  };
+  send({id:request.id,result}); return;
+ }
  if (request.method === 'no-response') return;
  if (request.method === 'malformed') { process.stdout.write('{not-json}\\n'); return; }
  if (request.method === 'fail') { send({id:request.id,error:{code:-32602,message:'secret-must-not-escape'}}); return; }
@@ -57,6 +62,14 @@ describe('Codex 0.142.3 continuous app-server channel', () => {
 		expect(frames.filter((frame) => frame.method === 'initialize')).toHaveLength(1);
 		expect(frames[1]).toEqual({ method: 'initialized', params: {} });
 	});
+	it.each([null, {}, { userAgent: 'native', codexHome: 'relative', platformFamily: 'unix', platformOs: 'linux' }])(
+		'does not acknowledge an invalid initialize response (%j)', async (result) => {
+			const { channel, wire } = await create({ FAKE_INIT: JSON.stringify(result) });
+			await expect(channel.start()).rejects.toThrow('CODEX_INITIALIZE_UNVERIFIED');
+			await expect(channel.request('thread/read', { threadId: 't' })).rejects.toThrow('CODEX_CHANNEL_CLOSED');
+			expect((await wire()).map((frame) => frame.method)).toEqual(['initialize']);
+		},
+	);
 	it('refuses a wrong CLI before starting app-server', async () => {
 		const { channel, wire } = await create({ FAKE_VERSION: 'codex-cli 0.142.4' });
 		await expect(channel.start()).rejects.toThrow('CODEX_VERSION_UNVERIFIED');

@@ -23,9 +23,10 @@ export function registerGatewayContext(api: OpenClawPluginApi): void {
   catch { healthy = false; }
   return healthy;
  };
- const deny = (runId: string, previous: Record<string, unknown>) => set(runId, {
-  schema: 1, stamp: text(previous.stamp) ? previous.stamp : stamp, state: 'deny', nativeRunId: runId,
+ const denial = (runId: string, previous?: Record<string, unknown>): PluginJsonValue => ({
+  schema: 1, stamp: text(previous?.stamp) ? previous.stamp : stamp, state: 'deny', nativeRunId: runId,
  });
+ const deny = (runId: string, previous: Record<string, unknown>) => set(runId, denial(runId, previous));
  api.on('before_prompt_build', async (_event, ctx) => {
   const runId = ctx?.runId;
   if (!healthy || !validOpenclawRunId(runId)) return;
@@ -45,7 +46,7 @@ export function registerGatewayContext(api: OpenClawPluginApi): void {
    const captured = previous ?? pending;
    const dir = resolveOpenclawRunBindDir();
    const binding = await waitForOpenclawRunBind(dir, runId);
-   if (!healthy || !same(get(runId), captured) || !binding) return;
+   if (!healthy || !same(get(runId), captured) || !binding || binding.observerStamp !== stamp) return;
    const owner: Owner = { nativeRunId: runId, runId: binding.runId, conversationId: binding.conversationId,
     generation: binding.generation, createdAt: binding.createdAt };
    if (previous?.owner && !same(previous.owner, owner)) { deny(runId, previous); return; }
@@ -54,10 +55,17 @@ export function registerGatewayContext(api: OpenClawPluginApi): void {
    set(runId, { ...pending, state: 'ready', owner });
   } catch { healthy = false; }
  });
- events.registerAgentEventSubscription({ id: 'aichat.gateway-context-terminal', streams: ['lifecycle'], handle: event => {
-  if (!validOpenclawRunId(event.runId) || !['end', 'error', 'aborted'].includes(String(event.data.phase))) return;
-  // First stack, before SDK terminal cleanup/awaits. Never clear and expose an old positive.
-  try { deny(event.runId, object(get(event.runId)) ?? {}); } catch { healthy = false; }
+ events.registerAgentEventSubscription({ id: 'aichat.gateway-context-terminal', streams: ['lifecycle'], handle: (event, ctx) => {
+  const { runId } = event, phase = String(event.data.phase);
+  if (!validOpenclawRunId(runId) || !['end', 'error', 'aborted'].includes(phase)) return;
+  // Deny synchronously: ordinary SDK writes can reject on a repeated closed-run event.
+  try {
+   const previous = get(runId), denied = denial(runId, object(previous));
+   if (ctx && phase !== 'aborted') ctx.setRunContext(NAMESPACE, denied);
+   else sdk.setRunContext({ runId, namespace: NAMESPACE, value: denied });
+   const current = get(runId);
+   if ((previous !== undefined || current !== undefined) && !same(current, denied)) healthy = false;
+  } catch { healthy = false; }
  } });
  registerMethod(METHOD, ({ params, respond }) => {
   try {

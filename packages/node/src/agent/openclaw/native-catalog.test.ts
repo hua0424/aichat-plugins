@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi, describe } from 'vitest';
 import type WebSocket from 'ws';
 import { OpenclawDriver } from './openclaw-driver.js';
-import { readOpenclawRunBindFile } from './run-bind.js';
+import { readOpenclawRunBindFile, writeOpenclawRunBindFile } from './run-bind.js';
 import { ConversationStore } from '../../capability/conversations.js';
 import { MessageHandler } from '../../handler/message.js';
 import type { HulaWSClient } from '../../server/hula-ws.js';
@@ -164,9 +164,21 @@ it('uses SDK runContext through one read method without metadata filesystem writ
  const receipt = await f.discover('sdk-catalog');
  expect(receipt.catalog!.discovery?.coverage).toBe('complete');
  expect(f.socket.sent.filter(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'observer')).toHaveLength(1);
- expect(f.socket.sent.some(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'context')).toBe(true);
+ const context = f.socket.sent.find(frame => frame.method === 'aichat.gatewayContext' && frame.params.kind === 'context');
+ expect(context?.params.stamp).toEqual(expect.any(String));
+ expect(f.originalBinding?.observerStamp).toBe(context?.params.stamp);
  expect(faults.metadataWrites).toBe(0);
  expect(await readOpenclawRunBindFile(f.bindDir, 'native-run-1')).toEqual(f.originalBinding);
+});
+
+it('refuses discovery if only the original binding stamp changes after the observer is ready', async () => {
+ const f = await fixture();
+ expect(f.observation()).toMatchObject({ state: 'ready' });
+ const binding = f.originalBinding;
+ if (!binding?.observerStamp) throw new Error('Expected the frozen observer stamp');
+ await writeOpenclawRunBindFile(f.bindDir, 'native-run-1', { ...binding, observerStamp: binding.observerStamp + '-other' });
+ expect((await f.discover('binding-stamp-changed')).catalog!.discovery?.coverage).toBe('unavailable');
+ expect(f.socket.sent.filter(frame => frame.method === 'commands.list')).toHaveLength(0);
 });
 
 it.each(['pending', 'missing', 'denied'] as const)('keeps ordinary independent of an observer %s result and never fills its old stamp', async observer => {
@@ -259,7 +271,26 @@ describe('catalog native boundaries', () => {
   const receipt = await f.discover('eligible');
   expect(receipt.catalog!.discovery?.coverage).toBe('complete'); expect(receipt.catalog!.capabilities.map(item => item.name)).toEqual(['usable']);
  });
- it('changes the version when native argument choices change', async () => {
+  it('omits explicit and implicit slash collisions without hiding unrelated skills', async () => {
+   const f = await fixture();
+   const longPluginName = 'x'.repeat(200);
+   f.socket.overrides.set('commands.list', { commands: [
+    { name: 'probe', description: '', source: 'skill', scope: 'both', textAliases: ['/probe', '/pick'], acceptsArgs: true },
+    { name: 'plugin-pick', description: '', source: 'plugin', scope: 'both', textAliases: ['/PiCk'], acceptsArgs: false },
+    { name: 'implicit', description: '', source: 'skill', scope: 'both', textAliases: ['/different'], acceptsArgs: false },
+    { name: 'ImPlIcIt', description: '', source: 'native', scope: 'both', textAliases: ['/native-alias'], acceptsArgs: false },
+    { name: longPluginName, description: '', source: 'plugin', scope: 'both', textAliases: [`/${longPluginName}`], acceptsArgs: false },
+    { name: 'other', description: '', source: 'skill', scope: 'both', textAliases: ['/other'], acceptsArgs: false },
+   ] });
+   const originalAgentSubmissions = f.socket.sent.filter(frame => frame.method === 'agent').length;
+   expect(originalAgentSubmissions).toBe(1);
+   const { catalog } = await f.discover('ambiguous-alias');
+   expect(catalog?.discovery?.coverage).toBe('complete');
+   expect(catalog?.capabilities.map(item => item.id)).toEqual(['skill:other']);
+   expect(f.socket.sent.filter(frame => frame.method === 'agent')).toHaveLength(originalAgentSubmissions);
+   expect(f.socket.sent.filter(frame => frame.method === 'chat.send')).toHaveLength(0);
+  });
+  it('changes the version when native argument choices change', async () => {
   const f = await fixture(); const first = await f.discover('before-args');
   f.socket.transform = (method, payload) => method === 'commands.list' ? { commands: [{ name: 'probe', description: 'Native eligible skill', source: 'skill', scope: 'text', textAliases: ['/probe'], acceptsArgs: true,
    args: [{ name: 'input', description: 'Literal input', type: 'string', choices: [{ value: 'literal', label: 'Literal' }] }] }] } : payload;

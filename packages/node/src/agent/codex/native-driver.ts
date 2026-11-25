@@ -42,7 +42,8 @@ export class CodexNativeDriver implements AgentDriver {
 	readonly type = 'codex';
 	readonly features = { cancel: 'best-effort', reset: 'supported', promptUpdate: 'new-session' } as const;
 	private readonly sessions = new Map<string, Promise<Session>>();
-	private discovery?: CodexAppServer;
+	// undefined: no live discovery channel; null: driver disconnected.
+	private discovery?: CodexAppServer | null;
 	constructor(private readonly deps: { command: string; env: NodeJS.ProcessEnv; model?: string;
 		createChannel?: (args: string[], env: NodeJS.ProcessEnv) => CodexAppServer;
 		createGrants?: () => Promise<CodexTurnGrants> }) {}
@@ -50,10 +51,16 @@ export class CodexNativeDriver implements AgentDriver {
 	private async snapshot(input: AgentCapabilityContext) {
 		if (!input.workspace) throw new Error('workspace_required');
 		input.signal.throwIfAborted();
-		this.discovery ??= this.deps.createChannel?.([], codexNativeEnv(this.deps.env)) ??
-			new CodexAppServer({ command: this.deps.command, env: codexNativeEnv(this.deps.env) });
-		await this.discovery.start();
-		return codexCatalog(this.discovery, input.workspace, input.signal);
+		if (this.discovery === null) throw new Error('CODEX_CHANNEL_CLOSED');
+		let channel = this.discovery;
+		if (!channel) {
+			const env = codexNativeEnv(this.deps.env);
+			channel = this.deps.createChannel?.([], env) ?? new CodexAppServer({ command: this.deps.command, env });
+			this.discovery = channel;
+			channel.onClose(() => { if (this.discovery === channel) this.discovery = undefined; });
+		}
+		await channel.start();
+		return codexCatalog(channel, input.workspace, input.signal);
 	}
 	async discoverCapabilities(input: AgentCapabilityContext): Promise<AgentCapabilityCatalog> {
 		const params = capabilityParameters('discover', input.capabilityId, input.parameters);
@@ -178,7 +185,9 @@ export class CodexNativeDriver implements AgentDriver {
 		}
 	}
 	async disconnect(): Promise<void> {
-		this.discovery?.close();
+		const discovery = this.discovery;
+		this.discovery = null;
+		discovery?.close();
 		await Promise.all([...this.sessions.values()].map(async (pending) => {
 			const session = await pending.catch(() => undefined);
 			if (session) await this.closeSession(session);
@@ -267,7 +276,7 @@ export class CodexNativeDriver implements AgentDriver {
 			input.conversation.assertCurrent();
 			const raw = await channel.request(scope.threadId ? 'thread/resume' : 'thread/start', {
 				...(scope.threadId ? { threadId: scope.threadId } : {}), cwd: input.workspace,
-				developerInstructions: scope.systemPrompt, approvalPolicy: 'never', sandbox: 'danger-full-access',
+				developerInstructions: scope.systemPrompt, approvalPolicy: 'never',
 				...((input.selectedModel?.modelID ?? this.deps.model) ? { model: input.selectedModel?.modelID ?? this.deps.model } : {}),
 			}, input.runId);
 			const response = object(raw), thread = object(response?.thread);
