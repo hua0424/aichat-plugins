@@ -109,6 +109,8 @@ export interface AgentCapabilityContext {
 	workspace?: string;
 	/** Core-derived default directory, not an owner-supplied host override. */
 	defaultWorkspace?: true;
+	/** Original authorization epoch from the authenticated command envelope. */
+	authorizationEpoch?: string;
 	signal: AbortSignal;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;

@@ -409,8 +409,9 @@ export class MessageHandler {
 			const assertCurrent = () => {
 				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
 				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-					(this.driver.type === 'cc' ? !this.ccCompactAdmissionMatches(request.roomId, epoch, request.context, connection) ||
-						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace
+					(this.driver.type === 'cc' ? !this.ccCommandAdmissionMatches(request.roomId, epoch, request.context, connection) ||
+						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
+						JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation)
 						: this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch) ||
 					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
 					throw new Error('discovery context changed');
@@ -421,7 +422,7 @@ export class MessageHandler {
 		} catch { return undefined; }
 	}
 
-	private ccCompactAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined): boolean {
+	private ccCommandAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined): boolean {
 		if (connection === undefined || this.ws.openConnectionAttempt !== connection) return false;
 		if (context.roomType === 2) {
 			// Owner DM admission comes from the authenticated IM envelope; IM truncates its epoch to 32 hex digits.
@@ -437,11 +438,11 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
-		const ccCompactAdmission = this.driver.type === 'cc' && request.capabilityId === 'session.compact'
+		const ccCommandAdmission = this.driver.type === 'cc' && (request.capabilityId === 'session.compact' || request.capabilityId?.startsWith('skill:'))
 			? { context: request.context, connection: this.ws.openConnectionAttempt } : undefined;
-		if (ccCompactAdmission) {
+		if (ccCommandAdmission) {
 			const current = store.get(this.selfUid, room);
-			if (!current || current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompactAdmission.context, ccCompactAdmission.connection) ||
+			if (!current || current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccCommandAdmission.context, ccCommandAdmission.connection) ||
 				(expectedGeneration !== undefined && Number(expectedGeneration) === 0)) {
 				return request.reconcileOnly ? { receipt: { status: 'unknown', error: 'authorization_changed' } }
 					: { receipt: { status: 'failed', error: 'authorization_changed' } };
@@ -511,22 +512,23 @@ export class MessageHandler {
 		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
 		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
 		return { execution: this.controlExecution({ requestId: request.requestId, roomId: room, authorizationEpoch: epoch,
-			capabilityId: request.capabilityId, ccCompactAdmission }, generation, systemPrompt,
+			capabilityId: request.capabilityId, ccCommandAdmission }, generation, systemPrompt,
 			(receipt) => { void this.apiClient?.reportAgentCommandResult({ ...receipt, requestId: request.requestId, roomId: room })
 				.catch(() => console.error('[command] control receipt publication failed; retained for explicit query')); }) };
 	}
 	private controlExecution(scope: { requestId: string; roomId: string; authorizationEpoch: string; capabilityId?: string;
-		ccCompactAdmission?: { context: AgentCommandRequest['context']; connection: number | undefined } }, generation: number, systemPrompt: string,
+		ccCommandAdmission?: { context: AgentCommandRequest['context']; connection: number | undefined } }, generation: number, systemPrompt: string,
 		report?: (receipt: AgentCapabilityResult) => void, owner?: { agent: () => AgentRun; abort: AbortController }): CapabilityExecution {
 		const store = this.getConversations(), room = scope.roomId, epoch = scope.authorizationEpoch, requestId = scope.requestId;
 		const record = store.assertGeneration(this.selfUid, room, generation), provider = this.driver.type;
-		const ccCompact = scope.ccCompactAdmission;
+		const ccAdmission = scope.ccCommandAdmission;
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
-			if (ccCompact && (current.state !== 'ready' || !this.ccCompactAdmissionMatches(room, epoch, ccCompact.context, ccCompact.connection) ||
-				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace))
-				throw new Error('Claude compact authorization changed');
+			if (ccAdmission && (current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccAdmission.context, ccAdmission.connection) ||
+				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
+				(scope.capabilityId?.startsWith('skill:') && JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation))))
+				throw new Error('Claude command authorization changed');
 			if ((owner || provider === 'openclaw') && (current.state !== 'ready' || this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch !== epoch))
 				throw new Error('native ordinary authorization changed');
 		};
@@ -545,10 +547,10 @@ export class MessageHandler {
 			},
 			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, requestId, value),
 			submitted: async (ref) => {
-				if (ccCompact) throw new Error('Claude compact requires the original reserved input');
+				if (ccAdmission) throw new Error('Scoped Claude commands cannot use generic native submission');
 				assertCurrent(); store.submitControl(this.selfUid, room, requestId, ref, provider === 'openclaw' && scope.capabilityId === 'session.reset');
 			},
-			...(ccCompact ? { reserveCcCompact: (sessionId: string, inputId: string) => {
+			...(ccAdmission && scope.capabilityId === 'session.compact' ? { reserveCcCompact: (sessionId: string, inputId: string) => {
 				assertCurrent();
 				store.submitCcCompact(this.selfUid, room, requestId, sessionId, inputId);
 				return (receipt?: AgentCapabilityResult) => store.releaseCcCompact(this.selfUid, room, requestId, inputId, receipt);

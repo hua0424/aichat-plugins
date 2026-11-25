@@ -74,7 +74,7 @@ export class AgentCommandHandler {
    if (request.reconcileOnly && (!mutation || !this.preparation)) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
   try {
    const workspace = this.workspaceBase ? deriveWorkspaceDir(this.workspaceBase, this.selfUid, { ...request.context, roomId: request.roomId }) : undefined;
-   const context: AgentCapabilityContext = { workspace, signal: abort.signal,
+   const context: AgentCapabilityContext = { workspace, signal: abort.signal, authorizationEpoch: request.context.authorizationEpoch,
     ...((workspace && !request.context.workspaceDir?.trim()) ? { defaultWorkspace: true } : {}) };
    if (mutation) {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
@@ -102,7 +102,7 @@ export class AgentCommandHandler {
     if (!this.driver.executeCapability) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
     let result: AgentCapabilityResult;
     try { result = await this.driver.executeCapability({ ...context, capabilityId: request.capabilityId!, parameters: request.parameters, catalogVersion: request.catalogVersion!, ...(execution ? { execution } : {}),
-						...(this.driver.type === 'cc' && request.capabilityId === 'model.list' && /^cc-models:[a-f0-9]{64}:[a-f0-9]{64}$/.test(request.catalogVersion ?? '')
+						...(this.driver.type === 'cc' && request.capabilityId === 'model.list' && /^cc-models:[a-f0-9]{64}:[a-f0-9]{64}(?::skills-[a-f0-9]{64})?$/.test(request.catalogVersion ?? '')
 							? { conversation: this.preparation?.conversation?.(request) } : {}) }); }
     catch { result = { status: mutation ? 'unknown' : 'failed', error: 'native_request_failed' }; }
     if (execution) {

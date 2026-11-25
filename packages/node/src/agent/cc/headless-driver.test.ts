@@ -68,12 +68,57 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 const posix = it;
 
 describe('CC native capability observation', () => {
+	posix('offers observed native skills for typed receipt after the ordinary child settles, without starting another turn', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		try {
+			const { done } = await f.start();
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'system', subtype: 'init', session_id: sessionId, cwd: f.dir, claude_code_version: '2.1.195',
+				slash_commands: ['ordinary', 'project:example'], skills: ['project:example'] });
+			f.line({ type: 'result', session_id: sessionId, is_error: false });
+			f.groupExit(); f.close(0);
+			await done;
+			const conversation = { ...f.input.conversation, get nativeState() {
+				return f.persisted.at(-1) as PreparedRun['conversation']['nativeState'];
+			} };
+			const emit = vi.fn<CapabilityExecution['emit']>().mockResolvedValue(undefined);
+			const execution = { requestId: 'skill', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+				authorizationEpoch: 'epoch', saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(), replaceSession: vi.fn(), emit, bindTurn: vi.fn() };
+			const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution }), conversation: () => conversation });
+			const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
+			const discovery = handler.handle({ ...scope, requestId: 'discover-skill', operation: 'discover' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(2));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[1]).request_id, subtype: 'success',
+				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
+			f.close(0);
+			const catalog = (await discovery)?.catalog;
+			expect(catalog?.capabilities).toEqual([
+				expect.objectContaining({ id: 'model.list' }),
+				expect.objectContaining({ id: 'skill:project:example', source: 'skill', kind: 'skill', supported: true,
+					executable: false, reason: 'submission_only', defaultVisibility: 'public' }),
+			]);
+			const invoke = { ...scope, requestId: 'skill', operation: 'invoke', capabilityId: 'skill:project:example',
+				catalogVersion: catalog!.version, parameters: { arguments: '  original\narguments  ' } };
+			const result = await handler.handle(invoke);
+			expect(result).toEqual({ requestId: 'skill', roomId: 'room', status: 'noop', phase: 'outcome', text: '插件已收到技能指令，未执行。' });
+			expect(emit.mock.calls).toEqual([[{ type: 'receipt', receipt: { status: 'noop', phase: 'outcome', text: '插件已收到技能指令，未执行。' } }]]);
+			expect(await handler.handle({ ...invoke, requestId: 'unknown-skill', capabilityId: 'skill:ordinary' })).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(await handler.handle({ ...invoke, requestId: 'wrong-version', catalogVersion: 'cc-models:previous' })).toMatchObject({ status: 'failed', error: 'catalog_stale' });
+			expect(execution.bindTurn).not.toHaveBeenCalled();
+			expect(execution.submitted).not.toHaveBeenCalled();
+			expect(f.spawnCalls).toHaveLength(2);
+			expect(f.writes).toHaveLength(2);
+		} finally { prepareNative.mockRestore(); }
+	});
 	posix('executes the discovered compact once with the original idle session and returns its verified effect', async () => {
 		const f = fixture();
 		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
 		const controlId = 'a2a059dd-ef7a-4120-864b-a3d7f3d99aa4';
 		const summaryId = '4ec5d7fe-0a1b-4260-9f6e-d02054d84698';
-		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir } } };
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir,
+			skillObservation: { runtimeVersion: '2.1.195', names: ['project:example'] } } } };
 		const path = join(f.dir, `${sessionId}.jsonl`), originalBytes = Buffer.from('original\n');
 		writeFileSync(path, originalBytes);
 		const handles: Awaited<ReturnType<typeof open>>[] = [];
@@ -100,7 +145,7 @@ describe('CC native capability observation', () => {
 		const execute = { requestId: 'compact', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
 			authorizationEpoch: 'epoch', reserveCcCompact: reserve, saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(),
 			replaceSession: vi.fn(), emit: vi.fn<CapabilityExecution['emit']>().mockResolvedValue(undefined), bindTurn: vi.fn() };
-		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir } };
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
 		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution: execute }), conversation: () => conversation });
 		try {
 			async function nativeInventory(index: number, value = 'native') {
@@ -114,6 +159,7 @@ describe('CC native capability observation', () => {
 			await nativeInventory(0);
 			const catalog = (await discovery)?.catalog;
 			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'session.compact', executable: true }));
+			expect(catalog?.capabilities).toContainEqual(expect.objectContaining({ id: 'skill:project:example', executable: false }));
 			const invoke = { ...scope, requestId: 'compact', operation: 'invoke', capabilityId: 'session.compact', catalogVersion: catalog!.version };
 			const list = handler.handle({ ...invoke, requestId: 'list', capabilityId: 'model.list' });
 			await nativeInventory(1);
