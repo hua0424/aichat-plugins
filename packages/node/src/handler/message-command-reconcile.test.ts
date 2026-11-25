@@ -154,17 +154,20 @@ describe('command reconcile evidence', () => {
 		const { handler, posted } = setup(store, execute, home, 'cc', false);
 		await handler.prewarmGroupConfigs();
 		const data = request('uncertain-compact', { capabilityId: 'session.compact', context: {
-			roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'a'.repeat(64),
+			roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'f287c6e86faa447e0e0e51c09a54638a',
 		} });
 		handler.handle({ type: 'agentCommand', data: { ...data, requestId: 'nonowner-compact', context: { ...data.context, isOwner: false } } });
 		await waitForReports(posted, 1);
 		expect(posted[0]).toMatchObject({ requestId: 'nonowner-compact', status: 'failed', error: 'authorization_changed' });
+		handler.handle({ type: 'agentCommand', data: { ...data, requestId: 'wrong-epoch-format', context: { ...data.context, authorizationEpoch: 'a'.repeat(64) } } });
+		await waitForReports(posted, 2);
+		expect(posted[1]).toMatchObject({ requestId: 'wrong-epoch-format', status: 'failed', error: 'authorization_changed' });
 		expect(execute).not.toHaveBeenCalled();
 		handler.handle({ type: 'agentCommand', data });
-		await waitForReports(posted, 2);
+		await waitForReports(posted, 3);
 		expect(execute).toHaveBeenCalledOnce();
 		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
-		await waitForReports(posted, 3);
+		await waitForReports(posted, 4);
 		expect(execute).toHaveBeenCalledTimes(2);
 		expect(execute.mock.calls[1][0]).toMatchObject({ recovery: { generation: 1, nativeRef: { sessionId }, ccCompactInputId: inputId } });
 		expect(execute.mock.calls[1][0].execution).toBeUndefined();

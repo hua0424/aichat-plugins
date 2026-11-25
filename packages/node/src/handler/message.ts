@@ -424,8 +424,8 @@ export class MessageHandler {
 	private ccCompactAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined): boolean {
 		if (connection === undefined || this.ws.openConnectionAttempt !== connection) return false;
 		if (context.roomType === 2) {
-			// Owner DM has no group-config row. Its authenticated IM command envelope is the admission source.
-			return context.isOwner === true && /^[a-f0-9]{64}$/.test(epoch);
+			// Owner DM admission comes from the authenticated IM envelope; IM truncates its epoch to 32 hex digits.
+			return context.isOwner === true && /^[a-f0-9]{32}$/.test(epoch);
 		}
 		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
 	}
