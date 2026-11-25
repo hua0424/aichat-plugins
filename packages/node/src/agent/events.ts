@@ -43,6 +43,8 @@ export interface PreparedRun {
 	runId: string;
 	message: string;
 	workspace?: string;
+	/** Group authorization epoch captured by core when this ordinary input arrived; absent in DMs. */
+	authorizationEpoch?: string;
 	/** Opaque core capability key, never inferred from a native session or server DTO. */
 	contextKey?: string;
 	/** Core-validated identity owning a shared native prompt scope; never parsed from a native key. */
@@ -98,10 +100,19 @@ export interface AgentCapabilityCatalog {
 	runtimeVersion: string;
 	capabilities: AgentCapability[];
 	models?: { items: { providerId: string; modelId: string; label: string; connected: boolean }[]; total: number; offset: number; nextOffset?: number };
+	discovery?: { source: 'native'; coverage: 'partial' | 'unavailable'; reason?: 'context_unavailable' };
 }
 export interface AgentCapabilityContext {
+	/** Read-only core snapshot; absence never authorizes guessing from a workspace. */
+	conversation?: Pick<BoundConversation, 'id' | 'generation' | 'assertCurrent' | 'nativeState'>;
 	/** Prepared by core from trusted room context, never supplied directly by the UI. */
 	workspace?: string;
+	/** Core-derived directory, not an owner-supplied override. */
+	defaultWorkspace?: true;
+	/** From the authenticated IM envelope. */
+	roomType?: 1 | 2;
+	isOwner?: boolean;
+	authorizationEpoch?: string;
 	signal: AbortSignal;
 	capabilityId?: string;
 	parameters?: Record<string, unknown>;
@@ -112,7 +123,9 @@ export interface AgentCapabilityInvocation extends AgentCapabilityContext {
 	catalogVersion: string;
 	execution?: CapabilityExecution;
 	/** Core journal only. Presence selects read-only reconciliation; never a submission fallback. */
-	recovery?: { generation: number; nativeRef?: NativeRef; receipt: AgentCapabilityResult; value?: { version: number; value: unknown } };
+	recovery?: { generation: number; nativeRef?: NativeRef; receipt: AgentCapabilityResult; value?: { version: number; value: unknown };
+		/** Private original input locator, never included in the public receipt. */
+		ccCompactInputId?: string };
 }
 export interface NativeRef { sessionId: string; inputId?: string; messageId?: string; parentId?: string; turnId?: string }
 export type CapabilityEffect =
@@ -143,12 +156,17 @@ export interface CapabilityExecution {
 	saveRecovery(value: { version: number; value: unknown }): Promise<void>;
 	/** Persist native locator BEFORE the native mutation. */
 	submitted(ref?: NativeRef): Promise<void>;
+	/** Holds the original Claude control slot. Release only after proven containment or before launch. */
+	reserveCcCompact?(sessionId: string, inputId: string): (receipt?: AgentCapabilityResult) => void;
 	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
 	replaceSession(id: string, state: { version: number; value: unknown }): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;
 	/** Returned only after the exact native unit's START receipt confirms its thinking target. */
 	bindTurn(turn: NativeTurnEvent): Promise<{ token: string; runId: string; thinkingId: string }>;
 }
+
+/** Disconnect could not confirm that driver-owned processes or shared writes have stopped. */
+export class DriverDisconnectIncompleteError extends Error {}
 
 /** Native per-run adapter; only core-owned binding handles may route capabilities. */
 export interface AgentDriver {

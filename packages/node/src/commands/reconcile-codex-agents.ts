@@ -76,7 +76,7 @@ export async function reconcileCodexAgents(args: string[], options: {
 		conflict('owner-approved original file or block hash differs');
 	const nextText = originalText.slice(0, begin) + (prompt === undefined ? '' : renderSystemBlock(prompt)) + originalText.slice(through);
 	const next = Buffer.from(nextText, 'utf8');
-	await withOfflineConversationStore(options, async (store) => {
+	await withOfflineConversationStore(options, async (store, assertCurrent) => {
 		const record = store.get(uid, room);
 		if (!record || record.adapterInstanceId !== 'codex' || record.generation !== generation || record.pendingRuns?.length ||
 			(record.state !== 'ready' && record.state !== 'suspended')) conflict('Codex owner binding changed or has pending work');
@@ -110,6 +110,7 @@ export async function reconcileCodexAgents(args: string[], options: {
 			const now = lstatSync(file);
 			if (!now.isFile() || now.isSymbolicLink() || now.dev !== identity.dev || now.ino !== identity.ino ||
 				sha(readFileSync(file)) !== sha(original) || realpathSync(dirname(file)) !== parent) conflict('file changed after backup; no replacement performed');
+			assertCurrent();
 			renameSync(temp, file);
 		} finally { if (existsSync(temp)) unlinkSync(temp); }
 		console.log(`Codex AGENTS.md managed block reconciled; backup SHA-256 ${sha(original)}; result SHA-256 ${sha(next)}; approval artifact SHA-256 ${sha(bytes)}. Owner identity and block provenance were operator-verified, not authenticated by CLI.`);

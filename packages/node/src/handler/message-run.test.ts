@@ -241,10 +241,10 @@ describe('persisted MessageHandler run', () => {
 			kill: (_pid, signal) => { if (signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
 			firstEventTimeoutMs: 1000, drainMs: 5, killGraceMs: 20,
 		});
-		const sent: number[] = [];
+		const sent: Array<{ type: number; data: Record<string, unknown> }> = [];
 		let runId: string | undefined;
 		const ws = { isConnected: true, send: (type: number, data: Record<string, unknown>) => {
-			sent.push(type);
+			sent.push({ type, data });
 			if (type === WSReqType.THINKING_START) runId = data.clientRunId as string;
 		} } as HulaWSClient;
 		const handler = new MessageHandler(ws, driver, '42', undefined, { waitMs: 1, maxWaitMs: 1 }, () => {}, () => store, home);
@@ -259,11 +259,12 @@ describe('persisted MessageHandler run', () => {
 		expect(argv.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
 		expect(argv[argv.indexOf('--append-system-prompt') + 1].match(/identity:42/g)).toHaveLength(1);
 		expect(store.pendingRuns()).toHaveLength(1);
-		stdoutData.forEach((data) => data('{"type":"result","is_error":false}\n'));
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+		stdoutData.forEach(data => data(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: sessionId })}\n${JSON.stringify({ type: 'result', session_id: sessionId, is_error: false })}\n`));
 		childClose.forEach((close) => close(0, null));
-		for (let i = 0; i < 30 && store.pendingRuns().length; i++) await tick();
+		await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({ type: WSReqType.THINKING_END, data: expect.objectContaining({ status: 'complete' }) })));
 		expect(store.pendingRuns()).toHaveLength(0);
-		expect(sent).toContain(WSReqType.THINKING_END);
+		expect(store.get('42', '9')?.nativeState.cc?.sessionId).toBe(sessionId);
 		handler.destroy();
 		store.close();
 	});

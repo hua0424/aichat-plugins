@@ -1,4 +1,4 @@
-import type { AgentDriver, AgentCapabilityResult, CapabilityExecution } from '../agent/events.js';
+import type { AgentDriver, AgentCapabilityResult, CapabilityExecution, AgentCapabilityContext } from '../agent/events.js';
 import { capabilityParameters, isMutation } from '../agent/capability-parameters.js';
 import { deriveWorkspaceDir } from '../agent/workspace.js';
 import type { AgentCommandRequest, AgentCommandResponse } from '../stream/protocol.js';
@@ -6,13 +6,14 @@ import type { AgentCommandRequest, AgentCommandResponse } from '../stream/protoc
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 const id = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 256 && !/[\x00-\x1f\x7f]/.test(v);
 export interface CommandPreparation {
+ conversation?(request: AgentCommandRequest): AgentCapabilityContext['conversation'];
 	/** Trusted local native generation snapshot for the approval fence probe; 0 means the conversation has no native record yet. */
 	generation?(request: AgentCommandRequest): number;
- prepare(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }>;
+ prepare(request: AgentCommandRequest, workspace?: string, matchingInvocationPending?: true): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult } | undefined>;
 }
 /** Independent native command lane; never acquires the ordinary chat queue/slot. */
 export class AgentCommandHandler {
- private readonly requests = new Map<string, { fingerprint: string; result: Promise<AgentCommandResponse>; done: boolean }>();
+ private readonly requests = new Map<string, { fingerprint: string; result: Promise<AgentCommandResponse | undefined>; done: boolean }>();
  constructor(private readonly driver: AgentDriver, private readonly selfUid: string, private readonly workspaceBase?: string,
   private readonly preparation?: CommandPreparation) {}
  async handle(raw: unknown): Promise<AgentCommandResponse | undefined> {
@@ -43,9 +44,12 @@ export class AgentCommandHandler {
   catch { return fail('invalid_request'); }
   const fingerprint = JSON.stringify([request.roomId, request.operation, request.capabilityId, request.catalogVersion,
    request.parameters, ctx.roomType, ctx.counterpartUid, ctx.isOwner, ctx.workspaceDir, ctx.account, ctx.authorizationEpoch, ctx.expectedGeneration]);
-  // An internal evidence query must bypass an in-flight invocation promise/cache.
-   if (request.reconcileOnly) return this.execute(request);
-   const prior = this.requests.get(request.requestId);
+  const prior = this.requests.get(request.requestId);
+  // IM already returns its last receipt to GET; a matching pending invocation owns its result.
+  if (request.reconcileOnly) {
+   const matching = prior?.fingerprint === fingerprint && !prior.done;
+   return this.execute(request, matching ? true : undefined);
+  }
   if (prior) {
    if (prior.fingerprint !== fingerprint) return fail('request_id_conflict');
    // A completed watchdog promise may precede a persisted reconciliation. Re-read the same journal, never resubmit.
@@ -61,7 +65,7 @@ export class AgentCommandHandler {
   void entry.result.finally(() => { entry.done = true; });
   return entry.result;
  }
- private async execute(request: AgentCommandRequest): Promise<AgentCommandResponse> {
+ private async execute(request: AgentCommandRequest, matchingInvocationPending?: true): Promise<AgentCommandResponse | undefined> {
   const correlation = { requestId: request.requestId, roomId: request.roomId };
   const abort = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -70,10 +74,16 @@ export class AgentCommandHandler {
    if (request.reconcileOnly && (!mutation || !this.preparation)) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
   try {
    const workspace = this.workspaceBase ? deriveWorkspaceDir(this.workspaceBase, this.selfUid, { ...request.context, roomId: request.roomId }) : undefined;
-   const context = { workspace, signal: abort.signal };
+   const { roomType, isOwner, authorizationEpoch } = request.context;
+   const context: AgentCapabilityContext = { workspace, signal: abort.signal, ...(this.driver.type === 'cc' ? {
+    roomType, isOwner, authorizationEpoch, ...(workspace && !request.context.workspaceDir?.trim() ? { defaultWorkspace: true } : {}),
+   } : {}) };
    if (mutation) {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
-    const prepared = await this.preparation.prepare(request, workspace);
+    const prepared = matchingInvocationPending
+      ? await this.preparation.prepare(request, workspace, true)
+      : await this.preparation.prepare(request, workspace);
+     if (!prepared) return undefined;
     if ('receipt' in prepared) return { ...prepared.receipt, ...correlation };
      if (request.reconcileOnly) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
     execution = { ...prepared.execution, emit: async (event) => {
@@ -89,11 +99,16 @@ export class AgentCommandHandler {
     if (request.operation === 'discover') {
      if (!this.driver.discoverCapabilities) return { ...correlation, status: 'unsupported', error: 'discovery_not_supported' };
      return { ...correlation, status: 'completed', catalog: await this.driver.discoverCapabilities({ ...context,
+      ...(this.preparation?.conversation ? { conversation: this.preparation.conversation(request) } : {}),
       ...(request.capabilityId ? { capabilityId: request.capabilityId, parameters: request.parameters } : {}) }) };
     }
     if (!this.driver.executeCapability) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };
     let result: AgentCapabilityResult;
-    try { result = await this.driver.executeCapability({ ...context, capabilityId: request.capabilityId!, parameters: request.parameters, catalogVersion: request.catalogVersion!, ...(execution ? { execution } : {}) }); }
+    const ccScopedList = this.driver.type === 'cc' && request.capabilityId === 'model.list' &&
+     /^cc-models:[a-f0-9]{64}:[a-f0-9]{64}(?::skills-[a-f0-9]{64})?$/.test(request.catalogVersion ?? '');
+    try { result = await this.driver.executeCapability({ ...context, capabilityId: request.capabilityId!, parameters: request.parameters,
+     catalogVersion: request.catalogVersion!, ...(execution ? { execution } : {}),
+     ...(ccScopedList ? { conversation: this.preparation?.conversation?.(request) } : {}) }); }
     catch { result = { status: mutation ? 'unknown' : 'failed', error: 'native_request_failed' }; }
     if (execution) {
      result = { ...result, phase: 'outcome', ...(timedOut && ['completed', 'failed', 'noop'].includes(result.status) ? { reconciled: true } : {}) };

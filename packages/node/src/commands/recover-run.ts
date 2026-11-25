@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, lstatSync, openSync, readFileSync, un
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { ConversationStore } from '../capability/conversations.js';
-import { capabilitySocketPath } from '../capability/endpoint.js';
+import { assertNoCcWriterHold, capabilitySocketPath } from '../capability/endpoint.js';
 import { AICHAT_HOME, getServerUrl, loadConfig } from '../config.js';
 import { restBaseUrlFromWsUrl } from '../api/hula-api.js';
 
@@ -27,39 +27,52 @@ export async function recoverRun(args: string[], options: { home: string; server
 	if (args.length !== 2 || args[0]?.startsWith('-') || !args[0]?.trim() || args[1] !== '--verified-stopped')
 		throw new Error('usage: aichat recover-run <runId> --verified-stopped (manually verify the upstream run has stopped first)');
 	const runId = args[0];
-	await withOfflineConversationStore(options, async (store) => {
+	await withOfflineConversationStore(options, async (store, assertCurrent) => {
 		const pending = store.pendingRuns().find((run) => run.runId === runId);
 		if (!pending) throw new Error(`runId ${runId} is not pending`);
 		await assertNoListener(options.socketPath);
+		assertCurrent();
 		store.confirmStopped(runId);
 		console.log(`Confirmed stopped run ${runId} (conversation ${pending.conversationId}, identity ${pending.identityId}, room ${pending.roomId}). Other pending runs remain blocked.`);
 	});
 }
 
-/** Exclusive offline writer; checks the endpoint both before loading and immediately before mutation. */
+/** Exclusive offline writer. Callers must recheck assertCurrent after any await before mutating. */
 export async function withOfflineConversationStore<T>(options: { home: string; serverNamespace: string; socketPath: string },
-	operation: (store: ConversationStore) => Promise<T>): Promise<T> {
+	operation: (store: ConversationStore, assertCurrent: () => void) => Promise<T>): Promise<T> {
 	const statePath = join(options.home, 'conversations.json');
 	if (!existsSync(statePath)) throw new Error('no existing conversation state; refusing to create recovery state');
+	assertNoCcWriterHold(options.home);
 	const lockPath = join(options.home, 'conversation-writer.lock');
 	const token = `${process.pid}:${randomUUID()}`;
 	// ponytail: never reclaim a stale lock here; owner must investigate/remove it offline before retrying.
 	const fd = openSync(lockPath, 'wx', 0o600);
-	const owned = fstatSync(fd);
+	let owned;
 	try {
-		try { writeSync(fd, token); } finally { closeSync(fd); }
+		owned = fstatSync(fd, { bigint: true });
+		writeSync(fd, token);
+	} finally { closeSync(fd); }
+	const ownsLease = () => {
+		const current = lstatSync(lockPath, { bigint: true, throwIfNoEntry: false });
+		return !!current?.isFile() && current.dev === owned.dev && current.ino === owned.ino && readFileSync(lockPath, 'utf8') === token;
+	};
+	const assertCurrent = () => {
+		assertNoCcWriterHold(options.home);
+		if (!ownsLease()) throw new Error('offline writer lease changed; refusing to modify conversation state');
+	};
+	try {
+		assertCurrent();
 		await assertNoListener(options.socketPath);
+		assertCurrent(); // Constructing the store can itself persist recovery state.
 		const store = new ConversationStore({ home: options.home, serverNamespace: options.serverNamespace, activeUids: new Set() });
 		try {
 			await assertNoListener(options.socketPath);
-			return await operation(store);
+			assertCurrent();
+			return await operation(store, assertCurrent);
 		} finally { store.close(); }
 	} finally {
-		try { closeSync(fd); } catch { /* already closed */ }
-		try {
-			const current = lstatSync(lockPath);
-			if (current.dev === owned.dev && current.ino === owned.ino && readFileSync(lockPath, 'utf8') === token) unlinkSync(lockPath);
-		} catch { /* never remove another writer's lock */ }
+		try { if (ownsLease()) unlinkSync(lockPath); }
+		catch { /* never remove another writer's lock */ }
 	}
 }
 

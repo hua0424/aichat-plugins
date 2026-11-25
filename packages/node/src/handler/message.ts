@@ -21,7 +21,7 @@ import type { AgentCommandRequest } from '../stream/protocol.js';
 import type { CapabilityExecution, AgentCapabilityResult, NativeTurnEvent, NativeRef } from '../agent/events.js';
 import type { CapabilityRegistry } from '../capability/registry.js';
 import type { AgentRun, PreparedRun } from '../agent/events.js';
-import { suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
+import { hasUnconfirmedCcCompact, suspensionReason, type ConversationStore, type SuspensionReason } from '../capability/conversations.js';
 
 /**
  * REQ-004 S4: THINKING_END content 帧安全上限（字节）。
@@ -358,8 +358,9 @@ export class MessageHandler {
 		this.ws = ws;
 		this.driver = driver;
 		this.agentCommands = new AgentCommandHandler(driver, selfUid, workspaceBase, {
-			prepare: (request, workspace) => this.prepareCommand(request, workspace),
+			prepare: (request, workspace, matchingInvocationPending) => this.prepareCommand(request, workspace, matchingInvocationPending),
 			generation: (request) => this.snapshotGeneration(request),
+			...(driver.type === 'cc' ? { conversation: (request: AgentCommandRequest) => this.discoveryConversation(request) } : {}),
 		});
 		this.selfUid = selfUid;
 		this.antiLoopGuard = new AntiLoopGuard();
@@ -397,13 +398,57 @@ export class MessageHandler {
 		return this.getConversations().get(this.selfUid, request.roomId)?.generation ?? 0;
 	}
 
-	private async prepareCommand(request: AgentCommandRequest, workspace?: string): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult }> {
+	private discoveryConversation(request: AgentCommandRequest) {
+		const epoch = request.context.authorizationEpoch;
+		if (!epoch) return undefined;
+		try {
+			const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
+			if (!record || record.adapterInstanceId !== this.driver.type) return undefined;
+			const connection = this.ws.openConnectionAttempt;
+			// The scoped model.list invoke reuses the owner-only compact profile.
+			const ownerOnly = request.operation === 'invoke';
+			const readCurrent = () => {
+				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
+				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
+					!this.ccCommandAdmissionMatches(request.roomId, epoch, request.context, connection, ownerOnly) ||
+					current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
+					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
+					throw new Error('discovery context changed');
+				return current.nativeState.cc;
+			};
+			readCurrent();
+			const conversation = { id: record.conversationId, generation: record.generation, assertCurrent: () => { readCurrent(); } };
+			return { ...conversation, get nativeState() {
+				const state = readCurrent();
+				return state ? { version: 1, value: state } : undefined;
+			} };
+		} catch { return undefined; }
+	}
+
+	private ccCommandAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined, ownerOnly: boolean): boolean {
+		if (connection === undefined || this.ws.openConnectionAttempt !== connection) return false;
+		if (context.roomType === 2) {
+			// The authenticated IM envelope authorizes the DM participant and carries a 32-hex epoch.
+			return typeof context.isOwner === 'boolean' && (!ownerOnly || context.isOwner) && /^[a-f0-9]{32}$/.test(epoch);
+		}
+		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
+	}
+
+	private async prepareCommand(request: AgentCommandRequest, workspace?: string, matchingInvocationPending?: true): Promise<{ execution: CapabilityExecution } | { receipt: AgentCapabilityResult } | undefined> {
 		if (!workspace || !request.context.authorizationEpoch) {
 			if (request.reconcileOnly) return { receipt: { status: 'unknown', error: 'native_request_failed' } };
 			throw new Error('trusted execution context required');
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
+		const ccCompact = this.driver.type === 'cc' && request.capabilityId === 'session.compact';
+		const ccSkill = this.driver.type === 'cc' && request.capabilityId?.startsWith('skill:');
+		const ccScoped = ccCompact || ccSkill;
+		const connection = ccScoped ? this.ws.openConnectionAttempt : undefined;
+		if (ccScoped && (store.get(this.selfUid, room)?.state !== 'ready' || Number(expectedGeneration) === 0 ||
+			!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccCompact))) {
+			return { receipt: { status: request.reconcileOnly ? 'unknown' : 'failed', error: 'authorization_changed' } };
+		}
 		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
 		// A reconcileOnly query that hits this request's own terminal journal is read-only evidence,
 		// not a new execution: a pure session reset may advance the native generation legitimately.
@@ -433,6 +478,7 @@ export class MessageHandler {
 				return { receipt: { status: 'failed', error: 'authorization_changed' } };
 			}
 		}
+		if (request.reconcileOnly && matchingInvocationPending && !terminalReplay) return undefined;
 		const prepared = store.prepareControl(this.selfUid, room, request.requestId, fingerprint, epoch);
 		if (!prepared.fresh) {
 			const entry = prepared.entry;
@@ -447,16 +493,30 @@ export class MessageHandler {
 			if (!['accepted', 'unknown'].includes(replay.status) || !this.driver.executeCapability) {
 				this.settleRecoveredControl(request, replay, entry.generation); return { receipt: replay };
 			}
+			if (entry.ccCompactInputId) {
+				const current = store.get(this.selfUid, room);
+				if (!current || current.generation !== entry.generation || current.nativeState.cc?.sessionId !== entry.nativeRef?.sessionId)
+					return { receipt: { status: 'unknown', phase: 'outcome', error: 'authorization_changed', generation: String(entry.generation), nativeRef: entry.nativeRef } };
+			}
 			// Journal identity was checked above. This branch has no execution/mutation handles.
 			const recovered = await this.driver.executeCapability({ workspace, signal: AbortSignal.timeout(10_000), capabilityId: request.capabilityId!,
 				catalogVersion: request.catalogVersion!, parameters: request.parameters,
-				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt } });
+				...(ccScoped ? { roomType: request.context.roomType, isOwner: request.context.isOwner } : {}),
+				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt,
+					...(entry.ccCompactInputId ? { ccCompactInputId: entry.ccCompactInputId } : {}) } });
 			const persisted = store.recordControl(this.selfUid, room, request.requestId, recovered);
 			this.settleRecoveredControl(request, persisted, entry.generation);
 			return { receipt: persisted };
 		}
 		const record = store.assertGeneration(this.selfUid, room, prepared.entry.generation), generation = record.generation;
-		const assertCurrent = () => { store.assertGeneration(this.selfUid, room, generation); };
+		const assertCurrent = () => {
+			const current = store.assertGeneration(this.selfUid, room, generation);
+			if (ccScoped && (current.conversationId !== record.conversationId || current.state !== 'ready' ||
+				!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccCompact) ||
+				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
+				(ccSkill && JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation))))
+				throw new Error('Claude command authorization changed');
+		};
 		const systemPrompt = this.templates ? buildSystemPrompt(this.templates, { displayName: await this.resolveSelfName(), uid: this.selfUid, persona: this.persona }) : '';
 		const execution: CapabilityExecution = {
 			requestId: request.requestId, systemPrompt, contextKey: record.contextKey, promptOwner: this.selfUid, authorizationEpoch: epoch,
@@ -469,7 +529,15 @@ export class MessageHandler {
 				registerNative: async (id, state) => { assertCurrent(); store.registerNative(this.driver.type, id, this.selfUid, room, state.value as Record<string, unknown>); },
 			},
 			saveRecovery: async (value) => store.saveControlRecovery(this.selfUid, room, request.requestId, value),
-			submitted: async (ref) => { assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref); },
+			submitted: async (ref) => {
+				if (ccScoped) throw new Error('Scoped Claude commands cannot use generic native submission');
+				assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref);
+			},
+			...(ccCompact ? { reserveCcCompact: (sessionId: string, inputId: string) => {
+				assertCurrent();
+				store.submitCcCompact(this.selfUid, room, request.requestId, sessionId, inputId);
+				return (receipt?: AgentCapabilityResult) => store.releaseCcCompact(this.selfUid, room, request.requestId, inputId, receipt);
+			} } : {}),
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state) => {
 				const next = store.replaceNativeSession(this.selfUid, room, generation, this.driver.type, id, state.value as Record<string, unknown>);
@@ -785,6 +853,8 @@ export class MessageHandler {
 	handle(msg: WSResponse): void {
 		switch (msg.type) {
 			case 'agentCommand':
+				// A frame delivered after close must not start even an unscoped CC inventory child.
+				if (this.driver.type === 'cc' && this.ws.openConnectionAttempt === undefined) break;
 				if (this.apiClient) void this.agentCommands.handle(msg.data).then(async (result) => {
 					if (result) await this.apiClient!.reportAgentCommandResult(result);
 				}).catch(() => console.warn('[handler] agent command result callback unconfirmed'));
@@ -918,6 +988,8 @@ export class MessageHandler {
 			return;
 		}
 
+		if (this.rejectDuringCcCompact(roomId, channel)) return;
+
 		// 缓存消息上下文（按房间隔离）。REQ-008 #77: roomType 透传给 driver 的 chatContext，
 		// 缺省/未知 roomType 与上方 @ 闸门一致按群聊（1）保守处理。
 		// isOwner 取自 inbound 的 message.aiclaw.isOwner（仅私聊推送带 aiclaw ext；群聊缺省 false）。
@@ -978,6 +1050,11 @@ export class MessageHandler {
 			return;
 		}
 
+		if (this.rejectDuringCcCompact(roomId, channel)) {
+			channel.batchSawHuman = false;
+			channel.batchAiFromUid = '';
+			return;
+		}
 		const { msgId, roomType, fromUid, isOwner, authorizationEpoch } = channel.lastCtx;
 		const sessionKey = bindingKey(this.selfUid, roomId);
 		if (!this.runReady(roomId)) {
@@ -1113,6 +1190,7 @@ export class MessageHandler {
 				const abort = new AbortController();
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
+					...(this.driver.type === 'cc' && roomType !== 2 && authorizationEpoch !== undefined ? { authorizationEpoch } : {}),
 					contextKey: bound.contextKey, promptOwner: this.selfUid,
 					bindToken: this.driver.type === 'cc' ? store.mintToken(this.selfUid, roomId) : undefined,
 					// #404: frozen per-run binding; fixed to one thinkingId by the exact START
@@ -1721,6 +1799,18 @@ export class MessageHandler {
 	}
 
 	/** #343: 发送带 autoReply 标记的系统通告（不会触发 AI 回环）。 */
+	private rejectDuringCcCompact(roomId: string, channel: RoomChannel): boolean {
+		if (this.driver.type !== 'cc') return false;
+		const record = this.getConversations().get(this.selfUid, roomId);
+		if (!record || !hasUnconfirmedCcCompact(record)) return false;
+		// Rejected input is never queued or replayed after the compact closes.
+		if (channel.suspendNoticeKey !== 'cc-compact-unconfirmed') {
+			channel.suspendNoticeKey = 'cc-compact-unconfirmed';
+			this.sendNotice(roomId, 'Claude 原生压缩尚未确认收口，本条消息未执行，也不会自动重试。');
+		}
+		return true;
+	}
+
 	private sendNotice(roomId: string, text: string): void {
 		if (!this.apiClient) {
 			console.warn('[anti-loop] autoReply skipped: no internal API client available');

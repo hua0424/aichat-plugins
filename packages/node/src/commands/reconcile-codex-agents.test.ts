@@ -90,6 +90,20 @@ it('rejects a second room of the same identity sharing the approved directory', 
 	expect(readFileSync(f.file, 'utf8')).toBe(f.original);
 });
 
+it('refuses the final replacement after its offline lease is lost to a CC writer', async () => {
+	const f = fixture();
+	const lease = join(f.home, 'conversation-writer.lock');
+	const marker = join(f.home, 'cc-writer-armed.lock');
+	await expect(reconcileCodexAgents(f.args, { ...f.opts, beforeCommit: () => {
+		rmSync(lease);
+		writeFileSync(lease, 'replacement-writer');
+		writeFileSync(marker, 'replacement CC writer');
+	} })).rejects.toThrow('CC cleanup unconfirmed; writer locked');
+	expect(readFileSync(f.file, 'utf8')).toBe(f.original);
+	expect(readFileSync(lease, 'utf8')).toBe('replacement-writer');
+	expect(readFileSync(marker, 'utf8')).toBe('replacement CC writer');
+});
+
 it('rejects a concurrent file change after backup without overwriting it', async () => {
 	const f = fixture();
 	const changed = 'someone changed this file';

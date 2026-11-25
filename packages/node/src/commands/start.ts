@@ -263,7 +263,7 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 	});
 	let ccBroker: CcBroker | null = null;
 	try {
-		await endpoint.listen(capabilitySocketPath());
+		await endpoint.listen(capabilitySocketPath(), registry.some((entry) => entry.tool === 'cc') ? { armCcWriter: true } : undefined);
 		console.log(`[start] Capability endpoint listening: ${capabilitySocketPath()}`);
 		await supervisor.start(registry, false);
 		const activeProviders = new Map(supervisor.agents.map((a) => [a.uid, a.driver.type]));
@@ -296,12 +296,21 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		}
 		supervisor.connectInbound();
 	} catch (err) {
-		await supervisor.stop().catch(() => {});
+		await closeRuntime();
+		throw err;
+	}
+
+	async function closeRuntime(): Promise<void> {
+		// Stop every identity before closing shared servers or releasing the home writer lease.
+		const writersQuiesced = await supervisor.stop();
 		await ccBroker?.close().catch(() => {});
 		await opencodeServer.stop().catch(() => {});
 		conversations?.close();
-		await endpoint.close().catch(() => {});
-		throw err;
+		await endpoint.close(writersQuiesced ? { ccWritersStopped: true } : undefined);
+		if (!writersQuiesced) {
+			console.error('[start] CC cleanup unconfirmed; restart is locked until operator verifies native process exit');
+			process.exit(1);
+		}
 	}
 
 	let shuttingDown = false;
@@ -309,15 +318,11 @@ async function startMultiIdentity(config: AichatConfig, registry: AgentEntry[]):
 		if (shuttingDown) return;
 		shuttingDown = true;
 		console.log('\n[start] Shutting down...');
-		// Stop per-identity supervision first, THEN close the shared opencode server. The
-		// singleton server is owned by global shutdown (not by any OpencodeDriver, whose
-		// disconnect() is a no-op for isolation). stop() is a safe no-op if it never started.
-		// Quiesce every writer before releasing the home lease held by endpoint.close().
-		await supervisor.stop().catch(() => {});
-		await ccBroker?.close().catch(() => {});
-		await opencodeServer.stop().catch(() => {});
-		conversations?.close();
-		await endpoint.close().catch(() => {});
+		try { await closeRuntime(); }
+		catch (error) {
+			console.error('[start] shutdown failed:', errMsg(error));
+			process.exit(1);
+		}
 		// ConversationStore commits each binding synchronously before exposing it; no queued binding writes.
 		process.exit(0);
 	};

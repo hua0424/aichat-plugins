@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Supervisor, type SupervisorDeps } from './supervisor.js';
 import type { AgentEntry } from './registry.js';
 import type { AichatCredentials } from './config.js';
-import type { RunDriver } from './agent/events.js';
+import { DriverDisconnectIncompleteError, type RunDriver } from './agent/events.js';
 import type { HulaWSClient } from './server/hula-ws.js';
 import type { HulaApiClient } from './api/hula-api.js';
 import type { MessageHandler } from './handler/message.js';
@@ -612,9 +612,26 @@ describe('Supervisor.stop', () => {
 		const { deps, built } = makeDeps();
 		const sup = new Supervisor(deps);
 		await sup.start(entries);
-		await sup.stop();
+		expect(await sup.stop()).toBe(true);
 		for (const w of built.wsList) expect(w.close).toHaveBeenCalled();
 		for (const d of built.drivers) expect(d.disconnect).toHaveBeenCalled();
+	});
+
+	it('reports unquiesced shared writes while stopping the remaining identities', async () => {
+		const { deps, built } = makeDeps();
+		const sup = new Supervisor(deps);
+		await sup.start(entries);
+		let failDrain!: (error: Error) => void;
+		built.drivers[0].disconnect.mockReturnValueOnce(new Promise<void>((_, reject) => { failDrain = reject; }));
+		const stopped = sup.stop();
+		try {
+			for (const destroy of built.destroyByUid.values()) expect(destroy).toHaveBeenCalledOnce();
+			for (const w of built.wsList) expect(w.close).toHaveBeenCalledOnce();
+		} finally {
+			failDrain(new DriverDisconnectIncompleteError('fixture write held'));
+			expect(await stopped).toBe(false);
+		}
+		for (const d of built.drivers) expect(d.disconnect).toHaveBeenCalledOnce();
 	});
 
 	it('destroys every agent handler on stop (timers/sessions must not leak)', async () => {

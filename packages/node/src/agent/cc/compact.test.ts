@@ -1,0 +1,204 @@
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { open, mkdtemp, realpath, rm, writeFile, appendFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { expect, it, vi } from 'vitest';
+import { observeCcCompact, verifyCcCompactAppend } from './compact.js';
+import type { CcSpawnFn } from './headless-driver.js';
+
+const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+const inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';
+const controlId = 'e93a3c97-8d67-4db8-947a-9012b59e88cf';
+const summaryId = '86b6f7c7-48de-4bc2-98a2-893869878277';
+const displayId = '60a8e918-37bb-4f26-8109-76a99c7b7805';
+const summary = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSynthetic fixture.';
+const cwd = process.cwd();
+function fixture() {
+	const child = Object.assign(new EventEmitter(), {
+		pid: 4242, stdin: { writable: true, write: vi.fn<(chunk: string) => void>(), end: vi.fn() },
+		stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(() => true),
+	});
+	const spawn = vi.fn<CcSpawnFn>(() => child);
+	let groupAlive = true;
+	const kill = vi.fn((pid: number, signal?: NodeJS.Signals | number) => {
+		if (pid === -child.pid && signal === 0 && !groupAlive) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+	});
+	const assertCurrent = vi.fn();
+	const start = (inputChecks: Pick<Parameters<typeof observeCcCompact>[0], 'beforeInput' | 'onSubmit' | 'onAccepted'> = {}) =>
+		observeCcCompact({ cwd, sessionId, inputId, version: '2.1.195', claudeBin: '/owned/claude',
+			settingsPath: '/owned/settings.json', env: { HOME: '/owned/home' }, signal: new AbortController().signal,
+			assertCurrent, spawn, kill, platform: 'linux', ...inputChecks });
+	const line = (value: object) => child.stdout.emit('data', JSON.stringify(value) + '\n');
+	const lines = () => child.stdin.write.mock.calls.map(([line]) => JSON.parse(line));
+	const ack = (requestId = lines()[0].request_id) => line({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } });
+	return { child, spawn, assertCurrent, start, lines, ack,
+		progress: () => {
+			line({ type: 'system', subtype: 'status', session_id: sessionId, status: 'compacting' });
+			line({ type: 'system', subtype: 'status', session_id: sessionId, status: null, compact_result: 'success' });
+		},
+		init: () => line({ type: 'system', subtype: 'init', session_id: sessionId, cwd, claude_code_version: '2.1.195', permissionMode: 'default', tools: [], mcp_servers: [] }),
+		boundary: (trigger = 'manual') => line({ type: 'system', subtype: 'compact_boundary', uuid: controlId, session_id: sessionId, compact_metadata: { trigger, pre_tokens: 1570, post_tokens: 1213 } }),
+		summary: () => line({ type: 'user', uuid: summaryId, session_id: sessionId, parent_tool_use_id: null, isSynthetic: true, isReplay: false, message: { role: 'user', content: summary } }),
+		display: () => line({ type: 'user', uuid: displayId, session_id: sessionId, parent_tool_use_id: null, isReplay: true, timestamp: '2026-11-24T02:00:00.000Z', message: { role: 'user', content: '<local-command-stdout>Compacted native display</local-command-stdout>' } }),
+		insufficientHistory: () => line({ type: 'assistant', uuid: displayId, session_id: sessionId, parent_tool_use_id: null,
+			message: { role: 'assistant', content: [{ type: 'text', text: 'Not enough messages to compact.' }] } }),
+		result: () => line({ type: 'result', subtype: 'success', session_id: sessionId, is_error: false }),
+		close: () => { groupAlive = false; child.emit('close', 0, null); },
+	};
+}
+
+it('writes one resumed compact only after its native ACK and observes effect through contained close', async () => {
+	const f = fixture(), onAccepted = vi.fn(), result = f.start({ onAccepted }), settled = vi.fn();
+	void result.then(settled, () => {});
+	expect(f.lines()).toHaveLength(1);
+	expect(f.spawn.mock.calls[0][1]).toEqual(expect.arrayContaining(['--resume', sessionId, '--settings', '/owned/settings.json']));
+	expect(f.spawn.mock.calls[0][1]).not.toContain('--no-session-persistence');
+	f.ack();
+	expect(f.lines()).toHaveLength(2);
+	expect(f.lines()[1]).toMatchObject({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
+		message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } });
+	expect(onAccepted).not.toHaveBeenCalled();
+	f.progress(); f.progress();
+	expect(onAccepted).toHaveBeenCalledOnce();
+	f.init(); f.boundary(); f.summary(); f.display(); f.result();
+	expect(f.child.stdin.end).toHaveBeenCalledOnce();
+	await Promise.resolve();
+	expect(settled).not.toHaveBeenCalled();
+	f.close();
+	await expect(result).resolves.toEqual({ controlId, summaryId, preTokens: 1570, postTokens: 1213,
+		summaryHash: createHash('sha256').update(summary).digest('hex') });
+	expect(f.lines()).toHaveLength(2);
+});
+
+it('never marks a late prewrite check as submitted when only stdin has closed', async () => {
+	const f = fixture(), onSubmit = vi.fn();
+	let allow!: () => void;
+	const ready = new Promise<void>(resolve => { allow = resolve; });
+	const result = f.start({ beforeInput: () => ready, onSubmit });
+	f.ack();
+	f.child.stdin.writable = false;
+	allow();
+	await ready;
+	await Promise.resolve();
+	f.close();
+	await expect(result).rejects.toThrow();
+	expect(onSubmit).not.toHaveBeenCalled();
+	expect(f.lines()).toHaveLength(1);
+});
+
+it('never marks a late prewrite check as a native submission once the child has closed', async () => {
+	const f = fixture(), onSubmit = vi.fn();
+	let allow!: () => void;
+	const ready = new Promise<void>(resolve => { allow = resolve; });
+	const result = f.start({ beforeInput: () => ready, onSubmit });
+	f.ack();
+	f.close();
+	await expect(result).rejects.toThrow('did not complete');
+	allow();
+	await ready;
+	expect(onSubmit).not.toHaveBeenCalled();
+	expect(f.lines()).toHaveLength(1);
+});
+
+it('correlates the observed effect to newly appended boundary and summary in the original native history', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'cc-compact-history-'));
+	const path = join(await realpath(dir), `${sessionId}.jsonl`);
+	const identity = { sessionId, cwd, version: '2.1.195', isSidechain: false };
+	const original = JSON.stringify({ type: 'user', ...identity }) + '\n';
+	const evidence = { controlId, summaryId, preTokens: 1570, postTokens: 1213,
+		summaryHash: createHash('sha256').update(summary).digest('hex') };
+	const boundary = { ...identity, type: 'system', subtype: 'compact_boundary', uuid: controlId,
+		compactMetadata: { trigger: 'manual', preTokens: 1570, postTokens: 1213 } };
+	const record = { ...identity, type: 'user', uuid: summaryId, isCompactSummary: true, parentUuid: controlId,
+		message: { role: 'user', content: summary } };
+	try {
+		await writeFile(path, original, { mode: 0o600 });
+		const handle = await open(path, 'r');
+		try {
+			const verify = () => verifyCcCompactAppend({ handle, path, original: Buffer.from(original), sessionId, cwd, version: '2.1.195', evidence });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await appendFile(path, [boundary, { ...record, parentUuid: displayId }].map(x => JSON.stringify(x)).join('\n') + '\n');
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await writeFile(path, original + [boundary, record].map(x => JSON.stringify(x)).join('\n') + '\n');
+			await expect(verify()).resolves.toEqual({ status: 'completed', controlId, summaryId });
+			await appendFile(path, [
+				{ ...identity, type: 'user', uuid: inputId, message: { role: 'user',
+					content: '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>' } },
+				{ ...identity, type: 'system', subtype: 'local_command', uuid: displayId,
+					parentUuid: inputId, content: '<local-command-stdout>Not enough messages to compact.</local-command-stdout>' },
+			].map(row => JSON.stringify(row)).join('\n') + '\n');
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+		} finally { await handle.close(); }
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+it('accepts the exact native insufficient-history row only as a linked no-op', async () => {
+	const dir = await mkdtemp(join(tmpdir(), 'cc-compact-noop-'));
+	const path = join(await realpath(dir), `${sessionId}.jsonl`);
+	const identity = { sessionId, cwd, version: '2.1.195', isSidechain: false };
+	const original = Buffer.from(JSON.stringify({ type: 'user', ...identity }) + '\n');
+	const command = { ...identity, type: 'user', uuid: controlId,
+		message: { role: 'user', content: '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>' } };
+	const notice = { ...identity, type: 'system', subtype: 'local_command', uuid: displayId, parentUuid: command.uuid,
+		content: '<local-command-stdout>Not enough messages to compact.</local-command-stdout>' };
+	try {
+		await writeFile(path, original, { mode: 0o600 });
+		const handle = await open(path, 'r');
+		try {
+			const f = fixture(), result = f.start();
+			f.ack(); f.init(); f.insufficientHistory(); f.result(); f.close();
+			const evidence = await result;
+			const verify = () => verifyCcCompactAppend({ handle, path, original, sessionId, cwd, version: '2.1.195', evidence });
+			const record = (...rows: object[]) => writeFile(path, Buffer.concat([original, Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n')]));
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, uuid: summaryId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, parentUuid: inputId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...identity, type: 'system', subtype: 'compact_boundary', uuid: controlId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, { ...notice, cwd: `${cwd}-foreign` });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...notice, uuid: summaryId });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...notice, uuid: summaryId, content: '<local-command-stdout>Compacted native display</local-command-stdout>' });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...command, message: { role: 'user', content: 'other' } });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice, { ...command, uuid: notice.uuid, message: { role: 'user', content: 'other' } });
+			await expect(verify()).rejects.toThrow('durable compact effect unconfirmed');
+			await record(command, notice);
+			await expect(verify()).resolves.toEqual({ status: 'noop' });
+			expect(evidence).toEqual({ insufficientHistoryNoticeId: displayId });
+		} finally { await handle.close(); }
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+it('never dispatches after an unrelated initialize response', async () => {
+	const f = fixture(), result = f.start();
+	const rejected = expect(result).rejects.toThrow('unexpected initialize response');
+	f.ack('foreign'); f.close();
+	await rejected;
+	expect(f.lines()).toHaveLength(1);
+});
+
+it('rechecks the original control scope before writing the compact input', async () => {
+	const f = fixture(), result = f.start();
+	const rejected = expect(result).rejects.toThrow('original scope changed');
+	f.assertCurrent.mockImplementationOnce(() => { throw new Error('revoked'); });
+	f.ack(); f.close();
+	await rejected;
+	expect(f.lines()).toHaveLength(1);
+});
+
+it('requires native outcome evidence before accepting a successful result', async () => {
+	for (const send of [(f: ReturnType<typeof fixture>) => f.result(), (f: ReturnType<typeof fixture>) => { f.boundary(); f.result(); },
+		(f: ReturnType<typeof fixture>) => f.boundary('auto'), (f: ReturnType<typeof fixture>) => { f.insufficientHistory(); f.boundary(); }]) {
+		const f = fixture(), result = f.start();
+		const rejected = expect(result).rejects.toThrow('native compact effect unconfirmed');
+		f.ack(); f.init(); send(f); f.close();
+		await rejected;
+		expect(f.lines()).toHaveLength(2);
+	}
+});
