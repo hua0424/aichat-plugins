@@ -25,7 +25,7 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 	pid?: number;
 	readonly stdout = new PassThrough();
 	readonly stderr = new PassThrough();
-	readonly stdin: { write(chunk: string): void; end(): void };
+	readonly stdin: NonNullable<CcChild['stdin']>;
 	readonly ready: Promise<void>;
 	verifiedGone = false;
 	private readonly helper: ChildProcessWithoutNullStreams;
@@ -44,10 +44,14 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 		this.ready = new Promise<void>((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
 		this.helper = spawn(binary, [command, ...args], { cwd: options.cwd, env: options.env, windowsHide: true,
 			stdio: ['pipe', 'pipe', 'pipe'] });
+		const child = this;
 		this.stdin = {
-			write: (text) => { this.helper.stdin.write(frame('I', Buffer.from(text))); },
-			end: () => { this.helper.stdin.write(frame('E')); },
+			get writable() { return child.controlWritable; },
+			write: (text) => { this.sendControl(frame('I', Buffer.from(text))); },
+			end: () => { this.sendControl(frame('E')); },
 		};
+		// A closing helper can race a control write; only its D frame and actual close prove stop.
+		this.helper.stdin.on('error', () => {});
 		this.helper.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
 		this.helper.stderr.on('data', (chunk: Buffer) => { this.helperStderr = (this.helperStderr + chunk.toString()).slice(-500); });
 		this.helper.on('error', (error) => { this.fail(error); this.emit('error', error); });
@@ -84,10 +88,18 @@ export class WindowsJobChild extends EventEmitter implements CcChild {
 			else { this.fail(new Error('CC Windows supervisor invalid frame sequence')); this.kill(); return; }
 		}
 	}
-	kill(): boolean {
-		if (this.exited) return false;
-		return this.helper.stdin.write(frame('K'));
+	/** Missing native P is not proof: only a failed OS launch of the helper cannot own a Job. */
+	get helperNeverLaunched(): boolean { return this.exited && this.helper.pid === undefined; }
+
+	private get controlWritable(): boolean {
+		return !this.exited && this.doneCode === undefined && this.helper.stdin.writable;
 	}
+
+	private sendControl(bytes: Buffer): boolean {
+		if (!this.controlWritable) return false;
+		return this.helper.stdin.write(bytes);
+	}
+	kill(): boolean { return this.sendControl(frame('K')); }
 	/** Last-resort containment on timeout: killing our helper closes its Job handle; never stop proof. */
 	forceKillHelper(): void { if (!this.exited) this.helper.kill(); }
 }

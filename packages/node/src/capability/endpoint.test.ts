@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, statSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, statSync, rmSync, existsSync, writeFileSync, readFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -703,6 +703,63 @@ describe('CapabilityEndpoint.listen socket permissions', () => {
 		await expect(second.listen(two)).rejects.toThrow();
 		await second.close();
 		expect((await postCapability(one, body())).status).toBe(404); // first pipe remains alive
+	});
+
+	describe('CC writer interlock', () => {
+		function fixture() {
+			const home = mkdtempSync(join(tmpdir(), 'aichat-cc-writer-'));
+			dirs.push(home);
+			const socket = (name: string) => process.platform === 'win32'
+				? `\\\\.\\pipe\\aichat-${name}-${randomUUID()}` : join(home, `${name}.sock`);
+			const deps = { registry: new CapabilityRegistry(), resolve: () => undefined, lockHome: home };
+			const owner = new CapabilityEndpoint(deps);
+			endpoint = owner;
+			return { owner, next: () => new CapabilityEndpoint(deps), socket,
+				primary: join(home, 'conversation-writer.lock'), marker: join(home, 'cc-writer-armed.lock') };
+		}
+
+		it.each(['missing', 'replaced with a dead owner'] as const)('blocks a CC-disabled restart if the primary is %s', async (loss) => {
+			const { owner, next, socket, primary, marker } = fixture();
+			await owner.listen(socket('first'), { armCcWriter: true });
+			// Startup must finish arming before starting any native driver; shutdown writes nothing to retain it.
+			const armed = readFileSync(marker, 'utf8');
+			expect(armed).toMatch(/^\d+:[\da-f-]+$/);
+			rmSync(primary);
+			const replacement = `9999999:${randomUUID()}`;
+			if (loss !== 'missing') writeFileSync(primary, replacement);
+			await owner.close(); // unconfirmed; the old daemon may now exit or be killed
+			const restart = next();
+			await expect(restart.listen(socket('alternate'))).rejects.toThrow('CC cleanup unconfirmed; writer locked');
+			await restart.close();
+			expect(readFileSync(marker, 'utf8')).toBe(armed);
+			if (loss !== 'missing') expect(readFileSync(primary, 'utf8')).toBe(replacement);
+			else expect(existsSync(primary)).toBe(false);
+		});
+
+		it('removes only its own marker after proven driver stop and allows another CC start', async () => {
+			const { owner, next, socket, primary, marker } = fixture();
+			await owner.listen(socket('first'), { armCcWriter: true });
+			expect(existsSync(marker)).toBe(true);
+			await owner.close({ ccWritersStopped: true });
+			expect(existsSync(marker)).toBe(false);
+			expect(existsSync(primary)).toBe(false);
+			const restart = next();
+			endpoint = restart;
+			await restart.listen(socket('alternate'), { armCcWriter: true });
+			await restart.close({ ccWritersStopped: true });
+			expect(existsSync(marker)).toBe(false);
+		});
+
+		it('does not delete a replaced marker with the original bytes even after driver stop', async () => {
+			const { owner, next, socket, marker } = fixture();
+			await owner.listen(socket('first'), { armCcWriter: true });
+			const token = readFileSync(marker, 'utf8');
+			renameSync(marker, `${marker}.old`);
+			writeFileSync(marker, token);
+			await expect(owner.close({ ccWritersStopped: true })).rejects.toThrow('CC writer marker changed');
+			expect(readFileSync(marker, 'utf8')).toBe(token);
+			await expect(next().listen(socket('alternate'))).rejects.toThrow('CC cleanup unconfirmed; writer locked');
+		});
 	});
 
 	it('reclaims only a verifiably dead writer lock and still handles a request', async () => {

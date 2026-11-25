@@ -1,0 +1,182 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { lstat, realpath, type FileHandle } from 'node:fs/promises';
+import { basename } from 'node:path';
+import { runCcControlChild } from './control-child.js';
+import type { CcKillFn, CcSpawnFn } from './headless-driver.js';
+
+const nativeId = (value: unknown): value is string => typeof value === 'string' &&
+	/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(value);
+const tokens = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+const summaryText = (content: unknown): string | undefined => {
+	if (typeof content === 'string') return content;
+	if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string') return content[0].text;
+};
+
+type CompactBoundary = { controlId: string; preTokens: number; postTokens?: number };
+type ObservedCcCompact = (CompactBoundary & { summaryId: string; summaryHash: string }) |
+	{ insufficientHistoryNoticeId: string };
+type VerifiedCcCompact = { status: 'noop' } | { status: 'completed'; controlId: string; summaryId: string };
+
+const COMPACT_COMMAND = '<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>';
+const INSUFFICIENT_HISTORY = 'Not enough messages to compact.';
+
+const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
+
+/** Read only the original file. A replacement, rewrite, or partial append is not effect evidence. */
+export async function verifyCcCompactAppend({ handle, path, original, sessionId, cwd, version, evidence }: {
+	handle: FileHandle; path: string; original: Buffer; sessionId: string; cwd: string; version: '2.1.195'; evidence: ObservedCcCompact;
+}): Promise<VerifiedCcCompact> {
+	const unconfirmed = () => new Error('CC durable compact effect unconfirmed');
+	try {
+		if (!nativeId(sessionId) || basename(path) !== `${sessionId}.jsonl` || !original.length || original.at(-1) !== 10) throw unconfirmed();
+		const before = await handle.stat();
+		const sameFile = async () => {
+			const named = await lstat(path);
+			return named.isFile() && named.nlink === 1 && named.dev === before.dev && named.ino === before.ino && await realpath(path) === path;
+		};
+		if (!before.isFile() || before.nlink !== 1 || before.size <= original.length || before.size > MAX_HISTORY_BYTES || !await sameFile()) throw unconfirmed();
+		const bytes = Buffer.alloc(before.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+			if (!bytesRead) throw unconfirmed();
+			offset += bytesRead;
+		}
+		const after = await handle.stat();
+		if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || !await sameFile() ||
+			!bytes.subarray(0, original.length).equals(original) || bytes.at(-1) !== 10) throw unconfirmed();
+		const appended = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(original.length));
+		const rows = appended.trimEnd().split('\n').map(line => JSON.parse(line));
+		const inScope = (m: { sessionId?: unknown; cwd?: unknown; version?: unknown; isSidechain?: unknown }) =>
+			m.sessionId === sessionId && m.cwd === cwd && m.version === version && m.isSidechain === false;
+		const freshUniqueId = (id: unknown) => nativeId(id) && !original.includes(id) && rows.filter(m => m?.uuid === id).length === 1;
+		const boundaries = rows.filter(m => m?.type === 'system' && m.subtype === 'compact_boundary');
+		const summaries = rows.filter(m => m?.type === 'user' && m.isCompactSummary === true);
+		const localResults = rows.filter(m => m?.type === 'system' && m.subtype === 'local_command');
+		const insufficient = `<local-command-stdout>${INSUFFICIENT_HISTORY}</local-command-stdout>`;
+		if ('insufficientHistoryNoticeId' in evidence) {
+			const id = evidence.insufficientHistoryNoticeId;
+			const commands = rows.filter(m => m?.type === 'user' && m.message?.role === 'user' && m.message.content === COMPACT_COMMAND);
+			const [command] = commands;
+			if (boundaries.length || summaries.length || commands.length !== 1 || !freshUniqueId(command.uuid) || !freshUniqueId(id)) throw unconfirmed();
+			const results = localResults.filter(m => m.parentUuid === command.uuid || m.content === insufficient);
+			const [notice] = results;
+			if (results.length !== 1 || notice.uuid !== id || notice.parentUuid !== command.uuid || notice.content !== insufficient ||
+				command.uuid === id || rows.indexOf(command) >= rows.indexOf(notice) || ![command, notice].every(inScope)) throw unconfirmed();
+			return { status: 'noop' };
+		}
+		const [boundary] = boundaries, [summary] = summaries;
+		if (!freshUniqueId(evidence.controlId) || !freshUniqueId(evidence.summaryId) || localResults.some(m => m.content === insufficient) ||
+			boundaries.length !== 1 || summaries.length !== 1 || rows.indexOf(boundary) >= rows.indexOf(summary) ||
+			![boundary, summary].every(inScope) ||
+			boundary.uuid !== evidence.controlId || boundary.compactMetadata?.trigger !== 'manual' ||
+			boundary.compactMetadata.preTokens !== evidence.preTokens || boundary.compactMetadata.postTokens !== evidence.postTokens ||
+			summary.uuid !== evidence.summaryId || summary.parentUuid !== boundary.uuid || summary.message?.role !== 'user' ||
+			createHash('sha256').update(summaryText(summary.message.content) ?? '').digest('hex') !== evidence.summaryHash) throw unconfirmed();
+		return { status: 'completed', controlId: evidence.controlId, summaryId: evidence.summaryId };
+	} catch { throw unconfirmed(); }
+}
+
+/** Observe one owned native compact. The caller must reserve and verify the scope and durable native history separately. */
+export async function observeCcCompact({ cwd, sessionId, inputId, version, claudeBin, settingsPath, env, signal,
+	assertCurrent, beforeInput, onSubmit, onAccepted, spawn, kill, platform }: { cwd: string; sessionId: string; inputId: string; version: '2.1.195';
+	claudeBin: string; settingsPath: string; env: NodeJS.ProcessEnv; signal: AbortSignal;
+	assertCurrent(): void; beforeInput?(): Promise<void>; onSubmit?(): void; onAccepted?(): void;
+	spawn?: CcSpawnFn; kill?: CcKillFn; platform?: NodeJS.Platform;
+}): Promise<ObservedCcCompact> {
+	if (!nativeId(sessionId) || !nativeId(inputId) || inputId === sessionId)
+		throw new Error('CC compact requires original native session and input IDs');
+	if (Object.keys(env).some(key => /^(?:AICHAT_.*|OPENCLAW_BIND|OPENCODE_SESSION_ID|CODEX_THREAD_ID)$/i.test(key)))
+		throw new Error('CC compact cannot inherit reply authority');
+	const initializeId = randomUUID();
+	let phase: 'initialize' | 'checking' | 'input' | 'effect' = 'initialize';
+	let boundary: CompactBoundary | undefined;
+	let nativeSummary: { summaryId: string; summaryHash: string } | undefined;
+	let insufficientHistoryNoticeId: string | undefined;
+	let displaySeen = false;
+	let acceptanceSeen = false;
+	assertCurrent();
+	return runCcControlChild<ObservedCcCompact>({ label: 'compact', cwd, signal, claudeBin, spawn, kill, platform,
+		argv: ['-p', '--resume', sessionId, '--settings', settingsPath, '--safe-mode', '--input-format', 'stream-json',
+			'--output-format', 'stream-json', '--verbose', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--max-turns', '1'],
+		env, deadlineMs: 5 * 60_000,
+		initialize: (io) => io.write({ type: 'control_request', request_id: initializeId, request: { subtype: 'initialize' } }),
+		onLine(line, io) {
+			const m = JSON.parse(line);
+			if (phase === 'initialize') {
+				if (m?.type !== 'control_response' || m.response?.subtype !== 'success' || m.response.request_id !== initializeId)
+					return io.fail('unexpected initialize response');
+				const submit = () => {
+					io.write({ type: 'user', uuid: inputId, session_id: sessionId, parent_tool_use_id: null,
+						message: { role: 'user', content: [{ type: 'text', text: '/compact' }] } }, () => {
+						signal.throwIfAborted(); assertCurrent(); onSubmit?.();
+						phase = 'input';
+					});
+				};
+				if (beforeInput) {
+					phase = 'checking';
+					void beforeInput().then(submit).catch(() => io.fail('original history changed'));
+				} else submit();
+				return;
+			}
+			const unconfirmed = () => io.fail('native compact effect unconfirmed');
+			if (phase === 'checking') return unconfirmed();
+			if (m?.session_id !== sessionId) return unconfirmed();
+			// This initialized child has received only the original /compact. Progress proves admission, not effect.
+			if (m.type === 'system' && m.subtype === 'status') {
+				if (m.status === 'compacting' && m.compact_result === undefined) {
+					if (!acceptanceSeen) { acceptanceSeen = true; onAccepted?.(); }
+					return;
+				}
+				if (m.status === null && (m.compact_result === undefined || m.compact_result === 'success')) return;
+			}
+			if (phase === 'input') {
+				if (m.type !== 'system' || m.subtype !== 'init' || m.cwd !== cwd || m.claude_code_version !== version ||
+					m.permissionMode === 'bypassPermissions' || !Array.isArray(m.tools) || m.tools.length ||
+					!Array.isArray(m.mcp_servers) || m.mcp_servers.length) return unconfirmed();
+				phase = 'effect';
+				return;
+			}
+			if (m.type === 'system' && m.subtype === 'compact_boundary') {
+				const meta = m.compact_metadata;
+				if (boundary || insufficientHistoryNoticeId || !nativeId(m.uuid) || m.uuid === inputId || meta?.trigger !== 'manual' || !tokens(meta.pre_tokens) ||
+					(meta.post_tokens !== undefined && !tokens(meta.post_tokens))) return unconfirmed();
+				boundary = { controlId: m.uuid, preTokens: meta.pre_tokens,
+					...(meta.post_tokens === undefined ? {} : { postTokens: meta.post_tokens }) };
+				return;
+			}
+			if (m.type === 'user' && boundary && nativeId(m.uuid) && m.uuid !== inputId && m.uuid !== boundary.controlId &&
+				m.parent_tool_use_id === null && m.message?.role === 'user') {
+				const content = m.message.content;
+				if (!nativeSummary && m.isSynthetic === true && m.isReplay === false) {
+					const text = summaryText(content);
+					const header = 'This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.';
+					if (text?.startsWith(header) && text.slice(header.length).trim()) {
+						nativeSummary = { summaryId: m.uuid, summaryHash: createHash('sha256').update(text).digest('hex') };
+						return;
+					}
+				}
+				// Stock 2.1.195 may echo the local display; it cannot supply effect evidence.
+				const timestamp = typeof m.timestamp === 'string' && m.timestamp.length === 24 ? Date.parse(m.timestamp) : NaN;
+				if (nativeSummary && !displaySeen && m.uuid !== nativeSummary.summaryId && m.isReplay === true &&
+					Object.keys(m).length === 7 && Object.keys(m.message).length === 2 &&
+					Number.isFinite(timestamp) && new Date(timestamp).toISOString() === m.timestamp &&
+					typeof content === 'string' && content.startsWith('<local-command-stdout>Compacted ') && content.endsWith('</local-command-stdout>')) {
+					displaySeen = true;
+					return;
+				}
+			}
+			// 2.1.195 projects local_command as an assistant display carrying that record's UUID.
+			if (m.type === 'assistant' && !boundary && !insufficientHistoryNoticeId && nativeId(m.uuid) && m.uuid !== inputId &&
+				m.parent_tool_use_id === null && m.message?.role === 'assistant' && summaryText(m.message.content) === INSUFFICIENT_HISTORY) {
+				insufficientHistoryNoticeId = m.uuid;
+				return;
+			}
+			if (m.type === 'result' && m.subtype === 'success' && m.is_error === false) {
+				if (boundary && nativeSummary) { io.complete({ ...boundary, ...nativeSummary }); return; }
+				if (insufficientHistoryNoticeId) { io.complete({ insufficientHistoryNoticeId }); return; }
+			}
+			unconfirmed();
+		},
+	});
+}

@@ -6,7 +6,7 @@
 // A missing D is ALWAYS unconfirmed, including helper crash or protocol corruption.
 #![cfg(windows)]
 use std::{env, io::{self, Read, Write}, mem::{size_of, zeroed}, os::windows::ffi::OsStrExt,
-    ptr::{null, null_mut}, sync::{Arc, atomic::{AtomicBool, Ordering}},
+    ptr::{null, null_mut}, sync::{Arc, mpsc, atomic::{AtomicBool, Ordering}},
     thread, time::{Duration, Instant}};
 use std::ffi::c_void;
 
@@ -130,8 +130,8 @@ fn active(job: Handle) -> io::Result<Dword> {
 fn input(child_stdin: Owned, job: Handle, writer_failed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>, writer_done: Arc<AtomicBool>) -> bool {
     let mut source = io::stdin().lock();
-    let mut input: Option<Vec<u8>> = None;
     let mut child_stdin = Some(child_stdin);
+    let mut close_writer = None;
     loop {
         let mut header = [0u8; 5];
         if source.read_exact(&mut header).is_err() { return false; }
@@ -142,15 +142,12 @@ fn input(child_stdin: Owned, job: Handle, writer_failed: Arc<AtomicBool>,
             unsafe { TerminateJobObject(job, 1); }
             return true;
         }
-        if header[0] == b'I' && input.is_none() && child_stdin.is_some() {
+        if header[0] == b'I' && child_stdin.is_some() {
             let mut bytes = vec![0u8; len];
             if source.read_exact(&mut bytes).is_err() { return false; }
-            input = Some(bytes);
-            continue;
-        }
-        if header[0] == b'E' && len == 0 && child_stdin.is_some() && input.is_some() {
-            let bytes = input.take().unwrap();
             let writer = child_stdin.take().unwrap();
+            let (close, wait_for_close) = mpsc::channel::<()>();
+            close_writer = Some(close);
             let writer_failure = Arc::clone(&writer_failed);
             let writer_cancelled = Arc::clone(&cancelled);
             let writer_finished = Arc::clone(&writer_done);
@@ -162,7 +159,12 @@ fn input(child_stdin: Owned, job: Handle, writer_failed: Arc<AtomicBool>,
                     unsafe { TerminateJobObject(job_value as Handle, 1); }
                 }
                 writer_finished.store(true, Ordering::Release);
+                let _ = wait_for_close.recv(); // Keep the child pipe open until E or control termination.
+                drop(writer);
             });
+            continue;
+        }
+        if header[0] == b'E' && len == 0 && close_writer.take().is_some_and(|close| close.send(()).is_ok()) {
             continue;
         }
         return false; // exactly one I, one E, then only K are accepted

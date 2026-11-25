@@ -442,6 +442,11 @@ export class HulaWSClient {
 		return this.ws?.readyState === WebSocket.OPEN;
 	}
 
+	/** Use the admitting connection only; a new open socket cannot inherit an old envelope. */
+	get openConnectionAttempt(): number | undefined {
+		return !this.closed && this.isConnected ? this.connectAttempt : undefined;
+	}
+
 	private startHeartbeat(): void {
 		// P1-3: idempotent — clear any existing timer so a double-start can never leak
 		// an orphaned interval.

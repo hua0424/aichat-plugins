@@ -8,6 +8,12 @@ import type { AgentCapabilityResult, NativeRef } from '../agent/events.js';
 export interface ControlEntry {
  requestId: string; fingerprint: string; authorizationEpoch: string; generation: number;
  state: 'prepared' | 'submitted' | 'settled'; nativeRef?: NativeRef; receipt?: AgentCapabilityResult; recovery?: RecoveryData;
+	ccCompactInputId?: string;
+	/** Process containment is independent of the public command receipt. */
+	ccCompactFence?: true;
+}
+export function hasUnconfirmedCcCompact(record: ConversationRecord): boolean {
+	return record.controls?.some((c) => c.generation === record.generation && c.ccCompactFence === true) ?? false;
 }
 const executionRuns = (r: ConversationRecord) => (r.pendingRuns ?? []).filter((run) =>
  !r.detachedGenerations?.includes(run.generation));
@@ -288,6 +294,7 @@ export class ConversationStore {
 			if ((this.snapshot.resetReceipts?.length ?? 0) >= 1024) throw new Error('reset receipt capacity exceeded');
 		}
 		const old = this.get(identityId, roomId) ?? this.newRecord(identityId, roomId);
+		if (hasUnconfirmedCcCompact(old)) throw new Error('CC_COMPACT_FENCED');
 		if (this.options.activeProviders?.has(identityId) && old.adapterInstanceId !== this.options.activeProviders.get(identityId))
 			throw new Error('activated provider changed for existing conversation');
 		if (!Number.isSafeInteger(old.generation + 1)) throw new Error('generation exhausted');
@@ -337,8 +344,36 @@ export class ConversationStore {
 	submitControl(uid: string, room: string, requestId: string, ref?: NativeRef): void {
 		const { r, c } = this.controlRecord(uid, room, requestId);
 		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (hasUnconfirmedCcCompact(r)) throw new Error('CC_COMPACT_FENCED');
 		if (ref) c.nativeRef = copy(ref);
 		c.state = 'submitted'; this.replace(r);
+	}
+	submitCcCompact(uid: string, room: string, requestId: string, sessionId: string, inputId: string): void {
+		this.assertProvider('cc', uid);
+		if (!validId(sessionId) || !validId(inputId)) throw new Error('invalid CC compact locator');
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		if (r.generation !== c.generation || c.state !== 'prepared') throw new Error('STALE_GENERATION');
+		if (r.adapterInstanceId !== 'cc' || r.nativeState.cc?.sessionId !== sessionId) throw new Error('CC compact session mismatch');
+		if (hasUnconfirmedCcCompact(r)) throw new Error('CC_COMPACT_FENCED');
+		if (r.state !== 'ready' || executionRuns(r).length) throw new Error('conversation paused or occupied');
+		c.state = 'submitted';
+		c.nativeRef = { sessionId };
+		c.ccCompactInputId = inputId;
+		c.ccCompactFence = true;
+		this.replace(r);
+	}
+	/** Only the caller that established containment (or proved no spawn) may release this fence. */
+	releaseCcCompact(uid: string, room: string, requestId: string, inputId: string, receipt?: AgentCapabilityResult): void {
+		this.assertProvider('cc', uid);
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		if (r.generation !== c.generation || c.ccCompactFence !== true || c.ccCompactInputId !== inputId)
+			throw new Error('CC compact fence ownership mismatch');
+		delete c.ccCompactFence;
+		if (receipt) {
+			// A live owned closer can settle its verified outcome even after the server watchdog reported unknown.
+			if (c.receipt?.status === 'unknown' && ['completed', 'noop', 'failed'].includes(receipt.status)) receipt = { ...receipt, reconciled: true };
+			this.writeControlReceipt(r, c, { ...receipt, phase: 'outcome' }, true);
+		} else this.replace(r);
 	}
 	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
 		this.assertRecovery(recovery);
@@ -346,13 +381,20 @@ export class ConversationStore {
 	}
 	recordControl(uid: string, room: string, requestId: string, result: AgentCapabilityResult): AgentCapabilityResult {
 		const { r, c } = this.controlRecord(uid, room, requestId);
+		return this.writeControlReceipt(r, c, result);
+	}
+	private writeControlReceipt(r: ConversationRecord, c: ControlEntry, result: AgentCapabilityResult, fenceReleased = false): AgentCapabilityResult {
 		const old = c.receipt;
-		if (old && !['accepted', 'unknown'].includes(old.status)) return copy(old);
+		const retain = (receipt: AgentCapabilityResult) => {
+			if (fenceReleased) this.replace(r);
+			return copy(receipt);
+		};
+		if (old && !['accepted', 'unknown'].includes(old.status)) return retain(old);
 		if (result.generation !== undefined && result.generation !== String(c.generation)) throw new Error('control generation conflict');
 		if (c.nativeRef && result.nativeRef && Object.entries(c.nativeRef).some(([k, v]) =>
 			result.nativeRef![k as keyof NativeRef] !== undefined && result.nativeRef![k as keyof NativeRef] !== v)) throw new Error('native reference conflict');
 		if (old?.status === 'unknown') {
-			if (!result.reconciled || !['completed', 'failed', 'noop'].includes(result.status)) return copy(old);
+			if (!result.reconciled || !['completed', 'failed', 'noop'].includes(result.status)) return retain(old);
 			if (!result.nativeRef && !result.effect) throw new Error('reconciliation evidence required');
 		}
 		if (result.nativeRef) c.nativeRef = { ...c.nativeRef, ...result.nativeRef };
@@ -378,6 +420,7 @@ export class ConversationStore {
 	replaceNativeSession(uid: string, room: string, generation: number, provider: Provider, id: string, state: Record<string, unknown>): ConversationRecord {
 		this.assertProvider(provider, uid);
 		const old = this.assertGeneration(uid, room, generation);
+		if (hasUnconfirmedCcCompact(old)) throw new Error('CC_COMPACT_FENCED');
 		if (!validId(id) || !Number.isSafeInteger(generation + 1)) throw new Error('invalid native reset');
 		if (provider === 'opencode') this.assertOpencodeDirectoryOwner(old.conversationId, state.directory as string);
 		const r: ConversationRecord = { ...old, generation: generation + 1, contextKey: randomBytes(32).toString('hex'),
@@ -419,6 +462,7 @@ export class ConversationStore {
 	beginRun(identityId: string, roomId: string, runId: string, options?: { authorizationEpoch?: string; nativeTurn?: NativeRef }): BoundConversationRun {
 		if (!validId(runId)) throw new Error('invalid runId');
 		const record = this.getOrCreate(identityId, roomId);
+		if (hasUnconfirmedCcCompact(record)) throw new Error('CC_COMPACT_FENCED');
 		if (record.state !== 'ready' || (!options?.nativeTurn && executionRuns(record).length)) throw new Error('conversation paused or occupied');
 		if (this.snapshot.records.some((r) => r.pendingRuns?.some((run) => run.runId === runId))) throw new Error('duplicate runId');
 		record.pendingRuns = [...(record.pendingRuns ?? []), { runId, generation: record.generation, startedAt: new Date().toISOString(),
@@ -869,7 +913,10 @@ export class ConversationStore {
 			if (r.detachedGenerations && (!Array.isArray(r.detachedGenerations) || r.detachedGenerations.some((g) => !Number.isSafeInteger(g) || g < 1 || g >= r.generation))) throw new Error('invalid detached generation');
 			if (r.selectedModel && (!validId(r.selectedModel.providerID) || !validId(r.selectedModel.modelID))) throw new Error('invalid selected model');
 			if (r.controls && (!Array.isArray(r.controls) || r.controls.length > 10000 || new Set(r.controls.map((c) => c.requestId)).size !== r.controls.length ||
-				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state)))) throw new Error('invalid control journal');
+				r.controls.some((c) => !validId(c.requestId) || !validId(c.fingerprint) || !validId(c.authorizationEpoch) || !Number.isSafeInteger(c.generation) || c.generation < 1 || c.generation > r.generation || !['prepared', 'submitted', 'settled'].includes(c.state) ||
+					(c.ccCompactInputId !== undefined && (!validId(c.ccCompactInputId) || r.adapterInstanceId !== 'cc' || c.state === 'prepared' ||
+						!validId(c.nativeRef?.sessionId) || Object.keys(c.nativeRef).length !== 1)) ||
+					(c.ccCompactFence !== undefined && (c.ccCompactFence !== true || c.ccCompactInputId === undefined))))) throw new Error('invalid control journal');
 			if (r.replyBindings !== undefined && !Array.isArray(r.replyBindings)) throw new Error('invalid reply bindings');
 			for (const b of r.replyBindings ?? []) {
 				if (!b || typeof b.token !== 'string' || !/^[0-9a-f]{64}$/.test(b.token) ||

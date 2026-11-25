@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import { createConnection } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { readJsonBody } from '../util/http-body.js';
-import { unlinkSync, existsSync, mkdirSync, chmodSync, openSync, writeSync, closeSync, readFileSync, lstatSync } from 'node:fs';
+import { unlinkSync, existsSync, mkdirSync, chmodSync, openSync, writeFileSync, closeSync, readFileSync, lstatSync, fstatSync, fsyncSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { AICHAT_HOME } from '../config.js';
@@ -62,6 +62,8 @@ export interface CapabilityResponse {
 
 /** Loopback addresses node:http reports for local connections. */
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const CC_WRITER_MARKER = 'cc-writer-armed.lock';
+type OwnedWriterFile = { path: string; token: string; dev: bigint; ino: bigint };
 
 /**
  * REQ-010 S1 — node-local capability endpoint (Flow2).
@@ -99,8 +101,8 @@ export class CapabilityEndpoint {
 	private server: Server | null = null;
 	private socketPath: string | null = null;
 	private socketIdentity: { dev: number; ino: number } | null = null;
-	private lockPath: string | null = null;
-	private lockToken: string | null = null;
+	private writerLock: OwnedWriterFile | null = null;
+	private ccWriterMarker: OwnedWriterFile | null = null;
 
 	constructor(deps: CapabilityEndpointDeps) {
 		this.registry = deps.registry;
@@ -342,16 +344,19 @@ export class CapabilityEndpoint {
 	}
 
 	/** Wire node:http over a UNIX domain socket (or named pipe on win32) → handle(). */
-	async listen(socketPath: string): Promise<void> {
-		if (this.server || this.lockToken) throw new Error('capability endpoint already listening');
+	async listen(socketPath: string, options?: { armCcWriter: true }): Promise<void> {
+		if (this.server || this.writerLock) throw new Error('capability endpoint already listening');
+		const home = this.lockHome;
+		if (options?.armCcWriter && !home) throw new Error('CC writer interlock requires a state home');
 		prepareSocketPath(socketPath, this.platform);
 		// Exclusive creation serializes startup across node processes, including the stale-socket probe.
 		// An unambiguous dead owner can be reclaimed; unknown liveness fails closed.
-		if (this.lockHome) {
-			mkdirSync(this.lockHome, { recursive: true, mode: 0o700 });
-			if (this.platform !== 'win32') chmodSync(this.lockHome, 0o700);
+		if (home) {
+			assertNoCcWriterHold(home);
+			mkdirSync(home, { recursive: true, mode: 0o700 });
+			if (this.platform !== 'win32') chmodSync(home, 0o700);
 		}
-		const lockPath = this.lockHome ? join(this.lockHome, 'conversation-writer.lock') : this.platform === 'win32'
+		const lockPath = home ? join(home, 'conversation-writer.lock') : this.platform === 'win32'
 			? join(tmpdir(), `aichat-capability-${createHash('sha256').update(socketPath).digest('hex')}.lock`)
 			: `${socketPath}.lock`;
 		const token = `${process.pid}:${randomUUID()}`;
@@ -360,13 +365,13 @@ export class CapabilityEndpoint {
 			fd = openSync(lockPath, 'wx', 0o600);
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-			await reclaimDeadLock(lockPath, socketPath);
+			await reclaimDeadLock(lockPath, socketPath, home);
 			fd = openSync(lockPath, 'wx', 0o600);
 		}
-		try { writeSync(fd, token); } finally { closeSync(fd); }
-		this.lockPath = lockPath;
-		this.lockToken = token;
+		this.writerLock = finishWriterFile(fd, lockPath, token, false);
 		try {
+			// A second check under the primary lease covers acquisition/reclaim races, regardless of socket or registry.
+			if (home) assertNoCcWriterHold(home);
 			if (this.platform !== 'win32' && existsSync(socketPath)) {
 				const old = lstatSync(socketPath);
 				if (!old.isSocket()) throw new Error('capability socket path is not a socket');
@@ -404,13 +409,27 @@ export class CapabilityEndpoint {
 				const stat = lstatSync(socketPath);
 				this.socketIdentity = { dev: stat.dev, ino: stat.ino };
 			}
+			// Socket setup awaited I/O; do not admit writers if either home guard changed in the meantime.
+			if (!ownsWriterFile(this.writerLock)) throw new Error('writer lease changed during startup');
+			if (home) assertNoCcWriterHold(home);
+			if (options?.armCcWriter && home) {
+				// Pre-arm before returning to the daemon. A PID lock alone cannot survive an unclean CC exit.
+				const markerPath = join(home, CC_WRITER_MARKER);
+				const marker = finishWriterFile(openSync(markerPath, 'wx', 0o600), markerPath, token, true);
+				if (this.platform !== 'win32') {
+					const dir = openSync(home, 'r');
+					try { fsyncSync(dir); } finally { closeSync(dir); }
+				}
+				if (!ownsWriterFile(marker) || !ownsWriterFile(this.writerLock)) throw new Error('writer lease changed during CC arming');
+				this.ccWriterMarker = marker;
+			}
 		} catch (err) {
 			await this.close();
 			throw err;
 		}
 	}
 
-	async close(): Promise<void> {
+	async close(options?: { ccWritersStopped: true }): Promise<void> {
 		const server = this.server;
 		this.server = null;
 		if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -422,17 +441,43 @@ export class CapabilityEndpoint {
 		}
 		this.socketPath = null;
 		this.socketIdentity = null;
-		if (this.lockPath && this.lockToken) {
-			try { if (readFileSync(this.lockPath, 'utf8') === this.lockToken) unlinkSync(this.lockPath); }
-			catch { /* ownership changed or already removed */ }
+		const marker = this.ccWriterMarker;
+		const lock = this.writerLock;
+		this.ccWriterMarker = null;
+		this.writerLock = null;
+		if (marker) {
+			if (!options?.ccWritersStopped) return; // No late write, PID inference or auto cleanup on uncertainty.
+			if (!ownsWriterFile(marker)) throw new Error('CC writer marker changed; refusing cleanup');
+			unlinkSync(marker.path);
 		}
-		this.lockPath = null;
-		this.lockToken = null;
+		try { if (lock && ownsWriterFile(lock)) unlinkSync(lock.path); }
+		catch { /* ownership changed or already removed */ }
 	}
 }
 
+/** Both daemon and offline writers fail closed on any marker in the state home, even stale or malformed. */
+export function assertNoCcWriterHold(home: string): void {
+	if (lstatSync(join(home, CC_WRITER_MARKER), { throwIfNoEntry: false })) {
+		throw new Error('CC cleanup unconfirmed; writer locked until operator verifies native process exit');
+	}
+}
+
+function finishWriterFile(fd: number, path: string, token: string, durable: boolean): OwnedWriterFile {
+	try {
+		const { dev, ino } = fstatSync(fd, { bigint: true });
+		writeFileSync(fd, token);
+		if (durable) fsyncSync(fd);
+		return { path, token, dev, ino };
+	} finally { closeSync(fd); }
+}
+
+function ownsWriterFile(file: OwnedWriterFile): boolean {
+	const stat = lstatSync(file.path, { bigint: true, throwIfNoEntry: false });
+	return !!stat?.isFile() && stat.dev === file.dev && stat.ino === file.ino && readFileSync(file.path, 'utf8') === file.token;
+}
+
 /** Never reclaim a live/unknown writer's lock. A dead PID plus a non-listening endpoint is required. */
-async function reclaimDeadLock(lockPath: string, socketPath: string): Promise<void> {
+async function reclaimDeadLock(lockPath: string, socketPath: string, home?: string): Promise<void> {
 	const old = lstatSync(lockPath);
 	const value = readFileSync(lockPath, 'utf8');
 	const match = /^(\d+):[0-9a-f-]+$/.exec(value);
@@ -452,6 +497,7 @@ async function reclaimDeadLock(lockPath: string, socketPath: string): Promise<vo
 	const current = lstatSync(lockPath);
 	if (old.dev !== current.dev || old.ino !== current.ino || readFileSync(lockPath, 'utf8') !== value)
 		throw new Error('capability lock changed during recovery');
+	if (home) assertNoCcWriterHold(home);
 	unlinkSync(lockPath);
 }
 
