@@ -68,12 +68,44 @@ function fixture(overrides: Partial<CcHeadlessDriverDeps> = {}) {
 const posix = it;
 
 describe('CC native capability observation', () => {
+	posix('withdraws the previous skills before resuming even if the new child never initializes', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const state = { sessionId, workspace: f.dir, skillObservation: { runtimeVersion: '2.1.195', names: ['project:example'] } };
+		const { done } = await f.start({ ...f.input, conversation: { ...f.input.conversation, nativeState: { version: 1, value: state } } });
+		await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+		f.groupExit(); f.close(1);
+		await done;
+		expect(f.persisted).toEqual([{ version: 1, value: { sessionId, workspace: f.dir } }]);
+	});
+	posix('still offers the observed skill when a clean native inventory child returns no models under the original scope', async () => {
+		const f = fixture();
+		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const observation = { runtimeVersion: '2.1.195', names: ['project:example'] };
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir, skillObservation: observation } } };
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		try {
+			const context = { roomType: 2, isOwner: true, workspace: f.dir, signal: f.controller.signal, conversation, authorizationEpoch: 'epoch' } as const;
+			const discovery = f.driver.discoverCapabilities(context);
+			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[0]).request_id, subtype: 'success', response: { models: [] } } });
+			f.groupExit(); f.close(0);
+			const catalog = await discovery;
+			expect(catalog.capabilities).toEqual([expect.objectContaining({ id: 'skill:project:example', executable: false, reason: 'submission_only' })]);
+			const execution = { requestId: 'skill', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+				authorizationEpoch: 'epoch', saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(), replaceSession: vi.fn(), emit: vi.fn(), bindTurn: vi.fn() };
+			expect(await f.driver.executeCapability({ ...context, execution, capabilityId: 'skill:project:example', parameters: {}, catalogVersion: catalog.version }))
+				.toMatchObject({ status: 'noop', text: '插件已收到技能指令，未执行。' });
+			expect(execution.submitted).not.toHaveBeenCalled();
+			expect(f.spawnCalls).toHaveLength(1);
+		} finally { prepareNative.mockRestore(); }
+	});
 	posix('offers observed native skills for typed receipt after the ordinary child settles, without starting another turn', async () => {
 		const f = fixture();
 		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
 		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
 		try {
-			const { done } = await f.start();
+			const { done } = await f.start({ ...f.input, authorizationEpoch: 'epoch' });
 			await vi.waitFor(() => expect(f.writes).toHaveLength(1));
 			f.line({ type: 'system', subtype: 'init', session_id: sessionId, cwd: f.dir, claude_code_version: '2.1.195',
 				slash_commands: ['ordinary', 'project:example'], skills: ['project:example'] });
@@ -87,7 +119,7 @@ describe('CC native capability observation', () => {
 			const execution = { requestId: 'skill', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
 				authorizationEpoch: 'epoch', saveRecovery: vi.fn(), submitted: vi.fn(), selectModel: vi.fn(), replaceSession: vi.fn(), emit, bindTurn: vi.fn() };
 			const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution }), conversation: () => conversation });
-			const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
+			const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 1, account: 'group', workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
 			const discovery = handler.handle({ ...scope, requestId: 'discover-skill', operation: 'discover' });
 			await vi.waitFor(() => expect(f.writes).toHaveLength(2));
 			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[1]).request_id, subtype: 'success',
@@ -110,6 +142,13 @@ describe('CC native capability observation', () => {
 			expect(execution.submitted).not.toHaveBeenCalled();
 			expect(f.spawnCalls).toHaveLength(2);
 			expect(f.writes).toHaveLength(2);
+			const rediscovery = handler.handle({ ...scope, context: { ...scope.context, authorizationEpoch: 'next-epoch' },
+				requestId: 'new-epoch', operation: 'discover' });
+			await vi.waitFor(() => expect(f.writes).toHaveLength(3));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[2]).request_id, subtype: 'success',
+				response: { models: [{ value: 'native', displayName: 'Native model' }] } } });
+			f.close(0);
+			expect((await rediscovery)?.catalog?.capabilities).toEqual([expect.objectContaining({ id: 'model.list' })]);
 		} finally { prepareNative.mockRestore(); }
 	});
 	posix('executes the discovered compact once with the original idle session and returns its verified effect', async () => {

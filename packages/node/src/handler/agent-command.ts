@@ -74,7 +74,8 @@ export class AgentCommandHandler {
    if (request.reconcileOnly && (!mutation || !this.preparation)) return { ...correlation, status: 'unknown', error: 'native_request_failed' };
   try {
    const workspace = this.workspaceBase ? deriveWorkspaceDir(this.workspaceBase, this.selfUid, { ...request.context, roomId: request.roomId }) : undefined;
-   const context: AgentCapabilityContext = { workspace, signal: abort.signal, authorizationEpoch: request.context.authorizationEpoch,
+   const { roomType, isOwner, authorizationEpoch } = request.context;
+   const context: AgentCapabilityContext = { workspace, signal: abort.signal, roomType, isOwner, authorizationEpoch,
     ...((workspace && !request.context.workspaceDir?.trim()) ? { defaultWorkspace: true } : {}) };
    if (mutation) {
     if (!this.preparation) return { ...correlation, status: 'unsupported', error: 'execution_not_supported' };

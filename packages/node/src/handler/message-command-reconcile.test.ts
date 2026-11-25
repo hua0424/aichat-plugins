@@ -2,7 +2,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AgentCapabilityInvocation, AgentDriver, NativeTurnEvent } from '../agent/events.js';
+import { CcHeadlessDriver } from '../agent/cc/headless-driver.js';
+import * as inventory from '../agent/cc/model-inventory.js';
+import * as preflight from '../agent/cc/native-compact-preflight.js';
+import type { AgentCapabilityCatalog, AgentCapabilityInvocation, AgentDriver, NativeTurnEvent } from '../agent/events.js';
 import type { HulaApiClient } from '../api/hula-api.js';
 import { ConversationStore } from '../capability/conversations.js';
 import type { HulaWSClient } from '../server/hula-ws.js';
@@ -36,14 +39,14 @@ const request = (requestId: string, extra: Record<string, unknown> = {}) => ({
 	parameters: {}, context: { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'epoch' }, ...extra,
 });
 
-function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string, provider = 'opencode', groupRows = true) {
+function setup(store: ConversationStore, executeCapability: AgentDriver['executeCapability'], home: string, provider: string | AgentDriver = 'opencode', groupRows = true) {
 	const posted: Posted[] = [];
 	const notices: string[] = [];
 	const api = { sendMessage: async (_room: string, body: string) => { notices.push(body); return { msgId: 'notice' }; },
 		reportAgentCommandResult: vi.fn(async (value: Posted) => { posted.push({ ...value }); }),
 		listSelfGroupConfigs: async () => groupRows ? [{ roomId: '20', authorizationEpoch: 'epoch', approved: 1, mentionRequired: 1 }] : [],
 	} as unknown as HulaApiClient;
-	const driver = { type: provider, executeCapability } as unknown as AgentDriver;
+	const driver = typeof provider === 'string' ? { type: provider, executeCapability } as unknown as AgentDriver : provider;
 	let handler!: MessageHandler;
 	const send = vi.fn((type: number, data: Record<string, unknown>) => {
 		if (type === 20) queueMicrotask(() => handler.handle({ type: 'thinkingStart', data: { ...data, fromUid: 'u', thinkingId: `thinking-${data.clientRunId}` } }));
@@ -69,6 +72,42 @@ const waitForReports = async (posted: Posted[], count: number) => {
 };
 
 describe('command reconcile evidence', () => {
+	it('lists and acknowledges an observed Claude skill in the original nonowner DM but blocks compact', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-skill-dm-')); dirs.push(home);
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+		const workspace = join(home, 'u', 'dm', 'friend');
+		const bound = store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace });
+		store.saveControlNativeState('u', '20', bound.generation, 'cc', { sessionId, workspace, skillObservation: { runtimeVersion: '2.1.195', names: ['project:example'] } });
+		const readInventory = vi.spyOn(inventory, 'readCcModelInventory').mockResolvedValue([{ value: 'example', displayName: 'Example' }]);
+		const prepareCompact = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		const spawn = vi.fn(() => { throw new Error('unexpected Claude spawn'); });
+		const driver = new CcHeadlessDriver({ workspaceBase: home, brokerPort: 0, registerHook: () => () => {}, spawn });
+		const { handler, posted, send } = setup(store, undefined, home, driver, false);
+		const context = { roomType: 2, counterpartUid: 'friend', isOwner: false, authorizationEpoch: 'f287c6e86faa447e0e0e51c09a54638a' };
+		try {
+			handler.handle({ type: 'agentCommand', data: request('discover-skills', { operation: 'discover', capabilityId: undefined, context }) });
+			await waitForReports(posted, 1);
+			const catalog = posted[0].catalog as AgentCapabilityCatalog;
+			expect(catalog.capabilities).toContainEqual(expect.objectContaining({ id: 'skill:project:example', executable: false, reason: 'submission_only' }));
+			expect(catalog.capabilities).not.toContainEqual(expect.objectContaining({ id: 'session.compact' }));
+
+			const invoke = { context, capabilityId: 'skill:project:example', catalogVersion: catalog.version, parameters: { arguments: '  original\narguments  ' } };
+			handler.handle({ type: 'agentCommand', data: request('invoke-skill', invoke) });
+			await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({ requestId: 'invoke-skill', status: 'noop', text: '插件已收到技能指令，未执行。' })));
+			handler.handle({ type: 'agentCommand', data: request('other-peer-skill', { ...invoke, context: { ...context, counterpartUid: 'other' } }) });
+			await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({ requestId: 'other-peer-skill', status: 'failed', error: 'catalog_stale' })));
+			handler.handle({ type: 'agentCommand', data: request('invoke-compact', { context, capabilityId: 'session.compact', catalogVersion: catalog.version }) });
+			await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({ requestId: 'invoke-compact', status: 'failed', error: 'authorization_changed' })));
+			expect(readInventory).toHaveBeenCalledOnce();
+			expect(prepareCompact).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+			expect(send).not.toHaveBeenCalled();
+		} finally {
+			prepareCompact.mockRestore();
+			readInventory.mockRestore();
+		}
+	});
 	it('does not submit Claude compact under an envelope from a replaced IM connection', async () => {
 		const home = mkdtempSync(join(tmpdir(), 'cc-compact-reconnect-')); dirs.push(home);
 		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';

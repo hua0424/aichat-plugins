@@ -43,6 +43,8 @@ export interface PreparedRun {
 	runId: string;
 	message: string;
 	workspace?: string;
+	/** Group authorization epoch captured by core when this ordinary input arrived; absent in DMs. */
+	authorizationEpoch?: string;
 	/** Opaque core capability key, never inferred from a native session or server DTO. */
 	contextKey?: string;
 	/** Core-validated identity owning a shared native prompt scope; never parsed from a native key. */
@@ -109,6 +111,9 @@ export interface AgentCapabilityContext {
 	workspace?: string;
 	/** Core-derived default directory, not an owner-supplied host override. */
 	defaultWorkspace?: true;
+	/** Room and DM ownership from the authenticated command envelope, not UI parameters. */
+	roomType?: 1 | 2;
+	isOwner?: boolean;
 	/** Original authorization epoch from the authenticated command envelope. */
 	authorizationEpoch?: string;
 	signal: AbortSignal;

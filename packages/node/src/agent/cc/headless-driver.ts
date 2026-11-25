@@ -27,15 +27,16 @@ const ccVersion = (value: unknown): value is string => typeof value === 'string'
 	/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(value);
 const skillCatalogSuffix = /:skills-([a-f0-9]{64})$/;
 
-function observedSkills(context: Pick<AgentCapabilityContext, 'conversation' | 'workspace' | 'authorizationEpoch'>) {
+function observedSkills(context: Pick<AgentCapabilityContext, 'conversation' | 'workspace' | 'authorizationEpoch' | 'roomType'>) {
 	const scope = compactScope(context);
-	const state = context.conversation?.nativeState?.value as { skillObservation?: { runtimeVersion?: unknown; names?: unknown } } | undefined;
+	const state = context.conversation?.nativeState?.value as { skillObservation?: { runtimeVersion?: unknown; names?: unknown; authorizationEpoch?: unknown } } | undefined;
 	const observation = state?.skillObservation;
 	if (!scope || !context.authorizationEpoch || !ccVersion(observation?.runtimeVersion) || !Array.isArray(observation.names) ||
-		!observation.names.length || observation.names.length > 254 || !observation.names.every(skillName)) return;
+		!observation.names.length || observation.names.length > 254 || !observation.names.every(skillName) ||
+		(context.roomType !== 2 && observation.authorizationEpoch !== context.authorizationEpoch)) return;
 	const names = [...new Set(observation.names)].sort();
 	const digest = createHash('sha256').update(JSON.stringify([scope.digest, context.authorizationEpoch, observation.runtimeVersion, names])).digest('hex');
-	return { names, digest };
+	return { names, digest, runtimeVersion: observation.runtimeVersion };
 }
 
 interface ReadableStreamish {
@@ -124,24 +125,27 @@ export class CcHeadlessDriver implements RunDriver {
 			context.conversation?.assertCurrent();
 			if (!this.active.size) {
 				const scope = compactScope(context);
-				const native = scope && !this.compactWork && !this.compactStopUnconfirmed
+				const native = scope && !(context.roomType === 2 && context.isOwner !== true) && !this.compactWork && !this.compactStopUnconfirmed
 					? await prepareCcNativeCompact({ ...scope, cliPath: this.deps.claudeBin ?? 'claude', env: process.env }) : undefined;
-				let catalog: AgentCapabilityCatalog;
+				let catalog: AgentCapabilityCatalog | undefined;
 				try {
 					await native?.assertIntact();
-					({ catalog } = await this.readModelCatalog(context, native));
+					try { ({ catalog } = await this.readModelCatalog(context, native)); }
+					catch (error) { if (error instanceof DriverDisconnectIncompleteError) throw error; }
 					await native?.assertIntact();
 				} finally { await native?.history.handle.close(); }
 				context.signal.throwIfAborted();
 				context.conversation?.assertCurrent();
-				if (this.active.size || this.closing || this.compactWork || (native && this.compactStopUnconfirmed)) return unavailable();
-				if (scope && native) catalog = { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`, capabilities: [...catalog.capabilities, {
+				if (this.active.size || this.closing || (native && (this.compactWork || this.compactStopUnconfirmed))) return unavailable();
+				if (catalog && scope && native) catalog = { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`, capabilities: [...catalog.capabilities, {
 					id: 'session.compact', kind: 'command', source: 'session', name: 'Compact', supported: true,
 					executable: true, defaultVisibility: 'public', scope: 'conversation', parameters: [],
 				}] };
-				const skills = observedSkills(context);
-				if (!skills) return catalog;
-				return { ...catalog, version: `${catalog.version}:skills-${skills.digest}`, capabilities: [...catalog.capabilities, ...skills.names.map((name): AgentCapability => ({
+				const skills = !this.modelRead && !this.modelReadStopUnconfirmed && !this.compactWork && !this.compactStopUnconfirmed && observedSkills(context);
+				if (!skills) return catalog ?? unavailable();
+				return { framework: 'cc', runtimeVersion: skills.runtimeVersion, discovery: { source: 'native', coverage: 'partial' }, ...catalog,
+					version: catalog ? `${catalog.version}:skills-${skills.digest}` : `cc-skills:${skills.digest}`,
+					capabilities: [...(catalog?.capabilities ?? []), ...skills.names.map((name): AgentCapability => ({
 					id: `skill:${name}`, kind: 'skill', source: 'skill', name, supported: true, executable: false, reason: 'submission_only',
 					defaultVisibility: 'public', scope: 'conversation', parameters: [{ name: 'arguments', type: 'string', required: false }],
 				}))] };
@@ -199,9 +203,10 @@ export class CcHeadlessDriver implements RunDriver {
 			} catch { return { status: 'failed', error: 'authorization_changed' }; }
 			if (this.closing || this.active.size || this.compactWork || this.compactStopUnconfirmed)
 				return { status: 'failed', error: 'command_busy' };
-			const skills = observedSkills({ workspace: input.workspace, conversation: execution.conversation, authorizationEpoch: execution.authorizationEpoch });
-			if (!skills || !/^cc-models:[a-f0-9]{64}(?::[a-f0-9]{64})?:skills-[a-f0-9]{64}$/.test(input.catalogVersion) ||
-				!input.catalogVersion.endsWith(`:skills-${skills.digest}`) || !skills.names.includes(input.capabilityId.slice(6)))
+			const skills = observedSkills({ ...input, conversation: execution.conversation, authorizationEpoch: execution.authorizationEpoch });
+			if (!skills || !(input.catalogVersion === `cc-skills:${skills.digest}` ||
+				(/^cc-models:[a-f0-9]{64}(?::[a-f0-9]{64})?:skills-[a-f0-9]{64}$/.test(input.catalogVersion) &&
+					input.catalogVersion.endsWith(`:skills-${skills.digest}`))) || !skills.names.includes(input.capabilityId.slice(6)))
 				return { status: 'failed', error: 'catalog_stale' };
 			// The core journals this receipt for the original typed request; no Native input or lease is created.
 			return { status: 'noop', text: '插件已收到技能指令，未执行。' };
@@ -427,7 +432,7 @@ class CcRun implements AgentRun {
 		let resultError: string | undefined;
 		let resultSeen = false;
 		let initSeen = false;
-		let skillObservation: { runtimeVersion: string; names: string[] } | undefined;
+		let skillObservation: { runtimeVersion: string; names: string[]; authorizationEpoch?: string } | undefined;
 		try {
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			input.signal.addEventListener('abort', this.onAbort, { once: true });
@@ -466,6 +471,12 @@ class CcRun implements AgentRun {
 				(ev) => this.notify({ type: 'hook', event: ev }));
 			await input.saveRecovery({ version: 1, value: { provider: 'cc', runId: input.runId,
 				attempt, inputId, sessionId: sessionId ?? null, workspace, stopProbe: 'unknown-after-restart' } });
+			if (previous && 'skillObservation' in previous) {
+				// A failed resume must not leave the preceding observation available as fresh.
+				const state = { ...previous };
+				delete state.skillObservation;
+				await input.conversation.saveNativeState({ version: 1, value: state });
+			}
 			input.conversation.assertCurrent();
 			if (this.cancelled || input.signal.aborted) { yield { type: 'cancelled', reason: 'Cancelled before submission' }; return; }
 			this.child = this.spawn(this.deps.claudeBin ?? 'claude', argv, {
@@ -544,7 +555,8 @@ class CcRun implements AgentRun {
 					initSeen = true; // #382: resume accepted — later failures are execution failures, not "history lost"
 					const { claude_code_version: runtimeVersion, skills } = obj;
 					skillObservation = obj.cwd === workspace && ccVersion(runtimeVersion) && Array.isArray(skills)
-						? { runtimeVersion, names: [...new Set(skills.filter(skillName))].sort().slice(0, 254) } : undefined;
+						? { runtimeVersion, names: [...new Set(skills.filter(skillName))].sort().slice(0, 254),
+							...(input.authorizationEpoch ? { authorizationEpoch: input.authorizationEpoch } : {}) } : undefined;
 					boundState = { ...(previous && typeof previous === 'object' && 'sessionId' in previous && previous.sessionId === sessionId
 						? previous : {}), sessionId, workspace };
 					delete boundState.skillObservation;

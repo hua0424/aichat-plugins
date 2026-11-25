@@ -406,27 +406,32 @@ export class MessageHandler {
 			const store = this.getConversations(), record = store.get(this.selfUid, request.roomId);
 			if (!record || record.adapterInstanceId !== this.driver.type) return undefined;
 			const connection = this.ws.openConnectionAttempt;
-			const assertCurrent = () => {
+			// The scoped model.list invoke reuses the owner-only compact profile.
+			const ownerOnly = request.operation === 'invoke';
+			const readCurrent = () => {
 				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
 				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-					(this.driver.type === 'cc' ? !this.ccCommandAdmissionMatches(request.roomId, epoch, request.context, connection) ||
-						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
-						JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation)
+					(this.driver.type === 'cc' ? !this.ccCommandAdmissionMatches(request.roomId, epoch, request.context, connection, ownerOnly) ||
+						current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace
 						: this.groupConfigCache.get(this.selfUid, request.roomId)?.authorizationEpoch !== epoch) ||
 					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
 					throw new Error('discovery context changed');
+				return current.nativeState.cc;
 			};
-			assertCurrent();
-			return { id: record.conversationId, generation: record.generation, assertCurrent,
-				...(this.driver.type === 'cc' && record.nativeState.cc ? { nativeState: { version: 1, value: record.nativeState.cc } } : {}) };
+			readCurrent();
+			const conversation = { id: record.conversationId, generation: record.generation, assertCurrent: () => { readCurrent(); } };
+			return this.driver.type === 'cc' ? { ...conversation, get nativeState() {
+				const state = readCurrent();
+				return state ? { version: 1, value: state } : undefined;
+			} } : conversation;
 		} catch { return undefined; }
 	}
 
-	private ccCommandAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined): boolean {
+	private ccCommandAdmissionMatches(room: string, epoch: string, context: AgentCommandRequest['context'], connection: number | undefined, ownerOnly: boolean): boolean {
 		if (connection === undefined || this.ws.openConnectionAttempt !== connection) return false;
 		if (context.roomType === 2) {
-			// Owner DM admission comes from the authenticated IM envelope; IM truncates its epoch to 32 hex digits.
-			return context.isOwner === true && /^[a-f0-9]{32}$/.test(epoch);
+			// The authenticated IM envelope authorizes the DM participant and carries a 32-hex epoch.
+			return typeof context.isOwner === 'boolean' && (!ownerOnly || context.isOwner) && /^[a-f0-9]{32}$/.test(epoch);
 		}
 		return !this.groupConfigCache.isStale(this.selfUid, room) && this.groupConfigCache.get(this.selfUid, room)?.authorizationEpoch === epoch;
 	}
@@ -442,7 +447,7 @@ export class MessageHandler {
 			? { context: request.context, connection: this.ws.openConnectionAttempt } : undefined;
 		if (ccCommandAdmission) {
 			const current = store.get(this.selfUid, room);
-			if (!current || current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccCommandAdmission.context, ccCommandAdmission.connection) ||
+			if (!current || current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccCommandAdmission.context, ccCommandAdmission.connection, request.capabilityId === 'session.compact') ||
 				(expectedGeneration !== undefined && Number(expectedGeneration) === 0)) {
 				return request.reconcileOnly ? { receipt: { status: 'unknown', error: 'authorization_changed' } }
 					: { receipt: { status: 'failed', error: 'authorization_changed' } };
@@ -502,7 +507,7 @@ export class MessageHandler {
 			}
 			// Journal identity was checked above. This branch has no execution/mutation handles.
 			const recovered = await this.driver.executeCapability({ workspace, signal: AbortSignal.timeout(10_000), capabilityId: request.capabilityId!,
-				catalogVersion: request.catalogVersion!, parameters: request.parameters,
+				catalogVersion: request.catalogVersion!, parameters: request.parameters, roomType: request.context.roomType, isOwner: request.context.isOwner,
 				recovery: { generation: entry.generation, nativeRef: entry.nativeRef, value: entry.recovery, receipt,
 					...(entry.ccCompactInputId ? { ccCompactInputId: entry.ccCompactInputId } : {}) } });
 			const persisted = store.recordControl(this.selfUid, room, request.requestId, recovered);
@@ -525,7 +530,7 @@ export class MessageHandler {
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (hasUnconfirmedNativeReset(current, requestId)) throw new Error('native reset outcome unconfirmed');
-			if (ccAdmission && (current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccAdmission.context, ccAdmission.connection) ||
+			if (ccAdmission && (current.state !== 'ready' || !this.ccCommandAdmissionMatches(room, epoch, ccAdmission.context, ccAdmission.connection, scope.capabilityId === 'session.compact') ||
 				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
 				(scope.capabilityId?.startsWith('skill:') && JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation))))
 				throw new Error('Claude command authorization changed');
@@ -1344,6 +1349,7 @@ export class MessageHandler {
 				if (!bound) throw new Error('ordinary run admission unavailable');
 				const prepared: PreparedRun = {
 					runId: id, message: agentEnvelope, systemPrompt,
+					...(roomType !== 2 && authorizationEpoch !== undefined ? { authorizationEpoch } : {}),
 					contextKey: bound.contextKey, promptOwner: this.selfUid,
 					bindToken: this.driver.type === 'cc' ? store.mintToken(this.selfUid, roomId) : undefined,
 					// #404: frozen per-run binding; fixed to one thinkingId by the exact START
