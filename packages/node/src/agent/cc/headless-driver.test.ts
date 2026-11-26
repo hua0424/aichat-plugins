@@ -180,7 +180,7 @@ describe('CC native capability observation', () => {
 			const handle = await open(path, 'r');
 			handles.push(handle);
 			return { cwd: f.dir, cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {},
-				assertIntact, history: { path, handle, originalBytes } };
+				assertIntact, captureClearScope: vi.fn(), verifyClearRotation: vi.fn(), history: { path, handle, originalBytes } };
 		});
 		const release = vi.fn();
 		const reserve = vi.fn(() => release);
@@ -248,6 +248,114 @@ describe('CC native capability observation', () => {
 			expect(execute.bindTurn).not.toHaveBeenCalled();
 		} finally { prepareNative.mockRestore(); observe.mockRestore(); verify.mockRestore(); }
 	});
+	posix('retains idle controls and stays within the catalog limit for a full skill observation', async () => {
+		const f = fixture(), sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir,
+			skillObservation: { runtimeVersion: '2.1.195', names: Array.from({ length: 254 }, (_, i) => `skill-${i}`) } } } };
+		const path = join(f.dir, `${sessionId}.jsonl`);
+		writeFileSync(path, 'original\n');
+		const prepare = vi.spyOn(preflight, 'prepareCcNativeCompact').mockImplementation(async () => ({ cwd: f.dir,
+			cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {}, assertIntact: vi.fn(),
+			captureClearScope: vi.fn(), verifyClearRotation: vi.fn(),
+			history: { path, handle: await open(path, 'r'), originalBytes: Buffer.from('original\n') } }));
+		try {
+			const context = { roomId: 'room', roomType: 2, workspace: f.dir, conversation, authorizationEpoch: 'epoch', signal: f.controller.signal };
+			for (const [index, isOwner] of [true, false].entries()) {
+				const discovery = f.driver.discoverCapabilities({ ...context, isOwner });
+				await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+				f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[index]).request_id, subtype: 'success',
+					response: { models: [{ value: 'scoped', displayName: 'Scoped model' }] } } });
+				await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(index + 1));
+				f.groupExit(); f.close(0);
+				const rows = (await discovery).capabilities;
+				expect(rows.some(item => item.id === 'session.reset' && item.executable)).toBe(isOwner);
+				expect(rows.length).toBe(isOwner ? 256 : 254);
+				expect(rows.filter(item => item.kind === 'skill')).toHaveLength(253);
+			}
+		} finally { prepare.mockRestore(); }
+	});
+	posix.each(['verified', 'unconfirmed', 'abort before write', 'abort during proof'])(
+		'keeps one original Clear request through %s', async (scenario) => {
+		const f = fixture(), sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
+		const next = 'c940a8cd-66dc-4538-9158-585dd681c274', output = 'be31980c-10ab-48f4-98b5-1ce2a2a2c957';
+		const conversation = { ...f.input.conversation, nativeState: { version: 1, value: { sessionId, workspace: f.dir } } };
+		const path = join(f.dir, `${sessionId}.jsonl`);
+		writeFileSync(path, 'original\n');
+		let finishCapture!: () => void, finishProof!: (verified: boolean) => void;
+		const capture = vi.fn(() => scenario === 'abort before write'
+			? new Promise<void>(resolve => { finishCapture = resolve; }) : Promise.resolve());
+		const verify = vi.fn(() => scenario === 'abort during proof'
+			? new Promise<boolean>(resolve => { finishProof = resolve; }) : Promise.resolve(scenario === 'verified'));
+		const prepare = vi.spyOn(preflight, 'prepareCcNativeCompact').mockImplementation(async () => ({ cwd: f.dir,
+			cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {}, assertIntact: vi.fn(),
+			captureClearScope: capture, verifyClearRotation: verify,
+			history: { path, handle: await open(path, 'r'), originalBytes: Buffer.from('original\n') } }));
+		const release = vi.fn(), reserve = vi.fn(() => release);
+		const completeCcClear = vi.fn(() => ({ status: 'completed' as const, generation: '1', nativeRef: { sessionId },
+			effect: { kind: 'reset' as const, sessionId: next, generation: '2' } }));
+		const execution = { requestId: 'clear', conversation, systemPrompt: '', contextKey: 'opaque', promptOwner: 'agent',
+			authorizationEpoch: 'epoch', reserveCcCompact: reserve, completeCcClear, saveRecovery: vi.fn(), submitted: vi.fn(),
+			selectModel: vi.fn(), replaceSession: vi.fn(), emit: vi.fn(), bindTurn: vi.fn() };
+		const scope = { roomId: 'room', aiclawUid: 'agent', context: { roomType: 2, counterpartUid: 'owner', isOwner: true, workspaceDir: f.dir, authorizationEpoch: 'epoch' } };
+		const handler = new AgentCommandHandler(f.driver, 'agent', f.dir, { prepare: async () => ({ execution }), conversation: () => conversation });
+		const respond = async (index: number) => {
+			await vi.waitFor(() => expect(f.writes).toHaveLength(index + 1));
+			f.line({ type: 'control_response', response: { request_id: JSON.parse(f.writes[index]).request_id, subtype: 'success',
+				response: { models: [{ value: 'scoped', displayName: 'Scoped model' }] } } });
+		};
+		const close = async (times: number) => {
+			await vi.waitFor(() => expect(f.endInput).toHaveBeenCalledTimes(times));
+			f.groupExit(); f.close(0);
+		};
+		try {
+			const discovery = handler.handle({ ...scope, requestId: 'discover', operation: 'discover' });
+			await respond(0); await close(1);
+			const catalog = (await discovery)?.catalog;
+			const invoke = { ...scope, requestId: 'clear', operation: 'invoke', capabilityId: 'session.reset', catalogVersion: catalog!.version };
+			const result = handler.handle(invoke), duplicate = handler.handle(invoke);
+			await respond(1); await close(2);
+			await respond(2);
+			await vi.waitFor(() => expect(capture).toHaveBeenCalledOnce());
+			if (scenario === 'abort before write') {
+				const disconnect = f.driver.disconnect();
+				expect(f.kill).toHaveBeenCalledWith(-4242, 'SIGTERM');
+				finishCapture(); await tick();
+				expect(f.writes).toHaveLength(3);
+				expect(release).not.toHaveBeenCalled();
+				f.groupExit(); f.close(null);
+				await disconnect;
+				expect(await result).toMatchObject({ status: 'failed' });
+				expect(release).toHaveBeenCalledOnce();
+				expect(verify).not.toHaveBeenCalled();
+			} else {
+				await vi.waitFor(() => expect(f.writes).toHaveLength(4));
+				const input = JSON.parse(f.writes[3]);
+				expect(input).toMatchObject({ type: 'user', session_id: sessionId, message: { content: [{ text: '/clear' }] } });
+				expect(reserve.mock.calls).toEqual([[sessionId, input.uuid]]);
+				f.line({ type: 'system', subtype: 'init', session_id: next, claude_code_version: '2.1.195', cwd: f.dir, tools: [], mcp_servers: [] });
+				const usage = { input_tokens: 0, output_tokens: 0 };
+				f.line({ type: 'assistant', session_id: next, uuid: output, parent_tool_use_id: null,
+					message: { role: 'assistant', model: '<synthetic>', usage, content: [{ type: 'text', text: '(no content)' }] } });
+				f.line({ type: 'result', session_id: next, subtype: 'success', is_error: false, num_turns: 0, result: '', usage, permission_denials: [] });
+				expect(completeCcClear).not.toHaveBeenCalled();
+				await close(3);
+				await vi.waitFor(() => expect(verify).toHaveBeenCalledWith(next, output));
+				if (scenario === 'abort during proof') {
+					const disconnect = f.driver.disconnect();
+					finishProof(true);
+					await disconnect;
+				}
+				expect(await result).toMatchObject(scenario === 'verified'
+					? { status: 'completed', effect: { kind: 'reset', sessionId: next } } : { status: 'unknown' });
+				if (scenario === 'verified') expect(completeCcClear).toHaveBeenCalledWith(input.uuid, next);
+				expect(release).not.toHaveBeenCalled();
+			}
+			expect(await duplicate).toEqual(await result);
+			expect(completeCcClear).toHaveBeenCalledTimes(scenario === 'verified' ? 1 : 0);
+			expect(execution.bindTurn).not.toHaveBeenCalled();
+			expect(f.writes.filter(frame => JSON.parse(frame).type === 'user')).toHaveLength(scenario === 'abort before write' ? 0 : 1);
+		} finally { prepare.mockRestore(); }
+	});
 	posix('does not advertise an ambient catalog when disconnect races a scoped inventory', async () => {
 		const f = fixture();
 		const sessionId = 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc';
@@ -258,7 +366,7 @@ describe('CC native capability observation', () => {
 		const assertIntact = vi.fn().mockResolvedValueOnce(undefined).mockImplementationOnce(() => f.driver.disconnect());
 		const prepare = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue({ cwd: f.dir,
 			cliPath: '/owned/claude', settingsPath: '/owned/settings.json', env: {}, assertIntact,
-			history: { path, handle, originalBytes: Buffer.from('original\n') } });
+			captureClearScope: vi.fn(), verifyClearRotation: vi.fn(), history: { path, handle, originalBytes: Buffer.from('original\n') } });
 		try {
 			const discovery = f.driver.discoverCapabilities({ roomId: 'room', workspace: f.dir, conversation, signal: f.controller.signal });
 			await vi.waitFor(() => expect(f.writes).toHaveLength(1));

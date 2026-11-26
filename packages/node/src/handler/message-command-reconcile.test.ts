@@ -217,6 +217,54 @@ describe('command reconcile evidence', () => {
 		expect(notices).toEqual([expect.stringContaining('不会自动重试')]);
 		expect(send.mock.calls.some(([type]) => type === 20)).toBe(false);
 	});
+	it('reconciles a confirmed Claude Clear on its original request after the generation advances', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-clear-command-')); dirs.push(home);
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b', inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';
+		const next = 'c940a8cd-66dc-4538-9158-585dd681c274', workspace = join(home, 'u', 'owner');
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace });
+		const execute = vi.fn(async ({ execution }: AgentCapabilityInvocation) => {
+			execution!.reserveCcCompact!(sessionId, inputId);
+			return execution!.completeCcClear!(inputId, next);
+		});
+		const { handler, posted, send } = setup(store, execute, home, 'cc', false);
+		const context = { roomType: 2, counterpartUid: 'owner', isOwner: true, expectedGeneration: '1', authorizationEpoch: 'f287c6e86faa447e0e0e51c09a54638a' };
+		const data = request('clear', { capabilityId: 'session.reset', context });
+		handler.handle({ type: 'agentCommand', data: { ...data, requestId: 'nonowner-clear', context: { ...context, isOwner: false } } });
+		await waitForReports(posted, 1);
+		expect(posted[0]).toMatchObject({ status: 'failed', error: 'authorization_changed' });
+		expect(execute).not.toHaveBeenCalled();
+		handler.handle({ type: 'agentCommand', data });
+		await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({ requestId: 'clear', status: 'completed',
+			generation: '1', nativeRef: { sessionId }, effect: { kind: 'reset', sessionId: next, generation: '2' } })));
+		handler.handle({ type: 'agentCommand', data: { ...data, reconcileOnly: true } });
+		await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({ requestId: 'clear', status: 'completed', reconciled: true })));
+		expect(execute).toHaveBeenCalledOnce();
+		expect(store.getNative('cc', 'u', '20')).toEqual({ sessionId: next, workspace });
+		expect(send.mock.calls.some(([type]) => type === 20)).toBe(false);
+	});
+	it('does not rediscover native session controls across an unresolved Clear fence', async () => {
+		const home = mkdtempSync(join(tmpdir(), 'cc-clear-discover-')); dirs.push(home);
+		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
+		const workspace = join(home, 'u', 'owner');
+		const store = new ConversationStore({ home, serverNamespace: 'test', activeUids: new Set(['u']), activeProviders: new Map([['u', 'cc' as const]]) });
+		const context = { roomType: 2, counterpartUid: 'owner', isOwner: true, authorizationEpoch: 'f287c6e86faa447e0e0e51c09a54638a' };
+		store.registerNative('cc', sessionId, 'u', '20', { sessionId, workspace });
+		store.prepareControl('u', '20', 'original-clear', 'original-fingerprint', context.authorizationEpoch);
+		store.submitCcCompact('u', '20', 'original-clear', sessionId, '94f1a809-4687-4f8f-8a80-0dc54fd7276c');
+		const readInventory = vi.spyOn(inventory, 'readCcModelInventory').mockResolvedValue([{ value: 'example', displayName: 'Example' }]);
+		const prepareNative = vi.spyOn(preflight, 'prepareCcNativeCompact').mockResolvedValue(undefined);
+		const driver = new CcHeadlessDriver({ workspaceBase: home, brokerPort: 0, registerHook: () => () => {} });
+		const { handler, posted } = setup(store, undefined, home, driver, false);
+		try {
+			handler.handle({ type: 'agentCommand', data: request('after-clear', { operation: 'discover', capabilityId: undefined, context }) });
+			await waitForReports(posted, 1);
+			const catalog = posted[0].catalog as AgentCapabilityCatalog;
+			expect(catalog.capabilities.map(item => item.id)).toEqual(['model.list']);
+			expect(prepareNative).not.toHaveBeenCalled();
+			expect(store.getControl('u', '20', 'original-clear')?.ccCompactFence).toBeDefined();
+		} finally { prepareNative.mockRestore(); readInventory.mockRestore(); }
+	});
 	it('recovers the original Claude compact input privately without resubmitting it', async () => {
 		const home = mkdtempSync(join(tmpdir(), 'cc-compact-recovery-')); dirs.push(home);
 		const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b', inputId = '94f1a809-4687-4f8f-8a80-0dc54fd7276c';

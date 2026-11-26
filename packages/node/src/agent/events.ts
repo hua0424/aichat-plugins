@@ -158,6 +158,8 @@ export interface CapabilityExecution {
 	submitted(ref?: NativeRef): Promise<void>;
 	/** Holds the original Claude control slot. Release only after proven containment or before launch. */
 	reserveCcCompact?(sessionId: string, inputId: string): (receipt?: AgentCapabilityResult) => void;
+	/** Clear only: settle this reserved request and rotate its idle conversation atomically. */
+	completeCcClear?(inputId: string, newSessionId: string): AgentCapabilityResult;
 	selectModel(model: { providerID: string; modelID: string }): Promise<void>;
 	replaceSession(id: string, state: { version: number; value: unknown }): Promise<number>;
 	emit(event: { type: 'receipt'; receipt: AgentCapabilityResult } | { type: 'turn'; turn: NativeTurnEvent }): Promise<void>;

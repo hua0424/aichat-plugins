@@ -12,6 +12,7 @@ import { capabilityParameters } from '../capability-parameters.js';
 import { readCcModelInventory } from './model-inventory.js';
 import { prepareCcNativeCompact } from './native-compact-preflight.js';
 import { observeCcCompact, verifyCcCompactAppend } from './compact.js';
+import { observeCcClear } from './clear.js';
 
 function compactScope({ conversation, workspace }: Pick<AgentCapabilityContext, 'conversation' | 'workspace'>) {
 	const state = conversation?.nativeState?.value as { sessionId?: unknown; workspace?: unknown } | undefined;
@@ -34,7 +35,8 @@ function observedSkills(context: Pick<AgentCapabilityContext, 'conversation' | '
 	if (!scope || !context.authorizationEpoch || !ccVersion(observation?.runtimeVersion) || !Array.isArray(observation.names) ||
 		!observation.names.length || observation.names.length > 254 || !observation.names.every(skillName) ||
 		(context.roomType !== 2 && observation.authorizationEpoch !== context.authorizationEpoch)) return;
-	const names = [...new Set(observation.names)].sort();
+	// Leave space for Models, Compact and Clear within the IM's 256-row catalog.
+	const names = [...new Set(observation.names)].sort().slice(0, 253);
 	const digest = createHash('sha256').update(JSON.stringify([scope.digest, context.authorizationEpoch, observation.runtimeVersion, names])).digest('hex');
 	return { names, digest, runtimeVersion: observation.runtimeVersion };
 }
@@ -137,10 +139,14 @@ export class CcHeadlessDriver implements RunDriver {
 				context.signal.throwIfAborted();
 				context.conversation?.assertCurrent();
 				if (this.active.size || this.closing || (native && (this.compactWork || this.compactStopUnconfirmed))) return unavailable();
-				if (catalog && scope && native) catalog = { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`, capabilities: [...catalog.capabilities, {
-					id: 'session.compact', kind: 'command', source: 'session', name: 'Compact', supported: true,
-					executable: true, defaultVisibility: 'public', scope: 'conversation', parameters: [],
-				}] };
+				if (catalog && scope && native) {
+					const controls: AgentCapability[] = [['session.compact', 'Compact'], ['session.reset', 'Clear']].map(([id, name]) => ({
+						id, name, kind: 'command', source: 'session', supported: true, executable: true,
+						defaultVisibility: 'public', scope: 'conversation', parameters: [],
+					}));
+					catalog = { ...catalog, runtimeVersion: '2.1.195', version: `${catalog.version}:${scope.digest}`,
+						capabilities: [...catalog.capabilities, ...controls] };
+				}
 				const skills = !this.modelRead && !this.modelReadStopUnconfirmed && !this.compactWork && !this.compactStopUnconfirmed && observedSkills(context);
 				if (!skills) return catalog ?? unavailable();
 				return { framework: 'cc', runtimeVersion: skills.runtimeVersion, discovery: { source: 'native', coverage: 'partial' }, ...catalog,
@@ -212,7 +218,7 @@ export class CcHeadlessDriver implements RunDriver {
 			return { status: 'noop', text: '插件已收到技能指令，未执行。' };
 		}
 		if (skillCatalogSuffix.test(input.catalogVersion)) input = { ...input, catalogVersion: input.catalogVersion.replace(skillCatalogSuffix, '') };
-		if (input.capabilityId === 'session.compact') return this.executeCompact(input);
+		if (input.capabilityId === 'session.compact' || input.capabilityId === 'session.reset') return this.executeSessionControl(input);
 		if (input.capabilityId !== 'model.list' || input.execution || input.recovery) return { status: 'unsupported', error: 'execution_not_connected' };
 		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
@@ -242,11 +248,12 @@ export class CcHeadlessDriver implements RunDriver {
 		} catch { return { status: 'failed', error: 'native_request_failed' }; }
 		finally { await native?.history.handle.close(); }
 	}
-	private async executeCompact(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
+	private async executeSessionControl(input: AgentCapabilityInvocation): Promise<AgentCapabilityResult> {
 		// This lane cannot establish teardown or recover the native write after a process restart.
 		if (input.recovery) return input.recovery.receipt;
-		const execution = input.execution, reserve = execution?.reserveCcCompact;
-		if (!execution || !reserve) return { status: 'unsupported', error: 'execution_not_connected' };
+		const clear = input.capabilityId === 'session.reset';
+		const execution = input.execution, reserve = execution?.reserveCcCompact, completeClear = execution?.completeCcClear;
+		if (!execution || !reserve || (clear && !completeClear)) return { status: 'unsupported', error: 'execution_not_connected' };
 		try { capabilityParameters('invoke', input.capabilityId, input.parameters); }
 		catch { return { status: 'failed', error: 'invalid_parameters' }; }
 		const scope = compactScope({ workspace: input.workspace, conversation: execution.conversation });
@@ -278,6 +285,15 @@ export class CcHeadlessDriver implements RunDriver {
 				if (this.active.size || this.closing) return { status: 'failed', error: 'command_busy' };
 				const inputId = randomUUID();
 				release = reserve(scope.sessionId, inputId);
+				if (clear && completeClear) {
+					const { observedSessionId, outputId } = await observeCcClear({ ...scope, inputId, claudeBin: native.cliPath,
+						settingsPath: native.settingsPath, env: native.env, signal, beforeInput: native.captureClearScope,
+						onSubmit: () => { assertCurrent(); submitted = true; }, spawn: this.deps.spawn, kill: this.deps.kill,
+						platform: this.deps.platform });
+					if (!await native.verifyClearRotation(observedSessionId, outputId)) throw new Error('CC clear history unconfirmed');
+					assertCurrent();
+					return completeClear(inputId, observedSessionId);
+				}
 				const version = '2.1.195' as const;
 				const { assertIntact } = native;
 				const evidence = await observeCcCompact({ ...scope, inputId, version, claudeBin: native.cliPath,
@@ -294,6 +310,8 @@ export class CcHeadlessDriver implements RunDriver {
 			} catch (error) {
 				const unknown = { ...original, status: 'unknown', error: 'native_request_failed' } as const;
 				if (error instanceof DriverDisconnectIncompleteError) { this.compactStopUnconfirmed = true; return unknown; }
+				// A contained child isn't proof that a submitted Clear left the old handle current.
+				if (clear && submitted) return unknown;
 				try { return finish(submitted ? unknown : { ...original, status: 'failed', error: 'native_request_failed' }); }
 				catch { return unknown; }
 			} finally { await native?.history.handle.close(); }

@@ -375,6 +375,33 @@ export class ConversationStore {
 			this.writeControlReceipt(r, c, { ...receipt, phase: 'outcome' }, true);
 		} else this.replace(r);
 	}
+	/** A confirmed idle Clear advances the native handle and settles the original request in one write. */
+	completeCcClear(uid: string, room: string, requestId: string, inputId: string, newSessionId: string, workspace: string): AgentCapabilityResult {
+		this.assertProvider('cc', uid);
+		const { r, c } = this.controlRecord(uid, room, requestId);
+		const previous = r.nativeState.cc;
+		const oldSessionId = c.nativeRef?.sessionId;
+		if (r.generation !== c.generation || c.ccCompactFence !== true || c.ccCompactInputId !== inputId ||
+			!oldSessionId || previous?.sessionId !== oldSessionId || previous.workspace !== workspace ||
+			r.state !== 'ready' || executionRuns(r).length || (c.receipt && c.receipt.status !== 'unknown'))
+			throw new Error('CC clear fence ownership mismatch');
+		const generation = r.generation + 1;
+		if (!Number.isSafeInteger(generation) || newSessionId.toLowerCase() === oldSessionId.toLowerCase()) throw new Error('invalid CC clear target');
+		const state = { sessionId: newSessionId, workspace };
+		this.assertCcNativeWrite('cc', state);
+		const receipt: AgentCapabilityResult = { status: 'completed', phase: 'outcome', generation: String(r.generation),
+			nativeRef: { sessionId: oldSessionId }, effect: { kind: 'reset', sessionId: newSessionId, generation: String(generation) },
+			...(c.receipt?.status === 'unknown' ? { reconciled: true } : {}) };
+		const { contextKey, nativeAliases } = r;
+		delete c.ccCompactFence;
+		c.state = 'settled'; c.receipt = receipt;
+		Object.assign(r, { generation, contextKey: randomBytes(32).toString('hex'), nativeAliases: [], nativeState: { cc: state }, replyBindings: [] });
+		this.commit(this.snapshot.records.map(item => item.conversationId === r.conversationId ? r : item), {
+			revokedKeys: [...(this.snapshot.revokedKeys ?? []), contextKey],
+			revokedAliases: [...(this.snapshot.revokedAliases ?? []), ...nativeAliases],
+		});
+		return copy(receipt);
+	}
 	saveControlRecovery(uid: string, room: string, requestId: string, recovery: RecoveryData): void {
 		this.assertRecovery(recovery);
 		const { r, c } = this.controlRecord(uid, room, requestId); c.recovery = copy(recovery); this.replace(r);
