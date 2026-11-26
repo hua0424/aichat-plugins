@@ -10,9 +10,9 @@ const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 const clearEnvelope = /^<command-name>\/clear<\/command-name>\s*<command-message>clear<\/command-message>\s*<command-args><\/command-args>$/;
 
 /** Validate already sealed snapshots. The caller must prove both file identities and fresh creation. */
-export function verifyCcClearHistory({ cwd, oldSessionId, newSessionId, outputId, oldBefore, oldAfter, newHistory }: {
+export function verifyCcClearHistory({ cwd, oldSessionId, newSessionId, outputId, oldBefore, oldAfter, newHistory, oldModeAlreadyAppended = false }: {
 	cwd: string; oldSessionId: string; newSessionId: string; outputId: string;
-	oldBefore: Buffer; oldAfter: Buffer; newHistory: Buffer;
+	oldBefore: Buffer; oldAfter: Buffer; newHistory: Buffer; oldModeAlreadyAppended?: boolean;
 }): boolean {
 	if (![oldSessionId, newSessionId, outputId].every(nativeId) ||
 		new Set([oldSessionId, newSessionId, outputId].map((id) => id.toLowerCase())).size !== 3 ||
@@ -27,7 +27,7 @@ export function verifyCcClearHistory({ cwd, oldSessionId, newSessionId, outputId
 	const isMode = (row: unknown, id: string) => JSON.stringify(row) === JSON.stringify({ type: 'mode', mode: 'normal', sessionId: id });
 	try {
 		const oldSuffix = rows(oldAfter.subarray(oldBefore.length));
-		if (oldSuffix.length > 3 || !oldSuffix.every(row => isMode(row, oldSessionId) ||
+		if (oldSuffix.length > 3 || !oldSuffix.every(row => (!oldModeAlreadyAppended && isMode(row, oldSessionId)) ||
 			(row?.type === 'queue-operation' && row.sessionId === oldSessionId &&
 				Object.keys(row).every(key => ['type', 'operation', 'content', 'sessionId', 'timestamp'].includes(key)) &&
 				((row.operation === 'enqueue' && (row.content === undefined || row.content === '/clear')) ||

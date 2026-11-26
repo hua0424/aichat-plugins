@@ -310,6 +310,18 @@ it('proves a new native Clear branch only after sealing the original scope and r
 	} finally { await result.history.handle.close(); }
 });
 
+it('rejects truncation of a native resume row already present immediately before Clear', async () => {
+	const { place, result } = await clearFixture();
+	try {
+		const old = fake.entries.get(historyPath)!;
+		old.bytes = Buffer.concat([rows(), jsonl({ type: 'mode', mode: 'normal', sessionId })]);
+		await result.captureClearScope();
+		old.bytes = rows();
+		place(newHistoryPath, 'file', clearRows());
+		await expect(result.verifyClearRotation(newSessionId, outputId)).resolves.toBe(false);
+	} finally { await result.history.handle.close(); }
+});
+
 it('rejects a new name that existed immediately before input, even if it is replaced with valid rows', async () => {
 	const { place, result } = await clearFixture();
 	try {

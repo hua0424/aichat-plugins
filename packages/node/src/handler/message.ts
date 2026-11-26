@@ -409,7 +409,7 @@ export class MessageHandler {
 			const ownerOnly = request.operation === 'invoke';
 			const readCurrent = () => {
 				const current = store.assertGeneration(this.selfUid, request.roomId, record.generation);
-				if (current.conversationId !== record.conversationId || current.state !== 'ready' ||
+				if (current.conversationId !== record.conversationId || current.state !== 'ready' || hasUnconfirmedCcCompact(current) ||
 					!this.ccCommandAdmissionMatches(request.roomId, epoch, request.context, connection, ownerOnly) ||
 					current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
 					(request.context.expectedGeneration !== undefined && request.context.expectedGeneration !== String(record.generation)))
@@ -1811,7 +1811,7 @@ export class MessageHandler {
 		// Rejected input is never queued or replayed after the compact closes.
 		if (channel.suspendNoticeKey !== 'cc-compact-unconfirmed') {
 			channel.suspendNoticeKey = 'cc-compact-unconfirmed';
-			this.sendNotice(roomId, 'Claude 原生压缩尚未确认收口，本条消息未执行，也不会自动重试。');
+			this.sendNotice(roomId, 'Claude 原生会话操作尚未确认结束，本条消息未执行，也不会自动重试。');
 		}
 		return true;
 	}

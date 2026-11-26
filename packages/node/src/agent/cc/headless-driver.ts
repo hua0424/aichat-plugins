@@ -35,7 +35,8 @@ function observedSkills(context: Pick<AgentCapabilityContext, 'conversation' | '
 	if (!scope || !context.authorizationEpoch || !ccVersion(observation?.runtimeVersion) || !Array.isArray(observation.names) ||
 		!observation.names.length || observation.names.length > 254 || !observation.names.every(skillName) ||
 		(context.roomType !== 2 && observation.authorizationEpoch !== context.authorizationEpoch)) return;
-	const names = [...new Set(observation.names)].sort();
+	// Leave space for Models, Compact and Clear within the IM's 256-row catalog.
+	const names = [...new Set(observation.names)].sort().slice(0, 253);
 	const digest = createHash('sha256').update(JSON.stringify([scope.digest, context.authorizationEpoch, observation.runtimeVersion, names])).digest('hex');
 	return { names, digest, runtimeVersion: observation.runtimeVersion };
 }

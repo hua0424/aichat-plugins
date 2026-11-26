@@ -212,12 +212,12 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 				if (await originalSnapshotIntact(snapshot) && bytes.subarray(0, originalBytes.length).equals(originalBytes))
 					return { snapshot, bytes };
 			};
-			const resumeHistoryIntact = async () => {
+			const readResumeHistory = async () => {
 				// Pinned resume touches the same file and may re-append its normal-mode metadata before reading input.
 				const mode = Buffer.from(JSON.stringify({ type: 'mode', mode: 'normal', sessionId }) + '\n');
 				const resume = await readOriginal(Math.min(MAX_HISTORY_BYTES, originalBytes.length + mode.length));
 				const suffix = resume?.bytes.subarray(originalBytes.length);
-				return !!suffix && (!suffix.length || suffix.equals(mode));
+				if (suffix && (!suffix.length || suffix.equals(mode))) return resume;
 			};
 			const scopeIntact = async () => {
 				const marker = await freshCleanupMarker(profile, uid);
@@ -226,14 +226,14 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 					same(settingsBefore, await stat(settings)) && same(cli.before, await stat(cli.binary));
 			};
 			const assertIntact = async (phase?: 'native-resume') => {
-				if (!await scopeIntact() || !await (phase === 'native-resume' ? resumeHistoryIntact() : file.current()))
+				if (!await scopeIntact() || !await (phase === 'native-resume' ? readResumeHistory() : file.current()))
 					throw new Error('Original Claude compact scope changed');
 			};
 			const clearScopeIntact = async (workspaceNow: BigIntStats) =>
 				workspaceBefore.uid === uid && workspaceBefore.ino > 0n && cwdBefore.ino > 0n &&
 				sameIdentity(workspaceBefore, workspaceNow) && await scopeIntact() && sameIdentity(cwdBefore, await stat(cwd));
 			let captureStarted = false;
-			let namesBeforeClear: Set<string> | undefined;
+			let clearBefore: { names: Set<string>; bytes: Buffer } | undefined;
 			const captureClearScope = async () => {
 				if (captureStarted) throw new Error('Claude clear scope already captured');
 				captureStarted = true;
@@ -246,20 +246,21 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 							if (names.size === MAX_PROJECT_ENTRIES || names.has(entry.name)) throw new Error('Unsealed directory');
 							names.add(entry.name);
 						}
-						if (names.has(path.basename(transcript)) && await resumeHistoryIntact() &&
-							await clearScopeIntact(workspaceNow) && same(workspaceNow, await stat(workspace))) {
-							namesBeforeClear = names;
-							return;
+						if (names.has(path.basename(transcript)) && await clearScopeIntact(workspaceNow) &&
+							same(workspaceNow, await stat(workspace))) {
+							const resume = await readResumeHistory();
+							if (resume) { clearBefore = { names, bytes: resume.bytes }; return; }
 						}
 					}
 				} catch { /* Never expose paths or native state. */ }
 				throw new Error('Original Claude clear scope changed');
 			};
 			const verifyClearRotation = async (newSessionId: string, outputId: string) => {
-				if (!namesBeforeClear || typeof newSessionId !== 'string' || !UUID.test(newSessionId) || newSessionId === sessionId ||
+				const captured = clearBefore;
+				if (!captured || typeof newSessionId !== 'string' || !UUID.test(newSessionId) || newSessionId === sessionId ||
 					typeof outputId !== 'string' || !UUID.test(outputId.toLowerCase())) return false;
 				const name = `${newSessionId}.jsonl`;
-				if (namesBeforeClear.has(name)) return false;
+				if (captured.names.has(name)) return false;
 				try {
 					const workspaceNow = await stat(workspace);
 					if (!await clearScopeIntact(workspaceNow)) return false;
@@ -275,8 +276,8 @@ export async function prepareCcNativeCompact({ cwd, sessionId, env, cliPath, set
 						await readExact(next.handle, newHistory, newHistory.length);
 						return await clearScopeIntact(workspaceNow) && await originalSnapshotIntact(previous.snapshot) &&
 							await next.current() && same(workspaceNow, await stat(workspace)) &&
-							verifyCcClearHistory({ cwd, oldSessionId: sessionId, newSessionId, outputId, oldBefore: originalBytes,
-								oldAfter: previous.bytes, newHistory });
+							verifyCcClearHistory({ cwd, oldSessionId: sessionId, newSessionId, outputId, oldBefore: captured.bytes,
+								oldAfter: previous.bytes, newHistory, oldModeAlreadyAppended: captured.bytes.length > originalBytes.length });
 					} finally { await next.handle.close(); }
 				} catch { return false; }
 			};
