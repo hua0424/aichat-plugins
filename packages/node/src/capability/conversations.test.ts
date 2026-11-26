@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { ConversationStore, suspensionReason, type Provider } from './conversations.js';
 
 const dirs: string[] = [];
@@ -357,6 +357,35 @@ describe('ConversationStore', () => {
 		expect(loaded.reset('11', '9').generation).toBe(3);
 		const raw = JSON.parse(readFileSync(join(root, 'conversations.json'), 'utf8'));
 		expect(raw.version).toBe(1);
+	});
+
+	it('commits a verified Claude Clear receipt with the new generation, or leaves the old slot fenced', () => {
+		let fail = false;
+		const root = home(), opts = active(root, { '11': 'cc' }, () => { if (fail) throw new Error('disk full'); });
+		const store = new ConversationStore(opts);
+		const workspace = resolve(root, 'work');
+		const old = store.getOrCreate('11', '9');
+		store.saveControlNativeState('11', '9', 1, 'cc', { sessionId: 'old-session', workspace, skillObservation: { names: ['stale'] } });
+		store.prepareControl('11', '9', 'clear', 'fingerprint', 'epoch');
+		store.submitCcCompact('11', '9', 'clear', 'old-session', 'input');
+		store.recordControl('11', '9', 'clear', { status: 'unknown', phase: 'outcome' });
+		const complete = (input: string) => store.completeCcClear('11', '9', 'clear', input, 'new-session', workspace);
+		expect(() => complete('foreign-input')).toThrow('ownership mismatch');
+		fail = true;
+		expect(() => complete('input')).toThrow('disk full');
+		expect(store.resolveCandidate({ key: old.contextKey })?.generation).toBe(1);
+		expect(store.getControl('11', '9', 'clear')).toMatchObject({ ccCompactFence: true, receipt: { status: 'unknown' } });
+		expect(() => store.beginRun('11', '9', 'competing')).toThrow('FENCED');
+		fail = false;
+		const receipt = complete('input');
+		expect(receipt).toMatchObject({ status: 'completed', phase: 'outcome', generation: '1', reconciled: true,
+			nativeRef: { sessionId: 'old-session' }, effect: { kind: 'reset', sessionId: 'new-session', generation: '2' } });
+		const reopened = new ConversationStore(opts);
+		expect(reopened.getControl('11', '9', 'clear')?.receipt).toEqual(receipt);
+		expect(reopened.prepareControl('11', '9', 'clear', 'fingerprint', 'epoch').fresh).toBe(false);
+		expect(reopened.resolveCandidate({ key: old.contextKey })).toBeUndefined();
+		expect(reopened.resolveLegacy('cc:new-session')).toBeUndefined();
+		expect(reopened.beginRun('11', '9', 'next')).toMatchObject({ generation: 2, nativeState: { cc: { sessionId: 'new-session', workspace } } });
 	});
 
 	it('persists only minimal bearer-bound reset receipts atomically with key revocation', () => {

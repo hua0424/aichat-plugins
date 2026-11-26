@@ -9,7 +9,11 @@ const cwd = '/root/.aichat/cc/work_space';
 const launcher = '/root/.local/bin/claude';
 const binary = '/root/.local/share/claude/versions/2.1.195';
 const sessionId = '350134b9-5bf9-49ab-b755-1868c400019b';
-const historyPath = `${profile}/projects/-root--aichat-cc-work-space/${sessionId}.jsonl`;
+const project = `${profile}/projects/-root--aichat-cc-work-space`;
+const historyPath = `${project}/${sessionId}.jsonl`;
+const newSessionId = 'a4b791fa-568f-479b-a65d-12f7a2eb5f55';
+const newHistoryPath = `${project}/${newSessionId}.jsonl`;
+const outputId = 'be31980c-10ab-48f4-98b5-1ce2a2a2c957';
 const now = 1_800_000_000_000;
 
 type FixtureEntry = {
@@ -22,7 +26,7 @@ const approvedEnv = {
 };
 const fake = vi.hoisted(() => ({
 	entries: new Map<string, FixtureEntry>(),
-	open: vi.fn(), close: vi.fn(), read: vi.fn(), digest: vi.fn(), platform: vi.fn(() => 'linux'),
+	open: vi.fn(), close: vi.fn(), read: vi.fn(), enumerate: vi.fn(), digest: vi.fn(), platform: vi.fn(() => 'linux'),
 }));
 vi.mock('node:os', () => ({ platform: fake.platform, userInfo: () => ({ homedir: '/root', uid: 0 }) }));
 vi.mock('node:crypto', () => ({ createHash: () => ({ update: vi.fn(), digest: fake.digest }) }));
@@ -39,6 +43,16 @@ vi.mock('node:fs/promises', () => {
 	return {
 		lstat: async (path: string) => stat(lookup(path)),
 		realpath: async (path: string) => lookup(path).alias ?? path,
+		opendir: async (path: string) => {
+			if (lookup(path).kind !== 'directory') throw new Error('not a directory');
+			return (async function* () {
+				for (const key of fake.entries.keys()) {
+					if (!key.startsWith(`${path}/`)) continue;
+					const name = key.slice(path.length + 1);
+					if (!name.includes('/')) { fake.enumerate(path, name); yield { name }; }
+				}
+			})();
+		},
 		open: async (path: string, flags: number) => {
 			fake.open(path, flags);
 			const entry = lookup(path);
@@ -63,16 +77,17 @@ function fixture() {
 	vi.spyOn(Date, 'now').mockReturnValue(now);
 	fake.platform.mockReturnValue('linux');
 	fake.digest.mockReturnValue(PIN);
-	fake.entries.clear(); fake.open.mockClear(); fake.close.mockClear(); fake.read.mockReset();
+	fake.entries.clear(); fake.open.mockClear(); fake.close.mockClear(); fake.read.mockReset(); fake.enumerate.mockReset();
+	let ino = 16;
 	const place = (path: string, kind: FixtureEntry['kind'] = 'directory', bytes = Buffer.alloc(0)) => {
-		const entry = { kind, ino: fake.entries.size + 16, uid: 0, mode: kind === 'directory' ? 0o755 : 0o644,
+		const entry: FixtureEntry = { kind, ino: ino++, uid: 0, mode: kind === 'directory' ? 0o755 : 0o644,
 			nlink: 1, mtimeMs: now - 1000, bytes };
 		fake.entries.set(path, entry);
 		return entry;
 	};
 	for (const path of ['/', home, profile, `${home}/.local`, `${home}/.local/bin`, `${home}/.local/share`,
 		`${home}/.local/share/claude`, `${home}/.local/share/claude/versions`, `${home}/.aichat`, `${home}/.aichat/cc`, cwd,
-		`${profile}/projects`, `${profile}/projects/-root--aichat-cc-work-space`, '/usr', '/usr/bin']) place(path);
+		`${profile}/projects`, project, '/usr', '/usr/bin']) place(path);
 	place(launcher, 'link');
 	fake.entries.get(launcher)!.alias = binary;
 	place(binary, 'file', Buffer.from('synthetic CLI bytes')).mode = 0o755;
@@ -81,6 +96,28 @@ function fixture() {
 	place(historyPath, 'file', rows());
 	const env = { HOME: home, PATH: `${home}/.local/bin:/usr/bin`, AICHAT_RUN_BIND: 'do-not-forward', OPENCLAW_BIND: 'do-not-forward' };
 	return { place, env, run: (overrides = {}) => prepareCcNativeCompact({ cwd, sessionId, env, cliPath: 'claude', ...overrides }) };
+}
+
+const jsonl = (...entries: object[]) => Buffer.from(entries.map(row => `${JSON.stringify(row)}\n`).join(''));
+function clearRows(overrides = {}) {
+	const scope = { cwd, sessionId: newSessionId, version: '2.1.195', isSidechain: false, ...overrides };
+	const caveat = '45c07ac5-895d-4ef8-88b4-a199a851ef5e';
+	const command = 'f7bc725c-74d0-46b7-a9cf-76050b7e4dc7';
+	return jsonl(
+		{ ...scope, type: 'user', uuid: caveat, parentUuid: null, isMeta: true,
+			message: { role: 'user', content: '<local-command-caveat>Native caveat only.</local-command-caveat>' } },
+		{ ...scope, type: 'user', uuid: command, parentUuid: caveat, message: { role: 'user',
+			content: '<command-name>/clear</command-name>\n  <command-message>clear</command-message>\n  <command-args></command-args>' } },
+		{ ...scope, type: 'system', uuid: outputId, parentUuid: command, subtype: 'local_command', level: 'info', isMeta: false,
+			content: '<local-command-stdout></local-command-stdout>' },
+	);
+}
+
+async function clearFixture() {
+	const f = fixture();
+	const result = await f.run();
+	if (!result) throw new Error('expected accepted preflight');
+	return { ...f, result };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -246,6 +283,91 @@ it('allows only the original transcript plus pinned normal-mode metadata after n
 		history.bytes = Buffer.concat([rows(), mode()]);
 		history.nlink = 2;
 		await expect(result.assertIntact('native-resume')).rejects.toThrow('scope changed');
+	} finally { await result.history.handle.close(); }
+});
+
+it('proves a new native Clear branch only after sealing the original scope and reading both exact transcripts', async () => {
+	const { place, result } = await clearFixture();
+	try {
+		await expect(result.verifyClearRotation(newSessionId, outputId)).resolves.toBe(false);
+		const mode = jsonl({ type: 'mode', mode: 'normal', sessionId });
+		const old = fake.entries.get(historyPath)!;
+		old.bytes = Buffer.concat([rows(), mode]);
+		place(`${project}/f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc.jsonl`, 'file', Buffer.from('another session'));
+		await result.captureClearScope();
+		await expect(result.captureClearScope()).rejects.toThrow('already captured');
+		place(newHistoryPath, 'file', clearRows());
+		old.bytes = Buffer.concat([old.bytes, jsonl({ type: 'queue-operation', operation: 'enqueue', content: '/clear', sessionId },
+			{ type: 'queue-operation', operation: 'dequeue', sessionId })]);
+		fake.entries.get(project)!.mtimeMs++;
+		result.history.originalBytes.fill(0); // A caller's copy cannot mutate the sealed prefix.
+		await expect(result.verifyClearRotation(newSessionId, outputId)).resolves.toBe(true);
+		expect(fake.enumerate.mock.calls).toEqual([[project, `${sessionId}.jsonl`], [project, 'f30ea438-e7d9-431c-a9a9-0f3d2ec18ebc.jsonl']]);
+		expect(fake.open.mock.calls.map(([name]) => name)).toEqual([`${profile}/settings.json`, binary, historyPath, newHistoryPath]);
+		expect(fake.open).toHaveBeenLastCalledWith(newHistoryPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		expect(fake.close).toHaveBeenCalledWith(newHistoryPath);
+		expect(fake.close).not.toHaveBeenCalledWith(historyPath);
+	} finally { await result.history.handle.close(); }
+});
+
+it('rejects a new name that existed immediately before input, even if it is replaced with valid rows', async () => {
+	const { place, result } = await clearFixture();
+	try {
+		place(newHistoryPath, 'link');
+		await result.captureClearScope();
+		place(newHistoryPath, 'file', clearRows());
+		await expect(result.verifyClearRotation(newSessionId, outputId)).resolves.toBe(false);
+		expect(fake.open).not.toHaveBeenCalledWith(newHistoryPath, expect.any(Number));
+	} finally { await result.history.handle.close(); }
+});
+
+it.each(['replaced original', 'rewritten original', 'replaced project', 'replaced cwd', 'missing new file',
+	'symlinked new file', 'hardlinked new file', 'foreign new file', 'oversized new file', 'wrong cwd', 'wrong session',
+	'wrong output', 'unsafe ID', 'old file changed during new read', 'new path changed mid-read'])('does not verify Clear with %s', async (kind) => {
+	const { place, result } = await clearFixture();
+	try {
+		await result.captureClearScope();
+		const next = place(newHistoryPath, 'file', clearRows());
+		let observedSession = newSessionId, observedOutput = outputId;
+		switch (kind) {
+			case 'replaced original': place(historyPath, 'file', rows()); break;
+			case 'rewritten original': fake.entries.get(historyPath)!.bytes = Buffer.from(rows().toString().replace('(fictional)', '(rewritten)')); break;
+			case 'replaced project': place(project); break;
+			case 'replaced cwd': place(cwd); break;
+			case 'missing new file': fake.entries.delete(newHistoryPath); break;
+			case 'symlinked new file': next.kind = 'link'; break;
+			case 'hardlinked new file': next.nlink = 2; break;
+			case 'foreign new file': next.uid = 1000; break;
+			case 'oversized new file': next.size = 16 * 1024 + 1; break;
+			case 'wrong cwd': next.bytes = clearRows({ cwd: `${cwd}2` }); break;
+			case 'wrong session': next.bytes = clearRows({ sessionId }); break;
+			case 'wrong output': observedOutput = 'ebfa5068-9aaa-4f47-a9b4-27b2bced095a'; break;
+			case 'unsafe ID': observedSession = '../foreign'; break;
+			case 'old file changed during new read':
+				fake.read.mockImplementation((name) => { if (name === newHistoryPath) fake.entries.get(historyPath)!.mtimeMs++; });
+				break;
+			case 'new path changed mid-read':
+				fake.read.mockImplementation((name) => { if (name === newHistoryPath) place(newHistoryPath, 'file', clearRows()); });
+				break;
+		}
+		await expect(result.verifyClearRotation(observedSession, observedOutput)).resolves.toBe(false);
+		if (fake.open.mock.calls.some(([name]) => name === newHistoryPath)) expect(fake.close).toHaveBeenCalledWith(newHistoryPath);
+		expect(fake.close).not.toHaveBeenCalledWith(historyPath);
+	} finally { await result.history.handle.close(); }
+});
+
+it.each(['over the bound', 'unstable project'])('will not seal a Clear scope with %s', async (kind) => {
+	const { place, result } = await clearFixture();
+	try {
+		if (kind === 'over the bound') {
+			for (let i = 0; i < 4096; i++) place(`${project}/entry-${i}`);
+		} else {
+			fake.enumerate.mockImplementation(() => { fake.entries.get(project)!.mtimeMs++; });
+		}
+		await expect(result.captureClearScope()).rejects.toThrow('scope changed');
+		if (kind === 'over the bound') expect(fake.enumerate).toHaveBeenCalledTimes(4097);
+		place(newHistoryPath, 'file', clearRows());
+		await expect(result.verifyClearRotation(newSessionId, outputId)).resolves.toBe(false);
 	} finally { await result.history.handle.close(); }
 });
 

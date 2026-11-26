@@ -441,12 +441,13 @@ export class MessageHandler {
 		}
 		const store = this.getConversations(), room = request.roomId, epoch = request.context.authorizationEpoch;
 		const expectedGeneration = request.context.expectedGeneration;
-		const ccCompact = this.driver.type === 'cc' && request.capabilityId === 'session.compact';
+		const ccClear = this.driver.type === 'cc' && request.capabilityId === 'session.reset';
+		const ccSessionControl = ccClear || (this.driver.type === 'cc' && request.capabilityId === 'session.compact');
 		const ccSkill = this.driver.type === 'cc' && request.capabilityId?.startsWith('skill:');
-		const ccScoped = ccCompact || ccSkill;
+		const ccScoped = ccSessionControl || ccSkill;
 		const connection = ccScoped ? this.ws.openConnectionAttempt : undefined;
 		if (ccScoped && (store.get(this.selfUid, room)?.state !== 'ready' || Number(expectedGeneration) === 0 ||
-			!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccCompact))) {
+			!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccSessionControl))) {
 			return { receipt: { status: request.reconcileOnly ? 'unknown' : 'failed', error: 'authorization_changed' } };
 		}
 		const fingerprint = createHash('sha256').update(JSON.stringify([request.operation, request.capabilityId, request.catalogVersion, request.parameters, workspace, epoch, expectedGeneration])).digest('hex');
@@ -512,7 +513,7 @@ export class MessageHandler {
 		const assertCurrent = () => {
 			const current = store.assertGeneration(this.selfUid, room, generation);
 			if (ccScoped && (current.conversationId !== record.conversationId || current.state !== 'ready' ||
-				!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccCompact) ||
+				!this.ccCommandAdmissionMatches(room, epoch, request.context, connection, ccSessionControl) ||
 				current.nativeState.cc?.sessionId !== record.nativeState.cc?.sessionId || current.nativeState.cc?.workspace !== record.nativeState.cc?.workspace ||
 				(ccSkill && JSON.stringify(current.nativeState.cc?.skillObservation) !== JSON.stringify(record.nativeState.cc?.skillObservation))))
 				throw new Error('Claude command authorization changed');
@@ -533,10 +534,14 @@ export class MessageHandler {
 				if (ccScoped) throw new Error('Scoped Claude commands cannot use generic native submission');
 				assertCurrent(); store.submitControl(this.selfUid, room, request.requestId, ref);
 			},
-			...(ccCompact ? { reserveCcCompact: (sessionId: string, inputId: string) => {
+			...(ccSessionControl ? { reserveCcCompact: (sessionId: string, inputId: string) => {
 				assertCurrent();
 				store.submitCcCompact(this.selfUid, room, request.requestId, sessionId, inputId);
 				return (receipt?: AgentCapabilityResult) => store.releaseCcCompact(this.selfUid, room, request.requestId, inputId, receipt);
+			} } : {}),
+			...(ccClear ? { completeCcClear: (inputId: string, newSessionId: string) => {
+				assertCurrent();
+				return store.completeCcClear(this.selfUid, room, request.requestId, inputId, newSessionId, workspace);
 			} } : {}),
 			selectModel: async (model) => store.selectModel(this.selfUid, room, generation, model),
 			replaceSession: async (id, state) => {
